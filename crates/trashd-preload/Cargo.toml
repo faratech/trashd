@@ -1,0 +1,14 @@
+[package]
+name = "trashd-preload"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+chrono = "0.4"
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

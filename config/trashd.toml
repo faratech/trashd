@@ -1,0 +1,48 @@
+# trashd configuration
+# Location: ~/.config/trashd/config.toml
+
+[retention]
+# Auto-purge items older than this
+max_age_days = 30
+# Maximum total trash size
+max_size_gb = 10.0
+# Purge oldest items when disk usage exceeds this
+disk_pressure_percent = 90
+
+# Paths that should never be trashed (use real delete instead).
+# Supports trailing * and leading *. wildcards.
+never_trash = [
+    "/tmp/*",
+    "/var/tmp/*",
+    "/var/cache/*",
+    "/proc/*",
+    "/sys/*",
+    "/dev/*",
+    "*.o",
+    "*.pyc",
+    "*.class",
+    "__pycache__/*",
+    "node_modules/*",
+    "target/debug/*",
+    "target/release/*",
+]
+
+# Processes that bypass trash automatically.
+# When these commands invoke rm, files are really deleted.
+bypass_processes = [
+    "apt",
+    "apt-get",
+    "dpkg",
+    "yum",
+    "dnf",
+    "pacman",
+    "rpm",
+    "pip",
+    "cargo",
+    "npm",
+    "make",
+]
+
+# Files larger than this (in MB) skip trash to avoid filling disk.
+# Set to 0 to disable.
+max_file_size_mb = 1024

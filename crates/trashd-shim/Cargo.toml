@@ -1,0 +1,12 @@
+[package]
+name = "trashd-shim"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "trashd-rm"
+path = "src/rm.rs"
+
+[dependencies]
+trashd-common = { path = "../trashd-common" }
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,15 @@
+[package]
+name = "trashd-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "trash"
+path = "src/main.rs"
+
+[dependencies]
+trashd-common = { path = "../trashd-common" }
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+tabled = "0.15"
+colored = "2"
