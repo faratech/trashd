@@ -24,12 +24,22 @@ use std::fs;
 // ---------------------------------------------------------------------------
 // Lightweight config — parsed once from ~/.config/trashd/config.toml
 // ---------------------------------------------------------------------------
-#[derive(Debug, Deserialize)]
+/// Preload config — mirrors trashd-common's Config but without pulling in
+/// SQLite or other heavy deps. Uses the same layered loading:
+///   1. Hardcoded defaults
+///   2. /etc/trashd/config.toml (global, extends lists, overrides scalars)
+///   3. ~/.config/trashd/config.toml (user, extends lists, overrides scalars)
+#[derive(Debug)]
 struct PreloadConfig {
-    #[serde(default)]
     never_trash: Vec<String>,
-    #[serde(default)]
     bypass_processes: Vec<String>,
+}
+
+/// Partial config for layered merge — all fields optional.
+#[derive(Debug, Deserialize, Default)]
+struct PartialPreloadConfig {
+    never_trash: Option<Vec<String>>,
+    bypass_processes: Option<Vec<String>>,
 }
 
 impl Default for PreloadConfig {
@@ -46,10 +56,18 @@ impl Default for PreloadConfig {
                 "*.o".into(),
                 "*.pyc".into(),
                 "*.class".into(),
+                "*.lock".into(),
+                "*.pid".into(),
+                "*.sock".into(),
+                "*.socket".into(),
+                "*.tmp".into(),
+                "*.swp".into(),
+                "*~".into(),
                 "__pycache__/*".into(),
                 "node_modules/*".into(),
                 "target/debug/*".into(),
                 "target/release/*".into(),
+                "*/.git/*".into(),
             ],
             bypass_processes: vec![
                 "apt".into(),
@@ -68,19 +86,50 @@ impl Default for PreloadConfig {
     }
 }
 
+impl PreloadConfig {
+    fn merge(&mut self, partial: PartialPreloadConfig) {
+        if let Some(extra) = partial.never_trash {
+            for item in extra {
+                if !self.never_trash.contains(&item) {
+                    self.never_trash.push(item);
+                }
+            }
+        }
+        if let Some(extra) = partial.bypass_processes {
+            for item in extra {
+                if !self.bypass_processes.contains(&item) {
+                    self.bypass_processes.push(item);
+                }
+            }
+        }
+    }
+}
+
 fn config() -> &'static PreloadConfig {
     static CFG: OnceLock<PreloadConfig> = OnceLock::new();
     CFG.get_or_init(|| {
-        let config_path = dirs::config_dir()
+        let mut cfg = PreloadConfig::default();
+
+        // Layer 1: global config
+        if let Some(partial) = load_partial_config(Path::new("/etc/trashd/config.toml")) {
+            cfg.merge(partial);
+        }
+
+        // Layer 2: user config
+        let user_path = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/nonexistent"))
             .join("trashd/config.toml");
-        if let Ok(content) = fs::read_to_string(&config_path) {
-            if let Ok(cfg) = toml::from_str::<PreloadConfig>(&content) {
-                return cfg;
-            }
+        if let Some(partial) = load_partial_config(&user_path) {
+            cfg.merge(partial);
         }
-        PreloadConfig::default()
+
+        cfg
     })
+}
+
+fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {
+    let content = fs::read_to_string(path).ok()?;
+    toml::from_str::<PartialPreloadConfig>(&content).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +241,7 @@ fn process_name(pid: u32) -> Option<String> {
 }
 
 /// Check if path matches the never-trash list from config.
+/// Uses the same matching logic as trashd-common's Config::should_skip.
 fn should_skip_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let cfg = config();
@@ -205,6 +255,10 @@ fn should_skip_path(path: &Path) -> bool {
             if s.ends_with(&pattern[1..]) {
                 return true;
             }
+        } else if pattern == "*~" {
+            if s.ends_with('~') {
+                return true;
+            }
         } else if let Some(suffix) = pattern.strip_prefix("*/") {
             if s.contains(&format!("/{suffix}"))
                 || s.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
@@ -214,23 +268,6 @@ fn should_skip_path(path: &Path) -> bool {
         } else if *pattern == *s {
             return true;
         }
-    }
-
-    // Always skip regardless of config: lock files, sockets, pid files
-    if s.ends_with(".lock")
-        || s.ends_with(".pid")
-        || s.ends_with(".sock")
-        || s.ends_with(".socket")
-        || s.ends_with(".tmp")
-        || s.ends_with(".swp")
-        || s.ends_with('~')
-    {
-        return true;
-    }
-
-    // Always skip .git internals
-    if s.contains("/.git/") {
-        return true;
     }
 
     false

@@ -48,60 +48,161 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             retention: default_retention(),
-            never_trash: vec![
-                "/tmp/*".into(),
-                "/var/tmp/*".into(),
-                "/var/cache/*".into(),
-                "/proc/*".into(),
-                "/sys/*".into(),
-                "/dev/*".into(),
-                "*.o".into(),
-                "*.pyc".into(),
-                "*.class".into(),
-                "__pycache__/*".into(),
-                "node_modules/*".into(),
-                "target/debug/*".into(),
-                "target/release/*".into(),
-            ],
-            bypass_processes: vec![
-                "apt".into(),
-                "apt-get".into(),
-                "dpkg".into(),
-                "yum".into(),
-                "dnf".into(),
-                "pacman".into(),
-                "rpm".into(),
-                "pip".into(),
-                "cargo".into(),
-                "npm".into(),
-                "make".into(),
-            ],
+            never_trash: default_never_trash(),
+            bypass_processes: default_bypass_processes(),
             max_file_size_mb: 1024,
         }
     }
 }
 
+/// Default never-trash patterns shared across all layers.
+fn default_never_trash() -> Vec<String> {
+    vec![
+        "/tmp/*".into(),
+        "/var/tmp/*".into(),
+        "/var/cache/*".into(),
+        "/proc/*".into(),
+        "/sys/*".into(),
+        "/dev/*".into(),
+        "/run/*".into(),
+        "*.o".into(),
+        "*.pyc".into(),
+        "*.class".into(),
+        "*.lock".into(),
+        "*.pid".into(),
+        "*.sock".into(),
+        "*.socket".into(),
+        "*.tmp".into(),
+        "*.swp".into(),
+        "*~".into(),
+        "__pycache__/*".into(),
+        "node_modules/*".into(),
+        "target/debug/*".into(),
+        "target/release/*".into(),
+        "*/.git/*".into(),
+    ]
+}
+
+fn default_bypass_processes() -> Vec<String> {
+    vec![
+        "apt".into(),
+        "apt-get".into(),
+        "dpkg".into(),
+        "yum".into(),
+        "dnf".into(),
+        "pacman".into(),
+        "rpm".into(),
+        "pip".into(),
+        "cargo".into(),
+        "npm".into(),
+        "make".into(),
+    ]
+}
+
+/// Partial config for layered loading. All fields are optional so we can
+/// distinguish "not set" from "set to default". Used for merging global
+/// and user configs.
+#[derive(Debug, Deserialize, Default)]
+struct PartialRetention {
+    max_age_days: Option<u32>,
+    max_size_gb: Option<f64>,
+    disk_pressure_percent: Option<u8>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PartialConfig {
+    #[serde(default)]
+    retention: Option<PartialRetention>,
+    never_trash: Option<Vec<String>>,
+    bypass_processes: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+}
+
 impl Config {
-    /// Load config from ~/.config/trashd/config.toml, falling back to defaults.
+    /// Load config with layered merge:
+    ///   1. Hardcoded defaults
+    ///   2. Global config (/etc/trashd/config.toml) overrides scalars, extends lists
+    ///   3. User config (~/.config/trashd/config.toml) overrides scalars, extends lists
     pub fn load() -> Self {
-        let config_path = Self::config_path();
-        if config_path.exists() {
-            match std::fs::read_to_string(&config_path) {
-                Ok(contents) => match toml::from_str(&contents) {
-                    Ok(config) => return config,
-                    Err(e) => eprintln!("trashd: bad config {}: {}", config_path.display(), e),
-                },
-                Err(e) => eprintln!("trashd: cannot read {}: {}", config_path.display(), e),
-            }
+        let mut config = Config::default();
+
+        // Layer 1: global config
+        if let Some(partial) = Self::load_partial(&Self::global_config_path()) {
+            config.merge(partial);
         }
-        Self::default()
+
+        // Layer 2: user config
+        if let Some(partial) = Self::load_partial(&Self::user_config_path()) {
+            config.merge(partial);
+        }
+
+        config
     }
 
-    pub fn config_path() -> PathBuf {
+    fn load_partial(path: &Path) -> Option<PartialConfig> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        match toml::from_str::<PartialConfig>(&contents) {
+            Ok(partial) => Some(partial),
+            Err(e) => {
+                eprintln!("trashd: bad config {}: {}", path.display(), e);
+                None
+            }
+        }
+    }
+
+    fn merge(&mut self, partial: PartialConfig) {
+        // Scalars: override if present
+        if let Some(ret) = partial.retention {
+            if let Some(v) = ret.max_age_days {
+                self.retention.max_age_days = v;
+            }
+            if let Some(v) = ret.max_size_gb {
+                self.retention.max_size_gb = v;
+            }
+            if let Some(v) = ret.disk_pressure_percent {
+                self.retention.disk_pressure_percent = v;
+            }
+        }
+        if let Some(v) = partial.max_file_size_mb {
+            self.max_file_size_mb = v;
+        }
+
+        // Lists: extend and deduplicate
+        if let Some(extra) = partial.never_trash {
+            for item in extra {
+                if !self.never_trash.contains(&item) {
+                    self.never_trash.push(item);
+                }
+            }
+        }
+        if let Some(extra) = partial.bypass_processes {
+            for item in extra {
+                if !self.bypass_processes.contains(&item) {
+                    self.bypass_processes.push(item);
+                }
+            }
+        }
+    }
+
+    /// Global config path: /etc/trashd/config.toml
+    pub fn global_config_path() -> PathBuf {
+        PathBuf::from("/etc/trashd/config.toml")
+    }
+
+    /// User config path: ~/.config/trashd/config.toml
+    pub fn user_config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~/.config"))
             .join("trashd")
             .join("config.toml")
+    }
+
+    /// Legacy alias — returns user config path for backward compatibility.
+    pub fn config_path() -> PathBuf {
+        Self::user_config_path()
     }
 
     /// Check if a path is in the never-trash list.
@@ -112,6 +213,8 @@ impl Config {
                 path_str.starts_with(prefix)
             } else if pattern.starts_with("*.") {
                 path_str.ends_with(&pattern[1..])
+            } else if pattern == "*~" {
+                path_str.ends_with('~')
             } else if let Some(suffix) = pattern.strip_prefix("*/") {
                 path_str.contains(&format!("/{suffix}"))
                     || path_str.ends_with(&format!("/{}", suffix.trim_end_matches('/')))

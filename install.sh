@@ -66,9 +66,24 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
         echo "    Removed trashd-daemon.service"
     fi
 
+    # Remove global config
+    if [ -f /etc/trashd/config.toml ]; then
+        rm -f /etc/trashd/config.toml
+        rmdir /etc/trashd 2>/dev/null || true
+        echo "    Removed /etc/trashd/config.toml"
+    fi
+
+    # Remove per-user configs for all users
+    for home_dir in /home/* /root; do
+        config_dir="${home_dir}/.config/trashd"
+        if [ -d "${config_dir}" ]; then
+            rm -rf "${config_dir}"
+            echo "    Removed ${config_dir}"
+        fi
+    done
+
     echo ""
     echo "==> trashd uninstalled."
-    echo "    User config preserved at ~/.config/trashd/"
     echo "    Trash contents preserved at ~/.local/share/Trash/"
     echo "    Start a new shell to clear PATH changes."
     exit 0
@@ -116,15 +131,15 @@ if [ -d /etc/profile.d ]; then
     echo "    Installed /etc/profile.d/trashd.sh"
 fi
 
-echo "==> Installing default config..."
-CONFIG_DIR="${HOME}/.config/trashd"
-if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
-    mkdir -p "${CONFIG_DIR}"
-    cp "$(dirname "$0")/config/trashd.toml" "${CONFIG_DIR}/config.toml"
-    echo "    Installed ${CONFIG_DIR}/config.toml"
+echo "==> Installing global config..."
+GLOBAL_CONFIG_DIR="/etc/trashd"
+if [ ! -f "${GLOBAL_CONFIG_DIR}/config.toml" ]; then
+    install -Dm644 "$(dirname "$0")/config/trashd.toml" "${GLOBAL_CONFIG_DIR}/config.toml"
+    echo "    Installed ${GLOBAL_CONFIG_DIR}/config.toml"
 else
-    echo "    Config already exists, skipping"
+    echo "    Global config already exists, skipping"
 fi
+echo "    Per-user overrides: ~/.config/trashd/config.toml"
 
 echo ""
 echo "==> trashd installed successfully!"

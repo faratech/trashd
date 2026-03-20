@@ -1,5 +1,12 @@
 # trashd configuration
-# Location: ~/.config/trashd/config.toml
+#
+# Layered config:
+#   /etc/trashd/config.toml        — global (admin-managed)
+#   ~/.config/trashd/config.toml   — per-user override
+#
+# Scalars: user overrides global overrides defaults.
+# Lists (never_trash, bypass_processes): user extends global — admin-set
+# patterns cannot be removed by individual users.
 
 [retention]
 # Auto-purge items older than this
@@ -11,6 +18,7 @@ disk_pressure_percent = 90
 
 # Paths that should never be trashed (use real delete instead).
 # Supports trailing * and leading *. wildcards.
+# User configs extend this list (they cannot remove entries set here).
 never_trash = [
     "/tmp/*",
     "/var/tmp/*",
@@ -18,17 +26,27 @@ never_trash = [
     "/proc/*",
     "/sys/*",
     "/dev/*",
+    "/run/*",
     "*.o",
     "*.pyc",
     "*.class",
+    "*.lock",
+    "*.pid",
+    "*.sock",
+    "*.socket",
+    "*.tmp",
+    "*.swp",
+    "*~",
     "__pycache__/*",
     "node_modules/*",
     "target/debug/*",
     "target/release/*",
+    "*/.git/*",
 ]
 
 # Processes that bypass trash automatically.
 # When these commands invoke rm, files are really deleted.
+# User configs extend this list (they cannot remove entries set here).
 bypass_processes = [
     "apt",
     "apt-get",
