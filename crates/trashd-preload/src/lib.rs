@@ -196,6 +196,17 @@ fn is_bypass_active() -> bool {
         .unwrap_or(false)
 }
 
+/// When Layer 4 (seccomp) is active, it handles interception at the kernel
+/// level. The preload layer defers to avoid double-trashing.
+fn is_seccomp_active() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var_os("TRASHD_SECCOMP_ACTIVE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Check if a parent process is in the bypass list.
 fn is_parent_bypassed() -> bool {
     let bypass = &config().bypass_processes;
@@ -589,7 +600,7 @@ fn resolve_at_path(dirfd: libc::c_int, pathname: *const libc::c_char) -> Option<
 // ---------------------------------------------------------------------------
 
 fn should_intercept() -> bool {
-    !is_bypass_active() && !is_parent_bypassed()
+    !is_bypass_active() && !is_seccomp_active() && !is_parent_bypassed()
 }
 
 // ---------------------------------------------------------------------------
