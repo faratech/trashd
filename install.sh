@@ -55,6 +55,19 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
     rmdir "${REAL_DIR}" 2>/dev/null || true
     rmdir "${LIB_DIR}" 2>/dev/null || true
 
+    # Remove man pages
+    for f in trash trash-ls trash-find trash-info trash-restore trash-undo \
+             trash-purge trash-empty trash-status trash-log trash-fsck; do
+        rm -f "${PREFIX}/share/man/man1/${f}.1" 2>/dev/null
+    done
+    echo "    Removed man pages"
+
+    # Remove shell completions
+    rm -f /etc/bash_completion.d/trash 2>/dev/null
+    rm -f "${PREFIX}/share/zsh/site-functions/_trash" 2>/dev/null
+    rm -f /usr/share/fish/vendor_completions.d/trash.fish 2>/dev/null
+    echo "    Removed shell completions"
+
     # Remove PATH hook
     if [ -f /etc/profile.d/trashd.sh ]; then
         rm -f /etc/profile.d/trashd.sh
@@ -128,6 +141,42 @@ install -Dm755 "${TARGET_DIR}/trashd-rm" "${SHIM_DIR}/rm"
 for cmd in unlink; do
     ln -sf rm "${SHIM_DIR}/${cmd}"
 done
+
+MAN_DIR="${PREFIX}/share/man/man1"
+COMP_DIR="$(dirname "$0")/target/completions"
+MAN_SRC="$(dirname "$0")/target/man"
+
+echo "==> Installing man pages..."
+if [ -d "${MAN_SRC}" ]; then
+    mkdir -p "${MAN_DIR}"
+    for f in "${MAN_SRC}"/*.1; do
+        install -Dm644 "$f" "${MAN_DIR}/$(basename "$f")"
+    done
+    echo "    Installed man pages to ${MAN_DIR}"
+else
+    echo "    No man pages found (skipping)"
+fi
+
+echo "==> Installing shell completions..."
+if [ -d "${COMP_DIR}" ]; then
+    # Bash
+    if [ -d /etc/bash_completion.d ]; then
+        install -Dm644 "${COMP_DIR}/trash.bash" /etc/bash_completion.d/trash
+        echo "    Installed bash completions"
+    fi
+    # Zsh
+    ZSH_COMP_DIR="${PREFIX}/share/zsh/site-functions"
+    mkdir -p "${ZSH_COMP_DIR}"
+    install -Dm644 "${COMP_DIR}/_trash" "${ZSH_COMP_DIR}/_trash"
+    echo "    Installed zsh completions"
+    # Fish
+    if [ -d /usr/share/fish/vendor_completions.d ]; then
+        install -Dm644 "${COMP_DIR}/trash.fish" /usr/share/fish/vendor_completions.d/trash.fish
+        echo "    Installed fish completions"
+    fi
+else
+    echo "    No completions found (skipping)"
+fi
 
 echo "==> Installing LD_PRELOAD library (Layer 2)..."
 install -Dm755 "${TARGET_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
