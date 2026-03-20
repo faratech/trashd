@@ -150,6 +150,34 @@ impl TrashStore {
             }
         }
 
+        // Check directory size limit
+        if meta.is_dir() && self.config.max_dir_size_mb > 0 {
+            let dir_size_bytes = dir_size(&abs_path);
+            let dir_size_mb = dir_size_bytes / (1024 * 1024);
+            if dir_size_mb > self.config.max_dir_size_mb {
+                return Err(TrashError::TooLarge {
+                    path: abs_path,
+                    size_mb: dir_size_mb,
+                    limit_mb: self.config.max_dir_size_mb,
+                });
+            }
+        }
+
+        // Check bypass_paths — if the calling process exe matches, skip trash
+        if !self.config.bypass_paths.is_empty() {
+            if let Ok(exe) = fs::read_link("/proc/self/exe") {
+                let exe_str = exe.to_string_lossy();
+                if self
+                    .config
+                    .bypass_paths
+                    .iter()
+                    .any(|p| exe_str.starts_with(p))
+                {
+                    return Err(TrashError::Excluded(abs_path));
+                }
+            }
+        }
+
         // Pick the right trash directory (same-device preferred)
         let trash_dir = self.trash_dir_for(&abs_path);
         Self::ensure_trash_dir(&trash_dir)?;
@@ -426,7 +454,31 @@ impl TrashStore {
             }
         }
 
-        // Verify hash if one was recorded and the restored path is a regular file.
+        // Transparent decompression: if the file was auto-compressed (zstd),
+        // decompress it back to original content before the user sees it.
+        if restore_to.is_file() {
+            if let Ok(data) = fs::read(&restore_to) {
+                if data.len() >= 4 {
+                    let magic =
+                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if magic == 0xFD2FB528 {
+                        match zstd::decode_all(data.as_slice()) {
+                            Ok(decompressed) => {
+                                let _ = fs::write(&restore_to, &decompressed);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "trashd: warning: failed to decompress {}: {e}",
+                                    restore_to.display(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify hash against the (now decompressed) restored file content.
         // This catches corruption during storage (bit rot, bad disk, partial copy).
         // We verify AFTER restore so the file is already in place — a mismatch is
         // reported as a warning, not a rollback (the user can decide what to do).
@@ -600,7 +652,39 @@ impl TrashStore {
             purged[i] = true;
         }
 
-        // Phase 2: trim by total size (purge oldest surviving until under limit)
+        // Phase 2a: auto-compress old uncompressed items before purging by size.
+        for i in (0..entries.len()).rev() {
+            if purged[i] || entries[i].orphaned {
+                continue;
+            }
+            let age = now.signed_duration_since(entries[i].info.deletion_date);
+            if age.num_days() < 7 {
+                continue;
+            }
+            let path = &entries[i].trashed_path;
+            if path.is_dir() || !path.exists() {
+                continue;
+            }
+            if let Ok(data) = fs::read(path) {
+                if data.len() >= 4 {
+                    let magic =
+                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if magic == 0xFD2FB528 {
+                        continue;
+                    }
+                }
+                if data.len() < 1024 {
+                    continue;
+                }
+                if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3) {
+                    if compressed.len() < data.len() {
+                        let _ = fs::write(path, &compressed);
+                    }
+                }
+            }
+        }
+
+        // Phase 2b: trim by total size (purge oldest surviving until under limit)
         let total_size: u64 = entries
             .iter()
             .enumerate()

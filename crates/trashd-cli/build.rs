@@ -57,20 +57,54 @@ fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("empty")
-                .about("Permanently empty the trash")
+                .about("Permanently empty the trash (requires confirmation)")
                 .arg(
                     Arg::new("older")
                         .long("older")
-                        .help("Only items older than N days"),
+                        .help("Only items older than this (e.g. '7d', '2w')"),
                 )
                 .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(clap::ArgAction::SetTrue)
-                        .help("Preview without deleting"),
+                        .help("Preview what would be deleted without deleting"),
+                )
+                .arg(
+                    Arg::new("yes")
+                        .short('y')
+                        .long("yes")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Skip confirmation prompt"),
                 ),
         )
-        .subcommand(Command::new("status").about("Show trash status"))
+        .subcommand(Command::new("status").about("Show trash status (size, count, per-partition)"))
+        .subcommand(
+            Command::new("compress")
+                .about("Compress old items in trash to save space (zstd)")
+                .arg(
+                    Arg::new("older")
+                        .long("older")
+                        .default_value("7d")
+                        .help("Only compress items older than this (e.g. '7d', '2w')"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Show what would be compressed without doing it"),
+                ),
+        )
+        .subcommand(
+            Command::new("du")
+                .about("Show largest items in trash sorted by size")
+                .arg(
+                    Arg::new("top")
+                        .short('n')
+                        .long("top")
+                        .default_value("20")
+                        .help("Number of items to show"),
+                ),
+        )
         .subcommand(
             Command::new("log")
                 .about("Show recent trash operations")
