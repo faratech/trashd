@@ -20,6 +20,7 @@ mod watchdog;
 use std::ffi::CString;
 use std::io;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -146,6 +147,9 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
         libc::close(watchdog_fd);
     }
 
+    // Forward SIGINT and SIGTERM to the child process so Ctrl-C works
+    install_signal_forwarder(child_pid);
+
     let result = wait_for_child(child_pid);
 
     // Child is done — clean up supervisor and watchdog
@@ -158,6 +162,24 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     }
 
     result
+}
+
+/// Global child PID for signal forwarding (signal handlers can't capture closures).
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let pid = CHILD_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+fn install_signal_forwarder(child_pid: libc::pid_t) {
+    CHILD_PID.store(child_pid, Ordering::Relaxed);
+    unsafe {
+        libc::signal(libc::SIGINT, forward_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, forward_signal as *const () as libc::sighandler_t);
+    }
 }
 
 /// Wait for the child process and return its exit code.

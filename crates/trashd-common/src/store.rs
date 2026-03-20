@@ -194,6 +194,9 @@ impl TrashStore {
         // Update index
         let _ = self.index.insert(&id, &info, &trash_dir);
 
+        // Log operation
+        crate::oplog::log_trash(&abs_path, &id, command);
+
         // Run auto-purge if needed
         let _ = self.auto_purge();
 
@@ -318,6 +321,9 @@ impl TrashStore {
         // Update index
         let _ = self.index.delete(&entry.id);
 
+        // Log operation
+        crate::oplog::log_restore(&entry.id, &restore_to);
+
         Ok(restore_to)
     }
 
@@ -349,6 +355,7 @@ impl TrashStore {
         }
         let _ = fs::remove_file(&entry.info_path);
         let _ = self.index.delete(&entry.id);
+        crate::oplog::log_purge(&entry.id);
         Ok(())
     }
 
@@ -379,6 +386,10 @@ impl TrashStore {
             let _ = fs::remove_file(&entry.info_path);
             let _ = self.index.delete(&entry.id);
             count += 1;
+        }
+        if count > 0 {
+            let filter_desc = max_age_days.map(|d| format!("older than {d}d"));
+            crate::oplog::log_empty(count, filter_desc.as_deref());
         }
         Ok(count)
     }

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod index;
 pub mod mounts;
+pub mod oplog;
 pub mod store;
 pub mod trashinfo;
 

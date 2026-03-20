@@ -57,6 +57,12 @@ enum Commands {
     },
     /// Show trash status (size, count, policy)
     Status,
+    /// Show recent trash operations (audit log)
+    Log {
+        /// Number of lines to show (default: 20)
+        #[arg(short = 'n', long, default_value = "20")]
+        lines: usize,
+    },
 }
 
 fn main() {
@@ -79,6 +85,7 @@ fn main() {
         Commands::Purge { target } => cmd_purge(&store, &target),
         Commands::Empty { older, dry_run } => cmd_empty(&store, older.as_deref(), dry_run),
         Commands::Status => cmd_status(&store),
+        Commands::Log { lines } => cmd_log(lines),
     }
 }
 
@@ -385,6 +392,17 @@ fn cmd_status(store: &TrashStore) {
             eprintln!("{} {e}", "trash: error:".red().bold());
             std::process::exit(1);
         }
+    }
+}
+
+fn cmd_log(lines: usize) {
+    let entries = trashd_common::oplog::read_log(lines);
+    if entries.is_empty() {
+        println!("{}", "No operations logged yet.".dimmed());
+        return;
+    }
+    for line in &entries {
+        println!("{line}");
     }
 }
 
