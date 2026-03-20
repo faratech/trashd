@@ -1,0 +1,13 @@
+[package]
+name = "trashd-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "trashd-daemon"
+path = "src/main.rs"
+
+[dependencies]
+trashd-common = { path = "../trashd-common" }
+libc = "0.2"
+chrono = "0.4"

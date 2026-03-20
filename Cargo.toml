@@ -5,6 +5,8 @@ members = [
     "crates/trashd-cli",
     "crates/trashd-shim",
     "crates/trashd-preload",
+    "crates/trashd-seccomp",
+    "crates/trashd-daemon",
 ]
 
 [workspace.package]

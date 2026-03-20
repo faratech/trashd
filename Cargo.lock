@@ -918,6 +918,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "trashd-daemon"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "trashd-common",
+]
+
+[[package]]
 name = "trashd-preload"
 version = "0.1.0"
 dependencies = [
@@ -926,6 +935,14 @@ dependencies = [
  "libc",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "trashd-seccomp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "trashd-common",
 ]
 
 [[package]]

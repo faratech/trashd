@@ -1,0 +1,12 @@
+[package]
+name = "trashd-seccomp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "trashd-exec"
+path = "src/main.rs"
+
+[dependencies]
+trashd-common = { path = "../trashd-common" }
+libc = "0.2"

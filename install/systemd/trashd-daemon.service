@@ -1,0 +1,15 @@
+[Unit]
+Description=trashd filesystem deletion monitor
+Documentation=https://github.com/faratech/trashd
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/trashd/trashd-daemon
+Restart=always
+RestartSec=5
+AmbientCapabilities=CAP_SYS_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
