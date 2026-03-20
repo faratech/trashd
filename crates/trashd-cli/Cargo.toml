@@ -17,6 +17,7 @@ trashd-common = { path = "../trashd-common" }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 colored = "3"
+zstd = "0.13"
 
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }

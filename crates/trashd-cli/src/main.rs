@@ -467,35 +467,13 @@ fn cmd_compress(store: &TrashStore, older: &str, dry_run: bool) {
         }
     };
 
-    // Find compression tool
-    let compressor = if std::process::Command::new("zstd").arg("--version")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false)
-    {
-        "zstd"
-    } else if std::process::Command::new("gzip").arg("--version")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false)
-    {
-        "gzip"
-    } else {
-        eprintln!("{} no compression tool found (install zstd or gzip)", "trash: error:".red().bold());
-        std::process::exit(1);
-    };
-
     let now = chrono::Local::now();
     let mut compressed = 0usize;
     let mut saved = 0u64;
 
     for entry in &entries {
-        // Skip directories, already compressed files, and recent items
-        if entry.trashed_path.is_dir() {
-            continue;
-        }
-        let ext = entry.trashed_path.extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if ext == "zst" || ext == "gz" {
+        // Skip directories and recent items
+        if entry.trashed_path.is_dir() || entry.orphaned {
             continue;
         }
         let age = now.signed_duration_since(entry.info.deletion_date);
@@ -503,9 +481,21 @@ fn cmd_compress(store: &TrashStore, older: &str, dry_run: bool) {
             continue;
         }
 
-        let size_before = entry.info.size.unwrap_or(0);
+        let size_before = match std::fs::metadata(&entry.trashed_path) {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
         if size_before < 1024 {
             continue; // not worth compressing tiny files
+        }
+
+        // Check if already compressed (zstd magic: 0x28B52FFD)
+        if let Ok(header) = std::fs::read(&entry.trashed_path).map(|d| {
+            if d.len() >= 4 { u32::from_le_bytes([d[0], d[1], d[2], d[3]]) } else { 0 }
+        }) {
+            if header == 0xFD2FB528 {
+                continue; // already zstd-compressed
+            }
         }
 
         if dry_run {
@@ -519,26 +509,17 @@ fn cmd_compress(store: &TrashStore, older: &str, dry_run: bool) {
             continue;
         }
 
-        // Compress in-place
-        let result = std::process::Command::new(compressor)
-            .arg(&entry.trashed_path)
-            .status();
-
-        if let Ok(status) = result {
-            if status.success() {
-                // Check new size
-                let compressed_path = if compressor == "zstd" {
-                    format!("{}.zst", entry.trashed_path.display())
-                } else {
-                    format!("{}.gz", entry.trashed_path.display())
-                };
-                let size_after = std::fs::metadata(&compressed_path)
-                    .map(|m| m.len())
-                    .unwrap_or(size_before);
-                // Rename back to original name for transparent restore
-                let _ = std::fs::rename(&compressed_path, &entry.trashed_path);
+        // Compress in-place using native zstd (level 3 = good balance)
+        match compress_file_zstd(&entry.trashed_path) {
+            Ok(size_after) => {
                 saved += size_before.saturating_sub(size_after);
                 compressed += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {}: {e}",
+                    "warn:".yellow(), entry.trashed_path.display(),
+                );
             }
         }
     }
@@ -548,7 +529,7 @@ fn cmd_compress(store: &TrashStore, older: &str, dry_run: bool) {
             println!("{}", "Nothing to compress.".dimmed());
         } else {
             println!(
-                "\n{} {} items would be compressed (using {compressor})",
+                "\n{} {} items would be compressed (zstd)",
                 "Dry run:".yellow().bold(), compressed,
             );
         }
@@ -559,6 +540,19 @@ fn cmd_compress(store: &TrashStore, older: &str, dry_run: bool) {
             "{} compressed {} items, saved {}",
             "Done:".green().bold(), compressed, format_size(saved),
         );
+    }
+}
+
+/// Compress a file in-place using zstd. Returns the new size.
+fn compress_file_zstd(path: &std::path::Path) -> std::io::Result<u64> {
+    let data = std::fs::read(path)?;
+    let compressed = zstd::encode_all(data.as_slice(), 3)?; // level 3
+    // Only replace if compression actually helped
+    if compressed.len() < data.len() {
+        std::fs::write(path, &compressed)?;
+        Ok(compressed.len() as u64)
+    } else {
+        Ok(data.len() as u64) // incompressible, leave as-is
     }
 }
 
