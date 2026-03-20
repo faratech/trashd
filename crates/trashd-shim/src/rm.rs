@@ -248,7 +248,9 @@ fn passthrough() -> ExitCode {
 
 fn passthrough_with_args(args: &[&str]) -> ExitCode {
     let rm = real_rm_path();
-    match Command::new(&rm).args(args).status() {
+    // Set TRASH_BYPASS=1 so the LD_PRELOAD layer doesn't re-intercept
+    // the real rm's unlink() calls when we're passing through.
+    match Command::new(&rm).args(args).env("TRASH_BYPASS", "1").status() {
         Ok(status) => {
             if status.success() {
                 ExitCode::SUCCESS
@@ -266,6 +268,15 @@ fn passthrough_with_args(args: &[&str]) -> ExitCode {
 /// Remove a file/dir/symlink correctly using symlink_metadata.
 /// `recursive` must be true for directories to be removed (matches rm -r semantics).
 fn real_rm(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
+    // Set TRASH_BYPASS so the LD_PRELOAD layer doesn't re-intercept
+    // our unlink/rmdir calls when we genuinely want a real delete.
+    std::env::set_var("TRASH_BYPASS", "1");
+    let result = real_rm_inner(path, recursive);
+    std::env::remove_var("TRASH_BYPASS");
+    result
+}
+
+fn real_rm_inner(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
 
     if meta.file_type().is_symlink() {
