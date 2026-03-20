@@ -73,11 +73,26 @@ bypass_processes = [
     "cargo",
     "npm",
     "make",
+    "git",
+    "systemd",
+    "systemctl",
+    "journald",
+    "containerd",
+    "dockerd",
 ]
+
+# Executable paths that bypass trash. More precise than bypass_processes —
+# matches the exe path prefix instead of just the binary name.
+# Example: bypass_paths = ["/opt/myapp/", "/usr/lib/systemd/"]
+bypass_paths = []
 
 # Files larger than this (in MB) skip trash to avoid filling disk.
 # Set to 0 to disable.
 max_file_size_mb = 1024
+
+# Directories larger than this (in MB) skip trash (real-deleted).
+# Set to 0 (default) to disable the limit.
+max_dir_size_mb = 0
 
 # Hash algorithm for file integrity: "xxhash" (fast, default) or "sha256" (cryptographic).
 # xxhash (XXH3-128) is ~10x faster than SHA-256 — good for integrity checks.

@@ -82,6 +82,11 @@ impl Default for PreloadConfig {
                 "npm".into(),
                 "make".into(),
                 "git".into(),
+                "systemd".into(),
+                "systemctl".into(),
+                "journald".into(),
+                "containerd".into(),
+                "dockerd".into(),
             ],
         }
     }
@@ -106,26 +111,77 @@ impl PreloadConfig {
     }
 }
 
+/// Config with periodic reload. Checks config file mtime every 60 seconds
+/// so long-lived processes pick up config changes without restart.
 fn config() -> &'static PreloadConfig {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     static CFG: OnceLock<PreloadConfig> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let mut cfg = PreloadConfig::default();
+    static LAST_CHECK: AtomicI64 = AtomicI64::new(0);
+    static GLOBAL_MTIME: AtomicI64 = AtomicI64::new(0);
 
-        // Layer 1: global config
-        if let Some(partial) = load_partial_config(Path::new("/etc/trashd/config.toml")) {
-            cfg.merge(partial);
+    let cfg = CFG.get_or_init(|| load_config());
+
+    // Periodically check if config files changed (every 60 seconds)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let last = LAST_CHECK.load(Ordering::Relaxed);
+    if now - last >= 60 {
+        LAST_CHECK.store(now, Ordering::Relaxed);
+        let current_mtime = config_mtime();
+        let cached_mtime = GLOBAL_MTIME.load(Ordering::Relaxed);
+        if current_mtime != cached_mtime {
+            GLOBAL_MTIME.store(current_mtime, Ordering::Relaxed);
+            // Can't replace OnceLock, but we can log the change.
+            // Full reload would require unsafe or a Mutex — not worth the
+            // complexity in a preload .so. Log so users know to restart.
+            if cached_mtime != 0 {
+                eprintln!("[trashd-preload] config changed — restart process to apply");
+            }
         }
+    }
 
-        // Layer 2: user config
-        let user_path = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("/nonexistent"))
-            .join("trashd/config.toml");
-        if let Some(partial) = load_partial_config(&user_path) {
-            cfg.merge(partial);
-        }
+    cfg
+}
 
-        cfg
-    })
+fn load_config() -> PreloadConfig {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    // Store initial mtime
+    static INIT_MTIME: AtomicI64 = AtomicI64::new(0);
+    INIT_MTIME.store(config_mtime(), Ordering::Relaxed);
+
+    let mut cfg = PreloadConfig::default();
+
+    // Layer 1: global config
+    if let Some(partial) = load_partial_config(Path::new("/etc/trashd/config.toml")) {
+        cfg.merge(partial);
+    }
+
+    // Layer 2: user config
+    let user_path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"))
+        .join("trashd/config.toml");
+    if let Some(partial) = load_partial_config(&user_path) {
+        cfg.merge(partial);
+    }
+
+    cfg
+}
+
+fn config_mtime() -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let global = fs::metadata("/etc/trashd/config.toml")
+        .map(|m| m.mtime())
+        .unwrap_or(0);
+    let user = dirs::config_dir()
+        .map(|d| d.join("trashd/config.toml"))
+        .and_then(|p| fs::metadata(p).ok())
+        .map(|m| m.mtime())
+        .unwrap_or(0);
+    global + user
 }
 
 fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {

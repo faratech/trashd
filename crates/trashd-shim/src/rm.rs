@@ -177,6 +177,10 @@ fn main() -> ExitCode {
                 if args.verbose {
                     eprintln!("trashed '{}' [{}]", file.display(), id);
                 }
+                trashd_common::oplog::notify_desktop(
+                    "Moved to Trash",
+                    &format!("{}", file.display()),
+                );
             }
             Err(trashd_common::store::TrashError::Excluded(_)) => {
                 if args.verbose {

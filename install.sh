@@ -36,18 +36,19 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
         echo "    Removed ${SHIM_DIR}"
     fi
 
-    # Remove LD_PRELOAD library
-    if [ -f "${LIB_DIR}/libtrashd_preload.so" ]; then
-        rm -f "${LIB_DIR}/libtrashd_preload.so"
-        echo "    Removed ${LIB_DIR}/libtrashd_preload.so"
-    fi
-
-    # Remove from /etc/ld.so.preload if present
+    # Remove from /etc/ld.so.preload FIRST (before deleting the .so,
+    # otherwise every process gets an error about missing preload library)
     if [ -f /etc/ld.so.preload ]; then
         if grep -q "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
             sed -i '\|libtrashd_preload.so|d' /etc/ld.so.preload
             echo "    Removed from /etc/ld.so.preload"
         fi
+    fi
+
+    # Now safe to remove the library itself
+    if [ -f "${LIB_DIR}/libtrashd_preload.so" ]; then
+        rm -f "${LIB_DIR}/libtrashd_preload.so"
+        echo "    Removed ${LIB_DIR}/libtrashd_preload.so"
     fi
 
     # Remove stashed real rm and lib dir if empty

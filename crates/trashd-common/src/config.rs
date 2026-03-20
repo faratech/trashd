@@ -26,6 +26,14 @@ pub struct Config {
     /// Hash algorithm for file integrity: "xxhash" (fast, default) or "sha256" (cryptographic).
     #[serde(default = "default_hash_algo")]
     pub hash_algorithm: String,
+    /// Maximum directory size (in MB) to trash. Directories larger than this are
+    /// real-deleted. Set to 0 (default) to disable the limit.
+    #[serde(default = "default_max_dir_size")]
+    pub max_dir_size_mb: u64,
+    /// Executable paths that bypass trash. If the deleting process's exe matches
+    /// any prefix here, trash is bypassed. More precise than `bypass_processes`.
+    #[serde(default)]
+    pub bypass_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +87,8 @@ impl Default for Config {
             sha256_max_size_mb: default_sha256_limit(),
             auto_purge_interval_secs: default_purge_interval(),
             hash_algorithm: default_hash_algo(),
+            max_dir_size_mb: default_max_dir_size(),
+            bypass_paths: Vec::new(),
         }
     }
 }
@@ -126,7 +136,16 @@ fn default_bypass_processes() -> Vec<String> {
         "npm".into(),
         "make".into(),
         "git".into(),
+        "systemd".into(),
+        "systemctl".into(),
+        "journald".into(),
+        "containerd".into(),
+        "dockerd".into(),
     ]
+}
+
+fn default_max_dir_size() -> u64 {
+    0 // 0 = no limit (default)
 }
 
 /// Partial config for layered loading. All fields are optional so we can
@@ -150,6 +169,8 @@ struct PartialConfig {
     sha256_max_size_mb: Option<u64>,
     auto_purge_interval_secs: Option<u64>,
     hash_algorithm: Option<String>,
+    max_dir_size_mb: Option<u64>,
+    bypass_paths: Option<Vec<String>>,
 }
 
 impl Config {
@@ -212,6 +233,9 @@ impl Config {
         if let Some(v) = partial.hash_algorithm {
             self.hash_algorithm = v;
         }
+        if let Some(v) = partial.max_dir_size_mb {
+            self.max_dir_size_mb = v;
+        }
 
         // Lists: extend and deduplicate
         if let Some(extra) = partial.never_trash {
@@ -229,6 +253,13 @@ impl Config {
             for item in extra {
                 if !self.bypass_processes.contains(&item) {
                     self.bypass_processes.push(item);
+                }
+            }
+        }
+        if let Some(extra) = partial.bypass_paths {
+            for item in extra {
+                if !self.bypass_paths.contains(&item) {
+                    self.bypass_paths.push(item);
                 }
             }
         }

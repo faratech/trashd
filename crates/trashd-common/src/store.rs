@@ -149,6 +149,29 @@ impl TrashStore {
             }
         }
 
+        // Check directory size limit
+        if meta.is_dir() && self.config.max_dir_size_mb > 0 {
+            let dir_size_bytes = dir_size(&abs_path);
+            let dir_size_mb = dir_size_bytes / (1024 * 1024);
+            if dir_size_mb > self.config.max_dir_size_mb {
+                return Err(TrashError::TooLarge {
+                    path: abs_path,
+                    size_mb: dir_size_mb,
+                    limit_mb: self.config.max_dir_size_mb,
+                });
+            }
+        }
+
+        // Check bypass_paths — if the calling process exe matches, skip trash
+        if !self.config.bypass_paths.is_empty() {
+            if let Ok(exe) = fs::read_link("/proc/self/exe") {
+                let exe_str = exe.to_string_lossy();
+                if self.config.bypass_paths.iter().any(|p| exe_str.starts_with(p)) {
+                    return Err(TrashError::Excluded(abs_path));
+                }
+            }
+        }
+
         // Pick the right trash directory (same-device preferred)
         let trash_dir = self.trash_dir_for(&abs_path);
         Self::ensure_trash_dir(&trash_dir)?;

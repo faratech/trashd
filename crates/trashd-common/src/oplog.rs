@@ -63,6 +63,20 @@ pub fn log_path() -> PathBuf {
     trash_dir.join(".trashd").join("operations.log")
 }
 
+/// Send a desktop notification if notify-send is available and DISPLAY/WAYLAND is set.
+/// Only called from the shim (not preload) to avoid spamming from LD_PRELOAD hooks.
+pub fn notify_desktop(summary: &str, body: &str) {
+    // Only notify in GUI sessions
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return;
+    }
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=trashd", "--icon=user-trash", "-t", "3000", summary, body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn write_log(message: &str) {
     let path = log_path();
 
