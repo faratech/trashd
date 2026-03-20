@@ -19,6 +19,7 @@ const OFFSET_NR: u32 = 0;   // offsetof(seccomp_data, nr)
 const OFFSET_ARCH: u32 = 4; // offsetof(seccomp_data, arch)
 
 // Architecture
+#[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
