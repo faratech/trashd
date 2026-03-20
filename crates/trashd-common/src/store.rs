@@ -685,11 +685,16 @@ impl TrashStore {
         }
 
         // Phase 2b: trim by total size (purge oldest surviving until under limit)
+        // Use actual disk size (not info.size) since compression may have shrunk files.
         let total_size: u64 = entries
             .iter()
             .enumerate()
             .filter(|(i, _)| !purged[*i])
-            .filter_map(|(_, e)| e.info.size)
+            .map(|(_, e)| {
+                fs::metadata(&e.trashed_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
             .sum();
         if total_size > max_size_bytes {
             let mut freed = 0u64;
@@ -735,10 +740,15 @@ impl TrashStore {
 
     /// Purge a single entry without re-scanning the list.
     fn purge_entry(&self, entry: &TrashEntry) -> Result<(), TrashError> {
-        if entry.trashed_path.is_dir() {
-            let _ = fs::remove_dir_all(&entry.trashed_path);
-        } else if entry.trashed_path.exists() {
-            let _ = fs::remove_file(&entry.trashed_path);
+        // Use symlink_metadata so dangling symlinks are detected and removed
+        match fs::symlink_metadata(&entry.trashed_path) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                let _ = fs::remove_dir_all(&entry.trashed_path);
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(&entry.trashed_path);
+            }
+            Err(_) => {} // already gone
         }
         let _ = fs::remove_file(&entry.info_path);
         let _ = self.index.delete(&entry.id);
@@ -770,7 +780,10 @@ impl TrashStore {
                     count: 0,
                 });
             ps.count += 1;
-            ps.total_size += entry.info.size.unwrap_or(0);
+            // Use actual disk size (may be smaller than info.size after compression)
+            ps.total_size += fs::metadata(&entry.trashed_path)
+                .map(|m| m.len())
+                .unwrap_or(entry.info.size.unwrap_or(0));
         }
 
         let mut result: Vec<PartitionStatus> = partitions.into_values().collect();
@@ -781,7 +794,15 @@ impl TrashStore {
     /// Total status across all partitions.
     pub fn status(&self) -> Result<(u64, usize), TrashError> {
         let entries = self.list(None)?;
-        let total_size: u64 = entries.iter().filter_map(|e| e.info.size).sum();
+        // Use actual disk size (reflects compression savings)
+        let total_size: u64 = entries
+            .iter()
+            .map(|e| {
+                fs::metadata(&e.trashed_path)
+                    .map(|m| m.len())
+                    .unwrap_or(e.info.size.unwrap_or(0))
+            })
+            .sum();
         let count = entries.len();
         Ok((total_size, count))
     }

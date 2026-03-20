@@ -679,6 +679,13 @@ fn resolve_at_path(dirfd: libc::c_int, pathname: *const libc::c_char) -> Option<
 // Common pre-check for all hooks
 // ---------------------------------------------------------------------------
 
+/// Return 0 with errno cleared. libc callers expect errno unchanged on success,
+/// but our trash operations may have set it as a side effect.
+fn success() -> libc::c_int {
+    unsafe { *libc::__errno_location() = 0 };
+    0
+}
+
 fn should_intercept() -> bool {
     !is_bypass_active() && !is_seccomp_active() && !is_parent_bypassed()
 }
@@ -711,7 +718,7 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
         // should be trashed, not permanently deleted via the fallthrough.
         if let Ok(meta) = fs::symlink_metadata(&abs) {
             if !should_skip_path(&abs) && !meta.is_dir() && try_trash(&abs) {
-                return 0;
+                return success();
             }
         }
     }
@@ -747,12 +754,12 @@ pub unsafe extern "C" fn unlinkat(
                     if is_real_dir {
                         if let Ok(mut rd) = fs::read_dir(&abs) {
                             if rd.next().is_none() && try_trash(&abs) {
-                                return 0;
+                                return success();
                             }
                         }
                     }
                 } else if !is_real_dir && try_trash(&abs) {
-                    return 0;
+                    return success();
                 }
             }
         }
@@ -786,7 +793,7 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
             if meta.is_dir() && !meta.file_type().is_symlink() && !should_skip_path(&abs) {
                 if let Ok(mut rd) = fs::read_dir(&abs) {
                     if rd.next().is_none() && try_trash(&abs) {
-                        return 0;
+                        return success();
                     }
                 }
             }
