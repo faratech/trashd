@@ -384,6 +384,7 @@ impl TrashStore {
     }
 
     /// Enforce retention policy: purge expired items and trim by size.
+    /// Single scan — all three phases work on the same in-memory list.
     fn auto_purge(&self) -> Result<(), TrashError> {
         let max_age = self.config.retention.max_age_days;
         let max_size_bytes = (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -395,42 +396,59 @@ impl TrashStore {
         }
 
         let now = chrono::Local::now();
+        // Track which entries were purged by index (newest-first order)
+        let mut purged = vec![false; entries.len()];
 
         // Phase 1: purge items older than max_age_days
-        for entry in entries.iter().rev() {
-            // entries are newest-first, so iterate in reverse (oldest first)
-            let age = now.signed_duration_since(entry.info.deletion_date);
+        // entries are newest-first, so iterate in reverse (oldest first)
+        for i in (0..entries.len()).rev() {
+            let age = now.signed_duration_since(entries[i].info.deletion_date);
             if age.num_days() < max_age as i64 {
-                break; // rest are newer
+                break;
             }
-            let _ = self.purge_entry(&entry);
+            let _ = self.purge_entry(&entries[i]);
+            purged[i] = true;
         }
 
-        // Phase 2: trim by total size (purge oldest until under limit)
-        let entries = self.list(None)?;
-        let total_size: u64 = entries.iter().filter_map(|e| e.info.size).sum();
+        // Phase 2: trim by total size (purge oldest surviving until under limit)
+        let total_size: u64 = entries.iter().enumerate()
+            .filter(|(i, _)| !purged[*i])
+            .filter_map(|(_, e)| e.info.size)
+            .sum();
         if total_size > max_size_bytes {
             let mut freed = 0u64;
             let excess = total_size - max_size_bytes;
-            for entry in entries.iter().rev() {
+            for i in (0..entries.len()).rev() {
+                if purged[i] {
+                    continue;
+                }
                 if freed >= excess {
                     break;
                 }
-                freed += entry.info.size.unwrap_or(0);
-                let _ = self.purge_entry(&entry);
+                freed += entries[i].info.size.unwrap_or(0);
+                let _ = self.purge_entry(&entries[i]);
+                purged[i] = true;
             }
         }
 
-        // Phase 3: disk pressure — check free space on home trash partition
+        // Phase 3: disk pressure — purge oldest 10% of surviving items
         if pressure_pct > 0 {
             let home = Self::home_trash_dir();
             if let Some(usage_pct) = disk_usage_percent(&home) {
                 if usage_pct >= pressure_pct as f64 {
-                    let entries = self.list(None)?;
-                    // Purge oldest 10% of items
-                    let to_purge = std::cmp::max(1, entries.len() / 10);
-                    for entry in entries.iter().rev().take(to_purge) {
-                        let _ = self.purge_entry(&entry);
+                    let surviving: usize = purged.iter().filter(|&&p| !p).count();
+                    let to_purge = std::cmp::max(1, surviving / 10);
+                    let mut purged_count = 0;
+                    for i in (0..entries.len()).rev() {
+                        if purged_count >= to_purge {
+                            break;
+                        }
+                        if purged[i] {
+                            continue;
+                        }
+                        let _ = self.purge_entry(&entries[i]);
+                        purged[i] = true;
+                        purged_count += 1;
                     }
                 }
             }

@@ -4,7 +4,11 @@ use std::path::PathBuf;
 use trashd_common::TrashStore;
 
 #[derive(Parser)]
-#[command(name = "trash", about = "trashd — Linux recycle bin for the CLI")]
+#[command(
+    name = "trash",
+    about = "trashd — Linux recycle bin for the CLI",
+    version = env!("CARGO_PKG_VERSION"),
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -16,6 +20,16 @@ enum Commands {
     Ls {
         /// Filter by glob pattern (e.g. '*.py')
         pattern: Option<String>,
+    },
+    /// Search trash by original path
+    Find {
+        /// Path substring or glob pattern to search for
+        query: String,
+    },
+    /// Show full metadata for a trash entry
+    Info {
+        /// Trash ID or file name
+        target: String,
     },
     /// Restore a trashed file by name or ID
     Restore {
@@ -37,6 +51,9 @@ enum Commands {
         /// Only empty items older than N days (e.g. '7d', '2w')
         #[arg(long)]
         older: Option<String>,
+        /// Show what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show trash status (size, count, policy)
     Status,
@@ -55,10 +72,12 @@ fn main() {
 
     match cli.command {
         Commands::Ls { pattern } => cmd_ls(&store, pattern.as_deref()),
+        Commands::Find { query } => cmd_find(&store, &query),
+        Commands::Info { target } => cmd_info(&store, &target),
         Commands::Restore { target, to } => cmd_restore(&store, &target, to.as_deref()),
         Commands::Undo => cmd_undo(&store),
         Commands::Purge { target } => cmd_purge(&store, &target),
-        Commands::Empty { older } => cmd_empty(&store, older.as_deref()),
+        Commands::Empty { older, dry_run } => cmd_empty(&store, older.as_deref(), dry_run),
         Commands::Status => cmd_status(&store),
     }
 }
@@ -77,36 +96,26 @@ fn cmd_ls(store: &TrashStore, pattern: Option<&str>) {
         return;
     }
 
-    // Detect if multi-partition
     let home_trash = TrashStore::trash_dir();
     let multi_part = entries.iter().any(|e| e.trash_root != home_trash);
 
     if multi_part {
         println!(
             "{:<20} {:>10} {:<6} {:<30} {}",
-            "DELETED".bold(),
-            "SIZE".bold(),
-            "DISK".bold(),
-            "ORIGINAL PATH".bold(),
-            "ID".bold(),
+            "DELETED".bold(), "SIZE".bold(), "DISK".bold(),
+            "ORIGINAL PATH".bold(), "ID".bold(),
         );
     } else {
         println!(
             "{:<20} {:>10} {:<30} {}",
-            "DELETED".bold(),
-            "SIZE".bold(),
-            "ORIGINAL PATH".bold(),
-            "ID".bold(),
+            "DELETED".bold(), "SIZE".bold(),
+            "ORIGINAL PATH".bold(), "ID".bold(),
         );
     }
 
     for entry in &entries {
         let date = entry.info.deletion_date.format("%Y-%m-%d %H:%M");
-        let size = entry
-            .info
-            .size
-            .map(format_size)
-            .unwrap_or_else(|| "?".into());
+        let size = entry.info.size.map(format_size).unwrap_or_else(|| "?".into());
         let path = entry.info.original_path.to_string_lossy();
 
         let max_path = if multi_part { 40 } else { 50 };
@@ -120,30 +129,97 @@ fn cmd_ls(store: &TrashStore, pattern: Option<&str>) {
             let disk = if entry.trash_root == home_trash {
                 "home".to_string()
             } else {
-                entry
-                    .trash_root
-                    .parent()
+                entry.trash_root.parent()
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "?".into())
             };
-            println!(
-                "{:<20} {:>10} {:<6} {:<30} {}",
-                date,
-                size,
-                disk,
-                path_display,
-                entry.id.dimmed()
-            );
+            println!("{:<20} {:>10} {:<6} {:<30} {}", date, size, disk, path_display, entry.id.dimmed());
         } else {
-            println!(
-                "{:<20} {:>10} {:<30} {}",
-                date, size, path_display, entry.id.dimmed()
-            );
+            println!("{:<20} {:>10} {:<30} {}", date, size, path_display, entry.id.dimmed());
         }
     }
 
     println!("\n{} items in trash", entries.len());
+}
+
+fn cmd_find(store: &TrashStore, query: &str) {
+    let entries = match store.list(None) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{} {e}", "trash: error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    let matches: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            let path_str = e.info.original_path.to_string_lossy();
+            path_str.contains(query) || e.id.contains(query)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        println!("{}", format!("No matches for '{query}'.").dimmed());
+        return;
+    }
+
+    for entry in &matches {
+        let date = entry.info.deletion_date.format("%Y-%m-%d %H:%M");
+        let size = entry.info.size.map(format_size).unwrap_or_else(|| "?".into());
+        println!(
+            "{:<20} {:>10} {} {}",
+            date, size,
+            entry.info.original_path.display(),
+            entry.id.dimmed(),
+        );
+    }
+    println!("\n{} matches", matches.len());
+}
+
+fn cmd_info(store: &TrashStore, target: &str) {
+    let entries = match store.list(None) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{} {e}", "trash: error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    let entry = entries.iter().find(|e| e.id == target)
+        .or_else(|| entries.iter().find(|e| {
+            e.info.original_path.file_name()
+                .map(|n| n.to_string_lossy() == target)
+                .unwrap_or(false)
+        }));
+
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            eprintln!("{} '{target}' not found in trash", "trash: error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    println!("{}", "Trash Entry".bold().underline());
+    println!("  ID:            {}", entry.id);
+    println!("  Original path: {}", entry.info.original_path.display());
+    println!("  Deleted:       {}", entry.info.deletion_date.format("%Y-%m-%d %H:%M:%S"));
+    if let Some(ref cmd) = entry.info.command {
+        println!("  Command:       {cmd}");
+    }
+    if let Some(pid) = entry.info.pid {
+        println!("  PID:           {pid}");
+    }
+    if let Some(size) = entry.info.size {
+        println!("  Size:          {} ({} bytes)", format_size(size), size);
+    }
+    if let Some(ref hash) = entry.info.sha256 {
+        println!("  SHA-256:       {hash}");
+    }
+    println!("  Trash dir:     {}", entry.trash_root.display());
+    println!("  Stored at:     {}", entry.trashed_path.display());
 }
 
 fn cmd_restore(store: &TrashStore, target: &str, to: Option<&std::path::Path>) {
@@ -152,11 +228,8 @@ fn cmd_restore(store: &TrashStore, target: &str, to: Option<&std::path::Path>) {
         Err(trashd_common::store::TrashError::AmbiguousMatch { pattern, count }) => {
             eprintln!(
                 "{} '{}' matches {} items — use trash ID for exact match:",
-                "trash: ambiguous:".yellow().bold(),
-                pattern,
-                count,
+                "trash: ambiguous:".yellow().bold(), pattern, count,
             );
-            // Show matching entries to help user pick
             if let Ok(entries) = store.list(Some(&pattern)) {
                 for entry in entries.iter().take(10) {
                     eprintln!(
@@ -192,9 +265,7 @@ fn cmd_purge(store: &TrashStore, target: &str) {
         Err(trashd_common::store::TrashError::AmbiguousMatch { pattern, count }) => {
             eprintln!(
                 "{} '{}' matches {} items — use trash ID for exact match",
-                "trash: ambiguous:".yellow().bold(),
-                pattern,
-                count,
+                "trash: ambiguous:".yellow().bold(), pattern, count,
             );
             if let Ok(entries) = store.list(Some(&pattern)) {
                 for entry in entries.iter().take(10) {
@@ -215,21 +286,61 @@ fn cmd_purge(store: &TrashStore, target: &str) {
     }
 }
 
-fn cmd_empty(store: &TrashStore, older: Option<&str>) {
+fn cmd_empty(store: &TrashStore, older: Option<&str>, dry_run: bool) {
     let days = match older {
         Some(s) => match parse_duration_days(s) {
             Some(d) => Some(d),
             None => {
                 eprintln!(
                     "{} invalid duration '{}' (use e.g. '7d', '2w', or a number of days)",
-                    "trash: error:".red().bold(),
-                    s,
+                    "trash: error:".red().bold(), s,
                 );
                 std::process::exit(1);
             }
         },
         None => None,
     };
+
+    if dry_run {
+        let entries = match store.list(None) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{} {e}", "trash: error:".red().bold());
+                std::process::exit(1);
+            }
+        };
+
+        let now = chrono::Local::now();
+        let mut count = 0usize;
+        let mut total_size = 0u64;
+
+        for entry in &entries {
+            if let Some(d) = days {
+                let age = now.signed_duration_since(entry.info.deletion_date);
+                if age.num_days() < d as i64 {
+                    continue;
+                }
+            }
+            count += 1;
+            total_size += entry.info.size.unwrap_or(0);
+            println!(
+                "  {} {} {}",
+                entry.info.deletion_date.format("%Y-%m-%d %H:%M"),
+                entry.info.original_path.display(),
+                format_size(entry.info.size.unwrap_or(0)).dimmed(),
+            );
+        }
+
+        if count == 0 {
+            println!("{}", "Nothing would be deleted.".dimmed());
+        } else {
+            println!(
+                "\n{} {} items ({}) would be permanently deleted",
+                "Dry run:".yellow().bold(), count, format_size(total_size),
+            );
+        }
+        return;
+    }
 
     match store.empty(days) {
         Ok(count) => {
@@ -262,9 +373,7 @@ fn cmd_status(store: &TrashStore) {
                 for ps in &partitions {
                     println!(
                         "    {} — {} items, {}",
-                        ps.label,
-                        ps.count,
-                        format_size(ps.total_size)
+                        ps.label, ps.count, format_size(ps.total_size),
                     );
                     println!("      {}", ps.trash_dir.display().to_string().dimmed());
                 }
