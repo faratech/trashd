@@ -248,7 +248,13 @@ fn send_fd(sock: i32, fd: i32) {
         msg.msg_controllen = 0;
     }
 
-    unsafe { libc::sendmsg(sock, &msg, 0) };
+    let ret = unsafe { libc::sendmsg(sock, &msg, 0) };
+    if ret < 0 {
+        eprintln!(
+            "trashd-exec: send_fd failed: {}",
+            io::Error::last_os_error()
+        );
+    }
 }
 
 fn recv_fd(sock: i32) -> io::Result<i32> {

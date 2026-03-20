@@ -5,7 +5,7 @@ use crate::trashinfo::TrashInfo;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -156,24 +156,39 @@ impl TrashStore {
         fs::write(&info_file, info.to_trashinfo_string())?;
 
         // Try rename (fast, same filesystem — should always work with topdir trash)
-        if fs::rename(&abs_path, &dest).is_err() {
-            // Cross-filesystem fallback
-            if meta.is_dir() || meta.file_type().is_symlink() && abs_path.is_dir() {
-                copy_tree(&abs_path, &dest)?;
-            } else if meta.file_type().is_symlink() {
-                let target = fs::read_link(&abs_path)?;
-                std::os::unix::fs::symlink(&target, &dest)?;
-            } else {
-                fs::copy(&abs_path, &dest)?;
-                // Preserve permissions
-                let perms = meta.permissions();
-                fs::set_permissions(&dest, perms)?;
+        let move_result: Result<(), TrashError> = (|| {
+            if fs::rename(&abs_path, &dest).is_err() {
+                // Cross-filesystem fallback
+                if meta.is_dir() || meta.file_type().is_symlink() && abs_path.is_dir() {
+                    copy_tree(&abs_path, &dest)?;
+                } else if meta.file_type().is_symlink() {
+                    let target = fs::read_link(&abs_path)?;
+                    std::os::unix::fs::symlink(&target, &dest)?;
+                } else {
+                    fs::copy(&abs_path, &dest)?;
+                    let perms = meta.permissions();
+                    fs::set_permissions(&dest, perms)?;
+                }
+                if meta.is_dir() || (meta.file_type().is_symlink() && abs_path.is_dir()) {
+                    fs::remove_dir_all(&abs_path)?;
+                } else {
+                    fs::remove_file(&abs_path)?;
+                }
             }
-            if meta.is_dir() || (meta.file_type().is_symlink() && abs_path.is_dir()) {
-                fs::remove_dir_all(&abs_path)?;
-            } else {
-                fs::remove_file(&abs_path)?;
+            Ok(())
+        })();
+
+        // On failure, clean up orphaned trashinfo and partial copy
+        if let Err(e) = move_result {
+            let _ = fs::remove_file(&info_file);
+            if dest.exists() {
+                if dest.is_dir() {
+                    let _ = fs::remove_dir_all(&dest);
+                } else {
+                    let _ = fs::remove_file(&dest);
+                }
             }
+            return Err(e);
         }
 
         // Update index
@@ -627,6 +642,13 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             std::os::unix::fs::symlink(&link_target, &dest_path)?;
         } else if entry_meta.is_dir() {
             copy_tree(&entry.path(), &dest_path)?;
+        } else if entry_meta.file_type().is_fifo()
+            || entry_meta.file_type().is_char_device()
+            || entry_meta.file_type().is_block_device()
+            || entry_meta.file_type().is_socket()
+        {
+            // Skip special files — fs::copy on FIFOs blocks indefinitely,
+            // and device nodes require mknod to recreate
         } else {
             fs::copy(entry.path(), &dest_path)?;
             fs::set_permissions(&dest_path, entry_meta.permissions())?;
@@ -691,7 +713,8 @@ fn disk_usage_percent(path: &Path) -> Option<f64> {
         if stat.f_blocks == 0 {
             return None;
         }
-        let used = stat.f_blocks - stat.f_bfree;
+        // Use f_bavail (excludes root-reserved blocks) not f_bfree
+        let used = stat.f_blocks - stat.f_bavail;
         Some((used as f64 / stat.f_blocks as f64) * 100.0)
     }
 }

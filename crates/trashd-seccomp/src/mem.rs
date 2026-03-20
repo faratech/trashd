@@ -38,11 +38,18 @@ pub fn read_path_from_process(pid: u32, addr: u64) -> io::Result<PathBuf> {
         return Err(io::Error::last_os_error());
     }
 
-    // Find NUL terminator
-    let len = buf[..n as usize]
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(n as usize);
+    let bytes_read = n as usize;
+
+    // Find NUL terminator — if missing, the path was truncated (partial read)
+    let len = match buf[..bytes_read].iter().position(|&b| b == 0) {
+        Some(pos) => pos,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "path string has no NUL terminator (truncated read)",
+            ));
+        }
+    };
 
     buf.truncate(len);
     Ok(PathBuf::from(OsString::from_vec(buf)))

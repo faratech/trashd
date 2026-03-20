@@ -8,7 +8,6 @@ pub struct DeletionEvent {
     pub path: PathBuf,
     pub pid: u32,
     pub process: String,
-    pub timestamp: String,
 }
 
 impl DeletionEvent {
@@ -48,7 +47,3 @@ pub fn process_name(pid: u32) -> String {
         .unwrap_or_else(|| format!("(pid {pid})"))
 }
 
-/// Resolve a path from a file descriptor via /proc/self/fd.
-pub fn path_from_fd(fd: i32) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/self/fd/{fd}")).ok()
-}

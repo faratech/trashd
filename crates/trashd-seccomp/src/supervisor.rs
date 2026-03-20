@@ -49,8 +49,9 @@ const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong =
     (3 << 30) | (80 << 16) | (0x21 << 8) | 0; // 0xC0502100
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong =
     (3 << 30) | (24 << 16) | (0x21 << 8) | 1; // 0xC0182101
+// NB: ID_VALID is _IOW (direction=1), not _IOWR (direction=3)
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong =
-    (3 << 30) | (8 << 16) | (0x21 << 8) | 2; // 0xC0082102
+    (1 << 30) | (8 << 16) | (0x21 << 8) | 2; // 0x40082102
 
 /// Flag to tell kernel to execute the original syscall.
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
@@ -172,10 +173,17 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
         }
     };
 
-    // Check if the notification is still valid (TOCTOU mitigation)
+    // Check if the notification is still valid (TOCTOU mitigation).
+    // If invalid, the target already died or was handled by the watchdog —
+    // any response we send will just get ENOENT, which is harmless.
     if !notif_id_valid(fd, notif.id) {
-        return; // Target already gone, nothing to respond to
+        // Target gone — no response needed (and any response would fail).
+        // This is safe: the kernel already cleaned up the notification.
+        return;
     }
+
+    // From this point, ALL code paths MUST send a response.
+    // Failure to respond will hang the supervised process.
 
     // Check TRASH_BYPASS env var in the target process
     // (We can't easily read env vars from another process, so we rely on
