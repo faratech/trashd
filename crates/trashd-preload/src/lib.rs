@@ -81,6 +81,7 @@ impl Default for PreloadConfig {
                 "cargo".into(),
                 "npm".into(),
                 "make".into(),
+                "git".into(),
             ],
         }
     }
@@ -277,7 +278,13 @@ fn should_skip_path(path: &Path) -> bool {
     let cfg = config();
 
     for pattern in &cfg.never_trash {
-        if let Some(prefix) = pattern.strip_suffix('*') {
+        if pattern.starts_with("*/") && pattern.ends_with("/*") {
+            // Infix pattern like "*/.git/*" — match as "contains"
+            let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
+            if s.contains(infix) {
+                return true;
+            }
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
             if s.starts_with(prefix) {
                 return true;
             }

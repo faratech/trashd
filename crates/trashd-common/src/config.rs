@@ -125,6 +125,7 @@ fn default_bypass_processes() -> Vec<String> {
         "cargo".into(),
         "npm".into(),
         "make".into(),
+        "git".into(),
     ]
 }
 
@@ -317,7 +318,11 @@ struct LocalConfig {
 fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     patterns.iter().any(|pattern| {
-        if let Some(prefix) = pattern.strip_suffix('*') {
+        if pattern.starts_with("*/") && pattern.ends_with("/*") {
+            // Infix pattern like "*/.git/*" — match as "contains"
+            let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
+            path_str.contains(infix)
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
             path_str.starts_with(prefix)
         } else if pattern.starts_with("*.") {
             path_str.ends_with(&pattern[1..])
