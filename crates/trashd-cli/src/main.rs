@@ -216,7 +216,20 @@ fn cmd_purge(store: &TrashStore, target: &str) {
 }
 
 fn cmd_empty(store: &TrashStore, older: Option<&str>) {
-    let days = older.and_then(|s| parse_duration_days(s));
+    let days = match older {
+        Some(s) => match parse_duration_days(s) {
+            Some(d) => Some(d),
+            None => {
+                eprintln!(
+                    "{} invalid duration '{}' (use e.g. '7d', '2w', or a number of days)",
+                    "trash: error:".red().bold(),
+                    s,
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     match store.empty(days) {
         Ok(count) => {

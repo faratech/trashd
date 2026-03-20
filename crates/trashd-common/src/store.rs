@@ -158,21 +158,21 @@ impl TrashStore {
         // Try rename (fast, same filesystem — should always work with topdir trash)
         let move_result: Result<(), TrashError> = (|| {
             if fs::rename(&abs_path, &dest).is_err() {
-                // Cross-filesystem fallback
-                if meta.is_dir() || meta.file_type().is_symlink() && abs_path.is_dir() {
+                // Cross-filesystem fallback — order matters: check symlink first
+                if meta.file_type().is_symlink() {
+                    let link_target = fs::read_link(&abs_path)?;
+                    std::os::unix::fs::symlink(&link_target, &dest)?;
+                } else if meta.is_dir() {
                     copy_tree(&abs_path, &dest)?;
-                } else if meta.file_type().is_symlink() {
-                    let target = fs::read_link(&abs_path)?;
-                    std::os::unix::fs::symlink(&target, &dest)?;
                 } else {
                     fs::copy(&abs_path, &dest)?;
-                    let perms = meta.permissions();
-                    fs::set_permissions(&dest, perms)?;
+                    fs::set_permissions(&dest, meta.permissions())?;
                 }
-                if meta.is_dir() || (meta.file_type().is_symlink() && abs_path.is_dir()) {
-                    fs::remove_dir_all(&abs_path)?;
-                } else {
+                // Remove the original
+                if meta.file_type().is_symlink() || meta.is_file() {
                     fs::remove_file(&abs_path)?;
+                } else {
+                    fs::remove_dir_all(&abs_path)?;
                 }
             }
             Ok(())
@@ -234,7 +234,7 @@ impl TrashStore {
                 continue;
             }
 
-            let id = filename.trim_end_matches(".trashinfo").to_string();
+            let id = filename.strip_suffix(".trashinfo").unwrap_or(&filename).to_string();
             let content = match fs::read_to_string(entry.path()) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -259,10 +259,11 @@ impl TrashStore {
                 }
             }
 
+            let trashed_path = files_dir.join(&id);
             entries.push(TrashEntry {
                 id,
                 info,
-                trashed_path: files_dir.join(filename.trim_end_matches(".trashinfo")),
+                trashed_path,
                 info_path: entry.path(),
                 trash_root: trash_dir.to_path_buf(),
             });
@@ -386,7 +387,7 @@ impl TrashStore {
         for entry in entries.iter().rev() {
             // entries are newest-first, so iterate in reverse (oldest first)
             let age = now.signed_duration_since(entry.info.deletion_date);
-            if age.num_days() <= max_age as i64 {
+            if age.num_days() < max_age as i64 {
                 break; // rest are newer
             }
             let _ = self.purge_entry(&entry);
@@ -713,9 +714,15 @@ fn disk_usage_percent(path: &Path) -> Option<f64> {
         if stat.f_blocks == 0 {
             return None;
         }
-        // Use f_bavail (excludes root-reserved blocks) not f_bfree
-        let used = stat.f_blocks - stat.f_bavail;
-        Some((used as f64 / stat.f_blocks as f64) * 100.0)
+        // Total usable by non-root = used_by_users + f_bavail
+        // where used_by_users = f_blocks - f_bfree
+        // So effective total = (f_blocks - f_bfree) + f_bavail
+        let used = stat.f_blocks - stat.f_bfree;
+        let effective_total = used + stat.f_bavail;
+        if effective_total == 0 {
+            return None;
+        }
+        Some((used as f64 / effective_total as f64) * 100.0)
     }
 }
 

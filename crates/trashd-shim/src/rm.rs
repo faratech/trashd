@@ -113,24 +113,25 @@ fn main() -> ExitCode {
         }
     }
 
-    let cmd_str = format!("rm {}", std::env::args().skip(1).collect::<Vec<_>>().join(" "));
+    let cmd_str = format!("rm {}", std::env::args().skip(1).map(|a| {
+        if a.contains(' ') || a.contains('\'') || a.contains('"') || a.contains('\\') {
+            format!("'{}'", a.replace('\'', "'\\''"))
+        } else {
+            a
+        }
+    }).collect::<Vec<_>>().join(" "));
 
     let mut exit_code = ExitCode::SUCCESS;
 
     for file in &args.files {
-        // Check if file exists (use symlink_metadata to not follow symlinks)
-        let exists = file.symlink_metadata().is_ok();
-        if !exists {
-            if args.force {
-                continue;
-            }
-            eprintln!("rm: cannot remove '{}': No such file or directory", file.display());
-            exit_code = ExitCode::FAILURE;
-            continue;
-        }
-
         let meta = match file.symlink_metadata() {
             Ok(m) => m,
+            Err(_) if args.force => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("rm: cannot remove '{}': No such file or directory", file.display());
+                exit_code = ExitCode::FAILURE;
+                continue;
+            }
             Err(e) => {
                 eprintln!("rm: cannot remove '{}': {e}", file.display());
                 exit_code = ExitCode::FAILURE;
@@ -181,7 +182,7 @@ fn main() -> ExitCode {
                 if args.verbose {
                     eprintln!("rm (real): '{}'", file.display());
                 }
-                if let Err(e) = real_rm(file) {
+                if let Err(e) = real_rm(file, args.recursive) {
                     eprintln!("rm: cannot remove '{}': {e}", file.display());
                     exit_code = ExitCode::FAILURE;
                 }
@@ -189,7 +190,7 @@ fn main() -> ExitCode {
             Err(e) => {
                 eprintln!("trashd: failed to trash '{}': {e}", file.display());
                 eprintln!("trashd: falling back to real rm for this file");
-                if let Err(e) = real_rm(file) {
+                if let Err(e) = real_rm(file, args.recursive) {
                     eprintln!("rm: cannot remove '{}': {e}", file.display());
                     exit_code = ExitCode::FAILURE;
                 }
@@ -263,13 +264,19 @@ fn passthrough_with_args(args: &[&str]) -> ExitCode {
 }
 
 /// Remove a file/dir/symlink correctly using symlink_metadata.
-fn real_rm(path: &PathBuf) -> std::io::Result<()> {
+/// `recursive` must be true for directories to be removed (matches rm -r semantics).
+fn real_rm(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
 
     if meta.file_type().is_symlink() {
-        // Symlinks are always removed with remove_file, regardless of target type
         std::fs::remove_file(path)
     } else if meta.is_dir() {
+        if !recursive {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Is a directory",
+            ));
+        }
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
