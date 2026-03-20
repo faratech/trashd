@@ -1025,6 +1025,7 @@ dependencies = [
  "toml",
  "url",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

@@ -611,7 +611,41 @@ impl TrashStore {
             purged[i] = true;
         }
 
-        // Phase 2: trim by total size (purge oldest surviving until under limit)
+        // Phase 2a: auto-compress old uncompressed items before purging by size.
+        // Compressing can free enough space to avoid purging at all.
+        for i in (0..entries.len()).rev() {
+            if purged[i] || entries[i].orphaned {
+                continue;
+            }
+            let age = now.signed_duration_since(entries[i].info.deletion_date);
+            if age.num_days() < 7 {
+                continue; // only compress items older than 7 days
+            }
+            let path = &entries[i].trashed_path;
+            if path.is_dir() || !path.exists() {
+                continue;
+            }
+            // Check zstd magic — skip if already compressed
+            if let Ok(data) = fs::read(path) {
+                if data.len() >= 4 {
+                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if magic == 0xFD2FB528 {
+                        continue; // already zstd
+                    }
+                }
+                if data.len() < 1024 {
+                    continue; // too small to bother
+                }
+                // Compress in-place
+                if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3) {
+                    if compressed.len() < data.len() {
+                        let _ = fs::write(path, &compressed);
+                    }
+                }
+            }
+        }
+
+        // Phase 2b: trim by total size (purge oldest surviving until under limit)
         let total_size: u64 = entries.iter().enumerate()
             .filter(|(i, _)| !purged[*i])
             .filter_map(|(_, e)| e.info.size)

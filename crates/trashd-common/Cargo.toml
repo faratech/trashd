@@ -16,6 +16,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
 toml = "1"
 thiserror = "2"
 url = "2"

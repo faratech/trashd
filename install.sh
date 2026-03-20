@@ -100,9 +100,37 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
         fi
     done
 
+    # Remove ALL FreeDesktop.org Trash spec v1.0 trash directories
+    echo "==> Removing all trash directories..."
+
+    # Home trash for all users
+    for home_dir in /home/* /root; do
+        trash_dir="${home_dir}/.local/share/Trash"
+        if [ -d "${trash_dir}" ]; then
+            rm -rf "${trash_dir}"
+            echo "    Removed ${trash_dir}"
+        fi
+    done
+
+    # Per-mountpoint trash directories (.Trash-$UID and .Trash/$UID)
+    # Scan all mount points for trash dirs
+    while IFS= read -r mpoint; do
+        # .Trash-* (per-user topdir trash)
+        for d in "${mpoint}"/.Trash-*; do
+            if [ -d "$d" ]; then
+                rm -rf "$d"
+                echo "    Removed $d"
+            fi
+        done
+        # .Trash/ (shared topdir trash)
+        if [ -d "${mpoint}/.Trash" ]; then
+            rm -rf "${mpoint}/.Trash"
+            echo "    Removed ${mpoint}/.Trash"
+        fi
+    done < <(awk '{print $2}' /proc/mounts 2>/dev/null | sort -u)
+
     echo ""
-    echo "==> trashd uninstalled."
-    echo "    Trash contents preserved at ~/.local/share/Trash/"
+    echo "==> trashd fully uninstalled. All trash directories removed."
     echo "    Start a new shell to clear PATH changes."
     exit 0
 fi
