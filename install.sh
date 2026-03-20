@@ -4,8 +4,79 @@ set -euo pipefail
 PREFIX="${PREFIX:-/usr/local}"
 SHIM_DIR="${PREFIX}/lib/trashd/bin"
 REAL_DIR="${PREFIX}/lib/trashd/real"
+LIB_DIR="${PREFIX}/lib/trashd"
 BIN_DIR="${PREFIX}/bin"
 
+# -----------------------------------------------------------------------
+# Uninstall
+# -----------------------------------------------------------------------
+if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
+    echo "==> Uninstalling trashd..."
+
+    # Restore real rm if we stashed it
+    if [ -f "${REAL_DIR}/rm" ]; then
+        echo "    Stashed real rm found at ${REAL_DIR}/rm (leaving in place)"
+    fi
+
+    # Remove binaries
+    for bin in trash trashd-exec trashd-daemon; do
+        if [ -f "${BIN_DIR}/${bin}" ]; then
+            rm -f "${BIN_DIR}/${bin}"
+            echo "    Removed ${BIN_DIR}/${bin}"
+        fi
+    done
+
+    # Remove shim directory (rm shim, unlink symlink)
+    if [ -d "${SHIM_DIR}" ]; then
+        rm -rf "${SHIM_DIR}"
+        echo "    Removed ${SHIM_DIR}"
+    fi
+
+    # Remove LD_PRELOAD library
+    if [ -f "${LIB_DIR}/libtrashd_preload.so" ]; then
+        rm -f "${LIB_DIR}/libtrashd_preload.so"
+        echo "    Removed ${LIB_DIR}/libtrashd_preload.so"
+    fi
+
+    # Remove from /etc/ld.so.preload if present
+    if [ -f /etc/ld.so.preload ]; then
+        if grep -q "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
+            sed -i '\|libtrashd_preload.so|d' /etc/ld.so.preload
+            echo "    Removed from /etc/ld.so.preload"
+        fi
+    fi
+
+    # Remove stashed real rm and lib dir if empty
+    rm -f "${REAL_DIR}/rm" 2>/dev/null
+    rmdir "${REAL_DIR}" 2>/dev/null || true
+    rmdir "${LIB_DIR}" 2>/dev/null || true
+
+    # Remove PATH hook
+    if [ -f /etc/profile.d/trashd.sh ]; then
+        rm -f /etc/profile.d/trashd.sh
+        echo "    Removed /etc/profile.d/trashd.sh"
+    fi
+
+    # Remove systemd service if installed
+    if [ -f /etc/systemd/system/trashd-daemon.service ]; then
+        systemctl stop trashd-daemon 2>/dev/null || true
+        systemctl disable trashd-daemon 2>/dev/null || true
+        rm -f /etc/systemd/system/trashd-daemon.service
+        systemctl daemon-reload 2>/dev/null || true
+        echo "    Removed trashd-daemon.service"
+    fi
+
+    echo ""
+    echo "==> trashd uninstalled."
+    echo "    User config preserved at ~/.config/trashd/"
+    echo "    Trash contents preserved at ~/.local/share/Trash/"
+    echo "    Start a new shell to clear PATH changes."
+    exit 0
+fi
+
+# -----------------------------------------------------------------------
+# Install
+# -----------------------------------------------------------------------
 echo "==> Building trashd..."
 cargo build --release --manifest-path="$(dirname "$0")/Cargo.toml"
 
@@ -34,7 +105,6 @@ for cmd in unlink; do
 done
 
 echo "==> Installing LD_PRELOAD library..."
-LIB_DIR="${PREFIX}/lib/trashd"
 install -Dm755 "${TARGET_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
 echo "    Installed ${LIB_DIR}/libtrashd_preload.so"
 echo "    To enable system-wide: echo '${LIB_DIR}/libtrashd_preload.so' >> /etc/ld.so.preload"
