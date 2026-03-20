@@ -240,9 +240,28 @@ fn process_name(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Check if a path is inside a trash directory (should never be intercepted).
+fn is_inside_trash(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    // Home trash
+    if s.contains("/.local/share/Trash/") {
+        return true;
+    }
+    // Per-mountpoint trash: .Trash-$UID or .Trash/$UID
+    if s.contains("/.Trash-") || s.contains("/.Trash/") {
+        return true;
+    }
+    false
+}
+
 /// Check if path matches the never-trash list from config.
 /// Uses the same matching logic as trashd-common's Config::should_skip.
 fn should_skip_path(path: &Path) -> bool {
+    // Never intercept operations inside trash directories themselves
+    if is_inside_trash(path) {
+        return true;
+    }
+
     let s = path.to_string_lossy();
     let cfg = config();
 

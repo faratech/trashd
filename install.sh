@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bypass trashd interception during install — we don't want the LD_PRELOAD
+# layer trashing old binaries when install overwrites them.
+export TRASH_BYPASS=1
+
 PREFIX="${PREFIX:-/usr/local}"
 SHIM_DIR="${PREFIX}/lib/trashd/bin"
 REAL_DIR="${PREFIX}/lib/trashd/real"
@@ -98,7 +102,9 @@ cargo build --release --manifest-path="$(dirname "$0")/Cargo.toml"
 TARGET_DIR="$(dirname "$0")/target/release"
 
 echo "==> Installing binaries..."
-install -Dm755 "${TARGET_DIR}/trash"    "${BIN_DIR}/trash"
+install -Dm755 "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
+install -Dm755 "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
+install -Dm755 "${TARGET_DIR}/trashd-daemon" "${LIB_DIR}/trashd-daemon"
 
 echo "==> Setting up shim directory..."
 mkdir -p "${SHIM_DIR}" "${REAL_DIR}"
@@ -119,16 +125,41 @@ for cmd in unlink; do
     ln -sf rm "${SHIM_DIR}/${cmd}"
 done
 
-echo "==> Installing LD_PRELOAD library..."
+echo "==> Installing LD_PRELOAD library (Layer 2)..."
 install -Dm755 "${TARGET_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
 echo "    Installed ${LIB_DIR}/libtrashd_preload.so"
-echo "    To enable system-wide: echo '${LIB_DIR}/libtrashd_preload.so' >> /etc/ld.so.preload"
-echo "    To enable per-session: export LD_PRELOAD=${LIB_DIR}/libtrashd_preload.so"
+# Enable system-wide: catches unlink/rmdir from any dynamically-linked program
+if ! grep -qs "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
+    echo "${LIB_DIR}/libtrashd_preload.so" >> /etc/ld.so.preload
+    echo "    Enabled system-wide via /etc/ld.so.preload"
+else
+    echo "    Already in /etc/ld.so.preload"
+fi
 
-echo "==> Installing PATH hook..."
+echo "==> Installing PATH + seccomp hook (Layers 1 & 4)..."
 if [ -d /etc/profile.d ]; then
     install -Dm644 "$(dirname "$0")/install/profile.d/trashd.sh" /etc/profile.d/trashd.sh
     echo "    Installed /etc/profile.d/trashd.sh"
+    echo "    Layer 1: PATH shim shadows rm"
+    echo "    Layer 4: Interactive shells run under seccomp protection"
+fi
+
+echo "==> Installing fanotify daemon (Layer 3)..."
+if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    install -Dm644 "$(dirname "$0")/install/systemd/trashd-daemon.service" \
+        /etc/systemd/system/trashd-daemon.service
+    systemctl daemon-reload
+    systemctl enable trashd-daemon 2>/dev/null || true
+    systemctl start trashd-daemon 2>/dev/null || true
+    if systemctl is-active --quiet trashd-daemon 2>/dev/null; then
+        echo "    trashd-daemon is running (monitoring deletions)"
+    else
+        echo "    trashd-daemon installed but could not start (needs CAP_SYS_ADMIN)"
+        echo "    Start manually: sudo systemctl start trashd-daemon"
+    fi
+else
+    echo "    systemd not available, skipping daemon install"
+    echo "    Run manually: sudo trashd-daemon --foreground"
 fi
 
 echo "==> Installing global config..."
@@ -142,22 +173,23 @@ fi
 echo "    Per-user overrides: ~/.config/trashd/config.toml"
 
 echo ""
-echo "==> trashd installed successfully!"
+echo "==> trashd installed successfully! All layers active."
 echo ""
 echo "    Start a new shell or run: source /etc/profile.d/trashd.sh"
 echo ""
-echo "    Layer 1 (PATH shims):"
-echo "      rm file.txt          # moves to trash (intercepted by shim)"
-echo "      rm --permanent file  # real delete (bypasses trash)"
-echo "      TRASH_BYPASS=1 rm f  # real delete via env var"
+echo "    Active layers:"
+echo "      Layer 1 — PATH shim:    rm -> trash (via PATH)"
+echo "      Layer 2 — LD_PRELOAD:   unlink()/rmdir() -> trash (system-wide)"
+echo "      Layer 3 — fanotify:     deletion audit/logging (systemd service)"
+echo "      Layer 4 — seccomp:      syscall trapping (interactive shells)"
 echo ""
-echo "    Layer 2 (LD_PRELOAD — catches unlink/rmdir from any program):"
-echo "      LD_PRELOAD=${LIB_DIR}/libtrashd_preload.so <command>"
-echo "      TRASHD_PRELOAD_LOG=1 to see interceptions"
+echo "    Bypass trash when needed:"
+echo "      rm --permanent file     # real delete through shim"
+echo "      TRASH_BYPASS=1 rm file  # real delete via env var"
 echo ""
 echo "    CLI:"
-echo "      trash ls             # list trashed files (all partitions)"
+echo "      trash ls             # list trashed files"
 echo "      trash undo           # restore last deletion"
 echo "      trash restore file   # restore specific file"
 echo "      trash empty          # permanently empty trash"
-echo "      trash status         # show per-partition trash stats"
+echo "      trash status         # show per-partition stats"
