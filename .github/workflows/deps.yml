@@ -1,0 +1,54 @@
+name: Update Dependencies
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # every Monday at 06:00 UTC
+  workflow_dispatch:       # manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Update Rust toolchain
+        run: rustup update stable
+
+      - name: Update dependencies
+        run: cargo update
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet Cargo.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build with updated deps
+        if: steps.diff.outputs.changed == 'true'
+        run: cargo build --release
+
+      - name: Run tests
+        if: steps.diff.outputs.changed == 'true'
+        run: cargo test --workspace
+
+      - name: Create PR
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: 'chore: update dependencies'
+          title: 'chore: weekly dependency update'
+          body: |
+            Automated dependency update via `cargo update`.
+
+            Tests pass with the updated lockfile.
+          branch: deps/weekly-update
+          delete-branch: true
