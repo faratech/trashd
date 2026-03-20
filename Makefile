@@ -8,11 +8,17 @@ COMPLETIONS_BASH ?= $(PREFIX)/share/bash-completion/completions
 COMPLETIONS_ZSH ?= $(PREFIX)/share/zsh/site-functions
 COMPLETIONS_FISH ?= $(PREFIX)/share/fish/vendor_completions.d
 
-.PHONY: all build install uninstall clean test
+.PHONY: all build install uninstall clean test update
 
 all: build
 
-build:
+update:
+	@echo "==> Updating Rust toolchain..."
+	rustup update stable 2>/dev/null || true
+	@echo "==> Updating dependencies..."
+	cargo update
+
+build: update
 	cargo build --release
 
 test:

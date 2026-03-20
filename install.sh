@@ -96,6 +96,10 @@ fi
 # -----------------------------------------------------------------------
 # Install
 # -----------------------------------------------------------------------
+echo "==> Updating Rust toolchain and dependencies..."
+rustup update stable 2>/dev/null || true
+cargo update --manifest-path="$(dirname "$0")/Cargo.toml" 2>/dev/null || true
+
 echo "==> Building trashd..."
 cargo build --release --manifest-path="$(dirname "$0")/Cargo.toml"
 
