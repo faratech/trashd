@@ -459,8 +459,7 @@ impl TrashStore {
         if restore_to.is_file() {
             if let Ok(data) = fs::read(&restore_to) {
                 if data.len() >= 4 {
-                    let magic =
-                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     if magic == 0xFD2FB528 {
                         match zstd::decode_all(data.as_slice()) {
                             Ok(decompressed) => {
@@ -667,8 +666,7 @@ impl TrashStore {
             }
             if let Ok(data) = fs::read(path) {
                 if data.len() >= 4 {
-                    let magic =
-                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     if magic == 0xFD2FB528 {
                         continue;
                     }
@@ -690,11 +688,7 @@ impl TrashStore {
             .iter()
             .enumerate()
             .filter(|(i, _)| !purged[*i])
-            .map(|(_, e)| {
-                fs::metadata(&e.trashed_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            })
+            .map(|(_, e)| fs::metadata(&e.trashed_path).map(|m| m.len()).unwrap_or(0))
             .sum();
         if total_size > max_size_bytes {
             let mut freed = 0u64;

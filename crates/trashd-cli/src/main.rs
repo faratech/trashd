@@ -439,10 +439,7 @@ fn cmd_empty(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) 
 
     // Confirmation prompt unless --yes
     if !yes {
-        let (total_size, count) = match store.status() {
-            Ok(s) => s,
-            Err(_) => (0, 0),
-        };
+        let (total_size, count) = store.status().unwrap_or_default();
         if count == 0 {
             println!("{}", "Nothing to empty.".dimmed());
             return;
@@ -608,9 +605,7 @@ fn cmd_du(store: &TrashStore, top: usize) {
         return;
     }
 
-    entries.sort_by(|a, b| {
-        b.info.size.unwrap_or(0).cmp(&a.info.size.unwrap_or(0))
-    });
+    entries.sort_by(|a, b| b.info.size.unwrap_or(0).cmp(&a.info.size.unwrap_or(0)));
 
     println!(
         "{:>10} {:<30} {}",
@@ -632,12 +627,7 @@ fn cmd_du(store: &TrashStore, top: usize) {
         } else {
             path.to_string()
         };
-        println!(
-            "{:>10} {:<30} {}",
-            size,
-            path_display,
-            entry.id.dimmed()
-        );
+        println!("{:>10} {:<30} {}", size, path_display, entry.id.dimmed());
     }
 
     if entries.len() > top {
