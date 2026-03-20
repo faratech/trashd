@@ -32,6 +32,12 @@ pub enum TrashError {
     RestoreConflict(PathBuf),
     #[error("multiple matches for '{pattern}': {count} items (use trash ID for exact match)")]
     AmbiguousMatch { pattern: String, count: usize },
+    #[error("hash mismatch for '{path}': expected {expected}, got {actual}")]
+    HashMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
 }
 
 pub struct TrashStore {
@@ -319,6 +325,30 @@ impl TrashStore {
             }
         }
 
+        // Verify hash if one was recorded and the restored path is a regular file.
+        // This catches corruption during storage (bit rot, bad disk, partial copy).
+        // We verify AFTER restore so the file is already in place — a mismatch is
+        // reported as a warning, not a rollback (the user can decide what to do).
+        let hash_warning = if let Some(ref expected_hash) = entry.info.sha256 {
+            if restore_to.is_file() {
+                // Try both algorithms — we don't know which was used originally
+                let xxhash = hash_file(&restore_to, "xxhash").ok();
+                let sha256 = hash_file(&restore_to, "sha256").ok();
+                if xxhash.as_deref() == Some(expected_hash.as_str())
+                    || sha256.as_deref() == Some(expected_hash.as_str())
+                {
+                    None // match
+                } else {
+                    let actual = xxhash.or(sha256).unwrap_or_else(|| "(unreadable)".into());
+                    Some((expected_hash.clone(), actual))
+                }
+            } else {
+                None // directories/symlinks don't get hashed
+            }
+        } else {
+            None
+        };
+
         // Remove trashinfo
         let _ = fs::remove_file(&entry.info_path);
 
@@ -327,6 +357,17 @@ impl TrashStore {
 
         // Log operation
         crate::oplog::log_restore(&entry.id, &restore_to);
+
+        // Report hash mismatch as a warning after successful restore
+        if let Some((expected, actual)) = hash_warning {
+            eprintln!(
+                "trashd: warning: hash mismatch for restored file {}",
+                restore_to.display()
+            );
+            eprintln!("  expected: {expected}");
+            eprintln!("  actual:   {actual}");
+            eprintln!("  file may be corrupted — verify contents before use");
+        }
 
         Ok(restore_to)
     }
