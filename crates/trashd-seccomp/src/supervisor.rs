@@ -50,6 +50,10 @@ const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = (3 << 30) | (24 << 16) | (0x21 <
                                                                                           // NB: ID_VALID is _IOW (direction=1), not _IOWR (direction=3)
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = (1 << 30) | (8 << 16) | (0x21 << 8) | 2; // 0x40082102
 
+// Compile-time verification that struct sizes match ioctl constants
+const _: () = assert!(std::mem::size_of::<SeccompNotif>() == 80);
+const _: () = assert!(std::mem::size_of::<SeccompNotifResp>() == 24);
+
 /// Flag to tell kernel to execute the original syscall.
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 
@@ -168,8 +172,10 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     // If invalid, the target already died or was handled by the watchdog —
     // any response we send will just get ENOENT, which is harmless.
     if !notif_id_valid(fd, notif.id) {
-        // Target gone — no response needed (and any response would fail).
-        // This is safe: the kernel already cleaned up the notification.
+        // Target likely gone. Send CONTINUE defensively — if the target is truly
+        // dead, the response harmlessly fails with ENOENT. If the ioctl failed
+        // spuriously, this prevents hanging the supervised process.
+        respond_continue(fd, notif.id);
         return;
     }
 

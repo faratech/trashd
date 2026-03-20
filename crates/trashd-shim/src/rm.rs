@@ -292,9 +292,14 @@ fn passthrough_with_args(args: &[&str]) -> ExitCode {
 fn real_rm(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
     // Set TRASH_BYPASS so the LD_PRELOAD layer doesn't re-intercept
     // our unlink/rmdir calls when we genuinely want a real delete.
-    std::env::set_var("TRASH_BYPASS", "1");
+    // Safety: the shim is single-threaded (no other threads to race with).
+    unsafe {
+        std::env::set_var("TRASH_BYPASS", "1");
+    }
     let result = real_rm_inner(path, recursive);
-    std::env::remove_var("TRASH_BYPASS");
+    unsafe {
+        std::env::remove_var("TRASH_BYPASS");
+    }
     result
 }
 

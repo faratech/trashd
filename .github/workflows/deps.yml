@@ -38,7 +38,7 @@ jobs:
 
       - name: Run tests
         if: steps.diff.outputs.changed == 'true'
-        run: cargo test --workspace
+        run: TRASH_BYPASS=1 cargo test --workspace -- --test-threads=1
 
       - name: Create PR
         if: steps.diff.outputs.changed == 'true'

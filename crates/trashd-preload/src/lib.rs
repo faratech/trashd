@@ -565,8 +565,12 @@ fn try_trash(path: &Path) -> bool {
                     return false;
                 }
             };
-            unsafe {
-                (real_unlink())(cpath.as_ptr());
+            let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
+            if ret != 0 {
+                // Unlink of original failed — clean up the copy to avoid orphan
+                let _ = fs::remove_file(&info_path);
+                let _ = fs::remove_file(&dest);
+                return false;
             }
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
             return true;
@@ -584,7 +588,7 @@ fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf
     // Truncate to avoid exceeding filesystem filename limits (255 bytes).
     let max_base = 223; // reserve 32 for ".YYYYMMDDHHMMSS.NNNNN.trashinfo"
     let base_name = if base_name.len() > max_base {
-        &base_name[..max_base]
+        &base_name[..base_name.floor_char_boundary(max_base)]
     } else {
         base_name
     };

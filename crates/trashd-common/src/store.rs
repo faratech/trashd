@@ -645,7 +645,7 @@ impl TrashStore {
         for i in (0..entries.len()).rev() {
             let age = now.signed_duration_since(entries[i].info.deletion_date);
             if age.num_days() < max_age as i64 {
-                break;
+                continue; // don't break — multi-partition entries may not be perfectly sorted
             }
             let _ = self.purge_entry(&entries[i]);
             purged[i] = true;
@@ -700,7 +700,10 @@ impl TrashStore {
                 if freed >= excess {
                     break;
                 }
-                freed += entries[i].info.size.unwrap_or(0);
+                // Use actual disk size (may differ from info.size after compression)
+                freed += fs::metadata(&entries[i].trashed_path)
+                    .map(|m| m.len())
+                    .unwrap_or(entries[i].info.size.unwrap_or(0));
                 let _ = self.purge_entry(&entries[i]);
                 purged[i] = true;
             }
@@ -887,7 +890,7 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
     // Most filesystems cap at 255 bytes. Reserve 32 for suffix.
     let max_base = 223;
     let base_name = if base_name.len() > max_base {
-        &base_name[..max_base]
+        &base_name[..base_name.floor_char_boundary(max_base)]
     } else {
         base_name
     };

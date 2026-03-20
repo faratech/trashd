@@ -354,7 +354,13 @@ fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
             let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
             path_str.contains(infix)
         } else if let Some(prefix) = pattern.strip_suffix('*') {
-            path_str.starts_with(prefix)
+            // "/tmp/*" → absolute prefix match
+            // "node_modules/*" → match anywhere in path (no leading /)
+            if prefix.starts_with('/') {
+                path_str.starts_with(prefix)
+            } else {
+                path_str.starts_with(prefix) || path_str.contains(&format!("/{prefix}"))
+            }
         } else if pattern.starts_with("*.") {
             path_str.ends_with(&pattern[1..])
         } else if pattern == "*~" {

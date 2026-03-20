@@ -107,9 +107,11 @@ fn dir_size_bytes(path: &Path) -> u64 {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_dir() {
                     total += dir_size_bytes(&entry.path());
+                } else {
+                    // Count blocks * 512 for actual disk usage (like du)
+                    // Only for files — directory content is counted by the recursive call
+                    total += meta.blocks() * 512;
                 }
-                // Count blocks * 512 for actual disk usage (like du)
-                total += meta.blocks() * 512;
             }
         }
     }
