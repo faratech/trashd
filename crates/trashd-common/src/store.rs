@@ -437,10 +437,31 @@ impl TrashStore {
             }
         }
 
-        // Verify hash if one was recorded and the restored path is a regular file.
-        // This catches corruption during storage (bit rot, bad disk, partial copy).
-        // We verify AFTER restore so the file is already in place — a mismatch is
-        // reported as a warning, not a rollback (the user can decide what to do).
+        // Transparent decompression: if the file was auto-compressed (zstd),
+        // decompress it back to original content before the user sees it.
+        if restore_to.is_file() {
+            if let Ok(data) = fs::read(&restore_to) {
+                if data.len() >= 4 {
+                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if magic == 0xFD2FB528 {
+                        // Zstd-compressed — decompress in place
+                        match zstd::decode_all(data.as_slice()) {
+                            Ok(decompressed) => {
+                                let _ = fs::write(&restore_to, &decompressed);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "trashd: warning: failed to decompress {}: {e}",
+                                    restore_to.display(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify hash against the (now decompressed) restored file content.
         let hash_warning = if let Some(ref expected_hash) = entry.info.sha256 {
             if restore_to.is_file() {
                 // Try both algorithms — we don't know which was used originally
@@ -455,7 +476,7 @@ impl TrashStore {
                     Some((expected_hash.clone(), actual))
                 }
             } else {
-                None // directories/symlinks don't get hashed
+                None
             }
         } else {
             None
