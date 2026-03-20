@@ -92,6 +92,7 @@ fn default_never_trash() -> Vec<String> {
         "/proc/*".into(),
         "/sys/*".into(),
         "/dev/*".into(),
+        "/dev/shm/*".into(),
         "/run/*".into(),
         "*.o".into(),
         "*.pyc".into(),

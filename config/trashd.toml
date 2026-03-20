@@ -26,6 +26,7 @@ never_trash = [
     "/proc/*",
     "/sys/*",
     "/dev/*",
+    "/dev/shm/*",
     "/run/*",
     "*.o",
     "*.pyc",
