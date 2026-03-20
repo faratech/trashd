@@ -225,7 +225,7 @@ only_trash = ["src/*", "*.config"]
 
 ## FreeDesktop.org compliance
 
-trashd implements the [FreeDesktop.org Trash specification](https://specifications.freedesktop.org/trash-spec/latest/):
+trashd implements the [FreeDesktop.org Trash specification](https://specifications.freedesktop.org/trash/latest/):
 
 - `.trashinfo` metadata files with percent-encoded paths
 - `$XDG_DATA_HOME/Trash/` home directory trash
