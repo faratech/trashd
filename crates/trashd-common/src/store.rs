@@ -3,12 +3,12 @@ use crate::index::TrashIndex;
 use crate::mounts;
 use crate::trashinfo::TrashInfo;
 use sha2::{Digest, Sha256};
-use xxhash_rust::xxh3::xxh3_128;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use xxhash_rust::xxh3::xxh3_128;
 
 #[derive(Error, Debug)]
 pub enum TrashError {
@@ -99,7 +99,8 @@ impl TrashStore {
     /// For `.Trash/$uid` → grandparent is the topdir.
     fn topdir_for_trash(trash_dir: &Path) -> PathBuf {
         if let Some(parent) = trash_dir.parent() {
-            let name = parent.file_name()
+            let name = parent
+                .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             if name == ".Trash" {
@@ -149,29 +150,6 @@ impl TrashStore {
             }
         }
 
-        // Check directory size limit
-        if meta.is_dir() && self.config.max_dir_size_mb > 0 {
-            let dir_size_bytes = dir_size(&abs_path);
-            let dir_size_mb = dir_size_bytes / (1024 * 1024);
-            if dir_size_mb > self.config.max_dir_size_mb {
-                return Err(TrashError::TooLarge {
-                    path: abs_path,
-                    size_mb: dir_size_mb,
-                    limit_mb: self.config.max_dir_size_mb,
-                });
-            }
-        }
-
-        // Check bypass_paths — if the calling process exe matches, skip trash
-        if !self.config.bypass_paths.is_empty() {
-            if let Ok(exe) = fs::read_link("/proc/self/exe") {
-                let exe_str = exe.to_string_lossy();
-                if self.config.bypass_paths.iter().any(|p| exe_str.starts_with(p)) {
-                    return Err(TrashError::Excluded(abs_path));
-                }
-            }
-        }
-
         // Pick the right trash directory (same-device preferred)
         let trash_dir = self.trash_dir_for(&abs_path);
         Self::ensure_trash_dir(&trash_dir)?;
@@ -193,17 +171,25 @@ impl TrashStore {
             // Topdir trash: relative path from the topdir (parent of .Trash-$uid or .Trash/$uid)
             // e.g. /mnt/data/.Trash-1000 -> topdir is /mnt/data
             //      /mnt/data/.Trash/1000 -> topdir is /mnt/data
-            let topdir = trash_dir.parent()
+            let topdir = trash_dir
+                .parent()
                 .and_then(|p| {
                     // .Trash/$uid has one extra level
                     let name = p.file_name()?.to_string_lossy();
-                    if name == ".Trash" { p.parent() } else { Some(p) }
+                    if name == ".Trash" {
+                        p.parent()
+                    } else {
+                        Some(p)
+                    }
                 })
                 .unwrap_or(trash_dir.as_ref());
-            abs_path.strip_prefix(topdir)
+            abs_path
+                .strip_prefix(topdir)
                 .map(|rel| {
                     // Spec: relative path MUST NOT contain ".."
-                    debug_assert!(!rel.components().any(|c| c == std::path::Component::ParentDir));
+                    debug_assert!(!rel
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir));
                     rel.to_path_buf()
                 })
                 .unwrap_or_else(|_| abs_path.clone()) // fallback to absolute if strip fails
@@ -319,7 +305,10 @@ impl TrashStore {
                 continue;
             }
 
-            let id = filename.strip_suffix(".trashinfo").unwrap_or(&filename).to_string();
+            let id = filename
+                .strip_suffix(".trashinfo")
+                .unwrap_or(&filename)
+                .to_string();
             let content = match fs::read_to_string(entry.path()) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -437,31 +426,10 @@ impl TrashStore {
             }
         }
 
-        // Transparent decompression: if the file was auto-compressed (zstd),
-        // decompress it back to original content before the user sees it.
-        if restore_to.is_file() {
-            if let Ok(data) = fs::read(&restore_to) {
-                if data.len() >= 4 {
-                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    if magic == 0xFD2FB528 {
-                        // Zstd-compressed — decompress in place
-                        match zstd::decode_all(data.as_slice()) {
-                            Ok(decompressed) => {
-                                let _ = fs::write(&restore_to, &decompressed);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "trashd: warning: failed to decompress {}: {e}",
-                                    restore_to.display(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Verify hash against the (now decompressed) restored file content.
+        // Verify hash if one was recorded and the restored path is a regular file.
+        // This catches corruption during storage (bit rot, bad disk, partial copy).
+        // We verify AFTER restore so the file is already in place — a mismatch is
+        // reported as a warning, not a rollback (the user can decide what to do).
         let hash_warning = if let Some(ref expected_hash) = entry.info.sha256 {
             if restore_to.is_file() {
                 // Try both algorithms — we don't know which was used originally
@@ -476,7 +444,7 @@ impl TrashStore {
                     Some((expected_hash.clone(), actual))
                 }
             } else {
-                None
+                None // directories/symlinks don't get hashed
             }
         } else {
             None
@@ -632,42 +600,10 @@ impl TrashStore {
             purged[i] = true;
         }
 
-        // Phase 2a: auto-compress old uncompressed items before purging by size.
-        // Compressing can free enough space to avoid purging at all.
-        for i in (0..entries.len()).rev() {
-            if purged[i] || entries[i].orphaned {
-                continue;
-            }
-            let age = now.signed_duration_since(entries[i].info.deletion_date);
-            if age.num_days() < 7 {
-                continue; // only compress items older than 7 days
-            }
-            let path = &entries[i].trashed_path;
-            if path.is_dir() || !path.exists() {
-                continue;
-            }
-            // Check zstd magic — skip if already compressed
-            if let Ok(data) = fs::read(path) {
-                if data.len() >= 4 {
-                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    if magic == 0xFD2FB528 {
-                        continue; // already zstd
-                    }
-                }
-                if data.len() < 1024 {
-                    continue; // too small to bother
-                }
-                // Compress in-place
-                if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3) {
-                    if compressed.len() < data.len() {
-                        let _ = fs::write(path, &compressed);
-                    }
-                }
-            }
-        }
-
-        // Phase 2b: trim by total size (purge oldest surviving until under limit)
-        let total_size: u64 = entries.iter().enumerate()
+        // Phase 2: trim by total size (purge oldest surviving until under limit)
+        let total_size: u64 = entries
+            .iter()
+            .enumerate()
             .filter(|(i, _)| !purged[*i])
             .filter_map(|(_, e)| e.info.size)
             .sum();
@@ -960,8 +896,7 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
 
 fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
     if depth > COPY_TREE_MAX_DEPTH {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"),
         ));
     }
@@ -1079,7 +1014,7 @@ pub fn is_parent_bypassed(bypass_list: &[String]) -> bool {
             _ => break,
         };
         if let Some(name) = process_name(ppid) {
-            if bypass_list.iter().any(|b| name == *b) {
+            if bypass_list.contains(&name) {
                 return true;
             }
         }
@@ -1125,7 +1060,12 @@ mod tests {
     /// Create a TrashStore with isolated trash + work directories.
     /// Places files under the project root (not /tmp, which is in never_trash).
     /// Returns a MutexGuard that serializes tests sharing the env var.
-    fn test_store() -> (TrashStore, TempDir, TempDir, std::sync::MutexGuard<'static, ()>) {
+    fn test_store() -> (
+        TrashStore,
+        TempDir,
+        TempDir,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1214,8 +1154,15 @@ mod tests {
         let id = store.trash(&link, None).unwrap();
         let restored = store.restore(&id, None).unwrap();
 
-        assert!(restored.symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(fs::read_link(&restored).unwrap(), PathBuf::from("target.txt"));
+        assert!(restored
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(&restored).unwrap(),
+            PathBuf::from("target.txt")
+        );
     }
 
     #[test]
@@ -1281,7 +1228,10 @@ mod tests {
 
         let py_only = store.list(Some("*.py")).unwrap();
         assert_eq!(py_only.len(), 1);
-        assert_eq!(py_only[0].info.original_path.file_name().unwrap(), "script.py");
+        assert_eq!(
+            py_only[0].info.original_path.file_name().unwrap(),
+            "script.py"
+        );
     }
 
     #[test]

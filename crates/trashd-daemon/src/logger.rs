@@ -46,4 +46,3 @@ pub fn process_name(pid: u32) -> String {
         })
         .unwrap_or_else(|| format!("(pid {pid})"))
 }
-

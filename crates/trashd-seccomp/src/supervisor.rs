@@ -45,13 +45,10 @@ pub struct SeccompNotifResp {
 //
 // seccomp_notif = 80 bytes on x86_64 (8+4+4+64)
 // seccomp_notif_resp = 24 bytes (8+8+4+4)
-const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong =
-    (3 << 30) | (80 << 16) | (0x21 << 8) | 0; // 0xC0502100
-const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong =
-    (3 << 30) | (24 << 16) | (0x21 << 8) | 1; // 0xC0182101
-// NB: ID_VALID is _IOW (direction=1), not _IOWR (direction=3)
-const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong =
-    (1 << 30) | (8 << 16) | (0x21 << 8) | 2; // 0x40082102
+const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = (3 << 30) | (80 << 16) | (0x21 << 8); // 0xC0502100
+const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = (3 << 30) | (24 << 16) | (0x21 << 8) | 1; // 0xC0182101
+                                                                                          // NB: ID_VALID is _IOW (direction=1), not _IOWR (direction=3)
+const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = (1 << 30) | (8 << 16) | (0x21 << 8) | 2; // 0x40082102
 
 /// Flag to tell kernel to execute the original syscall.
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
@@ -59,9 +56,7 @@ const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 /// Receive a pending notification from the seccomp fd.
 pub fn notif_recv(fd: i32) -> io::Result<SeccompNotif> {
     let mut notif = unsafe { std::mem::zeroed::<SeccompNotif>() };
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif as *mut _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif as *mut _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -71,9 +66,7 @@ pub fn notif_recv(fd: i32) -> io::Result<SeccompNotif> {
 
 /// Send a response to a notification.
 fn notif_send(fd: i32, resp: &SeccompNotifResp) -> io::Result<()> {
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, resp as *const _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, resp as *const _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -83,9 +76,7 @@ fn notif_send(fd: i32, resp: &SeccompNotifResp) -> io::Result<()> {
 
 /// Check if a notification ID is still valid (target is still blocked).
 fn notif_id_valid(fd: i32, id: u64) -> bool {
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id as *const _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id as *const _) };
     ret == 0
 }
 

@@ -1,5 +1,9 @@
 # trashd
 
+[![CI](https://github.com/faratech/trashd/actions/workflows/ci.yml/badge.svg)](https://github.com/faratech/trashd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+
 A Linux recycle bin that actually works — in scripts, cron jobs, and at the desktop.
 
 Unlike `safe-rm` (which only blocks deletes) or `trash-cli` (which requires calling `trash-put` instead of `rm`), trashd intercepts destructive commands transparently across four independent layers. Scripts that call `rm` get trash protection without any code changes. Programs that call `unlink()` directly get caught too. Even statically-linked binaries making raw syscalls are intercepted at the kernel boundary.

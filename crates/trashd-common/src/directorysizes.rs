@@ -122,9 +122,24 @@ fn encode_name(name: &str) -> String {
     let mut encoded = String::with_capacity(name.len());
     for byte in name.as_bytes() {
         match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'.' | b'_' | b'~' | b' ' | b'(' | b')' | b'!' | b'@' | b'+'
-            | b',' | b';' | b'=' | b'&' | b'\'' => {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b' '
+            | b'('
+            | b')'
+            | b'!'
+            | b'@'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b'&'
+            | b'\'' => {
                 encoded.push(*byte as char);
             }
             _ => {
@@ -143,10 +158,8 @@ fn decode_name(s: &str) -> String {
         if b == b'%' {
             let hi = chars.next().unwrap_or(b'0');
             let lo = chars.next().unwrap_or(b'0');
-            if let Ok(val) = u8::from_str_radix(
-                std::str::from_utf8(&[hi, lo]).unwrap_or("00"),
-                16,
-            ) {
+            if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or("00"), 16)
+            {
                 bytes.push(val);
             }
         } else {

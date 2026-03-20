@@ -27,7 +27,9 @@ impl TrashIndex {
 
         // Add trash_dir column if upgrading from older schema
         let has_trash_dir: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('trash_entries') WHERE name='trash_dir'")?
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('trash_entries') WHERE name='trash_dir'",
+            )?
             .query_row([], |row| row.get::<_, i64>(0))
             .unwrap_or(0)
             > 0;
@@ -38,7 +40,12 @@ impl TrashIndex {
         Ok(Self { conn })
     }
 
-    pub fn insert(&self, id: &str, info: &TrashInfo, trash_dir: &Path) -> Result<(), rusqlite::Error> {
+    pub fn insert(
+        &self,
+        id: &str,
+        info: &TrashInfo,
+        trash_dir: &Path,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT OR REPLACE INTO trash_entries (id, original_path, deletion_date, command, pid, size, sha256, trash_dir)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",

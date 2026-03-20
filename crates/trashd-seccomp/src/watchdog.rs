@@ -48,7 +48,10 @@ pub fn run_watchdog(notif_fd: i32, mut supervisor_pid: libc::pid_t) -> ! {
         let pid = unsafe { libc::fork() };
         match pid {
             -1 => {
-                eprintln!("trashd-exec: watchdog: fork failed: {}", io::Error::last_os_error());
+                eprintln!(
+                    "trashd-exec: watchdog: fork failed: {}",
+                    io::Error::last_os_error()
+                );
                 // Keep draining in passthrough mode — better than nothing
                 set_nonblocking(notif_fd, false);
                 passthrough_loop(notif_fd);
@@ -56,9 +59,10 @@ pub fn run_watchdog(notif_fd: i32, mut supervisor_pid: libc::pid_t) -> ! {
             0 => {
                 // New supervisor child process
                 set_nonblocking(notif_fd, false);
-                eprintln!("trashd-exec: watchdog: new supervisor started (pid {})", unsafe {
-                    libc::getpid()
-                });
+                eprintln!(
+                    "trashd-exec: watchdog: new supervisor started (pid {})",
+                    unsafe { libc::getpid() }
+                );
                 if let Err(e) = supervisor::run_supervisor(notif_fd) {
                     eprintln!("trashd-exec: supervisor error: {e}");
                 }
@@ -84,8 +88,9 @@ fn drain_with_continue(fd: i32) {
             Ok(notif) => {
                 supervisor::respond_continue(fd, notif.id);
             }
-            Err(e) if e.raw_os_error() == Some(libc::EAGAIN)
-                || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
+            Err(e)
+                if e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
             {
                 // No more pending notifications
                 break;

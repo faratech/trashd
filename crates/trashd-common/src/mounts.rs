@@ -45,10 +45,25 @@ pub fn list_mounts() -> Vec<MountPoint> {
         // Skip virtual filesystems
         if matches!(
             fstype.as_str(),
-            "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2"
-                | "pstore" | "securityfs" | "debugfs" | "tracefs" | "hugetlbfs"
-                | "mqueue" | "configfs" | "fusectl" | "binfmt_misc" | "autofs"
-                | "efivarfs" | "bpf" | "nsfs"
+            "proc"
+                | "sysfs"
+                | "devtmpfs"
+                | "devpts"
+                | "cgroup"
+                | "cgroup2"
+                | "pstore"
+                | "securityfs"
+                | "debugfs"
+                | "tracefs"
+                | "hugetlbfs"
+                | "mqueue"
+                | "configfs"
+                | "fusectl"
+                | "binfmt_misc"
+                | "autofs"
+                | "efivarfs"
+                | "bpf"
+                | "nsfs"
         ) {
             continue;
         }
@@ -93,11 +108,8 @@ pub fn same_filesystem(a: &Path, b: &Path) -> bool {
 
 /// Get the trash directory for a given file path.
 /// Per FreeDesktop Trash spec §1.2:
-///   1. Same filesystem as $HOME → ~/.local/share/Trash/
-///   2. Different filesystem:
-///      a. Check $topdir/.Trash/ — if it exists, is a directory (not symlink),
-///         has the sticky bit set, and is writable → use $topdir/.Trash/$UID/
-///      b. Otherwise → $topdir/.Trash-$UID/
+/// - Same filesystem as `$HOME` → `~/.local/share/Trash/`
+/// - Different filesystem → check `$topdir/.Trash/$UID/` (sticky-bit), fallback to `$topdir/.Trash-$UID/`
 pub fn trash_dir_for_path(path: &Path, home_trash: &Path) -> PathBuf {
     let abs = if path.is_absolute() {
         path.to_path_buf()

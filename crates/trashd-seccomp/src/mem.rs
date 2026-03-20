@@ -23,16 +23,7 @@ pub fn read_path_from_process(pid: u32, addr: u64) -> io::Result<PathBuf> {
         iov_len: buf.len(),
     };
 
-    let n = unsafe {
-        libc::process_vm_readv(
-            pid as libc::pid_t,
-            &local_iov,
-            1,
-            &remote_iov,
-            1,
-            0,
-        )
-    };
+    let n = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local_iov, 1, &remote_iov, 1, 0) };
 
     if n < 0 {
         return Err(io::Error::last_os_error());
@@ -60,11 +51,7 @@ pub fn read_path_from_process(pid: u32, addr: u64) -> io::Result<PathBuf> {
 /// - unlink(pathname):        args[0] = pathname pointer
 /// - rmdir(pathname):         args[0] = pathname pointer
 /// - unlinkat(dirfd, path, flags): args[0] = dirfd, args[1] = pathname pointer
-pub fn resolve_syscall_path(
-    pid: u32,
-    syscall_nr: i32,
-    args: &[u64; 6],
-) -> io::Result<PathBuf> {
+pub fn resolve_syscall_path(pid: u32, syscall_nr: i32, args: &[u64; 6]) -> io::Result<PathBuf> {
     #[cfg(target_arch = "x86_64")]
     const NR_UNLINKAT: i32 = 263;
     #[cfg(target_arch = "aarch64")]

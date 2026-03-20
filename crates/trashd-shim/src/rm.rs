@@ -104,22 +104,26 @@ fn main() -> ExitCode {
 
     // Handle -I: prompt once if more than 3 files
     if args.interactive_once && !args.force && args.files.len() > 3 {
-        let msg = format!(
-            "rm: remove {} arguments? [y/N] ",
-            args.files.len()
-        );
+        let msg = format!("rm: remove {} arguments? [y/N] ", args.files.len());
         if !prompt_user(&msg) {
             return ExitCode::SUCCESS;
         }
     }
 
-    let cmd_str = format!("rm {}", std::env::args().skip(1).map(|a| {
-        if a.contains(' ') || a.contains('\'') || a.contains('"') || a.contains('\\') {
-            format!("'{}'", a.replace('\'', "'\\''"))
-        } else {
-            a
-        }
-    }).collect::<Vec<_>>().join(" "));
+    let cmd_str = format!(
+        "rm {}",
+        std::env::args()
+            .skip(1)
+            .map(|a| {
+                if a.contains(' ') || a.contains('\'') || a.contains('"') || a.contains('\\') {
+                    format!("'{}'", a.replace('\'', "'\\''"))
+                } else {
+                    a
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     let mut exit_code = ExitCode::SUCCESS;
 
@@ -128,7 +132,10 @@ fn main() -> ExitCode {
             Ok(m) => m,
             Err(_) if args.force => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("rm: cannot remove '{}': No such file or directory", file.display());
+                eprintln!(
+                    "rm: cannot remove '{}': No such file or directory",
+                    file.display()
+                );
                 exit_code = ExitCode::FAILURE;
                 continue;
             }
@@ -149,13 +156,18 @@ fn main() -> ExitCode {
         }
 
         // Non-empty dir without -r
-        if is_dir && args.dir && !args.recursive {
-            if std::fs::read_dir(file).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                eprintln!("rm: cannot remove '{}': Directory not empty", file.display());
+        if is_dir && args.dir && !args.recursive
+            && std::fs::read_dir(file)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "rm: cannot remove '{}': Directory not empty",
+                    file.display()
+                );
                 exit_code = ExitCode::FAILURE;
                 continue;
             }
-        }
 
         // Handle -i: prompt before each removal
         if args.interactive_always && !args.force {
@@ -287,8 +299,7 @@ fn real_rm_inner(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
         std::fs::remove_file(path)
     } else if meta.is_dir() {
         if !recursive {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Is a directory",
             ));
         }

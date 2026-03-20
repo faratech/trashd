@@ -96,7 +96,8 @@ fn run() -> io::Result<()> {
 
     // Initialize fanotify with FAN_REPORT_FID | FAN_REPORT_DFID_NAME
     // so FAN_DELETE events include the directory + filename (Linux 5.9+)
-    let init_flags = FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FID | FAN_REPORT_DFID_NAME;
+    let init_flags =
+        FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FID | FAN_REPORT_DFID_NAME;
     let fan_fd = match fanotify_init(init_flags) {
         Ok(fd) => fd,
         Err(e) => {
@@ -143,8 +144,7 @@ fn run() -> io::Result<()> {
     }
 
     if marked == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "no filesystems could be monitored — check permissions (need CAP_SYS_ADMIN)",
         ));
     }
@@ -169,15 +169,16 @@ fn run() -> io::Result<()> {
         }
     }
 
-    eprintln!("trashd-daemon: monitoring {} filesystem(s) for deletions", marked);
+    eprintln!(
+        "trashd-daemon: monitoring {} filesystem(s) for deletions",
+        marked
+    );
 
     // Event loop
     let mut buf = vec![0u8; 8192];
 
     loop {
-        let n = unsafe {
-            libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
         if n < 0 {
             let err = io::Error::last_os_error();
@@ -200,9 +201,7 @@ fn run() -> io::Result<()> {
         let mut offset = 0;
 
         while offset + META_SIZE <= n {
-            let event = unsafe {
-                &*(buf.as_ptr().add(offset) as *const FanotifyEventMetadata)
-            };
+            let event = unsafe { &*(buf.as_ptr().add(offset) as *const FanotifyEventMetadata) };
 
             if event.vers != FANOTIFY_METADATA_VERSION {
                 eprintln!("trashd-daemon: unexpected fanotify version {}", event.vers);
@@ -254,7 +253,11 @@ fn run() -> io::Result<()> {
 /// We resolve the parent via open_by_handle_at and join with the filename.
 ///
 /// Falls back to reading /proc/self/fd/{event.fd} for FAN_DELETE_SELF.
-fn resolve_event_path(event_buf: &[u8], event: &FanotifyEventMetadata, mount_fds: &[RawFd]) -> Option<PathBuf> {
+fn resolve_event_path(
+    event_buf: &[u8],
+    event: &FanotifyEventMetadata,
+    mount_fds: &[RawFd],
+) -> Option<PathBuf> {
     // Try to extract path from extended FID info (for FAN_DELETE)
     if let Some(path) = extract_dfid_name_path(event_buf, mount_fds) {
         return Some(path);
@@ -274,9 +277,7 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathB
     let mut offset = META_SIZE;
 
     while offset + info_hdr_size <= event_buf.len() {
-        let hdr = unsafe {
-            &*(event_buf.as_ptr().add(offset) as *const FanotifyEventInfoHeader)
-        };
+        let hdr = unsafe { &*(event_buf.as_ptr().add(offset) as *const FanotifyEventInfoHeader) };
 
         let info_len = hdr.len as usize;
         if info_len < info_hdr_size || offset + info_len > event_buf.len() {
@@ -312,7 +313,10 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathB
 
             let name_bytes = &event_buf[name_offset..offset + info_len];
             // Name is NUL-terminated
-            let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+            let name_len = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
             if name_len == 0 {
                 break;
             }
@@ -320,11 +324,7 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathB
 
             // Try to resolve the parent directory via open_by_handle_at
             let file_handle_ptr = event_buf[fh_offset..].as_ptr();
-            let parent_dir = resolve_handle_to_path(
-                file_handle_ptr,
-                handle_bytes,
-                mount_fds,
-            );
+            let parent_dir = resolve_handle_to_path(file_handle_ptr, handle_bytes, mount_fds);
 
             if let Some(dir) = parent_dir {
                 return Some(dir.join(filename));

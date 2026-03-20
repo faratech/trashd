@@ -34,9 +34,7 @@ impl TrashInfo {
         let encoded_path = encode_path(&self.original_path);
         let date_str = self.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string();
 
-        let mut s = format!(
-            "[Trash Info]\nPath={encoded_path}\nDeletionDate={date_str}\n"
-        );
+        let mut s = format!("[Trash Info]\nPath={encoded_path}\nDeletionDate={date_str}\n");
 
         if let Some(ref cmd) = self.command {
             s.push_str(&format!("X-Trashd-Command={cmd}\n"));
@@ -64,8 +62,7 @@ impl TrashInfo {
     /// - Path value is NOT trimmed (percent-encoded spaces are meaningful)
     pub fn from_trashinfo(content: &str) -> Option<Self> {
         // Spec: "First line MUST be: [Trash Info]"
-        let first_line = content.lines()
-            .find(|l| !l.trim().is_empty())?;
+        let first_line = content.lines().find(|l| !l.trim().is_empty())?;
         if first_line.trim() != "[Trash Info]" {
             return None;
         }

@@ -15,7 +15,7 @@ const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 // seccomp_data offsets
-const OFFSET_NR: u32 = 0;   // offsetof(seccomp_data, nr)
+const OFFSET_NR: u32 = 0; // offsetof(seccomp_data, nr)
 const OFFSET_ARCH: u32 = 4; // offsetof(seccomp_data, arch)
 
 // Architecture
@@ -62,7 +62,12 @@ pub struct SockFprog {
 }
 
 fn bpf_stmt(code: u16, k: u32) -> SockFilter {
-    SockFilter { code, jt: 0, jf: 0, k }
+    SockFilter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {

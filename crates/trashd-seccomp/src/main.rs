@@ -49,7 +49,15 @@ fn main() -> ExitCode {
 fn run(command_args: &[String]) -> io::Result<ExitCode> {
     // Create a socketpair for passing the notification fd from child to parent.
     let mut sv = [0i32; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } < 0 {
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
 
@@ -177,8 +185,14 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 fn install_signal_forwarder(child_pid: libc::pid_t) {
     CHILD_PID.store(child_pid, Ordering::Relaxed);
     unsafe {
-        libc::signal(libc::SIGINT, forward_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, forward_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            forward_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -258,11 +272,7 @@ fn send_fd(sock: i32, fd: i32) {
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
-            std::ptr::copy_nonoverlapping(
-                fd_bytes.as_ptr(),
-                libc::CMSG_DATA(cmsg),
-                fd_bytes.len(),
-            );
+            std::ptr::copy_nonoverlapping(fd_bytes.as_ptr(), libc::CMSG_DATA(cmsg), fd_bytes.len());
         }
     } else {
         // No fd to send — just send the dummy byte

@@ -45,10 +45,7 @@ pub fn read_log(max_lines: usize) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
 
-    let lines: Vec<String> = content
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
+    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
     if lines.len() <= max_lines {
         lines

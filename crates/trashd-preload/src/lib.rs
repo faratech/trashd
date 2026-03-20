@@ -15,11 +15,11 @@
 use serde::Deserialize;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::fs;
 
 // ---------------------------------------------------------------------------
 // Lightweight config — parsed once from ~/.config/trashd/config.toml
@@ -226,19 +226,19 @@ type UnlinkatFn =
 type RmdirFn = unsafe extern "C" fn(*const libc::c_char) -> libc::c_int;
 
 unsafe fn real_unlink() -> UnlinkFn {
-    let sym = libc::dlsym(libc::RTLD_NEXT, b"unlink\0".as_ptr() as *const _);
+    let sym = libc::dlsym(libc::RTLD_NEXT, c"unlink".as_ptr() as *const _);
     assert!(!sym.is_null(), "trashd: dlsym(unlink) failed");
     std::mem::transmute(sym)
 }
 
 unsafe fn real_unlinkat() -> UnlinkatFn {
-    let sym = libc::dlsym(libc::RTLD_NEXT, b"unlinkat\0".as_ptr() as *const _);
+    let sym = libc::dlsym(libc::RTLD_NEXT, c"unlinkat".as_ptr() as *const _);
     assert!(!sym.is_null(), "trashd: dlsym(unlinkat) failed");
     std::mem::transmute(sym)
 }
 
 unsafe fn real_rmdir() -> RmdirFn {
-    let sym = libc::dlsym(libc::RTLD_NEXT, b"rmdir\0".as_ptr() as *const _);
+    let sym = libc::dlsym(libc::RTLD_NEXT, c"rmdir".as_ptr() as *const _);
     assert!(!sym.is_null(), "trashd: dlsym(rmdir) failed");
     std::mem::transmute(sym)
 }
@@ -280,7 +280,7 @@ fn is_parent_bypassed() -> bool {
                 _ => break,
             };
             if let Some(name) = process_name(ppid) {
-                if bypass.iter().any(|b| name == *b) {
+                if bypass.contains(&name) {
                     return true;
                 }
             }
@@ -501,7 +501,8 @@ fn try_trash(path: &Path) -> bool {
         encode_path(&abs_path),
         now.format("%Y-%m-%dT%H:%M:%S"),
         std::process::id(),
-        size.map(|s| format!("X-Trashd-Size={s}")).unwrap_or_default(),
+        size.map(|s| format!("X-Trashd-Size={s}"))
+            .unwrap_or_default(),
     );
 
     if fs::write(&info_path, &trashinfo).is_err() {
@@ -511,7 +512,11 @@ fn try_trash(path: &Path) -> bool {
 
     // Move the file
     if fs::rename(path, &dest).is_ok() {
-        log_preload(&format!("trashed: {} -> {}", path.display(), dest.display()));
+        log_preload(&format!(
+            "trashed: {} -> {}",
+            path.display(),
+            dest.display()
+        ));
         return true;
     }
 
@@ -536,7 +541,9 @@ fn try_trash(path: &Path) -> bool {
                         return false;
                     }
                 };
-                unsafe { (real_unlink())(cpath.as_ptr()); }
+                unsafe {
+                    (real_unlink())(cpath.as_ptr());
+                }
                 log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
                 return true;
             }
@@ -558,7 +565,9 @@ fn try_trash(path: &Path) -> bool {
                     return false;
                 }
             };
-            unsafe { (real_unlink())(cpath.as_ptr()); }
+            unsafe {
+                (real_unlink())(cpath.as_ptr());
+            }
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
             return true;
         }
@@ -678,6 +687,8 @@ fn should_intercept() -> bool {
 // Hooked functions
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
     let _guard = match ReentrancyGuard::enter() {
@@ -699,17 +710,18 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
         // Use symlink_metadata to not follow symlinks — dangling symlinks
         // should be trashed, not permanently deleted via the fallthrough.
         if let Ok(meta) = fs::symlink_metadata(&abs) {
-            if !should_skip_path(&abs) && !meta.is_dir() {
-                if try_trash(&abs) {
+            if !should_skip_path(&abs) && !meta.is_dir()
+                && try_trash(&abs) {
                     return 0;
                 }
-            }
         }
     }
 
     (real_unlink())(pathname)
 }
 
+/// # Safety
+/// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn unlinkat(
     dirfd: libc::c_int,
@@ -735,18 +747,16 @@ pub unsafe extern "C" fn unlinkat(
                 if is_removedir {
                     if is_real_dir {
                         if let Ok(mut rd) = fs::read_dir(&abs) {
-                            if rd.next().is_none() {
-                                if try_trash(&abs) {
+                            if rd.next().is_none()
+                                && try_trash(&abs) {
                                     return 0;
                                 }
-                            }
                         }
                     }
-                } else if !is_real_dir {
-                    if try_trash(&abs) {
+                } else if !is_real_dir
+                    && try_trash(&abs) {
                         return 0;
                     }
-                }
             }
         }
     }
@@ -754,6 +764,8 @@ pub unsafe extern "C" fn unlinkat(
     (real_unlinkat())(dirfd, pathname, flags)
 }
 
+/// # Safety
+/// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
     let _guard = match ReentrancyGuard::enter() {
@@ -776,11 +788,10 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
         if let Ok(meta) = fs::symlink_metadata(&abs) {
             if meta.is_dir() && !meta.file_type().is_symlink() && !should_skip_path(&abs) {
                 if let Ok(mut rd) = fs::read_dir(&abs) {
-                    if rd.next().is_none() {
-                        if try_trash(&abs) {
+                    if rd.next().is_none()
+                        && try_trash(&abs) {
                             return 0;
                         }
-                    }
                 }
             }
         }
