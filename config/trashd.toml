@@ -64,3 +64,17 @@ bypass_processes = [
 # Files larger than this (in MB) skip trash to avoid filling disk.
 # Set to 0 to disable.
 max_file_size_mb = 1024
+
+# Hash algorithm for file integrity: "xxhash" (fast, default) or "sha256" (cryptographic).
+# xxhash (XXH3-128) is ~10x faster than SHA-256 — good for integrity checks.
+# SHA-256 is better if you need cryptographic verification.
+hash_algorithm = "xxhash"
+
+# Files smaller than this (in MB) get a hash on trash for integrity checking.
+# Set to 0 to disable hashing entirely. Default is 1 MB.
+sha256_max_size_mb = 1
+
+# Minimum seconds between auto-purge scans. Auto-purge checks retention
+# policy (age, size, disk pressure) but scanning the entire trash on every
+# deletion is expensive. Default: 60 seconds.
+auto_purge_interval_secs = 60

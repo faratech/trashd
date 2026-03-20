@@ -3,6 +3,7 @@ use crate::index::TrashIndex;
 use crate::mounts;
 use crate::trashinfo::TrashInfo;
 use sha2::{Digest, Sha256};
+use xxhash_rust::xxh3::xxh3_128;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -143,9 +144,11 @@ impl TrashStore {
             dir_size(&abs_path)
         });
 
-        // Compute SHA-256 for files (skip for dirs and large files)
-        if meta.is_file() && meta.size() < 100 * 1024 * 1024 {
-            if let Ok(hash) = sha256_file(&abs_path) {
+        // Compute file hash for small files only (configurable, default 1 MB).
+        // Hashing reads the entire file — too expensive for large files on every rm.
+        let hash_limit = self.config.sha256_max_size_mb * 1024 * 1024;
+        if meta.is_file() && hash_limit > 0 && meta.size() <= hash_limit {
+            if let Ok(hash) = hash_file(&abs_path, &self.config.hash_algorithm) {
                 info.sha256 = Some(hash);
             }
         }
@@ -197,8 +200,9 @@ impl TrashStore {
         // Log operation
         crate::oplog::log_trash(&abs_path, &id, command);
 
-        // Run auto-purge if needed
-        let _ = self.auto_purge();
+        // Run auto-purge if enough time has passed since the last one.
+        // Scanning the entire trash on every deletion is O(n) — throttle it.
+        let _ = self.maybe_auto_purge();
 
         Ok(id)
     }
@@ -392,6 +396,35 @@ impl TrashStore {
             crate::oplog::log_empty(count, filter_desc.as_deref());
         }
         Ok(count)
+    }
+
+    /// Run auto_purge only if enough time has passed since the last run.
+    /// Uses a timestamp file to avoid scanning the entire trash on every deletion.
+    fn maybe_auto_purge(&self) -> Result<(), TrashError> {
+        let interval = self.config.auto_purge_interval_secs;
+        if interval == 0 {
+            return self.auto_purge();
+        }
+
+        let marker = Self::home_trash_dir().join(".trashd/last_purge");
+        if let Ok(meta) = fs::metadata(&marker) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    if elapsed.as_secs() < interval {
+                        return Ok(()); // too soon, skip
+                    }
+                }
+            }
+        }
+
+        // Touch the marker before purging (so concurrent callers also skip)
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&marker);
+
+        self.auto_purge()
     }
 
     /// Enforce retention policy: purge expired items and trim by size.
@@ -602,6 +635,16 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
 
     let info_dir = trash_dir.join("info");
 
+    // Truncate base_name if it would exceed filesystem filename limits.
+    // ".trashinfo" = 10 chars, ".YYYYMMDDHHMMSS.NNNNN" = 21 chars max.
+    // Most filesystems cap at 255 bytes. Reserve 32 for suffix.
+    let max_base = 223;
+    let base_name = if base_name.len() > max_base {
+        &base_name[..max_base]
+    } else {
+        base_name
+    };
+
     // Try base name first
     let info_path = info_dir.join(format!("{base_name}.trashinfo"));
     match fs::OpenOptions::new()
@@ -642,33 +685,75 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
     )))
 }
 
-fn sha256_file(path: &Path) -> io::Result<String> {
+/// Hash a file using the configured algorithm.
+/// "xxhash" (default): XXH3-128 — extremely fast, non-cryptographic.
+/// "sha256": SHA-256 — cryptographic, slower.
+fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
     let data = fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    Ok(format!("{:x}", hasher.finalize()))
+    match algorithm {
+        "sha256" => {
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        _ => {
+            // Default: xxhash (XXH3-128)
+            Ok(format!("{:032x}", xxh3_128(&data)))
+        }
+    }
 }
+
+/// Compute directory size with a file count cap to avoid walking huge trees.
+/// Returns the accumulated size once the cap is hit (partial but fast).
+const DIR_SIZE_MAX_FILES: u64 = 10_000;
 
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
+    let mut count = 0u64;
+    dir_size_inner(path, &mut total, &mut count);
+    total
+}
+
+fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
+    if *count >= DIR_SIZE_MAX_FILES {
+        return;
+    }
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
+            if *count >= DIR_SIZE_MAX_FILES {
+                return;
+            }
+            *count += 1;
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
             if meta.is_dir() {
-                total += dir_size(&entry.path());
+                dir_size_inner(&entry.path(), total, count);
             } else {
-                total += meta.len();
+                *total += meta.len();
             }
         }
     }
-    total
 }
 
 /// Copy a directory tree preserving symlinks and permissions.
+/// Depth-limited to prevent infinite recursion from symlink loops or
+/// bind mounts creating cycles.
+const COPY_TREE_MAX_DEPTH: u32 = 100;
+
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    copy_tree_inner(src, dst, 0)
+}
+
+fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
+    if depth > COPY_TREE_MAX_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"),
+        ));
+    }
+
     let meta = fs::symlink_metadata(src)?;
     fs::create_dir_all(dst)?;
     // Copy permissions of the directory itself
@@ -684,7 +769,7 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             let link_target = fs::read_link(entry.path())?;
             std::os::unix::fs::symlink(&link_target, &dest_path)?;
         } else if entry_meta.is_dir() {
-            copy_tree(&entry.path(), &dest_path)?;
+            copy_tree_inner(&entry.path(), &dest_path, depth + 1)?;
         } else if entry_meta.file_type().is_fifo()
             || entry_meta.file_type().is_char_device()
             || entry_meta.file_type().is_block_device()

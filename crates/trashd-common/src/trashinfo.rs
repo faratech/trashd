@@ -48,7 +48,9 @@ impl TrashInfo {
             s.push_str(&format!("X-Trashd-Size={size}\n"));
         }
         if let Some(ref hash) = self.sha256 {
-            s.push_str(&format!("X-Trashd-SHA256={hash}\n"));
+            // Use X-Trashd-Hash for new entries (algorithm-agnostic).
+            // X-Trashd-SHA256 is still read for backward compatibility.
+            s.push_str(&format!("X-Trashd-Hash={hash}\n"));
         }
 
         s
@@ -94,7 +96,7 @@ impl TrashInfo {
                     "X-Trashd-Command" => command = Some(value.trim().to_string()),
                     "X-Trashd-PID" => pid = value.trim().parse().ok(),
                     "X-Trashd-Size" => size = value.trim().parse().ok(),
-                    "X-Trashd-SHA256" => sha256 = Some(value.trim().to_string()),
+                    "X-Trashd-Hash" | "X-Trashd-SHA256" => sha256 = Some(value.trim().to_string()),
                     _ => {}
                 }
             }

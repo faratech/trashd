@@ -11,6 +11,17 @@ pub struct Config {
     pub bypass_processes: Vec<String>,
     #[serde(default = "default_size_limit")]
     pub max_file_size_mb: u64,
+    /// Maximum file size (in MB) for SHA-256 computation on trash.
+    /// Files larger than this skip the hash. Set to 0 to disable hashing entirely.
+    #[serde(default = "default_sha256_limit")]
+    pub sha256_max_size_mb: u64,
+    /// Minimum seconds between auto-purge runs. Prevents scanning the entire
+    /// trash directory on every single deletion.
+    #[serde(default = "default_purge_interval")]
+    pub auto_purge_interval_secs: u64,
+    /// Hash algorithm for file integrity: "xxhash" (fast, default) or "sha256" (cryptographic).
+    #[serde(default = "default_hash_algo")]
+    pub hash_algorithm: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +54,15 @@ fn default_disk_pressure() -> u8 {
 fn default_size_limit() -> u64 {
     1024
 }
+fn default_sha256_limit() -> u64 {
+    1 // 1 MB — only hash small files to avoid I/O overhead
+}
+fn default_purge_interval() -> u64 {
+    60 // at most once per minute
+}
+fn default_hash_algo() -> String {
+    "xxhash".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -51,6 +71,9 @@ impl Default for Config {
             never_trash: default_never_trash(),
             bypass_processes: default_bypass_processes(),
             max_file_size_mb: 1024,
+            sha256_max_size_mb: default_sha256_limit(),
+            auto_purge_interval_secs: default_purge_interval(),
+            hash_algorithm: default_hash_algo(),
         }
     }
 }
@@ -116,6 +139,9 @@ struct PartialConfig {
     never_trash: Option<Vec<String>>,
     bypass_processes: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
+    sha256_max_size_mb: Option<u64>,
+    auto_purge_interval_secs: Option<u64>,
+    hash_algorithm: Option<String>,
 }
 
 impl Config {
@@ -168,6 +194,15 @@ impl Config {
         }
         if let Some(v) = partial.max_file_size_mb {
             self.max_file_size_mb = v;
+        }
+        if let Some(v) = partial.sha256_max_size_mb {
+            self.sha256_max_size_mb = v;
+        }
+        if let Some(v) = partial.auto_purge_interval_secs {
+            self.auto_purge_interval_secs = v;
+        }
+        if let Some(v) = partial.hash_algorithm {
+            self.hash_algorithm = v;
         }
 
         // Lists: extend and deduplicate

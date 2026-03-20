@@ -509,6 +509,14 @@ fn try_trash(path: &Path) -> bool {
 fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf)> {
     use std::os::unix::fs::OpenOptionsExt;
 
+    // Truncate to avoid exceeding filesystem filename limits (255 bytes).
+    let max_base = 223; // reserve 32 for ".YYYYMMDDHHMMSS.NNNNN.trashinfo"
+    let base_name = if base_name.len() > max_base {
+        &base_name[..max_base]
+    } else {
+        base_name
+    };
+
     // Try base name
     let path = info_dir.join(format!("{base_name}.trashinfo"));
     if fs::OpenOptions::new()
