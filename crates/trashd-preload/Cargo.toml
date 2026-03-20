@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 [dependencies]
 libc = "0.2"
 chrono = "0.4"
-dirs = "5"
+dirs = "6"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"

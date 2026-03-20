@@ -11,5 +11,4 @@ path = "src/main.rs"
 trashd-common = { path = "../trashd-common" }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
-tabled = "0.15"
-colored = "2"
+colored = "3"

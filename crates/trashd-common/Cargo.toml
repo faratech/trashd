@@ -5,11 +5,11 @@ edition.workspace = true
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "5"
+dirs = "6"
 libc = "0.2"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-toml = "0.8"
-thiserror = "1"
+toml = "1"
+thiserror = "2"
 url = "2"
