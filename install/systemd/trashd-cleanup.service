@@ -1,0 +1,7 @@
+[Unit]
+Description=trashd periodic trash cleanup
+Documentation=https://github.com/faratech/trashd
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/trash empty --older 30d

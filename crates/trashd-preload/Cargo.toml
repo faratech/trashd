@@ -2,6 +2,11 @@
 name = "trashd-preload"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

@@ -8,8 +8,25 @@ Type=simple
 ExecStart=/usr/local/lib/trashd/trashd-daemon
 Restart=always
 RestartSec=5
-AmbientCapabilities=CAP_SYS_ADMIN
+
+# Capabilities
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
 NoNewPrivileges=true
+
+# Sandboxing
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryMax=256M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trashd-daemon
 
 [Install]
 WantedBy=default.target

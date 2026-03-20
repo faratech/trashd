@@ -1,0 +1,106 @@
+use clap::{Command, Arg};
+use clap_complete::{generate_to, Shell};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+fn build_cli() -> Command {
+    Command::new("trash")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("trashd — Linux recycle bin for the CLI")
+        .subcommand(
+            Command::new("ls")
+                .about("List items in the trash")
+                .arg(Arg::new("pattern").help("Filter by glob pattern")),
+        )
+        .subcommand(
+            Command::new("find")
+                .about("Search trash by original path")
+                .arg(Arg::new("query").required(true).help("Path substring or glob")),
+        )
+        .subcommand(
+            Command::new("info")
+                .about("Show full metadata for a trash entry")
+                .arg(Arg::new("target").required(true).help("Trash ID or file name")),
+        )
+        .subcommand(
+            Command::new("restore")
+                .about("Restore a trashed file by name or ID")
+                .arg(Arg::new("target").required(true).help("File name, trash ID, or glob"))
+                .arg(Arg::new("to").long("to").help("Restore to this path instead")),
+        )
+        .subcommand(Command::new("undo").about("Restore the most recently trashed item"))
+        .subcommand(
+            Command::new("purge")
+                .about("Permanently delete a specific trash entry")
+                .arg(Arg::new("target").required(true).help("Trash ID or file name")),
+        )
+        .subcommand(
+            Command::new("empty")
+                .about("Permanently empty the trash")
+                .arg(Arg::new("older").long("older").help("Only items older than N days"))
+                .arg(Arg::new("dry-run").long("dry-run").action(clap::ArgAction::SetTrue)
+                    .help("Preview without deleting")),
+        )
+        .subcommand(Command::new("status").about("Show trash status"))
+        .subcommand(
+            Command::new("log")
+                .about("Show recent trash operations")
+                .arg(Arg::new("lines").short('n').long("lines").default_value("20")
+                    .help("Number of lines")),
+        )
+        .subcommand(
+            Command::new("fsck")
+                .about("Check and repair trash directory integrity")
+                .arg(Arg::new("fix").long("fix").action(clap::ArgAction::SetTrue)
+                    .help("Fix problems (default: report only)")),
+        )
+}
+
+fn main() {
+    let out_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()),
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .join("target")
+    .join("completions");
+
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let mut cmd = build_cli();
+    for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+        generate_to(shell, &mut cmd, "trash", &out_dir).unwrap();
+    }
+
+    // Generate man page
+    let man_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()),
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .join("target")
+    .join("man");
+
+    fs::create_dir_all(&man_dir).unwrap();
+
+    let man = clap_mangen::Man::new(build_cli());
+    let mut buf = Vec::new();
+    man.render(&mut buf).unwrap();
+    fs::write(man_dir.join("trash.1"), buf).unwrap();
+
+    // Generate man pages for subcommands
+    for subcmd in build_cli().get_subcommands() {
+        let name = format!("trash-{}", subcmd.get_name());
+        // Clap's Str requires &'static str; leak is fine in a build script
+        let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+        let man = clap_mangen::Man::new(subcmd.clone().name(static_name));
+        let mut buf = Vec::new();
+        man.render(&mut buf).unwrap();
+        fs::write(man_dir.join(format!("{name}.1")), buf).unwrap();
+    }
+}

@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/trash dist/
+          cp target/${{ matrix.target }}/release/trashd-rm dist/
+          cp target/${{ matrix.target }}/release/trashd-exec dist/
+          cp target/${{ matrix.target }}/release/trashd-daemon dist/
+          cp target/${{ matrix.target }}/release/libtrashd_preload.so dist/
+          cp target/completions/* dist/ 2>/dev/null || true
+          cp target/man/trash.1 dist/ 2>/dev/null || true
+          cp LICENSE README.md config/trashd.toml dist/
+          cp install.sh dist/
+          tar czf trashd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trashd-${{ matrix.target }}
+          path: trashd-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            trashd-x86_64-unknown-linux-gnu/*.tar.gz
+            trashd-aarch64-unknown-linux-gnu/*.tar.gz
+          generate_release_notes: true

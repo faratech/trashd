@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly trash cleanup
+Documentation=https://github.com/faratech/trashd
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=timers.target
