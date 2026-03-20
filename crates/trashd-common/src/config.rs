@@ -7,6 +7,10 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub never_trash: Vec<String>,
+    /// If non-empty, ONLY files matching these patterns are trashed.
+    /// Everything else is real-deleted. `never_trash` still wins over this.
+    #[serde(default)]
+    pub only_trash: Vec<String>,
     #[serde(default)]
     pub bypass_processes: Vec<String>,
     #[serde(default = "default_size_limit")]
@@ -69,6 +73,7 @@ impl Default for Config {
         Self {
             retention: default_retention(),
             never_trash: default_never_trash(),
+            only_trash: Vec::new(),
             bypass_processes: default_bypass_processes(),
             max_file_size_mb: 1024,
             sha256_max_size_mb: default_sha256_limit(),
@@ -137,6 +142,7 @@ struct PartialConfig {
     #[serde(default)]
     retention: Option<PartialRetention>,
     never_trash: Option<Vec<String>>,
+    only_trash: Option<Vec<String>>,
     bypass_processes: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
     sha256_max_size_mb: Option<u64>,
@@ -213,6 +219,10 @@ impl Config {
                 }
             }
         }
+        // only_trash: user config replaces global (not additive — it's a whitelist)
+        if let Some(list) = partial.only_trash {
+            self.only_trash = list;
+        }
         if let Some(extra) = partial.bypass_processes {
             for item in extra {
                 if !self.bypass_processes.contains(&item) {
@@ -240,22 +250,83 @@ impl Config {
         Self::user_config_path()
     }
 
-    /// Check if a path is in the never-trash list.
+    /// Check if a path should skip trash (real-delete instead).
+    ///
+    /// Logic:
+    ///   1. Check per-directory .trashd.toml (if present, its rules apply)
+    ///   2. If path matches `never_trash` → skip (real-delete)
+    ///   3. If `only_trash` is non-empty and path doesn't match → skip (real-delete)
+    ///   4. Otherwise → trash it
     pub fn should_skip(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        self.never_trash.iter().any(|pattern| {
-            if let Some(prefix) = pattern.strip_suffix('*') {
-                path_str.starts_with(prefix)
-            } else if pattern.starts_with("*.") {
-                path_str.ends_with(&pattern[1..])
-            } else if pattern == "*~" {
-                path_str.ends_with('~')
-            } else if let Some(suffix) = pattern.strip_prefix("*/") {
-                path_str.contains(&format!("/{suffix}"))
-                    || path_str.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
-            } else {
-                path_str == *pattern
+        // Check per-directory .trashd.toml overrides
+        if let Some(local) = Self::load_local_config(path) {
+            // Local never_trash wins first
+            if !local.never_trash.is_empty() && pattern_matches_any(&local.never_trash, path) {
+                return true;
             }
-        })
+            // Local only_trash: if set and doesn't match, skip
+            if !local.only_trash.is_empty() && !pattern_matches_any(&local.only_trash, path) {
+                return true;
+            }
+            // If local only_trash matched, still check global never_trash
+        }
+
+        // Global never_trash always wins
+        if pattern_matches_any(&self.never_trash, path) {
+            return true;
+        }
+
+        // Global only_trash: if set and path doesn't match, skip
+        if !self.only_trash.is_empty() && !pattern_matches_any(&self.only_trash, path) {
+            return true;
+        }
+
+        false
     }
+
+    /// Look for a .trashd.toml in the file's parent directory (or ancestors).
+    fn load_local_config(path: &Path) -> Option<LocalConfig> {
+        let mut dir = path.parent()?;
+        // Walk up at most 5 levels to find .trashd.toml
+        for _ in 0..5 {
+            let config_path = dir.join(".trashd.toml");
+            if config_path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    if let Ok(local) = toml::from_str::<LocalConfig>(&content) {
+                        return Some(local);
+                    }
+                }
+            }
+            dir = dir.parent()?;
+        }
+        None
+    }
+}
+
+/// Per-directory config (.trashd.toml).
+#[derive(Debug, Deserialize, Default)]
+struct LocalConfig {
+    #[serde(default)]
+    never_trash: Vec<String>,
+    #[serde(default)]
+    only_trash: Vec<String>,
+}
+
+/// Check if a path matches any pattern in the list.
+fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    patterns.iter().any(|pattern| {
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            path_str.starts_with(prefix)
+        } else if pattern.starts_with("*.") {
+            path_str.ends_with(&pattern[1..])
+        } else if pattern == "*~" {
+            path_str.ends_with('~')
+        } else if let Some(suffix) = pattern.strip_prefix("*/") {
+            path_str.contains(&format!("/{suffix}"))
+                || path_str.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
+        } else {
+            path_str == *pattern
+        }
+    })
 }

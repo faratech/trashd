@@ -44,6 +44,19 @@ never_trash = [
     "*/.git/*",
 ]
 
+# If set, ONLY files matching these patterns are trashed.
+# Everything else is real-deleted. `never_trash` still takes priority.
+# Empty (default) means all files are eligible for trash.
+# User config replaces global (not additive — it's a whitelist).
+# Example: only_trash = ["*.py", "*.rs", "*.sql", "*.env", "*.conf"]
+only_trash = []
+
+# Per-directory overrides: place a .trashd.toml in any directory with
+# `never_trash` and/or `only_trash` lists. Searched up to 5 parent levels.
+# Example .trashd.toml:
+#   never_trash = ["build/*", "dist/*"]
+#   only_trash = ["src/*", "*.config"]
+
 # Processes that bypass trash automatically.
 # When these commands invoke rm, files are really deleted.
 # User configs extend this list (they cannot remove entries set here).
