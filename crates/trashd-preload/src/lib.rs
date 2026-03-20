@@ -121,7 +121,7 @@ fn config() -> &'static PreloadConfig {
     static LAST_CHECK: AtomicI64 = AtomicI64::new(0);
     static GLOBAL_MTIME: AtomicI64 = AtomicI64::new(0);
 
-    let cfg = CFG.get_or_init(|| load_config());
+    let cfg = CFG.get_or_init(load_config);
 
     // Periodically check if config files changed (every 60 seconds)
     let now = SystemTime::now()
@@ -710,10 +710,9 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
         // Use symlink_metadata to not follow symlinks — dangling symlinks
         // should be trashed, not permanently deleted via the fallthrough.
         if let Ok(meta) = fs::symlink_metadata(&abs) {
-            if !should_skip_path(&abs) && !meta.is_dir()
-                && try_trash(&abs) {
-                    return 0;
-                }
+            if !should_skip_path(&abs) && !meta.is_dir() && try_trash(&abs) {
+                return 0;
+            }
         }
     }
 
@@ -747,16 +746,14 @@ pub unsafe extern "C" fn unlinkat(
                 if is_removedir {
                     if is_real_dir {
                         if let Ok(mut rd) = fs::read_dir(&abs) {
-                            if rd.next().is_none()
-                                && try_trash(&abs) {
-                                    return 0;
-                                }
+                            if rd.next().is_none() && try_trash(&abs) {
+                                return 0;
+                            }
                         }
                     }
-                } else if !is_real_dir
-                    && try_trash(&abs) {
-                        return 0;
-                    }
+                } else if !is_real_dir && try_trash(&abs) {
+                    return 0;
+                }
             }
         }
     }
@@ -788,10 +785,9 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
         if let Ok(meta) = fs::symlink_metadata(&abs) {
             if meta.is_dir() && !meta.file_type().is_symlink() && !should_skip_path(&abs) {
                 if let Ok(mut rd) = fs::read_dir(&abs) {
-                    if rd.next().is_none()
-                        && try_trash(&abs) {
-                            return 0;
-                        }
+                    if rd.next().is_none() && try_trash(&abs) {
+                        return 0;
+                    }
                 }
             }
         }

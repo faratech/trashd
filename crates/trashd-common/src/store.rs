@@ -896,9 +896,9 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
 
 fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
     if depth > COPY_TREE_MAX_DEPTH {
-        return Err(io::Error::other(
-            format!("directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"),
-        ));
+        return Err(io::Error::other(format!(
+            "directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"
+        )));
     }
 
     let meta = fs::symlink_metadata(src)?;

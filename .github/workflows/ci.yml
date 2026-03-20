@@ -27,7 +27,7 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Test
-        run: cargo test --workspace
+        run: TRASH_BYPASS=1 cargo test --workspace -- --test-threads=1
       - name: Verify completions generated
         run: |
           test -f target/completions/trash.bash

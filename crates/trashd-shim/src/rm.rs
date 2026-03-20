@@ -156,18 +156,20 @@ fn main() -> ExitCode {
         }
 
         // Non-empty dir without -r
-        if is_dir && args.dir && !args.recursive
+        if is_dir
+            && args.dir
+            && !args.recursive
             && std::fs::read_dir(file)
                 .map(|mut d| d.next().is_some())
                 .unwrap_or(false)
-            {
-                eprintln!(
-                    "rm: cannot remove '{}': Directory not empty",
-                    file.display()
-                );
-                exit_code = ExitCode::FAILURE;
-                continue;
-            }
+        {
+            eprintln!(
+                "rm: cannot remove '{}': Directory not empty",
+                file.display()
+            );
+            exit_code = ExitCode::FAILURE;
+            continue;
+        }
 
         // Handle -i: prompt before each removal
         if args.interactive_always && !args.force {
@@ -266,7 +268,11 @@ fn passthrough_with_args(args: &[&str]) -> ExitCode {
     let rm = real_rm_path();
     // Set TRASH_BYPASS=1 so the LD_PRELOAD layer doesn't re-intercept
     // the real rm's unlink() calls when we're passing through.
-    match Command::new(&rm).args(args).env("TRASH_BYPASS", "1").status() {
+    match Command::new(&rm)
+        .args(args)
+        .env("TRASH_BYPASS", "1")
+        .status()
+    {
         Ok(status) => {
             if status.success() {
                 ExitCode::SUCCESS
@@ -299,9 +305,7 @@ fn real_rm_inner(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
         std::fs::remove_file(path)
     } else if meta.is_dir() {
         if !recursive {
-            return Err(std::io::Error::other(
-                "Is a directory",
-            ));
+            return Err(std::io::Error::other("Is a directory"));
         }
         std::fs::remove_dir_all(path)
     } else {

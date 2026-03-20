@@ -68,7 +68,14 @@ pub fn notify_desktop(summary: &str, body: &str) {
         return;
     }
     let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=trashd", "--icon=user-trash", "-t", "3000", summary, body])
+        .args([
+            "--app-name=trashd",
+            "--icon=user-trash",
+            "-t",
+            "3000",
+            summary,
+            body,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
