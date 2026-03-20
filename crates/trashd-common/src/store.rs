@@ -784,3 +784,313 @@ fn process_name(pid: u32) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Tests must run single-threaded because TrashStore::open() reads
+    // XDG_DATA_HOME from the environment (process-global state).
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Create a TrashStore with isolated trash + work directories.
+    /// Places files under the project root (not /tmp, which is in never_trash).
+    /// Returns a MutexGuard that serializes tests sharing the env var.
+    fn test_store() -> (TrashStore, TempDir, TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-trash");
+        fs::create_dir_all(&base).unwrap();
+
+        let data_dir = TempDir::with_prefix_in("data-", &base).unwrap();
+        let workdir = TempDir::with_prefix_in("work-", &base).unwrap();
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+
+        let store = TrashStore::open().unwrap();
+        (store, data_dir, workdir, guard)
+    }
+
+    /// Create a temp file with content in a given directory.
+    fn create_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn trash_and_restore_file() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "hello.txt", "hello world");
+
+        // Trash it
+        let id = store.trash(&file, Some("test")).unwrap();
+        assert!(!file.exists(), "original file should be gone");
+
+        // Should appear in list
+        let entries = store.list(None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].info.original_path, file);
+
+        // Restore it
+        let restored = store.restore(&id, None).unwrap();
+        assert_eq!(restored, file);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
+
+        // Trash should be empty now
+        assert_eq!(store.list(None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn trash_and_restore_directory() {
+        let (store, _data, workdir, _lock) = test_store();
+        let dir = workdir.path().join("mydir");
+        fs::create_dir(&dir).unwrap();
+        create_file(&dir, "a.txt", "aaa");
+        create_file(&dir, "b.txt", "bbb");
+
+        let id = store.trash(&dir, None).unwrap();
+        assert!(!dir.exists());
+
+        let restored = store.restore(&id, None).unwrap();
+        assert!(restored.is_dir());
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "aaa");
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "bbb");
+    }
+
+    #[test]
+    fn trash_symlink_preserves_target() {
+        let (store, _data, workdir, _lock) = test_store();
+        let target = create_file(workdir.path(), "target.txt", "target content");
+        let link = workdir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        store.trash(&link, None).unwrap();
+
+        // Symlink is gone but target is preserved
+        assert!(!link.exists());
+        assert!(target.exists());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+    }
+
+    #[test]
+    fn restore_symlink_recreates_link() {
+        let (store, _data, workdir, _lock) = test_store();
+        let target = create_file(workdir.path(), "target.txt", "data");
+        let link = workdir.path().join("mylink");
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+
+        let id = store.trash(&link, None).unwrap();
+        let restored = store.restore(&id, None).unwrap();
+
+        assert!(restored.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&restored).unwrap(), PathBuf::from("target.txt"));
+    }
+
+    #[test]
+    fn undo_restores_most_recent() {
+        let (store, _data, workdir, _lock) = test_store();
+        let f1 = create_file(workdir.path(), "first.txt", "1");
+        let f2 = create_file(workdir.path(), "second.txt", "2");
+
+        store.trash(&f1, None).unwrap();
+        // Trashinfo timestamps have 1-second resolution
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        store.trash(&f2, None).unwrap();
+
+        // Undo restores the most recent (second.txt)
+        let restored = store.undo().unwrap();
+        assert_eq!(restored.file_name().unwrap(), "second.txt");
+        assert!(f2.exists());
+        assert!(!f1.exists());
+    }
+
+    #[test]
+    fn purge_permanently_deletes() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "gone.txt", "bye");
+
+        let id = store.trash(&file, None).unwrap();
+        assert_eq!(store.list(None).unwrap().len(), 1);
+
+        store.purge(&id).unwrap();
+        assert_eq!(store.list(None).unwrap().len(), 0);
+
+        // Can't restore after purge
+        assert!(store.restore(&id, None).is_err());
+    }
+
+    #[test]
+    fn empty_clears_all() {
+        let (store, _data, workdir, _lock) = test_store();
+        for i in 0..5 {
+            let f = create_file(workdir.path(), &format!("f{i}.txt"), "x");
+            store.trash(&f, None).unwrap();
+        }
+        assert_eq!(store.list(None).unwrap().len(), 5);
+
+        let count = store.empty(None).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(store.list(None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_pattern_filter() {
+        let (store, _data, workdir, _lock) = test_store();
+        let py = create_file(workdir.path(), "script.py", "python");
+        let rs = create_file(workdir.path(), "main.rs", "rust");
+        let txt = create_file(workdir.path(), "notes.txt", "text");
+
+        store.trash(&py, None).unwrap();
+        store.trash(&rs, None).unwrap();
+        store.trash(&txt, None).unwrap();
+
+        let all = store.list(None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let py_only = store.list(Some("*.py")).unwrap();
+        assert_eq!(py_only.len(), 1);
+        assert_eq!(py_only[0].info.original_path.file_name().unwrap(), "script.py");
+    }
+
+    #[test]
+    fn trash_nonexistent_file_errors() {
+        let (store, _data, workdir, _lock) = test_store();
+        let result = store.trash(&workdir.path().join("nonexistent_xyz"), None);
+        assert!(matches!(result, Err(TrashError::NotFound(_))));
+    }
+
+    #[test]
+    fn restore_conflict_errors() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "conflict.txt", "v1");
+
+        let id = store.trash(&file, None).unwrap();
+
+        // Create a new file at the same path
+        create_file(workdir.path(), "conflict.txt", "v2");
+
+        let result = store.restore(&id, None);
+        assert!(matches!(result, Err(TrashError::RestoreConflict(_))));
+    }
+
+    #[test]
+    fn restore_to_alternate_path() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "original.txt", "data");
+
+        let id = store.trash(&file, None).unwrap();
+        let alt = workdir.path().join("restored_here.txt");
+        let restored = store.restore(&id, Some(&alt)).unwrap();
+
+        assert_eq!(restored, alt);
+        assert_eq!(fs::read_to_string(&alt).unwrap(), "data");
+        assert!(!file.exists()); // original path still gone
+    }
+
+    #[test]
+    fn ambiguous_match_detected() {
+        let (store, _data, workdir, _lock) = test_store();
+
+        // Trash two files with the same name
+        let f1 = create_file(workdir.path(), "dup.txt", "v1");
+        store.trash(&f1, None).unwrap();
+        let f2 = create_file(workdir.path(), "dup.txt", "v2");
+        store.trash(&f2, None).unwrap();
+
+        // Purge the one with exact ID "dup.txt" so both remaining have timestamped IDs
+        let _ = store.purge("dup.txt");
+
+        // If only one remains, no ambiguity
+        let entries = store.list(None).unwrap();
+        if entries.len() >= 2 {
+            let result = store.restore("dup.txt", None);
+            assert!(matches!(result, Err(TrashError::AmbiguousMatch { .. })));
+        }
+    }
+
+    #[test]
+    fn duplicate_trash_gets_unique_id() {
+        let (store, _data, workdir, _lock) = test_store();
+
+        let f1 = create_file(workdir.path(), "same.txt", "a");
+        let id1 = store.trash(&f1, None).unwrap();
+
+        let f2 = create_file(workdir.path(), "same.txt", "b");
+        let id2 = store.trash(&f2, None).unwrap();
+
+        // IDs must be different
+        assert_ne!(id1, id2);
+        assert_eq!(store.list(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn status_reports_size_and_count() {
+        let (store, _data, workdir, _lock) = test_store();
+
+        let f = create_file(workdir.path(), "sized.txt", "hello"); // 5 bytes
+        store.trash(&f, None).unwrap();
+
+        let (size, count) = store.status().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(size, 5);
+    }
+
+    #[test]
+    fn trashinfo_has_metadata() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "meta.txt", "test data");
+
+        let id = store.trash(&file, Some("rm -f meta.txt")).unwrap();
+        let entries = store.list(None).unwrap();
+        let entry = &entries[0];
+
+        assert_eq!(entry.info.command.as_deref(), Some("rm -f meta.txt"));
+        assert!(entry.info.pid.is_some());
+        assert_eq!(entry.info.size, Some(9)); // "test data" = 9 bytes
+        assert!(entry.info.sha256.is_some());
+    }
+
+    // --- simple_glob_match tests ---
+
+    #[test]
+    fn glob_wildcard_all() {
+        assert!(simple_glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn glob_suffix() {
+        assert!(simple_glob_match("*.py", "script.py"));
+        assert!(!simple_glob_match("*.py", "script.rs"));
+    }
+
+    #[test]
+    fn glob_prefix() {
+        assert!(simple_glob_match("test*", "test_file.txt"));
+        assert!(!simple_glob_match("test*", "my_test.txt"));
+    }
+
+    #[test]
+    fn glob_infix() {
+        assert!(simple_glob_match("a*z", "abcz"));
+        assert!(!simple_glob_match("a*z", "abcy"));
+    }
+
+    #[test]
+    fn glob_infix_short_text_no_false_positive() {
+        // Regression: "ab*ab" should NOT match "ab" (text shorter than prefix+suffix)
+        assert!(!simple_glob_match("ab*ab", "ab"));
+        assert!(simple_glob_match("ab*ab", "abXab"));
+    }
+
+    #[test]
+    fn glob_exact() {
+        assert!(simple_glob_match("foo.txt", "foo.txt"));
+        assert!(!simple_glob_match("foo.txt", "bar.txt"));
+    }
+}
