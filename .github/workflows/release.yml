@@ -1,73 +1,261 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (leave empty for auto date-based, e.g. 2026.03.20)'
+        required: false
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # Build for both architectures
   build:
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            arch: x86_64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-
+            arch: aarch64
     runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
       - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.arch == 'aarch64'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-
-      - name: Package
+      - name: Determine version
+        id: version
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/trash dist/
-          cp target/${{ matrix.target }}/release/trashd-rm dist/
-          cp target/${{ matrix.target }}/release/trashd-exec dist/
-          cp target/${{ matrix.target }}/release/trashd-daemon dist/
-          cp target/${{ matrix.target }}/release/libtrashd_preload.so dist/
-          cp target/completions/* dist/ 2>/dev/null || true
-          cp target/man/trash.1 dist/ 2>/dev/null || true
-          cp LICENSE README.md config/trashd.toml dist/
-          cp install.sh dist/
-          tar czf trashd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=$(date -u +%Y.%m.%d)
+          fi
+          # Check if tag exists, append .N if so
+          BASE_VERSION="${VERSION}"
+          SUFFIX=0
+          while git tag -l "v${VERSION}" | grep -q .; do
+            SUFFIX=$((SUFFIX + 1))
+            VERSION="${BASE_VERSION}.${SUFFIX}"
+          done
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.arch == 'x86_64'
+        run: TRASH_BYPASS=1 cargo test --workspace -- --test-threads=1
+
+      - name: Package release tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STAGING="trashd-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p "${STAGING}/bin" "${STAGING}/lib" "${STAGING}/share/man/man1" "${STAGING}/share/completions" "${STAGING}/config" "${STAGING}/install"
+
+          # Binaries
+          cp target/${{ matrix.target }}/release/trash "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd-rm "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd-exec "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd-daemon "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/libtrashd_preload.so "${STAGING}/lib/"
+
+          # Strip binaries for smaller release
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            strip "${STAGING}/bin/"* "${STAGING}/lib/"*.so 2>/dev/null || true
+          elif command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
+            aarch64-linux-gnu-strip "${STAGING}/bin/"* "${STAGING}/lib/"*.so 2>/dev/null || true
+          fi
+
+          # Config, install scripts, systemd
+          cp config/trashd.toml "${STAGING}/config/"
+          cp install.sh "${STAGING}/"
+          chmod +x "${STAGING}/install.sh"
+          cp -r install/ "${STAGING}/install/"
+
+          # Man pages and completions
+          if [ -d target/man ]; then
+            cp target/man/*.1 "${STAGING}/share/man/man1/" 2>/dev/null || true
+          fi
+          if [ -d target/completions ]; then
+            cp target/completions/* "${STAGING}/share/completions/" 2>/dev/null || true
+          fi
+
+          # Docs
+          cp README.md "${STAGING}/"
+          cp LICENSE* "${STAGING}/" 2>/dev/null || true
+
+          # Create tarball + checksum
+          tar czf "${STAGING}.tar.gz" "${STAGING}"
+          sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: trashd-${{ matrix.target }}
-          path: trashd-*.tar.gz
+          name: trashd-linux-${{ matrix.arch }}
+          path: |
+            trashd-*.tar.gz
+            trashd-*.tar.gz.sha256
 
+  # Create GitHub Release with all artifacts
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@v4
         with:
-          files: |
-            trashd-x86_64-unknown-linux-gnu/*.tar.gz
-            trashd-aarch64-unknown-linux-gnu/*.tar.gz
-          generate_release_notes: true
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=$(date -u +%Y.%m.%d)
+          fi
+          BASE_VERSION="${VERSION}"
+          SUFFIX=0
+          while git tag -l "v${VERSION}" | grep -q .; do
+            SUFFIX=$((SUFFIX + 1))
+            VERSION="${BASE_VERSION}.${SUFFIX}"
+          done
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create quick-install script
+        run: |
+          cat > artifacts/install-trashd.sh << 'INSTALLER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # trashd installer — downloads and installs the latest release
+          # Usage: curl -fsSL https://github.com/faratech/trashd/releases/latest/download/install-trashd.sh | sudo bash
+
+          REPO="faratech/trashd"
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="aarch64" ;;
+            *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+
+          echo "==> Detecting latest release..."
+          LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+          VERSION="${LATEST#v}"
+          echo "    Version: ${VERSION}"
+          echo "    Architecture: ${ARCH}"
+
+          TARBALL="trashd-${VERSION}-linux-${ARCH}.tar.gz"
+          URL="https://github.com/${REPO}/releases/download/${LATEST}/${TARBALL}"
+
+          TMPDIR=$(mktemp -d)
+          trap 'rm -rf "${TMPDIR}"' EXIT
+
+          echo "==> Downloading ${TARBALL}..."
+          curl -fsSL -o "${TMPDIR}/${TARBALL}" "${URL}"
+
+          echo "==> Extracting..."
+          tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
+
+          echo "==> Installing..."
+          cd "${TMPDIR}/trashd-${VERSION}-linux-${ARCH}"
+          export TRASH_BYPASS=1
+          ./install.sh
+          INSTALLER
+          chmod +x artifacts/install-trashd.sh
+
+      - name: Create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PRERELEASE=""
+          if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRERELEASE="--prerelease"
+          fi
+
+          # Collect release files
+          ASSETS=""
+          for f in artifacts/trashd-linux-*/trashd-*.tar.gz artifacts/trashd-linux-*/trashd-*.sha256; do
+            [ -f "$f" ] && ASSETS="${ASSETS} ${f}"
+          done
+          ASSETS="${ASSETS} artifacts/install-trashd.sh"
+
+          # Build checksums section
+          CHECKSUMS=$(cat artifacts/trashd-linux-*/trashd-*.sha256 2>/dev/null || echo "see .sha256 files")
+
+          gh release create "v${VERSION}" \
+            --title "trashd ${VERSION}" \
+            --notes "## trashd ${VERSION}
+
+          Linux recycle bin with 4-layer interception (PATH shim, LD_PRELOAD, seccomp, fanotify).
+
+          ### Quick install (no Rust required)
+          \`\`\`bash
+          curl -fsSL https://github.com/faratech/trashd/releases/download/v${VERSION}/install-trashd.sh | sudo bash
+          \`\`\`
+
+          ### Manual install from tarball
+          \`\`\`bash
+          tar xzf trashd-${VERSION}-linux-x86_64.tar.gz
+          cd trashd-${VERSION}-linux-x86_64
+          sudo ./install.sh
+          \`\`\`
+
+          ### Build from source
+          \`\`\`bash
+          git clone https://github.com/faratech/trashd.git && cd trashd
+          sudo ./install.sh
+          \`\`\`
+
+          ### Checksums
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`" \
+            ${PRERELEASE} \
+            ${ASSETS}
+
+      - name: Release summary
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "Release v${VERSION} created successfully!"
+          echo "https://github.com/faratech/trashd/releases/tag/v${VERSION}"

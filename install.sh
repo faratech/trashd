@@ -138,14 +138,30 @@ fi
 # -----------------------------------------------------------------------
 # Install
 # -----------------------------------------------------------------------
-echo "==> Updating Rust toolchain and dependencies..."
-rustup update stable 2>/dev/null || true
-cargo update --manifest-path="$(dirname "$0")/Cargo.toml" 2>/dev/null || true
 
-echo "==> Building trashd..."
-cargo build --release --manifest-path="$(dirname "$0")/Cargo.toml"
+# Detect pre-built binaries (tarball install) vs source install
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR}/bin/trash" ]; then
+    # Tarball install — binaries already built
+    TARGET_DIR="${SCRIPT_DIR}/bin"
+    PRELOAD_DIR="${SCRIPT_DIR}/lib"
+    MAN_SRC="${SCRIPT_DIR}/share/man/man1"
+    COMP_DIR="${SCRIPT_DIR}/share/completions"
+    echo "==> Installing from pre-built release..."
+else
+    # Source install — build from cargo
+    echo "==> Updating Rust toolchain and dependencies..."
+    rustup update stable 2>/dev/null || true
+    cargo update --manifest-path="${SCRIPT_DIR}/Cargo.toml" 2>/dev/null || true
 
-TARGET_DIR="$(dirname "$0")/target/release"
+    echo "==> Building trashd..."
+    cargo build --release --manifest-path="${SCRIPT_DIR}/Cargo.toml"
+
+    TARGET_DIR="${SCRIPT_DIR}/target/release"
+    PRELOAD_DIR="${TARGET_DIR}"
+    MAN_SRC="${SCRIPT_DIR}/target/man"
+    COMP_DIR="${SCRIPT_DIR}/target/completions"
+fi
 
 echo "==> Installing binaries..."
 install -Dm755 "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
@@ -172,8 +188,7 @@ for cmd in unlink; do
 done
 
 MAN_DIR="${PREFIX}/share/man/man1"
-COMP_DIR="$(dirname "$0")/target/completions"
-MAN_SRC="$(dirname "$0")/target/man"
+# MAN_SRC and COMP_DIR already set above (tarball or source paths)
 
 echo "==> Installing man pages..."
 if [ -d "${MAN_SRC}" ]; then
@@ -208,7 +223,7 @@ else
 fi
 
 echo "==> Installing LD_PRELOAD library (Layer 2)..."
-install -Dm755 "${TARGET_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
+install -Dm755 "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
 echo "    Installed ${LIB_DIR}/libtrashd_preload.so"
 # Enable system-wide: catches unlink/rmdir from any dynamically-linked program
 if ! grep -qs "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then

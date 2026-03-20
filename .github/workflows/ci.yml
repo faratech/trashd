@@ -18,8 +18,6 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Update dependencies
-        run: cargo update
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -33,5 +31,91 @@ jobs:
           test -f target/completions/trash.bash
           test -f target/completions/_trash
           test -f target/completions/trash.fish
-      - name: Verify man page generated
-        run: test -f target/man/trash.1
+      - name: Verify man pages generated
+        run: |
+          test -f target/man/trash.1
+          test -f target/man/trash-compress.1
+          test -f target/man/trash-du.1
+
+  # Build release artifacts on every push to main
+  build-artifacts:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(date -u +%Y.%m.%d)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Package release tarball
+        run: |
+          STAGING="trashd-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}"
+          mkdir -p "${STAGING}/bin" "${STAGING}/lib" "${STAGING}/share/man/man1" "${STAGING}/share/completions" "${STAGING}/config" "${STAGING}/install"
+
+          # Binaries
+          cp target/${{ matrix.target }}/release/trash "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd-rm "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd-exec "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd-daemon "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/libtrashd_preload.so "${STAGING}/lib/"
+
+          # Config, install scripts, systemd
+          cp config/trashd.toml "${STAGING}/config/"
+          cp install.sh "${STAGING}/"
+          cp -r install/ "${STAGING}/install/"
+
+          # Man pages and completions (from x86_64 build, same content)
+          if [ -d target/man ]; then
+            cp target/man/*.1 "${STAGING}/share/man/man1/" 2>/dev/null || true
+          fi
+          if [ -d target/completions ]; then
+            cp target/completions/* "${STAGING}/share/completions/" 2>/dev/null || true
+          fi
+
+          # README and LICENSE
+          cp README.md "${STAGING}/"
+          cp LICENSE* "${STAGING}/" 2>/dev/null || true
+
+          # Create tarball
+          tar czf "${STAGING}.tar.gz" "${STAGING}"
+
+          # SHA256
+          sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trashd-linux-${{ matrix.arch }}
+          path: |
+            trashd-*.tar.gz
+            trashd-*.tar.gz.sha256
