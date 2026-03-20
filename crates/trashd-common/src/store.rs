@@ -334,10 +334,18 @@ impl TrashStore {
     pub fn purge(&self, id: &str) -> Result<(), TrashError> {
         let entry = self.find_entry(id)?;
 
-        if entry.trashed_path.is_dir() {
-            fs::remove_dir_all(&entry.trashed_path)?;
-        } else if entry.trashed_path.exists() {
-            fs::remove_file(&entry.trashed_path)?;
+        // Use symlink_metadata so dangling symlinks are detected and removed
+        match fs::symlink_metadata(&entry.trashed_path) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                fs::remove_dir_all(&entry.trashed_path)?;
+            }
+            Ok(_) => {
+                // Regular file, symlink (dangling or not), etc.
+                fs::remove_file(&entry.trashed_path)?;
+            }
+            Err(_) => {
+                // File already gone — just clean up the trashinfo
+            }
         }
         let _ = fs::remove_file(&entry.info_path);
         let _ = self.index.delete(&entry.id);
@@ -358,10 +366,15 @@ impl TrashStore {
                 }
             }
             // Inline purge to avoid re-scanning list for each entry
-            if entry.trashed_path.is_dir() {
-                let _ = fs::remove_dir_all(&entry.trashed_path);
-            } else if entry.trashed_path.exists() {
-                let _ = fs::remove_file(&entry.trashed_path);
+            // Use symlink_metadata so dangling symlinks are removed too
+            match fs::symlink_metadata(&entry.trashed_path) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                    let _ = fs::remove_dir_all(&entry.trashed_path);
+                }
+                Ok(_) => {
+                    let _ = fs::remove_file(&entry.trashed_path);
+                }
+                Err(_) => {}
             }
             let _ = fs::remove_file(&entry.info_path);
             let _ = self.index.delete(&entry.id);

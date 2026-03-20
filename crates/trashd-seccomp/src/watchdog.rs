@@ -22,12 +22,10 @@ pub fn run_watchdog(notif_fd: i32, mut supervisor_pid: libc::pid_t) -> ! {
         let mut status: libc::c_int = 0;
         let waited = unsafe { libc::waitpid(supervisor_pid, &mut status, 0) };
 
-        if waited <= 0 {
-            // waitpid error — supervisor might already be gone
-            // Try to drain and respawn anyway
-        }
-
-        let exit_info = if libc::WIFEXITED(status) {
+        let exit_info = if waited <= 0 {
+            // waitpid error — status is uninitialized, don't read it
+            format!("waitpid error: {}", io::Error::last_os_error())
+        } else if libc::WIFEXITED(status) {
             format!("exited with code {}", libc::WEXITSTATUS(status))
         } else if libc::WIFSIGNALED(status) {
             format!("killed by signal {}", libc::WTERMSIG(status))

@@ -149,6 +149,26 @@ fn run() -> io::Result<()> {
         ));
     }
 
+    // Open O_PATH fds to each watched mount point for open_by_handle_at.
+    // open_by_handle_at requires a mount fd on the same filesystem as the handle.
+    let mut mount_fds: Vec<RawFd> = Vec::new();
+    for mount in &mount_list {
+        if matches!(
+            mount.fstype.as_str(),
+            "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
+        ) {
+            continue;
+        }
+        let c_path = match std::ffi::CString::new(mount.path.to_string_lossy().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
+        if fd >= 0 {
+            mount_fds.push(fd);
+        }
+    }
+
     eprintln!("trashd-daemon: monitoring {} filesystem(s) for deletions", marked);
 
     // Event loop
@@ -197,7 +217,7 @@ fn run() -> io::Result<()> {
 
             // Process event
             if event.mask & (FAN_DELETE | FAN_DELETE_SELF | FAN_MOVED_FROM) != 0 {
-                let path = resolve_event_path(&buf[offset..offset + event_len], event);
+                let path = resolve_event_path(&buf[offset..offset + event_len], event, &mount_fds);
                 let pid = event.pid as u32;
                 let proc_name = process_name(pid);
                 if let Some(ref p) = path {
@@ -234,9 +254,9 @@ fn run() -> io::Result<()> {
 /// We resolve the parent via open_by_handle_at and join with the filename.
 ///
 /// Falls back to reading /proc/self/fd/{event.fd} for FAN_DELETE_SELF.
-fn resolve_event_path(event_buf: &[u8], event: &FanotifyEventMetadata) -> Option<PathBuf> {
+fn resolve_event_path(event_buf: &[u8], event: &FanotifyEventMetadata, mount_fds: &[RawFd]) -> Option<PathBuf> {
     // Try to extract path from extended FID info (for FAN_DELETE)
-    if let Some(path) = extract_dfid_name_path(event_buf) {
+    if let Some(path) = extract_dfid_name_path(event_buf, mount_fds) {
         return Some(path);
     }
 
@@ -249,7 +269,7 @@ fn resolve_event_path(event_buf: &[u8], event: &FanotifyEventMetadata) -> Option
 }
 
 /// Parse the DFID_NAME extended info to get parent_dir + filename.
-fn extract_dfid_name_path(event_buf: &[u8]) -> Option<PathBuf> {
+fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
@@ -303,6 +323,7 @@ fn extract_dfid_name_path(event_buf: &[u8]) -> Option<PathBuf> {
             let parent_dir = resolve_handle_to_path(
                 file_handle_ptr,
                 handle_bytes,
+                mount_fds,
             );
 
             if let Some(dir) = parent_dir {
@@ -320,25 +341,34 @@ fn extract_dfid_name_path(event_buf: &[u8]) -> Option<PathBuf> {
 }
 
 /// Try to resolve a file_handle to a path via open_by_handle_at + /proc/self/fd.
-fn resolve_handle_to_path(file_handle_ptr: *const u8, _handle_bytes: usize) -> Option<PathBuf> {
-    // open_by_handle_at needs a mount fd. Use AT_FDCWD as a starting point
-    // (requires CAP_DAC_READ_SEARCH for arbitrary handles).
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_open_by_handle_at,
-            libc::AT_FDCWD as libc::c_long,
-            file_handle_ptr as libc::c_long,
-            libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
-        )
-    };
+///
+/// `mount_fd_hint` is an O_PATH fd to a file on the same filesystem as the handle,
+/// or -1 to try all known mount points.
+fn resolve_handle_to_path(
+    file_handle_ptr: *const u8,
+    _handle_bytes: usize,
+    mount_fds: &[RawFd],
+) -> Option<PathBuf> {
+    // open_by_handle_at requires a mount fd on the same filesystem as the handle.
+    // Try each cached mount fd until one succeeds.
+    for &mount_fd in mount_fds {
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_open_by_handle_at,
+                mount_fd as libc::c_long,
+                file_handle_ptr as libc::c_long,
+                libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
+            )
+        };
 
-    if fd < 0 {
-        return None;
+        if fd >= 0 {
+            let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
+            unsafe { libc::close(fd as i32) };
+            return path;
+        }
     }
 
-    let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
-    unsafe { libc::close(fd as i32) };
-    path
+    None
 }
 
 fn fanotify_init(flags: libc::c_uint) -> io::Result<RawFd> {

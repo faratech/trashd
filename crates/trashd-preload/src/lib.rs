@@ -206,7 +206,9 @@ fn should_skip_path(path: &Path) -> bool {
                 return true;
             }
         } else if let Some(suffix) = pattern.strip_prefix("*/") {
-            if s.contains(&format!("/{suffix}")) {
+            if s.contains(&format!("/{suffix}"))
+                || s.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
+            {
                 return true;
             }
         } else if *pattern == *s {
@@ -312,8 +314,14 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 
     for line in content.lines() {
         let mut parts = line.split_whitespace();
-        let _dev = parts.next()?;
-        let mpoint = parts.next()?;
+        let _dev = match parts.next() {
+            Some(d) => d,
+            None => continue,
+        };
+        let mpoint = match parts.next() {
+            Some(m) => m,
+            None => continue,
+        };
         let mp = PathBuf::from(mpoint);
         if abs.starts_with(&mp) && mp.as_os_str().len() > best_len {
             best_len = mp.as_os_str().len();
@@ -550,9 +558,13 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
             std::env::current_dir().unwrap_or_default().join(&path)
         };
 
-        if !should_skip_path(&abs) && abs.exists() && !abs.is_dir() {
-            if try_trash(&abs) {
-                return 0;
+        // Use symlink_metadata to not follow symlinks — dangling symlinks
+        // should be trashed, not permanently deleted via the fallthrough.
+        if let Ok(meta) = fs::symlink_metadata(&abs) {
+            if !should_skip_path(&abs) && !meta.is_dir() {
+                if try_trash(&abs) {
+                    return 0;
+                }
             }
         }
     }
@@ -578,20 +590,24 @@ pub unsafe extern "C" fn unlinkat(
     let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
     if let Some(abs) = resolve_at_path(dirfd, pathname) {
-        if !should_skip_path(&abs) && abs.exists() {
-            if is_removedir {
-                if abs.is_dir() {
-                    if let Ok(mut rd) = fs::read_dir(&abs) {
-                        if rd.next().is_none() {
-                            if try_trash(&abs) {
-                                return 0;
+        // Use symlink_metadata to not follow symlinks
+        if let Ok(meta) = fs::symlink_metadata(&abs) {
+            if !should_skip_path(&abs) {
+                let is_real_dir = meta.is_dir() && !meta.file_type().is_symlink();
+                if is_removedir {
+                    if is_real_dir {
+                        if let Ok(mut rd) = fs::read_dir(&abs) {
+                            if rd.next().is_none() {
+                                if try_trash(&abs) {
+                                    return 0;
+                                }
                             }
                         }
                     }
-                }
-            } else if !abs.is_dir() {
-                if try_trash(&abs) {
-                    return 0;
+                } else if !is_real_dir {
+                    if try_trash(&abs) {
+                        return 0;
+                    }
                 }
             }
         }
@@ -618,11 +634,14 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
             std::env::current_dir().unwrap_or_default().join(&path)
         };
 
-        if !should_skip_path(&abs) && abs.is_dir() {
-            if let Ok(mut rd) = fs::read_dir(&abs) {
-                if rd.next().is_none() {
-                    if try_trash(&abs) {
-                        return 0;
+        // Use symlink_metadata — rmdir only applies to real directories, not symlinks
+        if let Ok(meta) = fs::symlink_metadata(&abs) {
+            if meta.is_dir() && !meta.file_type().is_symlink() && !should_skip_path(&abs) {
+                if let Ok(mut rd) = fs::read_dir(&abs) {
+                    if rd.next().is_none() {
+                        if try_trash(&abs) {
+                            return 0;
+                        }
                     }
                 }
             }
