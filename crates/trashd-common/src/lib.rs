@@ -1,4 +1,5 @@
 pub mod config;
+pub mod directorysizes;
 pub mod index;
 pub mod mounts;
 pub mod oplog;

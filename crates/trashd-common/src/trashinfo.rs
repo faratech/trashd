@@ -56,8 +56,20 @@ impl TrashInfo {
         s
     }
 
-    /// Parse a .trashinfo file.
+    /// Parse a .trashinfo file per FreeDesktop.org Trash spec.
+    ///
+    /// Spec requirements enforced:
+    /// - First non-empty line MUST be exactly `[Trash Info]`
+    /// - If `Path=` or `DeletionDate=` appears multiple times, first occurrence wins
+    /// - Path value is NOT trimmed (percent-encoded spaces are meaningful)
     pub fn from_trashinfo(content: &str) -> Option<Self> {
+        // Spec: "First line MUST be: [Trash Info]"
+        let first_line = content.lines()
+            .find(|l| !l.trim().is_empty())?;
+        if first_line.trim() != "[Trash Info]" {
+            return None;
+        }
+
         let mut path: Option<PathBuf> = None;
         let mut date: Option<DateTime<Local>> = None;
         let mut command = None;
@@ -74,14 +86,16 @@ impl TrashInfo {
             // (handles '=' in filenames since Path values are percent-encoded)
             if let Some((key, value)) = line.split_once('=') {
                 match key.trim() {
-                    "Path" => path = Some(decode_path(value.trim())),
-                    "DeletionDate" => {
+                    // Spec: first occurrence wins for Path and DeletionDate
+                    "Path" if path.is_none() => {
+                        // Spec: Path value is percent-encoded bytes — don't trim
+                        // (leading/trailing spaces in encoded form are meaningful)
+                        path = Some(decode_path(value));
+                    }
+                    "DeletionDate" if date.is_none() => {
                         if let Ok(naive) =
                             NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%dT%H:%M:%S")
                         {
-                            // Use latest() instead of single() to handle DST
-                            // ambiguity (fall-back transitions where one wall-clock
-                            // time maps to two UTC instants).
                             date = match naive.and_local_timezone(Local) {
                                 chrono::LocalResult::Single(dt) => Some(dt),
                                 chrono::LocalResult::Ambiguous(_, latest) => Some(latest),

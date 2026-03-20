@@ -58,6 +58,8 @@ pub struct TrashEntry {
     pub info_path: PathBuf,
     /// Which trash directory this entry lives in
     pub trash_root: PathBuf,
+    /// True if this entry has no .trashinfo (emergency/orphaned per spec)
+    pub orphaned: bool,
 }
 
 impl TrashStore {
@@ -90,6 +92,24 @@ impl TrashStore {
     /// Determine the correct trash directory for a file (same-device or topdir).
     fn trash_dir_for(&self, path: &Path) -> PathBuf {
         mounts::trash_dir_for_path(path, &Self::home_trash_dir())
+    }
+
+    /// Get the topdir (mount point) for a trash directory.
+    /// For `.Trash-$uid` → parent is the topdir.
+    /// For `.Trash/$uid` → grandparent is the topdir.
+    fn topdir_for_trash(trash_dir: &Path) -> PathBuf {
+        if let Some(parent) = trash_dir.parent() {
+            let name = parent.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name == ".Trash" {
+                // .Trash/$uid → topdir is grandparent
+                return parent.parent().unwrap_or(parent).to_path_buf();
+            }
+            // .Trash-$uid → topdir is parent
+            return parent.to_path_buf();
+        }
+        trash_dir.to_path_buf()
     }
 
     /// Ensure a trash directory has the required subdirectories.
@@ -140,8 +160,32 @@ impl TrashStore {
             .unwrap_or_else(|| "unnamed".into());
         let (id, info_file) = unique_id_atomic(&trash_dir, &file_name)?;
 
-        // Build trashinfo
-        let mut info = TrashInfo::new(abs_path.clone());
+        // Build trashinfo — per spec, topdir trash should use relative paths
+        // from the topdir mount point, not absolute paths.
+        let home_trash = Self::home_trash_dir();
+        let trashinfo_path = if trash_dir == home_trash {
+            // Home trash: absolute path per spec
+            abs_path.clone()
+        } else {
+            // Topdir trash: relative path from the topdir (parent of .Trash-$uid or .Trash/$uid)
+            // e.g. /mnt/data/.Trash-1000 -> topdir is /mnt/data
+            //      /mnt/data/.Trash/1000 -> topdir is /mnt/data
+            let topdir = trash_dir.parent()
+                .and_then(|p| {
+                    // .Trash/$uid has one extra level
+                    let name = p.file_name()?.to_string_lossy();
+                    if name == ".Trash" { p.parent() } else { Some(p) }
+                })
+                .unwrap_or(trash_dir.as_ref());
+            abs_path.strip_prefix(topdir)
+                .map(|rel| {
+                    // Spec: relative path MUST NOT contain ".."
+                    debug_assert!(!rel.components().any(|c| c == std::path::Component::ParentDir));
+                    rel.to_path_buf()
+                })
+                .unwrap_or_else(|_| abs_path.clone()) // fallback to absolute if strip fails
+        };
+        let mut info = TrashInfo::new(trashinfo_path);
         info.command = command.map(|s| s.to_string());
         info.pid = Some(std::process::id());
         info.size = Some(if meta.is_file() {
@@ -203,6 +247,11 @@ impl TrashStore {
         // Update index
         let _ = self.index.insert(&id, &info, &trash_dir);
 
+        // Update directorysizes cache if we just trashed a directory
+        if meta.is_dir() {
+            let _ = crate::directorysizes::write_cache(&trash_dir);
+        }
+
         // Log operation
         crate::oplog::log_trash(&abs_path, &id, command);
 
@@ -253,10 +302,17 @@ impl TrashStore {
                 Err(_) => continue,
             };
 
-            let info = match TrashInfo::from_trashinfo(&content) {
+            let mut info = match TrashInfo::from_trashinfo(&content) {
                 Some(i) => i,
                 None => continue,
             };
+
+            // Spec: topdir trash may store relative paths. Resolve to absolute
+            // using the topdir (parent of the trash directory).
+            if !info.original_path.is_absolute() {
+                let topdir = Self::topdir_for_trash(trash_dir);
+                info.original_path = topdir.join(&info.original_path);
+            }
 
             // Apply pattern filter
             if let Some(pat) = pattern {
@@ -279,7 +335,40 @@ impl TrashStore {
                 trashed_path,
                 info_path: entry.path(),
                 trash_root: trash_dir.to_path_buf(),
+                orphaned: false,
             });
+        }
+
+        // Spec: "If info file corresponding to file in $trash/files is unavailable,
+        // this is emergency case and MUST be presented as such."
+        // Scan files/ for entries without matching .trashinfo.
+        if files_dir.exists() {
+            let known_ids: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.id.clone()).collect();
+            let mut orphans = Vec::new();
+            if let Ok(file_entries) = fs::read_dir(&files_dir) {
+                for fe in file_entries.flatten() {
+                    let name = fe.file_name().to_string_lossy().into_owned();
+                    if !known_ids.contains(&name) {
+                        // Apply pattern filter to orphans too
+                        if let Some(pat) = pattern {
+                            if !simple_glob_match(pat, &name) {
+                                continue;
+                            }
+                        }
+                        let trashed_path = files_dir.join(&name);
+                        orphans.push(TrashEntry {
+                            id: name.clone(),
+                            info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
+                            trashed_path,
+                            info_path: info_dir.join(format!("{name}.trashinfo")),
+                            trash_root: trash_dir.to_path_buf(),
+                            orphaned: true,
+                        });
+                    }
+                }
+            }
+            entries.extend(orphans);
         }
 
         Ok(())
@@ -435,6 +524,10 @@ impl TrashStore {
         if count > 0 {
             let filter_desc = max_age_days.map(|d| format!("older than {d}d"));
             crate::oplog::log_empty(count, filter_desc.as_deref());
+            // Refresh directorysizes cache after purging
+            for (dir, _) in self.all_trash_dirs() {
+                let _ = crate::directorysizes::write_cache(&dir);
+            }
         }
         Ok(count)
     }
