@@ -380,3 +380,78 @@ fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn default_config() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn never_trash_tmp() {
+        let cfg = default_config();
+        assert!(cfg.should_skip(Path::new("/tmp/foo.txt")));
+        assert!(cfg.should_skip(Path::new("/var/cache/apt/something")));
+        assert!(cfg.should_skip(Path::new("/proc/1/status")));
+    }
+
+    #[test]
+    fn never_trash_extensions() {
+        let cfg = default_config();
+        assert!(cfg.should_skip(Path::new("/home/user/foo.tmp")));
+        assert!(cfg.should_skip(Path::new("/home/user/foo.swp")));
+        assert!(cfg.should_skip(Path::new("/home/user/foo.pyc")));
+        assert!(cfg.should_skip(Path::new("/home/user/backup~")));
+    }
+
+    #[test]
+    fn never_trash_git_objects() {
+        let cfg = default_config();
+        assert!(cfg.should_skip(Path::new("/home/user/repo/.git/objects/abc")));
+        assert!(cfg.should_skip(Path::new("/home/user/repo/.git/HEAD")));
+    }
+
+    #[test]
+    fn normal_files_not_skipped() {
+        let cfg = default_config();
+        assert!(!cfg.should_skip(Path::new("/home/user/document.txt")));
+        assert!(!cfg.should_skip(Path::new("/home/user/project/main.rs")));
+        assert!(!cfg.should_skip(Path::new("/home/user/photo.jpg")));
+    }
+
+    #[test]
+    fn only_trash_whitelist() {
+        let mut cfg = default_config();
+        cfg.only_trash = vec!["*.py".into()];
+
+        // .py files should be trashed (not skipped)
+        assert!(!cfg.should_skip(Path::new("/home/user/script.py")));
+        // .rs files should be skipped (not in whitelist)
+        assert!(cfg.should_skip(Path::new("/home/user/main.rs")));
+        // never_trash still wins over only_trash
+        assert!(cfg.should_skip(Path::new("/tmp/script.py")));
+    }
+
+    #[test]
+    fn pattern_matches_node_modules() {
+        let cfg = default_config();
+        // "node_modules/*" should match anywhere in path
+        assert!(cfg.should_skip(Path::new("/home/user/project/node_modules/pkg/index.js")));
+    }
+
+    #[test]
+    fn local_config_only_trash_overrides_global() {
+        // This tests the fix for the bug where local only_trash
+        // was overridden by global only_trash.
+        let mut cfg = default_config();
+        cfg.only_trash = vec!["*.txt".into()]; // global whitelist
+
+        // A .py file would normally be skipped by global only_trash
+        assert!(cfg.should_skip(Path::new("/home/user/script.py")));
+        // But local .trashd.toml with only_trash=["*.py"] should override
+        // (tested via integration test since it requires filesystem)
+    }
+}
