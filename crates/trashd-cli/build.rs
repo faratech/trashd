@@ -155,6 +155,52 @@ fn build_cli() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("config")
+                .about("View or modify trashd configuration")
+                .subcommand(
+                    Command::new("show").about("Show active configuration").arg(
+                        Arg::new("json")
+                            .long("json")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Output as JSON"),
+                    ),
+                )
+                .subcommand(
+                    Command::new("get")
+                        .about("Get a config value")
+                        .arg(Arg::new("key").required(true).help("Config key")),
+                )
+                .subcommand(Command::new("set").about("Set a config value").args([
+                    Arg::new("key").required(true).help("Config key"),
+                    Arg::new("value").required(true).help("Value"),
+                ]))
+                .subcommand(Command::new("add").about("Add to a list config").args([
+                    Arg::new("key").required(true).help("List key"),
+                    Arg::new("value").required(true).help("Value to add"),
+                ]))
+                .subcommand(
+                    Command::new("remove")
+                        .about("Remove from a list config")
+                        .args([
+                            Arg::new("key").required(true).help("List key"),
+                            Arg::new("value").required(true).help("Value to remove"),
+                        ]),
+                )
+                .subcommand(Command::new("path").about("Show config file paths"))
+                .subcommand(Command::new("edit").about("Open user config in $EDITOR"))
+                .subcommand(
+                    Command::new("reset")
+                        .about("Reset user config to defaults")
+                        .arg(
+                            Arg::new("yes")
+                                .short('y')
+                                .long("yes")
+                                .action(clap::ArgAction::SetTrue)
+                                .help("Skip confirmation"),
+                        ),
+                ),
+        )
+        .subcommand(
             Command::new("self-update")
                 .about("Update trashd to the latest release from GitHub")
                 .arg(

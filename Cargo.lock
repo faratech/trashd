@@ -1279,6 +1279,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "toml",
  "trashd-common",
  "ureq",
  "zstd",

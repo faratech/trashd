@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_retention")]
     pub retention: RetentionConfig,
@@ -36,7 +36,7 @@ pub struct Config {
     pub bypass_paths: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RetentionConfig {
     #[serde(default = "default_max_age")]
     pub max_age_days: u32,
