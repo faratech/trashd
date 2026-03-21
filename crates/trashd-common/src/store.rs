@@ -268,13 +268,16 @@ impl TrashStore {
             Ok(())
         })();
 
-        // On failure, clean up orphaned trashinfo and partial copy
+        // On failure, clean up orphaned trashinfo and partial copy.
+        // Use symlink_metadata to avoid following symlinks — remove_dir_all
+        // on a symlink-to-directory would delete the target's contents.
         if let Err(e) = move_result {
             let _ = fs::remove_file(&info_file);
-            if dest.exists() {
-                if dest.is_dir() {
+            if let Ok(meta) = fs::symlink_metadata(&dest) {
+                if meta.is_dir() && !meta.file_type().is_symlink() {
                     let _ = fs::remove_dir_all(&dest);
                 } else {
+                    // Symlinks, regular files, etc.
                     let _ = fs::remove_file(&dest);
                 }
             }
@@ -426,8 +429,8 @@ impl TrashStore {
             .map(|t| t.to_path_buf())
             .unwrap_or_else(|| entry.info.original_path.clone());
 
-        // Check for conflicts
-        if restore_to.exists() {
+        // Check for conflicts (use symlink_metadata so dangling symlinks are detected)
+        if fs::symlink_metadata(&restore_to).is_ok() {
             return Err(TrashError::RestoreConflict(restore_to));
         }
 

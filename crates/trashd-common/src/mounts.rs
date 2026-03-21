@@ -163,7 +163,19 @@ fn check_shared_trash(topdir: &Path, uid: u32) -> Option<PathBuf> {
 
     // Must be writable by us (check by trying to create the uid subdir)
     let uid_dir = trash_dir.join(uid.to_string());
-    if uid_dir.exists() || fs::create_dir_all(&uid_dir).is_ok() {
+    if !uid_dir.exists() {
+        if fs::create_dir_all(&uid_dir).is_err() {
+            return None;
+        }
+    }
+
+    // Verify the uid subdir is owned by us (FreeDesktop spec §1.2.2a).
+    // A malicious user could pre-create this directory with different ownership.
+    if let Ok(m) = fs::symlink_metadata(&uid_dir) {
+        use std::os::unix::fs::MetadataExt;
+        if m.uid() != uid || m.file_type().is_symlink() {
+            return None;
+        }
         return Some(uid_dir);
     }
 

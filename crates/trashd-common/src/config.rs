@@ -297,11 +297,18 @@ impl Config {
             if !local.never_trash.is_empty() && pattern_matches_any(&local.never_trash, path) {
                 return true;
             }
-            // Local only_trash: if set and doesn't match, skip
-            if !local.only_trash.is_empty() && !pattern_matches_any(&local.only_trash, path) {
-                return true;
+            // Local only_trash: if set, it takes precedence over global only_trash
+            if !local.only_trash.is_empty() {
+                if !pattern_matches_any(&local.only_trash, path) {
+                    return true; // doesn't match local whitelist → skip
+                }
+                // Matched local whitelist — still check global never_trash below,
+                // but skip the global only_trash check (local overrides it).
+                if pattern_matches_any(&self.never_trash, path) {
+                    return true;
+                }
+                return false;
             }
-            // If local only_trash matched, still check global never_trash
         }
 
         // Global never_trash always wins

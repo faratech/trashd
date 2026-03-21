@@ -167,7 +167,8 @@ fn cmd_ls(store: &TrashStore, pattern: Option<&str>) {
 
         let max_path = if multi_part { 40 } else { 50 };
         let path_display = if path.len() > max_path {
-            format!("...{}", &path[path.len() - (max_path - 3)..])
+            let start = path.floor_char_boundary(path.len() - (max_path - 3));
+            format!("...{}", &path[start..])
         } else {
             path.to_string()
         };
@@ -584,7 +585,10 @@ fn compress_file_zstd(path: &std::path::Path) -> std::io::Result<u64> {
     let data = std::fs::read(path)?;
     let compressed = zstd::encode_all(data.as_slice(), 3)?;
     if compressed.len() < data.len() {
-        std::fs::write(path, &compressed)?;
+        // Write to temp file + rename to avoid corrupting the original on partial write
+        let tmp = path.with_extension("zst.tmp");
+        std::fs::write(&tmp, &compressed)?;
+        std::fs::rename(&tmp, path)?;
         Ok(compressed.len() as u64)
     } else {
         Ok(data.len() as u64)
@@ -623,7 +627,8 @@ fn cmd_du(store: &TrashStore, top: usize) {
             .unwrap_or_else(|| "?".into());
         let path = entry.info.original_path.to_string_lossy();
         let path_display = if path.len() > 50 {
-            format!("...{}", &path[path.len() - 47..])
+            let start = path.floor_char_boundary(path.len() - 47);
+            format!("...{}", &path[start..])
         } else {
             path.to_string()
         };

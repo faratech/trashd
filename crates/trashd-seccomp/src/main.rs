@@ -80,8 +80,12 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
             let notif_fd = match filter::install_filter() {
                 Ok(fd) => fd,
                 Err(e) => {
-                    eprintln!("trashd-exec: seccomp filter install failed: {e}");
-                    eprintln!("trashd-exec: running command without protection");
+                    // EBUSY means a seccomp listener already exists in this filter
+                    // chain (common in Docker, WSL2, etc.) — fall through silently.
+                    if e.raw_os_error() != Some(libc::EBUSY) {
+                        eprintln!("trashd-exec: seccomp filter install failed: {e}");
+                        eprintln!("trashd-exec: running command without protection");
+                    }
                     // Send -1 to signal failure, then exec without protection
                     send_fd(sv[1], -1);
                     unsafe { libc::close(sv[1]) };
@@ -111,20 +115,28 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
 
     if notif_fd < 0 {
         // Child couldn't install seccomp — just wait for it
-        eprintln!("trashd-exec: running without seccomp protection");
         return wait_for_child(child_pid);
     }
 
     // Dup the fd for the watchdog
     let watchdog_fd = unsafe { libc::dup(notif_fd) };
     if watchdog_fd < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(notif_fd) };
+        return Err(e);
     }
 
     // Fork the supervisor
     let supervisor_pid = unsafe { libc::fork() };
     match supervisor_pid {
-        -1 => return Err(io::Error::last_os_error()),
+        -1 => {
+            let e = io::Error::last_os_error();
+            unsafe {
+                libc::close(notif_fd);
+                libc::close(watchdog_fd);
+            }
+            return Err(e);
+        }
         0 => {
             // --- SUPERVISOR PROCESS ---
             unsafe { libc::close(watchdog_fd) };
@@ -139,7 +151,16 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     // Fork the watchdog
     let watchdog_pid = unsafe { libc::fork() };
     match watchdog_pid {
-        -1 => return Err(io::Error::last_os_error()),
+        -1 => {
+            let e = io::Error::last_os_error();
+            unsafe {
+                libc::kill(supervisor_pid, libc::SIGTERM);
+                libc::waitpid(supervisor_pid, std::ptr::null_mut(), 0);
+                libc::close(notif_fd);
+                libc::close(watchdog_fd);
+            }
+            return Err(e);
+        }
         0 => {
             // --- WATCHDOG PROCESS ---
             unsafe { libc::close(notif_fd) };

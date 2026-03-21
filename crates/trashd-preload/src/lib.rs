@@ -490,7 +490,10 @@ fn try_trash(path: &Path) -> bool {
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return false,
+        }
     };
 
     let size = fs::symlink_metadata(&abs_path).ok().map(|m| m.len());
@@ -683,10 +686,11 @@ fn resolve_at_path(dirfd: libc::c_int, pathname: *const libc::c_char) -> Option<
 // Common pre-check for all hooks
 // ---------------------------------------------------------------------------
 
-/// Return 0 with errno cleared. libc callers expect errno unchanged on success,
-/// but our trash operations may have set it as a side effect.
-fn success() -> libc::c_int {
-    unsafe { *libc::__errno_location() = 0 };
+/// Return 0 with errno preserved from before the intercept.
+/// Our trash operations may set errno as a side effect — restore the
+/// caller's original errno so they see a clean success.
+fn success_with_errno(saved_errno: libc::c_int) -> libc::c_int {
+    unsafe { *libc::__errno_location() = saved_errno };
     0
 }
 
@@ -711,18 +715,23 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
         return (real_unlink())(pathname);
     }
 
+    let saved_errno = *libc::__errno_location();
+
     if let Some(path) = cstr_to_path(pathname) {
         let abs = if path.is_absolute() {
             path.clone()
         } else {
-            std::env::current_dir().unwrap_or_default().join(&path)
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&path),
+                Err(_) => return (real_unlink())(pathname),
+            }
         };
 
         // Use symlink_metadata to not follow symlinks — dangling symlinks
         // should be trashed, not permanently deleted via the fallthrough.
         if let Ok(meta) = fs::symlink_metadata(&abs) {
             if !should_skip_path(&abs) && !meta.is_dir() && try_trash(&abs) {
-                return success();
+                return success_with_errno(saved_errno);
             }
         }
     }
@@ -747,6 +756,7 @@ pub unsafe extern "C" fn unlinkat(
         return (real_unlinkat())(dirfd, pathname, flags);
     }
 
+    let saved_errno = *libc::__errno_location();
     let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
     if let Some(abs) = resolve_at_path(dirfd, pathname) {
@@ -758,12 +768,12 @@ pub unsafe extern "C" fn unlinkat(
                     if is_real_dir {
                         if let Ok(mut rd) = fs::read_dir(&abs) {
                             if rd.next().is_none() && try_trash(&abs) {
-                                return success();
+                                return success_with_errno(saved_errno);
                             }
                         }
                     }
                 } else if !is_real_dir && try_trash(&abs) {
-                    return success();
+                    return success_with_errno(saved_errno);
                 }
             }
         }
@@ -785,11 +795,16 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
         return (real_rmdir())(pathname);
     }
 
+    let saved_errno = *libc::__errno_location();
+
     if let Some(path) = cstr_to_path(pathname) {
         let abs = if path.is_absolute() {
             path.clone()
         } else {
-            std::env::current_dir().unwrap_or_default().join(&path)
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&path),
+                Err(_) => return (real_rmdir())(pathname),
+            }
         };
 
         // Use symlink_metadata — rmdir only applies to real directories, not symlinks
@@ -797,7 +812,7 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
             if meta.is_dir() && !meta.file_type().is_symlink() && !should_skip_path(&abs) {
                 if let Ok(mut rd) = fs::read_dir(&abs) {
                     if rd.next().is_none() && try_trash(&abs) {
-                        return success();
+                        return success_with_errno(saved_errno);
                     }
                 }
             }
