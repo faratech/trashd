@@ -341,7 +341,12 @@ fn should_skip_path(path: &Path) -> bool {
                 return true;
             }
         } else if let Some(prefix) = pattern.strip_suffix('*') {
-            if s.starts_with(prefix) {
+            // "node_modules/*" → match anywhere in path (no leading /)
+            if prefix.starts_with('/') {
+                if s.starts_with(prefix) {
+                    return true;
+                }
+            } else if s.starts_with(prefix) || s.contains(&format!("/{prefix}")) {
                 return true;
             }
         } else if pattern.starts_with("*.") {
@@ -401,11 +406,23 @@ fn trash_dir_for(path: &Path) -> PathBuf {
                 && (meta.permissions().mode() & 0o1000) != 0
             {
                 let uid_dir = shared_trash.join(uid.to_string());
-                if uid_dir.exists()
-                    || (fs::create_dir_all(uid_dir.join("files")).is_ok()
-                        && fs::create_dir_all(uid_dir.join("info")).is_ok())
-                {
-                    return uid_dir;
+                if !uid_dir.exists() {
+                    if fs::create_dir_all(uid_dir.join("files")).is_err()
+                        || fs::create_dir_all(uid_dir.join("info")).is_err()
+                    {
+                        // Fall through to .Trash-$UID
+                    } else {
+                        return uid_dir;
+                    }
+                } else {
+                    // Verify ownership — don't use a dir pre-created by another user
+                    use std::os::unix::fs::MetadataExt;
+                    if let Ok(m) = fs::symlink_metadata(&uid_dir) {
+                        if m.uid() == uid && !m.file_type().is_symlink() {
+                            return uid_dir;
+                        }
+                    }
+                    // Ownership mismatch or symlink — fall through to .Trash-$UID
                 }
             }
         }

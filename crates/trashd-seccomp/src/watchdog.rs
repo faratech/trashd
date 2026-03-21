@@ -110,6 +110,20 @@ fn passthrough_loop(fd: i32) -> ! {
                 // fd closed — we're done
                 unsafe { libc::_exit(0) };
             }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
+            {
+                // fd is non-blocking and no notifications pending — poll until ready
+                unsafe {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    libc::poll(&mut pfd, 1, 1000);
+                }
+            }
             Err(_) => continue,
         }
     }

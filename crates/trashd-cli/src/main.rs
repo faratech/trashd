@@ -440,15 +440,32 @@ fn cmd_empty(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) 
 
     // Confirmation prompt unless --yes
     if !yes {
-        let (total_size, count) = store.status().unwrap_or_default();
-        if count == 0 {
+        // When --older is set, count only the items that will actually be deleted
+        let (prompt_size, prompt_count) = if let Some(d) = days {
+            let entries = store.list(None).unwrap_or_default();
+            let now = chrono::Local::now();
+            let mut size = 0u64;
+            let mut cnt = 0u64;
+            for entry in &entries {
+                let age = now.signed_duration_since(entry.info.deletion_date);
+                if age.num_days() >= d as i64 {
+                    cnt += 1;
+                    size += entry.info.size.unwrap_or(0);
+                }
+            }
+            (size, cnt)
+        } else {
+            let (s, c) = store.status().unwrap_or_default();
+            (s, c as u64)
+        };
+        if prompt_count == 0 {
             println!("{}", "Nothing to empty.".dimmed());
             return;
         }
         eprint!(
             "Permanently delete {} items ({})? [y/N] ",
-            count,
-            format_size(total_size),
+            prompt_count,
+            format_size(prompt_size),
         );
         let _ = std::io::Write::flush(&mut std::io::stderr());
         let mut input = String::new();
@@ -701,6 +718,7 @@ fn cmd_fsck(_store: &TrashStore, fix: bool) {
                     let _ = std::fs::remove_file(entry.path());
                     println!("    {}", "removed".green());
                 }
+                continue; // already reported — don't also count as corrupt
             }
 
             // Check if trashinfo is parseable

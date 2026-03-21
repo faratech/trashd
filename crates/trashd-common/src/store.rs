@@ -977,10 +977,14 @@ fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
                 return;
             }
             *count += 1;
-            let meta = match entry.metadata() {
+            let meta = match entry.path().symlink_metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            if meta.file_type().is_symlink() {
+                // Count symlink itself (typically 0 or small), don't follow
+                continue;
+            }
             if meta.is_dir() {
                 dir_size_inner(&entry.path(), total, count);
             } else {
@@ -1067,11 +1071,17 @@ fn simple_glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
+    // Only use the prefix/suffix shortcuts when there's a single wildcard.
+    // Patterns like "*.py*" must fall through to the split_once handler.
     if let Some(suffix) = pattern.strip_prefix('*') {
-        return text.ends_with(suffix);
+        if !suffix.contains('*') {
+            return text.ends_with(suffix);
+        }
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
-        return text.starts_with(prefix);
+        if !prefix.contains('*') {
+            return text.starts_with(prefix);
+        }
     }
     if let Some((prefix, suffix)) = pattern.split_once('*') {
         // Guard: text must be long enough for both prefix and suffix
