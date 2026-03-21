@@ -150,16 +150,32 @@ fn decode_path(s: &str) -> PathBuf {
             return path;
         }
     }
-    // Fallback: manual decode
+    // Fallback: manual decode — preserve invalid sequences literally
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            let hex = [hi, lo];
-            if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&hex).unwrap_or("00"), 16) {
-                bytes.push(val);
+            match (chars.next(), chars.next()) {
+                (Some(hi), Some(lo)) => {
+                    if let Ok(val) =
+                        u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or(""), 16)
+                    {
+                        bytes.push(val);
+                    } else {
+                        // Invalid hex digits — preserve literally
+                        bytes.push(b'%');
+                        bytes.push(hi);
+                        bytes.push(lo);
+                    }
+                }
+                (Some(hi), None) => {
+                    // Truncated sequence — preserve literally
+                    bytes.push(b'%');
+                    bytes.push(hi);
+                }
+                _ => {
+                    bytes.push(b'%');
+                }
             }
         } else {
             bytes.push(b);

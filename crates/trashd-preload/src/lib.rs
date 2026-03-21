@@ -181,7 +181,9 @@ fn config_mtime() -> i64 {
         .and_then(|p| fs::metadata(p).ok())
         .map(|m| m.mtime())
         .unwrap_or(0);
-    global + user
+    // Avoid collisions from simple addition (e.g., global=100+user=200 == global=200+user=100).
+    // Shift one value to make the pair distinguishable.
+    global.wrapping_mul(1000003) ^ user
 }
 
 fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {
@@ -515,10 +517,31 @@ fn try_trash(path: &Path) -> bool {
 
     let size = fs::symlink_metadata(&abs_path).ok().map(|m| m.len());
 
+    // Per FreeDesktop spec, topdir trash stores relative paths from the mount point.
+    let home_trash = home_trash_dir();
+    let trashinfo_path = if trash_dir == home_trash {
+        abs_path.clone()
+    } else {
+        // Topdir: strip the mount point prefix to get a relative path.
+        // .Trash-$uid -> parent is the topdir
+        // .Trash/$uid -> grandparent is the topdir
+        let topdir = trash_dir
+            .parent()
+            .and_then(|p| {
+                let name = p.file_name()?.to_string_lossy();
+                if name == ".Trash" { p.parent() } else { Some(p) }
+            })
+            .unwrap_or(&trash_dir);
+        abs_path
+            .strip_prefix(topdir)
+            .map(|rel| rel.to_path_buf())
+            .unwrap_or_else(|_| abs_path.clone())
+    };
+
     let now = chrono::Local::now();
     let trashinfo = format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\nX-Trashd-Command=preload\nX-Trashd-PID={}\n{}\n",
-        encode_path(&abs_path),
+        encode_path(&trashinfo_path),
         now.format("%Y-%m-%dT%H:%M:%S"),
         std::process::id(),
         size.map(|s| format!("X-Trashd-Size={s}"))
@@ -615,14 +638,15 @@ fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf
 
     // Try base name
     let path = info_dir.join(format!("{base_name}.trashinfo"));
-    if fs::OpenOptions::new()
+    match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&path)
-        .is_ok()
     {
-        return Some((base_name.to_string(), path));
+        Ok(_) => return Some((base_name.to_string(), path)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {} // retry below
+        Err(_) => return None, // real I/O error (disk full, permission denied)
     }
 
     // Append timestamp + counter
@@ -634,14 +658,15 @@ fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf
             format!("{base_name}.{ts}.{i}")
         };
         let path = info_dir.join(format!("{candidate}.trashinfo"));
-        if fs::OpenOptions::new()
+        match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)
-            .is_ok()
         {
-            return Some((candidate, path));
+            Ok(_) => return Some((candidate, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None, // real I/O error
         }
     }
     None

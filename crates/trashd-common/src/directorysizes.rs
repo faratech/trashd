@@ -158,11 +158,25 @@ fn decode_name(s: &str) -> String {
     let mut chars = s.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or("00"), 16)
-            {
-                bytes.push(val);
+            match (chars.next(), chars.next()) {
+                (Some(hi), Some(lo)) => {
+                    if let Ok(val) =
+                        u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or(""), 16)
+                    {
+                        bytes.push(val);
+                    } else {
+                        bytes.push(b'%');
+                        bytes.push(hi);
+                        bytes.push(lo);
+                    }
+                }
+                (Some(hi), None) => {
+                    bytes.push(b'%');
+                    bytes.push(hi);
+                }
+                _ => {
+                    bytes.push(b'%');
+                }
             }
         } else {
             bytes.push(b);
