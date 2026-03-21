@@ -9,7 +9,7 @@ Initial release.
 - **4-layer interception architecture**
   - Layer 1: PATH shim (`trashd-rm`) — drop-in `rm` replacement
   - Layer 2: LD_PRELOAD (`libtrashd_preload.so`) — hooks unlink/unlinkat/rmdir
-  - Layer 3: fanotify daemon (`trashd-daemon`) — system-wide deletion audit (Linux 5.9+)
+  - Layer 3: fanotify daemon (`trashd`) — system-wide deletion audit (Linux 5.9+)
   - Layer 4: seccomp supervisor (`trashd-exec`) — kernel-level syscall trapping with watchdog failover (Linux 5.5+)
 
 - **CLI (`trash` command)**

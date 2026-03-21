@@ -23,12 +23,17 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
     fi
 
     # Remove binaries
-    for bin in trash trashd-exec trashd-daemon; do
+    for bin in trash trashd-exec; do
         if [ -f "${BIN_DIR}/${bin}" ]; then
             rm -f "${BIN_DIR}/${bin}"
             echo "    Removed ${BIN_DIR}/${bin}"
         fi
     done
+    # Daemon lives in LIB_DIR, not BIN_DIR
+    if [ -f "${LIB_DIR}/trashd" ]; then
+        rm -f "${LIB_DIR}/trashd"
+        echo "    Removed ${LIB_DIR}/trashd"
+    fi
 
     # Remove shim directory (rm shim, unlink symlink)
     if [ -d "${SHIM_DIR}" ]; then
@@ -76,12 +81,12 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
     fi
 
     # Remove systemd service if installed
-    if [ -f /etc/systemd/system/trashd-daemon.service ]; then
-        systemctl stop trashd-daemon 2>/dev/null || true
-        systemctl disable trashd-daemon 2>/dev/null || true
-        rm -f /etc/systemd/system/trashd-daemon.service
+    if [ -f /etc/systemd/system/trashd.service ]; then
+        systemctl stop trashd 2>/dev/null || true
+        systemctl disable trashd 2>/dev/null || true
+        rm -f /etc/systemd/system/trashd.service
         systemctl daemon-reload 2>/dev/null || true
-        echo "    Removed trashd-daemon.service"
+        echo "    Removed trashd.service"
     fi
 
     # Remove global config
@@ -166,7 +171,7 @@ fi
 echo "==> Installing binaries..."
 install -Dm755 "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
 install -Dm755 "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
-install -Dm755 "${TARGET_DIR}/trashd-daemon" "${LIB_DIR}/trashd-daemon"
+install -Dm755 "${TARGET_DIR}/trashd" "${LIB_DIR}/trashd"
 
 echo "==> Setting up shim directory..."
 mkdir -p "${SHIM_DIR}" "${REAL_DIR}"
@@ -243,20 +248,29 @@ fi
 
 echo "==> Installing fanotify daemon (Layer 3)..."
 if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-    install -Dm644 "$(dirname "$0")/install/systemd/trashd-daemon.service" \
-        /etc/systemd/system/trashd-daemon.service
+    # Migrate from old trashd-daemon.service name
+    if [ -f /etc/systemd/system/trashd-daemon.service ]; then
+        systemctl stop trashd-daemon 2>/dev/null || true
+        systemctl disable trashd-daemon 2>/dev/null || true
+        rm -f /etc/systemd/system/trashd-daemon.service
+        echo "    Migrated from trashd-daemon.service -> trashd.service"
+    fi
+    # Remove old daemon binary name
+    rm -f "${LIB_DIR}/trashd-daemon" 2>/dev/null
+    install -Dm644 "$(dirname "$0")/install/systemd/trashd.service" \
+        /etc/systemd/system/trashd.service
     systemctl daemon-reload
-    systemctl enable trashd-daemon 2>/dev/null || true
-    systemctl restart trashd-daemon 2>/dev/null || true
-    if systemctl is-active --quiet trashd-daemon 2>/dev/null; then
-        echo "    trashd-daemon is running (monitoring deletions)"
+    systemctl enable trashd 2>/dev/null || true
+    systemctl restart trashd 2>/dev/null || true
+    if systemctl is-active --quiet trashd 2>/dev/null; then
+        echo "    trashd is running (monitoring deletions)"
     else
-        echo "    trashd-daemon installed but could not start (needs CAP_SYS_ADMIN)"
-        echo "    Start manually: sudo systemctl start trashd-daemon"
+        echo "    trashd installed but could not start (needs CAP_SYS_ADMIN)"
+        echo "    Start manually: sudo systemctl start trashd"
     fi
 else
     echo "    systemd not available, skipping daemon install"
-    echo "    Run manually: sudo trashd-daemon --foreground"
+    echo "    Run manually: sudo trashd --foreground"
 fi
 
 echo "==> Installing global config..."

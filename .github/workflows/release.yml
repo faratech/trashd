@@ -87,7 +87,7 @@ jobs:
           cp target/${{ matrix.target }}/release/trash "${STAGING}/bin/"
           cp target/${{ matrix.target }}/release/trashd-rm "${STAGING}/bin/"
           cp target/${{ matrix.target }}/release/trashd-exec "${STAGING}/bin/"
-          cp target/${{ matrix.target }}/release/trashd-daemon "${STAGING}/bin/"
+          cp target/${{ matrix.target }}/release/trashd "${STAGING}/bin/"
           cp target/${{ matrix.target }}/release/libtrashd_preload.so "${STAGING}/lib/"
 
           # Strip binaries for smaller release

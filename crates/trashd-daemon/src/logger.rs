@@ -15,14 +15,14 @@ impl DeletionEvent {
     pub fn log(&self, skipped: bool) {
         if skipped {
             eprintln!(
-                "[trashd-daemon] DELETE pid={} proc={} path={} (skipped)",
+                "[trashd] DELETE pid={} proc={} path={} (skipped)",
                 self.pid,
                 self.process,
                 self.path.display(),
             );
         } else {
             eprintln!(
-                "[trashd-daemon] DELETE pid={} proc={} path={}",
+                "[trashd] DELETE pid={} proc={} path={}",
                 self.pid,
                 self.process,
                 self.path.display(),

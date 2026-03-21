@@ -31,26 +31,26 @@ cargo build --release
 %doc README.md CHANGELOG.md
 %{_bindir}/trash
 %{_bindir}/trashd-exec
-%{_bindir}/trashd-daemon
+%{_bindir}/trashd
 %dir %{_prefix}/lib/trashd
 %{_prefix}/lib/trashd/bin/rm
 %{_prefix}/lib/trashd/libtrashd_preload.so
 %config(noreplace) %{_sysconfdir}/trashd/config.toml
 %{_sysconfdir}/profile.d/trashd.sh
-%{_unitdir}/trashd-daemon.service
+%{_unitdir}/trashd.service
 %{_mandir}/man1/trash.1*
 %{_datadir}/bash-completion/completions/trash
 %{_datadir}/zsh/site-functions/_trash
 %{_datadir}/fish/vendor_completions.d/trash.fish
 
 %post
-%systemd_post trashd-daemon.service
+%systemd_post trashd.service
 
 %preun
-%systemd_preun trashd-daemon.service
+%systemd_preun trashd.service
 
 %postun
-%systemd_postun_with_restart trashd-daemon.service
+%systemd_postun_with_restart trashd.service
 
 %changelog
 * Thu Mar 20 2026 Faratech <dev@faratech.com> - 0.1.0-1

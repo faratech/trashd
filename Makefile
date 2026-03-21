@@ -31,11 +31,11 @@ install: build
 	install -Dm755 target/release/trash $(DESTDIR)$(BINDIR)/trash
 	install -Dm755 target/release/trashd-rm $(DESTDIR)$(LIBDIR)/bin/rm
 	install -Dm755 target/release/trashd-exec $(DESTDIR)$(BINDIR)/trashd-exec
-	install -Dm755 target/release/trashd-daemon $(DESTDIR)$(BINDIR)/trashd-daemon
+	install -Dm755 target/release/trashd $(DESTDIR)$(BINDIR)/trashd
 	install -Dm755 target/release/libtrashd_preload.so $(DESTDIR)$(LIBDIR)/libtrashd_preload.so
 	install -Dm644 config/trashd.toml $(DESTDIR)/etc/trashd/config.toml
 	install -Dm644 install/profile.d/trashd.sh $(DESTDIR)/etc/profile.d/trashd.sh
-	install -Dm644 install/systemd/trashd-daemon.service $(DESTDIR)/etc/systemd/system/trashd-daemon.service
+	install -Dm644 install/systemd/trashd.service $(DESTDIR)/etc/systemd/system/trashd.service
 	# Man page
 	install -Dm644 target/man/trash.1 $(DESTDIR)$(MANDIR)/trash.1
 	# Shell completions
@@ -46,10 +46,10 @@ install: build
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/trash
 	rm -f $(DESTDIR)$(BINDIR)/trashd-exec
-	rm -f $(DESTDIR)$(BINDIR)/trashd-daemon
+	rm -f $(DESTDIR)$(BINDIR)/trashd
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -f $(DESTDIR)/etc/profile.d/trashd.sh
-	rm -f $(DESTDIR)/etc/systemd/system/trashd-daemon.service
+	rm -f $(DESTDIR)/etc/systemd/system/trashd.service
 	rm -f $(DESTDIR)$(MANDIR)/trash.1
 	rm -f $(DESTDIR)$(COMPLETIONS_BASH)/trash
 	rm -f $(DESTDIR)$(COMPLETIONS_ZSH)/_trash

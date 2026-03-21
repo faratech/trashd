@@ -5,7 +5,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/trashd/trashd-daemon
+ExecStart=/usr/local/lib/trashd/trashd
 Restart=always
 RestartSec=5
 
@@ -26,7 +26,7 @@ MemoryMax=256M
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=trashd-daemon
+SyslogIdentifier=trashd
 
 [Install]
 WantedBy=default.target

@@ -42,7 +42,7 @@ Every layer is fail-safe: if trashing fails for any reason, the real delete exec
            ▼
 ┌──────────────────────────┐
 │  fanotify daemon         │  detects ALL deletions system-wide
-│  trashd-daemon           │  audit log (cannot intercept)
+│  trashd           │  audit log (cannot intercept)
 └──────────────────────────┘
 ```
 
@@ -70,7 +70,7 @@ Key safety mechanisms:
 - **Seccomp deference** — When `TRASHD_SECCOMP_ACTIVE=1` is set (by Layer 4), the preload skips interception entirely to avoid double-trashing.
 - **Config change detection** — Checks config file mtime every 60 seconds and logs when changes are detected. Full reload requires process restart (intentional — mutating global state in a preload `.so` is unsafe).
 
-### Layer 3 — fanotify daemon (`trashd-daemon`)
+### Layer 3 — fanotify daemon (`trashd`)
 
 A system service that monitors all real filesystems for `FAN_DELETE`, `FAN_DELETE_SELF`, and `FAN_MOVED_FROM` events using fanotify with `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (requires Linux 5.9+). Detection and audit only — it cannot intercept or prevent deletions.
 
@@ -130,7 +130,7 @@ Requires Rust (cargo). The install script:
 5. Creates the PATH shim at `/usr/local/lib/trashd/bin/rm` (+ `unlink` symlink)
 6. Adds `libtrashd_preload.so` to `/etc/ld.so.preload` (system-wide)
 7. Installs `/etc/profile.d/trashd.sh` (PATH shim + seccomp wrapper)
-8. Installs and starts the `trashd-daemon` systemd service
+8. Installs and starts the `trashd` systemd service
 9. Installs man pages to `/usr/local/share/man/man1/`
 10. Installs shell completions for bash, zsh, and fish
 11. Creates global config at `/etc/trashd/config.toml`
@@ -156,7 +156,7 @@ cp target/release/trash /usr/local/bin/
 cp target/release/trashd-rm /usr/local/lib/trashd/bin/rm
 cp target/release/libtrashd_preload.so /usr/local/lib/trashd/
 cp target/release/trashd-exec /usr/local/bin/
-cp target/release/trashd-daemon /usr/local/bin/
+cp target/release/trashd /usr/local/bin/
 ```
 
 ## Usage
@@ -574,14 +574,14 @@ trashd/
 │   ├── trashd-shim/         # `rm` drop-in replacement
 │   ├── trashd-preload/      # LD_PRELOAD .so (standalone, no SQLite)
 │   ├── trashd-seccomp/      # seccomp supervisor + watchdog + BPF filter
-│   └── trashd-daemon/       # fanotify filesystem monitor
+│   └── trashd/       # fanotify filesystem monitor
 ├── config/
 │   └── trashd.toml          # default config template
 ├── tests/
 │   └── integration.sh       # 12 end-to-end integration tests
 └── install/
     ├── profile.d/           # PATH shim + seccomp activation
-    └── systemd/             # trashd-daemon.service
+    └── systemd/             # trashd.service
 ```
 
 ### Binaries produced
@@ -592,7 +592,7 @@ trashd/
 | `trashd-rm` | trashd-shim | Drop-in `rm` replacement (installed as `rm` in shim PATH) |
 | `libtrashd_preload.so` | trashd-preload | LD_PRELOAD shared library (~870 KB, no SQLite) |
 | `trashd-exec` | trashd-seccomp | Seccomp supervisor wrapper (three-process architecture) |
-| `trashd-daemon` | trashd-daemon | fanotify filesystem monitor (systemd service) |
+| `trashd` | trashd | fanotify filesystem monitor (systemd service) |
 
 ## Testing
 

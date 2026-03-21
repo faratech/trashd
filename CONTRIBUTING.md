@@ -33,7 +33,7 @@ Tests use isolated temp directories (not `/tmp`, which is in the never-trash lis
 | `trashd-shim` | `trashd-rm` binary (drop-in `rm` replacement) |
 | `trashd-preload` | `libtrashd_preload.so` (LD_PRELOAD hooks) |
 | `trashd-seccomp` | `trashd-exec` binary (seccomp supervisor + watchdog) |
-| `trashd-daemon` | `trashd-daemon` binary (fanotify monitor) |
+| `trashd` | `trashd` binary (fanotify monitor) |
 
 `trashd-preload` is standalone (no `trashd-common` dependency) to keep the `.so` small and avoid SQLite. It duplicates some logic from `trashd-common` — if you change config parsing or trash directory selection, update both.
 

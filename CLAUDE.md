@@ -23,7 +23,7 @@ Four interception layers feed into a shared trash store, all active by default a
 ```
 Layer 1: PATH shim (trashd-shim)       — shadows rm via PATH ordering
 Layer 2: LD_PRELOAD (trashd-preload)   — hooks unlink/unlinkat/rmdir (system-wide via /etc/ld.so.preload)
-Layer 3: fanotify daemon (trashd-daemon) — detection/audit only (systemd service, Linux 5.9+)
+Layer 3: fanotify daemon (trashd) — detection/audit only (systemd service, Linux 5.9+)
 Layer 4: seccomp supervisor (trashd-seccomp) — traps syscalls at kernel boundary (interactive shells, Linux 5.5+)
 ```
 
@@ -35,7 +35,7 @@ Layer 4 (seccomp) is the primary layer for interactive shells. Layer 2 (LD_PRELO
 trashd-cli      → trashd-common + zstd (native compression)
 trashd-shim     → trashd-common
 trashd-seccomp  → trashd-common
-trashd-daemon   → trashd-common
+trashd   → trashd-common
 trashd-preload  → (standalone — no trashd-common to avoid pulling in SQLite)
 ```
 
@@ -70,7 +70,7 @@ Orchestrator forwards SIGINT/SIGTERM to child process.
 
 BPF filter (`filter.rs`): architecture-specific — x86_64 traps `SYS_unlink`/`SYS_unlinkat`/`SYS_rmdir`; aarch64 traps only `SYS_unlinkat`.
 
-### trashd-daemon — fanotify monitor
+### trashd — fanotify monitor
 
 Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Resolves parent via `open_by_handle_at()` against cached per-mount O_PATH fds. Detection/audit only.
 
@@ -95,7 +95,7 @@ Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Resolves parent via `
 | `trashd-rm` | trashd-shim | Drop-in `rm` replacement |
 | `libtrashd_preload.so` | trashd-preload | LD_PRELOAD shared library |
 | `trashd-exec` | trashd-seccomp | Seccomp supervisor wrapper |
-| `trashd-daemon` | trashd-daemon | fanotify filesystem monitor |
+| `trashd` | trashd | fanotify filesystem monitor |
 
 ## Bypass mechanisms
 

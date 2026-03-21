@@ -1,11 +1,11 @@
-//! trashd-daemon — system-wide deletion monitor using fanotify.
+//! trashd — system-wide deletion monitor using fanotify.
 //!
 //! Watches all real filesystems for FAN_DELETE events and logs them.
 //! Detection only — cannot intercept or prevent deletions.
 //!
 //! Requires CAP_SYS_ADMIN (or root) and Linux 5.9+.
 //!
-//! Usage: trashd-daemon [--foreground]
+//! Usage: trashd [--foreground]
 
 mod logger;
 
@@ -74,7 +74,7 @@ const META_SIZE: usize = std::mem::size_of::<FanotifyEventMetadata>();
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("Usage: trashd-daemon [--foreground]");
+        eprintln!("Usage: trashd [--foreground]");
         eprintln!();
         eprintln!("Monitor filesystem deletions using fanotify.");
         eprintln!("Requires CAP_SYS_ADMIN or root, and Linux 5.9+.");
@@ -85,7 +85,7 @@ fn main() {
     match run() {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("trashd-daemon: fatal: {e}");
+            eprintln!("trashd: fatal: {e}");
             std::process::exit(1);
         }
     }
@@ -102,12 +102,12 @@ fn run() -> io::Result<()> {
         Ok(fd) => fd,
         Err(e) => {
             if e.raw_os_error() == Some(libc::EINVAL) {
-                eprintln!("trashd-daemon: fanotify_init failed (kernel too old? need 5.9+)");
+                eprintln!("trashd: fanotify_init failed (kernel too old? need 5.9+)");
             }
             return Err(e);
         }
     };
-    eprintln!("trashd-daemon: fanotify initialized (fd {})", fan_fd);
+    eprintln!("trashd: fanotify initialized (fd {})", fan_fd);
 
     // Mark all real mount points
     let mount_list = mounts::list_mounts();
@@ -128,17 +128,14 @@ fn run() -> io::Result<()> {
         ) {
             Ok(()) => {
                 eprintln!(
-                    "trashd-daemon: watching {} ({})",
+                    "trashd: watching {} ({})",
                     mount.path.display(),
                     mount.fstype,
                 );
                 marked += 1;
             }
             Err(e) => {
-                eprintln!(
-                    "trashd-daemon: failed to mark {}: {e}",
-                    mount.path.display(),
-                );
+                eprintln!("trashd: failed to mark {}: {e}", mount.path.display(),);
             }
         }
     }
@@ -169,10 +166,7 @@ fn run() -> io::Result<()> {
         }
     }
 
-    eprintln!(
-        "trashd-daemon: monitoring {} filesystem(s) for deletions",
-        marked
-    );
+    eprintln!("trashd: monitoring {} filesystem(s) for deletions", marked);
 
     // Event loop
     let mut buf = vec![0u8; 8192];
@@ -204,13 +198,13 @@ fn run() -> io::Result<()> {
             let event = unsafe { &*(buf.as_ptr().add(offset) as *const FanotifyEventMetadata) };
 
             if event.vers != FANOTIFY_METADATA_VERSION {
-                eprintln!("trashd-daemon: unexpected fanotify version {}", event.vers);
+                eprintln!("trashd: unexpected fanotify version {}", event.vers);
                 break;
             }
 
             let event_len = event.event_len as usize;
             if event_len < META_SIZE {
-                eprintln!("trashd-daemon: corrupt event (event_len={})", event_len);
+                eprintln!("trashd: corrupt event (event_len={})", event_len);
                 break;
             }
 
@@ -230,7 +224,7 @@ fn run() -> io::Result<()> {
                 } else {
                     // Could not resolve path — log with what we have
                     eprintln!(
-                        "[trashd-daemon] DELETE pid={} proc={} path=(unresolved)",
+                        "[trashd] DELETE pid={} proc={} path=(unresolved)",
                         pid, proc_name,
                     );
                 }
