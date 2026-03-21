@@ -11,7 +11,23 @@ fn build_cli() -> Command {
         .subcommand(
             Command::new("ls")
                 .about("List items in the trash")
-                .arg(Arg::new("pattern").help("Filter by glob pattern")),
+                .arg(Arg::new("pattern").help("Filter by glob pattern"))
+                .arg(
+                    Arg::new("after")
+                        .long("after")
+                        .help("Only items deleted after this time"),
+                )
+                .arg(
+                    Arg::new("before")
+                        .long("before")
+                        .help("Only items deleted before this time"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Output as JSON"),
+                ),
         )
         .subcommand(
             Command::new("find")
@@ -43,6 +59,18 @@ fn build_cli() -> Command {
                     Arg::new("to")
                         .long("to")
                         .help("Restore to this path instead"),
+                )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Auto-rename if destination exists"),
+                )
+                .arg(
+                    Arg::new("all")
+                        .long("all")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Restore all matches"),
                 ),
         )
         .subcommand(Command::new("undo").about("Restore the most recently trashed item"))

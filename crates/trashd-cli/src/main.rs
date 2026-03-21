@@ -27,6 +27,15 @@ enum Commands {
     Ls {
         /// Filter by glob pattern (e.g. '*.py')
         pattern: Option<String>,
+        /// Only show items deleted after this time (e.g. '1h', '30m', '2d', '2026-03-20')
+        #[arg(long)]
+        after: Option<String>,
+        /// Only show items deleted before this time (e.g. '1h', '2d', '2026-03-20')
+        #[arg(long)]
+        before: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Search trash by original path
     Find {
@@ -45,6 +54,12 @@ enum Commands {
         /// Restore to this path instead of original location
         #[arg(long = "to")]
         to: Option<PathBuf>,
+        /// Auto-rename if destination exists (append .1, .2, etc.)
+        #[arg(long)]
+        force: bool,
+        /// Restore all matches (for glob patterns)
+        #[arg(long)]
+        all: bool,
     },
     /// Restore the most recently trashed item
     Undo,
@@ -115,10 +130,26 @@ fn main() {
     };
 
     match cli.command {
-        Commands::Ls { pattern } => cmd_ls(&store, pattern.as_deref()),
+        Commands::Ls {
+            pattern,
+            after,
+            before,
+            json,
+        } => cmd_ls(
+            &store,
+            pattern.as_deref(),
+            after.as_deref(),
+            before.as_deref(),
+            json,
+        ),
         Commands::Find { query } => cmd_find(&store, &query),
         Commands::Info { target } => cmd_info(&store, &target),
-        Commands::Restore { target, to } => cmd_restore(&store, &target, to.as_deref()),
+        Commands::Restore {
+            target,
+            to,
+            force,
+            all,
+        } => cmd_restore(&store, &target, to.as_deref(), force, all),
         Commands::Undo => cmd_undo(&store),
         Commands::Purge { target } => cmd_purge(&store, &target),
         Commands::Empty {
@@ -135,8 +166,14 @@ fn main() {
     }
 }
 
-fn cmd_ls(store: &TrashStore, pattern: Option<&str>) {
-    let entries = match store.list(pattern) {
+fn cmd_ls(
+    store: &TrashStore,
+    pattern: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
+    json: bool,
+) {
+    let mut entries = match store.list(pattern) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("{} {e}", "trash: error:".red().bold());
@@ -144,8 +181,28 @@ fn cmd_ls(store: &TrashStore, pattern: Option<&str>) {
         }
     };
 
+    // Apply time filters
+    let now = chrono::Local::now();
+    if let Some(after_str) = after {
+        let cutoff = parse_time_spec(after_str, &now);
+        entries.retain(|e| e.info.deletion_date >= cutoff);
+    }
+    if let Some(before_str) = before {
+        let cutoff = parse_time_spec(before_str, &now);
+        entries.retain(|e| e.info.deletion_date <= cutoff);
+    }
+
     if entries.is_empty() {
-        println!("{}", "Trash is empty.".dimmed());
+        if json {
+            println!("[]");
+        } else {
+            println!("{}", "Trash is empty.".dimmed());
+        }
+        return;
+    }
+
+    if json {
+        print_json_entries(&entries);
         return;
     }
 
@@ -314,12 +371,54 @@ fn cmd_info(store: &TrashStore, target: &str) {
     println!("  Stored at:     {}", entry.trashed_path.display());
 }
 
-fn cmd_restore(store: &TrashStore, target: &str, to: Option<&std::path::Path>) {
-    match store.restore(target, to) {
+fn cmd_restore(
+    store: &TrashStore,
+    target: &str,
+    to: Option<&std::path::Path>,
+    force: bool,
+    all: bool,
+) {
+    // --all: restore all matches for a glob pattern
+    if all {
+        let entries = match store.list(Some(target)) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{} {e}", "trash: error:".red().bold());
+                std::process::exit(1);
+            }
+        };
+        if entries.is_empty() {
+            eprintln!("{} no matches for '{target}'", "trash: error:".red().bold());
+            std::process::exit(1);
+        }
+        let mut restored = 0;
+        let mut failed = 0;
+        for entry in &entries {
+            match restore_entry(store, &entry.id, to, force) {
+                Ok(path) => {
+                    println!("{} {}", "Restored:".green().bold(), path.display());
+                    restored += 1;
+                }
+                Err(e) => {
+                    eprintln!("{} {}: {e}", "trash: error:".red().bold(), entry.id);
+                    failed += 1;
+                }
+            }
+        }
+        if restored > 0 || failed > 0 {
+            println!("\n{} restored, {} failed", restored, failed,);
+        }
+        if failed > 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match restore_entry(store, target, to, force) {
         Ok(path) => println!("{} {}", "Restored:".green().bold(), path.display()),
         Err(trashd_common::store::TrashError::AmbiguousMatch { pattern, count }) => {
             eprintln!(
-                "{} '{}' matches {} items. Use the exact trash ID to restore:",
+                "{} '{}' matches {} items. Use the exact trash ID, or --all to restore all:",
                 "trash: ambiguous:".yellow().bold(),
                 pattern,
                 count,
@@ -340,7 +439,8 @@ fn cmd_restore(store: &TrashStore, target: &str, to: Option<&std::path::Path>) {
                     );
                 }
                 if !entries.is_empty() {
-                    eprintln!("\nExample: {} {}", "trash restore".bold(), entries[0].id);
+                    eprintln!("\n  {} {}", "trash restore".bold(), entries[0].id,);
+                    eprintln!("  {} {} --all", "trash restore".bold(), target,);
                 }
             }
             std::process::exit(1);
@@ -349,6 +449,30 @@ fn cmd_restore(store: &TrashStore, target: &str, to: Option<&std::path::Path>) {
             eprintln!("{} {e}", "trash: error:".red().bold());
             std::process::exit(1);
         }
+    }
+}
+
+/// Restore a single entry, handling --force conflict resolution.
+fn restore_entry(
+    store: &TrashStore,
+    target: &str,
+    to: Option<&std::path::Path>,
+    force: bool,
+) -> Result<PathBuf, trashd_common::store::TrashError> {
+    match store.restore(target, to) {
+        Ok(path) => Ok(path),
+        Err(trashd_common::store::TrashError::RestoreConflict(path)) if force => {
+            // Auto-rename: try .1, .2, .3, ...
+            let stem = path.to_string_lossy().to_string();
+            for i in 1..1000 {
+                let renamed = PathBuf::from(format!("{stem}.{i}"));
+                if std::fs::symlink_metadata(&renamed).is_err() {
+                    return store.restore(target, Some(&renamed));
+                }
+            }
+            Err(trashd_common::store::TrashError::RestoreConflict(path))
+        }
+        other => other,
     }
 }
 
@@ -826,6 +950,74 @@ fn parse_duration_days(s: &str) -> Option<u32> {
     } else {
         s.parse().ok()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Time parsing and JSON output
+// ---------------------------------------------------------------------------
+
+/// Parse a time specification into a DateTime.
+/// Supports relative durations (e.g., "1h", "30m", "2d", "1w") and
+/// absolute dates (e.g., "2026-03-20", "2026-03-20T14:00").
+fn parse_time_spec(
+    s: &str,
+    now: &chrono::DateTime<chrono::Local>,
+) -> chrono::DateTime<chrono::Local> {
+    let s = s.trim();
+
+    // Relative: "30m", "1h", "2d", "1w"
+    if let Some(mins) = s.strip_suffix('m').and_then(|v| v.parse::<i64>().ok()) {
+        return *now - chrono::Duration::minutes(mins);
+    }
+    if let Some(hours) = s.strip_suffix('h').and_then(|v| v.parse::<i64>().ok()) {
+        return *now - chrono::Duration::hours(hours);
+    }
+    if let Some(days) = s.strip_suffix('d').and_then(|v| v.parse::<i64>().ok()) {
+        return *now - chrono::Duration::days(days);
+    }
+    if let Some(weeks) = s.strip_suffix('w').and_then(|v| v.parse::<i64>().ok()) {
+        return *now - chrono::Duration::weeks(weeks);
+    }
+
+    // Absolute: "2026-03-20T14:00:00" or "2026-03-20"
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        if let Some(local) = dt.and_local_timezone(chrono::Local).single() {
+            return local;
+        }
+    }
+    if let Ok(dt) =
+        chrono::NaiveDateTime::parse_from_str(&format!("{s}T00:00:00"), "%Y-%m-%dT%H:%M:%S")
+    {
+        if let Some(local) = dt.and_local_timezone(chrono::Local).single() {
+            return local;
+        }
+    }
+
+    eprintln!(
+        "{} invalid time spec '{s}' — use e.g. '1h', '2d', '1w', or '2026-03-20'",
+        "trash: error:".red().bold(),
+    );
+    std::process::exit(1);
+}
+
+fn print_json_entries(entries: &[trashd_common::store::TrashEntry]) {
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "original_path": e.info.original_path.to_string_lossy(),
+                "deletion_date": e.info.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                "size": e.info.size,
+                "command": e.info.command,
+                "trash_dir": e.trash_root.to_string_lossy(),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into())
+    );
 }
 
 // ---------------------------------------------------------------------------
