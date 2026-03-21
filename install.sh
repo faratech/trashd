@@ -247,7 +247,7 @@ if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         /etc/systemd/system/trashd-daemon.service
     systemctl daemon-reload
     systemctl enable trashd-daemon 2>/dev/null || true
-    systemctl start trashd-daemon 2>/dev/null || true
+    systemctl restart trashd-daemon 2>/dev/null || true
     if systemctl is-active --quiet trashd-daemon 2>/dev/null; then
         echo "    trashd-daemon is running (monitoring deletions)"
     else
