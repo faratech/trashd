@@ -642,6 +642,7 @@ impl TrashStore {
         let now = chrono::Local::now();
         // Track which entries were purged by index (newest-first order)
         let mut purged = vec![false; entries.len()];
+        let mut purge_count = 0u64;
 
         // Phase 1: purge items older than max_age_days
         // entries are newest-first, so iterate in reverse (oldest first)
@@ -652,6 +653,7 @@ impl TrashStore {
             }
             let _ = self.purge_entry(&entries[i]);
             purged[i] = true;
+            purge_count += 1;
         }
 
         // Phase 2a: auto-compress old uncompressed items before purging by size.
@@ -709,6 +711,7 @@ impl TrashStore {
                     .unwrap_or(entries[i].info.size.unwrap_or(0));
                 let _ = self.purge_entry(&entries[i]);
                 purged[i] = true;
+                purge_count += 1;
             }
         }
 
@@ -729,10 +732,23 @@ impl TrashStore {
                         }
                         let _ = self.purge_entry(&entries[i]);
                         purged[i] = true;
+                        purge_count += 1;
                         purged_count += 1;
                     }
                 }
             }
+        }
+
+        // Log and notify if items were auto-purged
+        if purge_count > 0 {
+            crate::oplog::log_empty(purge_count, Some("auto-purge"));
+            crate::oplog::notify_desktop(
+                "trashd: auto-purge",
+                &format!(
+                    "{purge_count} item{} permanently deleted by retention policy",
+                    if purge_count == 1 { "" } else { "s" }
+                ),
+            );
         }
 
         Ok(())
@@ -1067,7 +1083,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
-fn simple_glob_match(pattern: &str, text: &str) -> bool {
+pub fn simple_glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }

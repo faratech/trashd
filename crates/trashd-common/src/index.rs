@@ -68,4 +68,18 @@ impl TrashIndex {
             .execute("DELETE FROM trash_entries WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    /// Drop all entries and rebuild from the provided list.
+    pub fn rebuild(
+        &self,
+        entries: &[(String, TrashInfo, std::path::PathBuf)],
+    ) -> Result<usize, rusqlite::Error> {
+        self.conn.execute("DELETE FROM trash_entries", [])?;
+        let mut count = 0;
+        for (id, info, trash_dir) in entries {
+            self.insert(id, info, trash_dir)?;
+            count += 1;
+        }
+        Ok(count)
+    }
 }

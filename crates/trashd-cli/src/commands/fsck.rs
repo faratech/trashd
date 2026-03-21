@@ -83,4 +83,45 @@ pub fn run(_store: &TrashStore, fix: bool) {
             println!("Run {} to fix.", "trash fsck --fix".bold());
         }
     }
+
+    // Rebuild SQLite index from .trashinfo files
+    if fix {
+        print!("\nRebuilding index... ");
+        match rebuild_index(&home_trash) {
+            Ok(count) => println!("{} ({count} entries)", "done".green()),
+            Err(e) => println!("{} {e}", "failed".red()),
+        }
+    }
+}
+
+/// Scan all .trashinfo files and rebuild the SQLite index from scratch.
+fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::error::Error>> {
+    let info_dir = trash_dir.join("info");
+    let index_path = trash_dir.join(".trashd/index.db");
+
+    // Ensure parent dir exists
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let index = trashd_common::index::TrashIndex::open(&index_path)?;
+
+    let mut entries = Vec::new();
+    if let Ok(dir_entries) = std::fs::read_dir(&info_dir) {
+        for entry in dir_entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".trashinfo") {
+                continue;
+            }
+            let id = name.strip_suffix(".trashinfo").unwrap_or(&name).to_string();
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                if let Some(info) = trashd_common::trashinfo::TrashInfo::from_trashinfo(&content) {
+                    entries.push((id, info, trash_dir.to_path_buf()));
+                }
+            }
+        }
+    }
+
+    let count = index.rebuild(&entries)?;
+    Ok(count)
 }

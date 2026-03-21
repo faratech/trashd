@@ -30,6 +30,22 @@ pub fn run(store: &TrashStore, target: &str) {
         "  Deleted:       {}",
         entry.info.deletion_date.format("%Y-%m-%d %H:%M:%S")
     );
+
+    // File type from the trashed copy
+    let file_type = match std::fs::symlink_metadata(&entry.trashed_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                "symlink"
+            } else if meta.is_dir() {
+                "directory"
+            } else {
+                "file"
+            }
+        }
+        Err(_) => "missing",
+    };
+    println!("  Type:          {file_type}");
+
     if let Some(ref cmd) = entry.info.command {
         println!("  Command:       {cmd}");
     }
