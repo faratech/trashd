@@ -207,6 +207,10 @@ fn install_signal_forwarder(child_pid: libc::pid_t) {
     CHILD_PID.store(child_pid, Ordering::Relaxed);
     unsafe {
         libc::signal(
+            libc::SIGHUP,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
             libc::SIGINT,
             forward_signal as *const () as libc::sighandler_t,
         );
