@@ -29,11 +29,13 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
             echo "    Removed ${BIN_DIR}/${bin}"
         fi
     done
-    # Daemon lives in LIB_DIR, not BIN_DIR
-    if [ -f "${LIB_DIR}/trashd" ]; then
-        rm -f "${LIB_DIR}/trashd"
-        echo "    Removed ${LIB_DIR}/trashd"
-    fi
+    # Daemon lives in LIB_DIR (current) or BIN_DIR (old versions)
+    for loc in "${LIB_DIR}/trashd" "${LIB_DIR}/trashd-daemon" "${BIN_DIR}/trashd-daemon"; do
+        if [ -f "$loc" ]; then
+            rm -f "$loc"
+            echo "    Removed $loc"
+        fi
+    done
 
     # Remove shim directory (rm shim, unlink symlink)
     if [ -d "${SHIM_DIR}" ]; then
@@ -80,14 +82,16 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
         echo "    Removed /etc/profile.d/trashd.sh"
     fi
 
-    # Remove systemd service if installed
-    if [ -f /etc/systemd/system/trashd.service ]; then
-        systemctl stop trashd 2>/dev/null || true
-        systemctl disable trashd 2>/dev/null || true
-        rm -f /etc/systemd/system/trashd.service
-        systemctl daemon-reload 2>/dev/null || true
-        echo "    Removed trashd.service"
-    fi
+    # Remove systemd service (check both old and new names)
+    for svc in trashd trashd-daemon; do
+        if [ -f "/etc/systemd/system/${svc}.service" ]; then
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}.service"
+            echo "    Removed ${svc}.service"
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
 
     # Remove global config
     if [ -f /etc/trashd/config.toml ]; then
@@ -255,8 +259,8 @@ if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         rm -f /etc/systemd/system/trashd-daemon.service
         echo "    Migrated from trashd-daemon.service -> trashd.service"
     fi
-    # Remove old daemon binary name
-    rm -f "${LIB_DIR}/trashd-daemon" 2>/dev/null
+    # Remove old daemon binary name (was in BIN_DIR or LIB_DIR depending on version)
+    rm -f "${LIB_DIR}/trashd-daemon" "${BIN_DIR}/trashd-daemon" 2>/dev/null
     install -Dm644 "$(dirname "$0")/install/systemd/trashd.service" \
         /etc/systemd/system/trashd.service
     systemctl daemon-reload
