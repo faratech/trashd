@@ -203,9 +203,10 @@ pub fn run(check_only: bool) {
 
     println!("\n{}", "Running installer...".bold());
     let status = std::process::Command::new("sudo")
+        .arg("env")
+        .arg("TRASH_BYPASS=1")
         .arg("bash")
         .arg(&install_script)
-        .env("TRASH_BYPASS", "1")
         .current_dir(&install_dir)
         .status();
 
