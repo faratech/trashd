@@ -164,19 +164,6 @@ else
 fi
 
 echo "==> Installing binaries..."
-# Kill stale trashd-exec processes from previous install — they hold the old
-# binary in memory. Skip our own ancestor chain to avoid killing the current shell.
-MY_PID=$$
-STALE_PIDS=$(pgrep -x trashd-exec 2>/dev/null || true)
-if [ -n "${STALE_PIDS}" ]; then
-    for pid in ${STALE_PIDS}; do
-        # Don't kill ancestors of this installer process
-        if ! grep -q "PPid:.*${pid}" /proc/${MY_PID}/status 2>/dev/null && \
-           [ "${pid}" != "${PPID}" ]; then
-            kill "${pid}" 2>/dev/null && echo "    Stopped stale trashd-exec (pid ${pid})" || true
-        fi
-    done
-fi
 install -Dm755 "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
 install -Dm755 "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
 install -Dm755 "${TARGET_DIR}/trashd-daemon" "${LIB_DIR}/trashd-daemon"
