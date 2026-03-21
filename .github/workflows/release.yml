@@ -101,7 +101,7 @@ jobs:
           cp config/trashd.toml "${STAGING}/config/"
           cp install.sh "${STAGING}/"
           chmod +x "${STAGING}/install.sh"
-          cp -r install/ "${STAGING}/install/"
+          cp -r install/* "${STAGING}/install/"
 
           # Man pages and completions
           if [ -d target/man ]; then
