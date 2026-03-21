@@ -70,6 +70,8 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          TRASHD_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Run tests
         if: matrix.arch == 'x86_64'

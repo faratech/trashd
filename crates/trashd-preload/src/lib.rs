@@ -529,7 +529,11 @@ fn try_trash(path: &Path) -> bool {
             .parent()
             .and_then(|p| {
                 let name = p.file_name()?.to_string_lossy();
-                if name == ".Trash" { p.parent() } else { Some(p) }
+                if name == ".Trash" {
+                    p.parent()
+                } else {
+                    Some(p)
+                }
             })
             .unwrap_or(&trash_dir);
         abs_path

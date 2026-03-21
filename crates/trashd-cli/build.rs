@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 fn build_cli() -> Command {
     Command::new("trash")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(option_env!("TRASHD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))
         .about("trashd — Linux recycle bin for the CLI")
         .subcommand(
             Command::new("ls")
@@ -124,6 +124,16 @@ fn build_cli() -> Command {
                         .long("fix")
                         .action(clap::ArgAction::SetTrue)
                         .help("Fix problems (default: report only)"),
+                ),
+        )
+        .subcommand(
+            Command::new("self-update")
+                .about("Update trashd to the latest release from GitHub")
+                .arg(
+                    Arg::new("check")
+                        .long("check")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Check for updates without installing"),
                 ),
         )
 }
