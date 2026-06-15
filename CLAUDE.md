@@ -10,7 +10,7 @@ cargo build -p trashd-cli           # single crate
 TRASH_BYPASS=1 cargo test           # run all tests (bypass preload to avoid interference)
 cargo test -p trashd-common --lib   # run just the 32 unit tests
 sudo ./install.sh                   # build + install all layers + man pages + completions
-sudo ./install.sh --uninstall       # remove everything (preserves trash contents)
+sudo ./install.sh --uninstall       # remove all components (preserves trash; add --purge to delete trash too)
 sudo ./tests/integration.sh         # 12 end-to-end integration tests (requires install)
 ```
 

@@ -28,6 +28,14 @@ struct Rm {
     #[arg(short = 'I')]
     interactive_once: bool,
 
+    /// Long form of -i / -I. WHEN is never, once, or always (default: always).
+    /// Without this, `rm --interactive` failed to parse and fell through to a
+    /// PERMANENT delete instead of trashing. require_equals matches GNU's
+    /// optional-argument convention and stops a following filename being eaten
+    /// as the WHEN value.
+    #[arg(long = "interactive", num_args = 0..=1, default_missing_value = "always", require_equals = true, value_name = "WHEN")]
+    interactive: Option<String>,
+
     /// Remove empty directories
     #[arg(short = 'd', long = "dir")]
     dir: bool,
@@ -36,9 +44,27 @@ struct Rm {
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
+    /// Accepted for GNU rm compatibility (don't cross filesystem boundaries on
+    /// recursive delete). Accepting it means we still TRASH rather than fall
+    /// through to a permanent delete.
+    #[arg(long = "one-file-system")]
+    one_file_system: bool,
+
+    /// Accepted for GNU rm compatibility. Optional value `all` is allowed.
+    #[arg(long = "preserve-root", num_args = 0..=1, require_equals = true, value_name = "all")]
+    preserve_root: Option<String>,
+
+    /// Accepted for GNU rm compatibility.
+    #[arg(long = "no-preserve-root")]
+    no_preserve_root: bool,
+
     /// TRASHD: bypass trash and permanently delete
     #[arg(long = "permanent", alias = "no-trash")]
     permanent: bool,
+
+    /// Print version and exit
+    #[arg(long = "version")]
+    version: bool,
 
     /// Show help
     #[arg(long = "help")]
@@ -69,6 +95,34 @@ fn main() -> ExitCode {
         println!("Use `trash undo` to restore the last deletion");
         println!("Use `trash ls` to see trashed files\n");
         return passthrough_with_args(&["--help"]);
+    }
+
+    if args.version {
+        println!("trashd rm shim {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
+    // Accepted for GNU rm compatibility — parsed only so these invocations
+    // trash rather than fall through to a permanent delete.
+    let _ = (
+        &args.one_file_system,
+        &args.preserve_root,
+        &args.no_preserve_root,
+    );
+
+    // Fold --interactive[=WHEN] into the -i / -I behavior. A bare --interactive
+    // maps to "always" via default_missing_value.
+    let mut interactive_always = args.interactive_always;
+    let mut interactive_once = args.interactive_once;
+    match args.interactive.as_deref() {
+        Some("always") => interactive_always = true,
+        Some("once") => interactive_once = true,
+        Some("never") | None => {}
+        Some(other) => {
+            eprintln!("rm: invalid argument '{other}' for '--interactive'");
+            eprintln!("Valid arguments are: 'never', 'once', 'always'");
+            return ExitCode::FAILURE;
+        }
     }
 
     // If --permanent, pass through to real rm (stripping our custom flags)
@@ -103,7 +157,7 @@ fn main() -> ExitCode {
     }
 
     // Handle -I: prompt once if more than 3 files
-    if args.interactive_once && !args.force && args.files.len() > 3 {
+    if interactive_once && !args.force && args.files.len() > 3 {
         let msg = format!("rm: remove {} arguments? [y/N] ", args.files.len());
         if !prompt_user(&msg) {
             return ExitCode::SUCCESS;
@@ -172,7 +226,7 @@ fn main() -> ExitCode {
         }
 
         // Handle -i: prompt before each removal
-        if args.interactive_always && !args.force {
+        if interactive_always && !args.force {
             let kind = if meta.file_type().is_symlink() {
                 "symbolic link"
             } else if is_dir {
@@ -315,5 +369,39 @@ fn real_rm_inner(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Standard GNU rm options that previously failed to parse — which made the
+    // shim fall through to a PERMANENT delete instead of trashing.
+    #[test]
+    fn parses_gnu_compat_options() {
+        for argv in [
+            &["rm", "--interactive", "f"][..],
+            &["rm", "--interactive=once", "f"][..],
+            &["rm", "--interactive=never", "f"][..],
+            &["rm", "--one-file-system", "f"][..],
+            &["rm", "--preserve-root", "f"][..],
+            &["rm", "--preserve-root=all", "f"][..],
+            &["rm", "--no-preserve-root", "f"][..],
+            &["rm", "--version"][..],
+        ] {
+            assert!(
+                Rm::try_parse_from(argv).is_ok(),
+                "should parse (not bypass to permanent delete): {argv:?}"
+            );
+        }
+    }
+
+    // A bare --interactive must default to "always" and NOT swallow the file.
+    #[test]
+    fn bare_interactive_defaults_to_always_and_keeps_file() {
+        let a = Rm::try_parse_from(["rm", "--interactive", "f"]).unwrap();
+        assert_eq!(a.interactive.as_deref(), Some("always"));
+        assert_eq!(a.files, vec![PathBuf::from("f")]);
     }
 }

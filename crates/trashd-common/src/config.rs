@@ -38,10 +38,14 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RetentionConfig {
+    /// Auto-purge items older than this many days. `0` disables the age limit
+    /// (items are kept until trimmed by size or purged manually).
     #[serde(default = "default_max_age")]
     pub max_age_days: u32,
+    /// Trim the trash once it exceeds this many GB. `0` disables the size limit.
     #[serde(default = "default_max_size")]
     pub max_size_gb: f64,
+    /// Purge the oldest items once disk usage reaches this percent. `0` disables.
     #[serde(default = "default_disk_pressure")]
     pub disk_pressure_percent: u8,
 }

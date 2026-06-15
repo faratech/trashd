@@ -14,132 +14,143 @@ BIN_DIR="${PREFIX}/bin"
 # -----------------------------------------------------------------------
 # Uninstall
 # -----------------------------------------------------------------------
-if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
+if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "--purge" ]; then
     echo "==> Uninstalling trashd..."
 
-    # Restore real rm if we stashed it
-    if [ -f "${REAL_DIR}/rm" ]; then
-        echo "    Stashed real rm found at ${REAL_DIR}/rm (leaving in place)"
-    fi
-
-    # Remove binaries
-    for bin in trash trashd-exec; do
-        if [ -f "${BIN_DIR}/${bin}" ]; then
-            rm -f "${BIN_DIR}/${bin}"
-            echo "    Removed ${BIN_DIR}/${bin}"
-        fi
-    done
-    # Daemon lives in LIB_DIR (current) or BIN_DIR (old versions)
-    for loc in "${LIB_DIR}/trashd" "${LIB_DIR}/trashd-daemon" "${BIN_DIR}/trashd-daemon"; do
-        if [ -f "$loc" ]; then
-            rm -f "$loc"
-            echo "    Removed $loc"
-        fi
+    # By default we remove all trashd software but PRESERVE trash contents
+    # (the whole point of the tool is to not lose data). Pass --purge to also
+    # delete every trash directory.
+    PURGE=0
+    for arg in "$@"; do
+        [ "$arg" = "--purge" ] && PURGE=1
     done
 
-    # Remove shim directory (rm shim, unlink symlink)
-    if [ -d "${SHIM_DIR}" ]; then
-        rm -rf "${SHIM_DIR}"
-        echo "    Removed ${SHIM_DIR}"
-    fi
+    # CRITICAL: the trashd `rm` shim shadows the real `rm` in PATH, and step 4
+    # below deletes it. After that, any PATH/hash lookup of `rm` resolves to the
+    # now-deleted shim and every later `rm` fails with "No such file or
+    # directory". Two defenses (TRASH_BYPASS=1, set at top, also stops the shim
+    # from trashing what we delete):
+    #   (a) resolve an absolute real `rm` once and use "$RM" for every removal;
+    #   (b) scrub the shim dir from PATH (duplicate-safe) and clear the hash.
+    RM=rm
+    for _cand in /usr/bin/rm /bin/rm /usr/local/bin/rm; do
+        if [ -x "$_cand" ] && [ "$_cand" != "${SHIM_DIR}/rm" ]; then
+            RM="$_cand"
+            break
+        fi
+    done
+    # Rebuild PATH without SHIM_DIR. A simple ":${SHIM_DIR}:" -> ":" substitution
+    # mishandles ADJACENT duplicates (they share a colon), so split and filter.
+    set -f
+    _new_path=""
+    _old_ifs="$IFS"
+    IFS=':'
+    for _d in $PATH; do
+        [ -z "$_d" ] && continue
+        [ "$_d" = "${SHIM_DIR}" ] && continue
+        _new_path="${_new_path:+$_new_path:}$_d"
+    done
+    IFS="$_old_ifs"
+    set +f
+    PATH="$_new_path"
+    export PATH
+    hash -r 2>/dev/null || true
 
-    # Remove from /etc/ld.so.preload FIRST (before deleting the .so,
-    # otherwise every process gets an error about missing preload library)
+    # 1. Remove the LD_PRELOAD entry FIRST — before deleting the .so — otherwise
+    #    every dynamically-linked process errors about the missing library.
     if [ -f /etc/ld.so.preload ]; then
         if grep -q "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
             sed -i '\|libtrashd_preload.so|d' /etc/ld.so.preload
             echo "    Removed from /etc/ld.so.preload"
         fi
+        # Drop the file entirely if nothing else is left in it.
+        [ -s /etc/ld.so.preload ] || "$RM" -f /etc/ld.so.preload
     fi
 
-    # Now safe to remove the library itself
-    if [ -f "${LIB_DIR}/libtrashd_preload.so" ]; then
-        rm -f "${LIB_DIR}/libtrashd_preload.so"
-        echo "    Removed ${LIB_DIR}/libtrashd_preload.so"
-    fi
-
-    # Remove stashed real rm and lib dir if empty
-    rm -f "${REAL_DIR}/rm" 2>/dev/null
-    rmdir "${REAL_DIR}" 2>/dev/null || true
-    rmdir "${LIB_DIR}" 2>/dev/null || true
-
-    # Remove man pages
-    for f in trash trash-ls trash-find trash-info trash-restore trash-undo \
-             trash-purge trash-empty trash-status trash-log trash-fsck; do
-        rm -f "${PREFIX}/share/man/man1/${f}.1" 2>/dev/null
-    done
-    echo "    Removed man pages"
-
-    # Remove shell completions
-    rm -f /etc/bash_completion.d/trash 2>/dev/null
-    rm -f "${PREFIX}/share/zsh/site-functions/_trash" 2>/dev/null
-    rm -f /usr/share/fish/vendor_completions.d/trash.fish 2>/dev/null
-    echo "    Removed shell completions"
-
-    # Remove PATH hook
-    if [ -f /etc/profile.d/trashd.sh ]; then
-        rm -f /etc/profile.d/trashd.sh
-        echo "    Removed /etc/profile.d/trashd.sh"
-    fi
-
-    # Remove systemd service (check both old and new names)
-    for svc in trashd trashd-daemon; do
-        if [ -f "/etc/systemd/system/${svc}.service" ]; then
-            systemctl stop "$svc" 2>/dev/null || true
-            systemctl disable "$svc" 2>/dev/null || true
-            rm -f "/etc/systemd/system/${svc}.service"
-            echo "    Removed ${svc}.service"
-        fi
-    done
-    systemctl daemon-reload 2>/dev/null || true
-
-    # Remove global config
-    if [ -f /etc/trashd/config.toml ]; then
-        rm -f /etc/trashd/config.toml
-        rmdir /etc/trashd 2>/dev/null || true
-        echo "    Removed /etc/trashd/config.toml"
-    fi
-
-    # Remove per-user configs for all users
-    for home_dir in /home/* /root; do
-        config_dir="${home_dir}/.config/trashd"
-        if [ -d "${config_dir}" ]; then
-            rm -rf "${config_dir}"
-            echo "    Removed ${config_dir}"
-        fi
-    done
-
-    # Remove ALL FreeDesktop.org Trash spec v1.0 trash directories
-    echo "==> Removing all trash directories..."
-
-    # Home trash for all users
-    for home_dir in /home/* /root; do
-        trash_dir="${home_dir}/.local/share/Trash"
-        if [ -d "${trash_dir}" ]; then
-            rm -rf "${trash_dir}"
-            echo "    Removed ${trash_dir}"
-        fi
-    done
-
-    # Per-mountpoint trash directories (.Trash-$UID and .Trash/$UID)
-    # Scan all mount points for trash dirs
-    while IFS= read -r mpoint; do
-        # .Trash-* (per-user topdir trash)
-        for d in "${mpoint}"/.Trash-*; do
-            if [ -d "$d" ]; then
-                rm -rf "$d"
-                echo "    Removed $d"
+    # 2. Stop the fanotify daemon: the systemd unit (old + new names) AND any
+    #    lingering process (covers manual / non-systemd starts).
+    if command -v systemctl >/dev/null 2>&1; then
+        for svc in trashd trashd-daemon; do
+            if [ -f "/etc/systemd/system/${svc}.service" ]; then
+                systemctl stop "$svc" 2>/dev/null || true
+                systemctl disable "$svc" 2>/dev/null || true
+                "$RM" -f "/etc/systemd/system/${svc}.service"
+                echo "    Removed ${svc}.service"
             fi
         done
-        # .Trash/ (shared topdir trash)
-        if [ -d "${mpoint}/.Trash" ]; then
-            rm -rf "${mpoint}/.Trash"
-            echo "    Removed ${mpoint}/.Trash"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    if pkill -x trashd 2>/dev/null; then
+        echo "    Stopped running trashd daemon"
+    fi
+
+    # 3. Remove CLI binaries (current + legacy locations/names).
+    "$RM" -f "${BIN_DIR}/trash" "${BIN_DIR}/trashd-exec" "${BIN_DIR}/trashd-daemon"
+    echo "    Removed binaries from ${BIN_DIR}"
+
+    # 4. Remove the entire trashd lib tree in one shot: the rm shim (bin/), the
+    #    stashed real rm (real/), the preload .so, and the daemon binary.
+    if [ -d "${LIB_DIR}" ]; then
+        "$RM" -rf "${LIB_DIR}"
+        echo "    Removed ${LIB_DIR}"
+    fi
+
+    # 5. Remove ALL trashd man pages: trash.1 plus every trash-<subcommand>.1
+    #    (globbed, so new subcommands are covered without editing this list).
+    MAN_DIR="${PREFIX}/share/man/man1"
+    "$RM" -f "${MAN_DIR}/trash.1" "${MAN_DIR}"/trash-*.1
+    echo "    Removed man pages"
+
+    # 6. Remove shell completions (bash, zsh, fish).
+    "$RM" -f /etc/bash_completion.d/trash \
+          "${PREFIX}/share/zsh/site-functions/_trash" \
+          /usr/share/fish/vendor_completions.d/trash.fish
+    echo "    Removed shell completions"
+
+    # 7. Remove the PATH + seccomp hook.
+    "$RM" -f /etc/profile.d/trashd.sh
+    echo "    Removed /etc/profile.d/trashd.sh"
+
+    # 8. Remove global config.
+    if [ -d /etc/trashd ]; then
+        "$RM" -rf /etc/trashd
+        echo "    Removed /etc/trashd"
+    fi
+
+    # 9. Remove per-user configs for all users (and root).
+    for home_dir in /home/* /root; do
+        if [ -d "${home_dir}/.config/trashd" ]; then
+            "$RM" -rf "${home_dir}/.config/trashd"
+            echo "    Removed ${home_dir}/.config/trashd"
         fi
-    done < <(awk '{print $2}' /proc/mounts 2>/dev/null | sort -u)
+    done
+
+    # 10. Optionally remove every FreeDesktop.org Trash spec v1.0 trash
+    #     directory (home + per-mountpoint). This DESTROYS trashed files, so it
+    #     only runs with --purge.
+    if [ "${PURGE}" -eq 1 ]; then
+        echo "==> Removing all trash directories (--purge)..."
+        for home_dir in /home/* /root; do
+            if [ -d "${home_dir}/.local/share/Trash" ]; then
+                "$RM" -rf "${home_dir}/.local/share/Trash"
+                echo "    Removed ${home_dir}/.local/share/Trash"
+            fi
+        done
+        while IFS= read -r mpoint; do
+            for d in "${mpoint}"/.Trash-*; do
+                [ -d "$d" ] && { "$RM" -rf "$d"; echo "    Removed $d"; }
+            done
+            [ -d "${mpoint}/.Trash" ] && { "$RM" -rf "${mpoint}/.Trash"; echo "    Removed ${mpoint}/.Trash"; }
+        done < <(awk '{print $2}' /proc/mounts 2>/dev/null | sort -u)
+    fi
 
     echo ""
-    echo "==> trashd fully uninstalled. All trash directories removed."
+    if [ "${PURGE}" -eq 1 ]; then
+        echo "==> trashd fully uninstalled. All trash directories removed."
+    else
+        echo "==> trashd uninstalled. Trash contents were preserved."
+        echo "    Re-run with --purge to also delete all trash directories."
+    fi
     echo "    Start a new shell to clear PATH changes."
     exit 0
 fi

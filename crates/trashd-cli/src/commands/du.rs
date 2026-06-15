@@ -13,7 +13,7 @@ pub fn run(store: &TrashStore, top: usize) {
         return;
     }
 
-    entries.sort_by(|a, b| b.info.size.unwrap_or(0).cmp(&a.info.size.unwrap_or(0)));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.info.size.unwrap_or(0)));
 
     println!(
         "{:>10} {:<30} {}",

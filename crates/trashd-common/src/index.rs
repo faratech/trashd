@@ -2,6 +2,10 @@ use crate::trashinfo::TrashInfo;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// Index location relative to a trash directory. Shared so every caller
+/// (store, fsck rebuild) targets the SAME file and cannot drift.
+pub const REL_PATH: &str = ".trashd/index.sqlite";
+
 /// SQLite index for fast trash lookups.
 pub struct TrashIndex {
     conn: Connection,
@@ -10,6 +14,12 @@ pub struct TrashIndex {
 impl TrashIndex {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        // A transient lock must never demote a protection layer to real `rm`:
+        // wait for the lock instead of returning SQLITE_BUSY immediately.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // WAL allows a reader and a writer to coexist; ignore if the
+        // filesystem (e.g. some network mounts) refuses it.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS trash_entries (
                 id TEXT PRIMARY KEY,
@@ -69,17 +79,68 @@ impl TrashIndex {
         Ok(())
     }
 
+    /// Number of rows currently in the index (test/diagnostic helper).
+    #[cfg(test)]
+    pub fn count(&self) -> Result<i64, rusqlite::Error> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM trash_entries", [], |r| r.get(0))
+    }
+
     /// Drop all entries and rebuild from the provided list.
     pub fn rebuild(
         &self,
         entries: &[(String, TrashInfo, std::path::PathBuf)],
     ) -> Result<usize, rusqlite::Error> {
+        // Wrap the whole rebuild in ONE transaction. Otherwise every insert
+        // autocommits (and fsyncs) on its own, so recovering an index for a
+        // large trash is O(entries) disk syncs instead of one. The transaction
+        // rolls back automatically if any step fails (tx dropped without commit).
+        let tx = self.conn.unchecked_transaction()?;
         self.conn.execute("DELETE FROM trash_entries", [])?;
         let mut count = 0;
         for (id, info, trash_dir) in entries {
             self.insert(id, info, trash_dir)?;
             count += 1;
         }
+        tx.commit()?;
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trashinfo::TrashInfo;
+    use std::path::PathBuf;
+
+    // rebuild() must commit every row in one transaction and be idempotent.
+    #[test]
+    fn rebuild_commits_all_rows() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("idx-test")
+            .join(format!("{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = TrashIndex::open(&dir.join("index.sqlite")).unwrap();
+
+        let entries: Vec<(String, TrashInfo, PathBuf)> = (0..50)
+            .map(|i| {
+                (
+                    format!("id{i}"),
+                    TrashInfo::new(PathBuf::from(format!("/home/u/file{i}"))),
+                    PathBuf::from("/home/u/.local/share/Trash"),
+                )
+            })
+            .collect();
+
+        assert_eq!(idx.rebuild(&entries).unwrap(), 50);
+        assert_eq!(idx.count().unwrap(), 50, "all rows must be committed");
+
+        // Re-running replaces the contents (DELETE + reinsert) atomically.
+        assert_eq!(idx.rebuild(&entries[..10]).unwrap(), 10);
+        assert_eq!(idx.count().unwrap(), 10);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -181,6 +181,11 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
 
     let result = wait_for_child(child_pid);
 
+    // The child has been reaped — its PID may now be recycled by the kernel for
+    // an unrelated process. Disable the forwarder BEFORE doing anything else so
+    // a late SIGINT/SIGTERM can't deliver `kill()` to a recycled PID.
+    CHILD_PID.store(0, Ordering::Relaxed);
+
     // Child is done — clean up supervisor and watchdog
     unsafe {
         libc::kill(supervisor_pid, libc::SIGTERM);

@@ -149,40 +149,76 @@ pub fn run(check_only: bool) {
         return;
     }
 
-    // Download to temp dir
-    let tmp_dir = std::env::temp_dir().join(format!("trashd-update-{latest}"));
-    if tmp_dir.exists() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-    std::fs::create_dir_all(&tmp_dir).unwrap_or_else(|e| fatal(format!("create temp dir: {e}")));
+    // The checksum is REQUIRED — we run install.sh as root below, so refuse to
+    // proceed with an unverifiable artifact rather than silently skipping.
+    let sha_asset = match sha_asset {
+        Some(a) => a,
+        None => fatal(format!(
+            "release is missing checksum asset {sha_name}; refusing to install unverified"
+        )),
+    };
+
+    // Download to a PRIVATE temp dir. install.sh is executed from here under
+    // sudo, so a co-located local user must not be able to pre-create/symlink
+    // the path or read its contents. Rather than remove_dir_all-then-create a
+    // GUESSABLE path (which invites a squatting race), create a fresh dir with
+    // an unpredictable name, exclusively and at 0700 atomically (mkdir applies
+    // the mode at creation and fails if the path already exists).
+    use std::os::unix::fs::DirBuilderExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let tmp_base = std::env::temp_dir();
+    let tmp_dir = {
+        let mut chosen = None;
+        for attempt in 0..128u32 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let candidate = tmp_base.join(format!(
+                "trashd-update-{latest}-{}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => fatal(format!("create temp dir: {e}")),
+            }
+        }
+        chosen.unwrap_or_else(|| fatal("could not create a private temp directory"))
+    };
 
     let tarball_path = tmp_dir.join(&tarball_name);
 
-    // Download tarball
+    // Download tarball (size-capped to the advertised size + slack)
     eprint!("Downloading {}... ", tarball_name);
-    if let Err(e) = download_file(&tarball_asset.browser_download_url, &tarball_path) {
+    if let Err(e) = download_file(
+        &tarball_asset.browser_download_url,
+        &tarball_path,
+        tarball_asset.size + (1 << 20),
+    ) {
         eprintln!("{}", "failed".red());
         let _ = std::fs::remove_dir_all(&tmp_dir);
         fatal(e);
     }
     eprintln!("{}", "done".green());
 
-    // Verify checksum if available
-    if let Some(sha_asset) = sha_asset {
-        eprint!("Verifying checksum... ");
-        let sha_path = tmp_dir.join(&sha_name);
-        if let Err(e) = download_file(&sha_asset.browser_download_url, &sha_path) {
-            eprintln!("{}", "failed".red());
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            fatal(format!("download checksum: {e}"));
-        }
-        if let Err(e) = verify_sha256(&tarball_path, &sha_path) {
-            eprintln!("{}", "FAILED".red().bold());
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            fatal(e);
-        }
-        eprintln!("{}", "ok".green());
+    // Verify checksum (mandatory)
+    eprint!("Verifying checksum... ");
+    let sha_path = tmp_dir.join(&sha_name);
+    if let Err(e) = download_file(&sha_asset.browser_download_url, &sha_path, 1 << 20) {
+        eprintln!("{}", "failed".red());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        fatal(format!("download checksum: {e}"));
     }
+    if let Err(e) = verify_sha256(&tarball_path, &sha_path) {
+        eprintln!("{}", "FAILED".red().bold());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        fatal(e);
+    }
+    eprintln!("{}", "ok".green());
 
     // Extract tarball
     eprint!("Extracting... ");
@@ -268,16 +304,31 @@ fn fetch_latest_release() -> Result<GhRelease, String> {
     Ok(release)
 }
 
-fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+fn download_file(url: &str, dest: &std::path::Path, max_bytes: u64) -> Result<(), String> {
+    // Only ever fetch over TLS — never silently downgrade to a plaintext URL
+    // returned in the release JSON.
+    if !url.starts_with("https://") {
+        return Err(format!("refusing non-HTTPS download URL: {url}"));
+    }
+
     let resp = http_agent()
         .get(url)
         .header("User-Agent", "trashd-self-update")
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
 
-    let mut reader = resp.into_body().into_reader();
+    use std::io::Read;
+    // Bound the body so a malicious/oversized response can't fill the temp
+    // filesystem. ureq's reader is unbounded by default.
+    let mut reader = resp.into_body().into_reader().take(max_bytes);
     let mut file = std::fs::File::create(dest).map_err(|e| format!("create file: {e}"))?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| format!("write file: {e}"))?;
+    let written = std::io::copy(&mut reader, &mut file).map_err(|e| format!("write file: {e}"))?;
+    if written >= max_bytes {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!(
+            "download exceeded the expected size ({max_bytes} bytes)"
+        ));
+    }
     Ok(())
 }
 

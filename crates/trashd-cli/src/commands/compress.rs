@@ -58,6 +58,14 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
 
         match compress_file_zstd(&entry.trashed_path) {
             Ok(size_after) => {
+                // Record that trashd compressed this entry so restore
+                // decompresses by marker, never by guessing magic bytes
+                // (which would corrupt a user's genuine .zst file).
+                if size_after < size_before {
+                    let mut info = entry.info.clone();
+                    info.compressed = Some("zstd".into());
+                    let _ = trashd_common::store::write_trashinfo_atomic(&entry.info_path, &info);
+                }
                 saved += size_before.saturating_sub(size_after);
                 compressed += 1;
             }

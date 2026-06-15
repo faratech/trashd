@@ -101,16 +101,27 @@ pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
 
 /// Compute directory size recursively (bytes, like `du -B1`).
 fn dir_size_bytes(path: &Path) -> u64 {
+    dir_size_bytes_inner(path, 0)
+}
+
+/// Depth cap mirrors `copy_tree`'s, so a pathological deep tree can't exhaust
+/// the stack (returns a partial total once the cap is hit).
+const DIR_SIZE_MAX_DEPTH: u32 = 100;
+
+fn dir_size_bytes_inner(path: &Path, depth: u32) -> u64 {
+    if depth > DIR_SIZE_MAX_DEPTH {
+        return 0;
+    }
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_dir() {
-                    total += dir_size_bytes(&entry.path());
+                    total = total.saturating_add(dir_size_bytes_inner(&entry.path(), depth + 1));
                 } else {
                     // Count blocks * 512 for actual disk usage (like du)
                     // Only for files — directory content is counted by the recursive call
-                    total += meta.blocks() * 512;
+                    total = total.saturating_add(meta.blocks().saturating_mul(512));
                 }
             }
         }
@@ -122,26 +133,13 @@ fn dir_size_bytes(path: &Path) -> u64 {
 /// Spec: no `/` allowed (even as %2F). Encode control chars, `%`, and newlines.
 fn encode_name(name: &str) -> String {
     let mut encoded = String::with_capacity(name.len());
+    // Keep only the unreserved set safe. The directorysizes line is a
+    // space-separated triple `size SP mtime SP name`, so a space (or other
+    // separator) in the name MUST be percent-encoded or strict third-party
+    // parsers split the field wrong. decode_name round-trips %20 back to space.
     for byte in name.as_bytes() {
         match *byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~'
-            | b' '
-            | b'('
-            | b')'
-            | b'!'
-            | b'@'
-            | b'+'
-            | b','
-            | b';'
-            | b'='
-            | b'&'
-            | b'\'' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(*byte as char);
             }
             _ => {

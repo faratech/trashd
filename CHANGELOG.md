@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.1 (2026-06-15)
+
+Bug-fix release from a full security/correctness audit. Hardens the data-loss
+and cross-layer-consistency paths; no breaking changes.
+
+### Fixed — data loss
+
+- `fsck --fix` no longer deletes a recoverable data file when its `.trashinfo`
+  is corrupt; the data is quarantined and reported instead.
+- `TrashStore::open` no longer fails (forcing real `rm`) on transient SQLite
+  lock contention — the index sets a busy timeout and is now optional.
+- Restore decompresses in-trash, atomically, and reports failure instead of
+  silently leaving a corrupted file with the trash copy already gone.
+- Trashing no longer overwrites a pre-existing orphaned `files/<id>`.
+- Auto-purge compresses via temp-file + atomic rename (no truncation on crash)
+  and skips oversized files instead of reading them fully into memory.
+- Compression is now recorded with an `X-Trashd-Compressed` marker; restore
+  decompresses only marked entries, so a user's genuine `.zst` is left intact.
+- Cross-device directory moves recreate FIFOs instead of dropping them.
+
+### Fixed — security
+
+- Restore validates destinations from untrusted `.trashinfo` (rejects `..` and
+  topdir escapes; no-clobber rename) — blocks path-traversal overwrite.
+- `self-update` requires the checksum (fails closed if absent), enforces HTTPS,
+  caps the download size, and extracts/runs from a private `0700` temp dir.
+- Topdir trash directories (`.Trash-$uid` / `.Trash/$uid`) are created `0700`.
+
+### Fixed — cross-layer consistency
+
+- The seccomp supervisor honors `bypass_processes` and no longer trashes a
+  whole directory tree when it cannot confirm the directory is empty.
+- The LD_PRELOAD layer honors `only_trash` and per-directory `.trashd.toml`,
+  fixes `is_inside_trash` over-matching (which could permanently delete user
+  files), checks the unlink result on cross-device symlink moves, preserves the
+  caller's `errno`, and logs when a `dirfd` cannot be resolved.
+
+### Fixed — spec / other
+
+- `max_dir_size_mb` is enforced for directories with more than 10,000 files.
+- `directorysizes` is refreshed on purge/restore/auto-purge and percent-encodes
+  spaces; `fsck --fix` rebuilds the correct index file.
+
 ## 0.1.0 (2026-03-20)
 
 Initial release.

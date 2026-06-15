@@ -143,10 +143,13 @@ source /etc/profile.d/trashd.sh
 ### Uninstall
 
 ```bash
-sudo ./install.sh --uninstall
+sudo ./install.sh --uninstall          # remove trashd; KEEP trashed files
+sudo ./install.sh --uninstall --purge  # also delete every trash directory
 ```
 
-Removes all binaries, libraries, config, man pages, shell completions, the systemd service, the `/etc/ld.so.preload` entry (removed *before* deleting the `.so` to prevent error messages), and **all FreeDesktop.org trash directories** across all users and all mount points — including `~/.local/share/Trash/` for every user in `/home/` and `/root`, plus `$mountpoint/.Trash-$UID/` and `$mountpoint/.Trash/` on every mounted filesystem.
+Removes all binaries, libraries, config, man pages, shell completions, the systemd service (and any running daemon process), the PATH/seccomp hook, and the `/etc/ld.so.preload` entry (removed *before* deleting the `.so` to prevent error messages). Trash **contents are preserved by default** — your deleted files stay recoverable.
+
+Pass `--purge` to also remove **all FreeDesktop.org trash directories** across all users and all mount points: `~/.local/share/Trash/` for every user in `/home/` and `/root`, plus `$mountpoint/.Trash-$UID/` and `$mountpoint/.Trash/` on every mounted filesystem. This permanently destroys trashed files.
 
 ### Manual install
 

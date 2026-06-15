@@ -187,6 +187,17 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     // the config's skip/bypass lists instead. TRASH_BYPASS is checked in
     // the shim and preload layers.)
 
+    // Honor bypass_processes: if the deleting process (or an ancestor) is in
+    // the bypass list (git, cargo, apt, …), let the real delete happen — same
+    // as the shim/preload layers do. Without this, builds/package managers
+    // running under seccomp would flood the trash with artifacts they expect to
+    // be permanently removed. The target thread is frozen in the syscall, so
+    // its /proc tree is stable to walk.
+    if process_bypassed(notif.pid, &config.bypass_processes) {
+        respond_continue(fd, notif.id);
+        return;
+    }
+
     // Check never-trash list
     if config.should_skip(&path) {
         respond_continue(fd, notif.id);
@@ -218,10 +229,25 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
             let _ = respond_errno(fd, notif.id, libc::ENOTDIR);
             return;
         }
-        // Only trash empty directories (matching rmdir semantics)
-        if let Ok(mut entries) = std::fs::read_dir(&path) {
-            if entries.next().is_some() {
-                let _ = respond_errno(fd, notif.id, libc::ENOTEMPTY);
+        // Only trash EMPTY directories (matching rmdir semantics). We must be
+        // able to POSITIVELY confirm emptiness — if read_dir errors we cannot,
+        // so fall back to the real syscall instead of trashing. Otherwise a
+        // permission/IO error here would skip the check and recursively trash a
+        // non-empty tree via store.trash().
+        match std::fs::read_dir(&path) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    let _ = respond_errno(fd, notif.id, libc::ENOTEMPTY);
+                    return;
+                }
+            }
+            Err(_) => {
+                // Can't verify the directory is empty — let the real rmdir run
+                // (it returns ENOTEMPTY/EACCES correctly). NOTE: a tiny race
+                // remains between this check and store.trash's move where a
+                // sibling process could repopulate the dir; the result is still
+                // recoverable from the trash, so we accept it (residual L2).
+                respond_continue(fd, notif.id);
                 return;
             }
         }
@@ -248,6 +274,51 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
             respond_continue(fd, notif.id);
         }
     }
+}
+
+/// Walk the target's process tree from `pid` upward; return true if any
+/// process name is in the bypass list. Mirrors the preload layer's logic so a
+/// given process makes the same trash/skip decision regardless of which
+/// interception layer is active.
+fn process_bypassed(pid: u32, bypass: &[String]) -> bool {
+    if bypass.is_empty() {
+        return false;
+    }
+    let mut cur = pid;
+    for _ in 0..16 {
+        if let Some(name) = process_name(cur) {
+            if bypass.contains(&name) {
+                return true;
+            }
+        }
+        match parent_pid(cur) {
+            Some(p) if p > 1 && p != cur => cur = p,
+            _ => break,
+        }
+    }
+    false
+}
+
+/// Parse the parent PID (field 4) from /proc/{pid}/stat, accounting for a comm
+/// field that may itself contain spaces/parens.
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rfind(')')? + 2;
+    let fields: Vec<&str> = stat.get(after_comm..)?.split_whitespace().collect();
+    fields.get(1)?.parse().ok()
+}
+
+/// Best-effort process name from /proc/{pid}/exe (basename), falling back to
+/// /proc/{pid}/comm.
+fn process_name(pid: u32) -> Option<String> {
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        if let Some(name) = exe.file_name() {
+            return Some(name.to_string_lossy().into_owned());
+        }
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Passthrough mode: respond CONTINUE to every notification.

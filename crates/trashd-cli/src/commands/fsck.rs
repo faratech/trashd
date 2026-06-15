@@ -36,10 +36,18 @@ pub fn run(_store: &TrashStore, fix: bool) {
                 if trashd_common::trashinfo::TrashInfo::from_trashinfo(&content).is_none() {
                     corrupt_info += 1;
                     println!("  {} corrupt trashinfo: {}", "WARN".yellow(), id);
+                    // NEVER delete the data file just because its metadata is
+                    // unparseable — the file in files/<id> is intact and is
+                    // exactly what the trash bin exists to protect. Quarantine:
+                    // leave both the data and the (still-present) sidecar in
+                    // place so the data is never auto-orphaned, and tell the
+                    // user where to recover it by hand.
                     if fix {
-                        let _ = std::fs::remove_file(entry.path());
-                        let _ = std::fs::remove_file(&file_path);
-                        println!("    {}", "removed".green());
+                        println!(
+                            "    {} data preserved at {} (metadata unreadable; recover manually)",
+                            "kept".green(),
+                            file_path.display(),
+                        );
                     }
                 }
             }
@@ -97,7 +105,9 @@ pub fn run(_store: &TrashStore, fix: bool) {
 /// Scan all .trashinfo files and rebuild the SQLite index from scratch.
 fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::error::Error>> {
     let info_dir = trash_dir.join("info");
-    let index_path = trash_dir.join(".trashd/index.db");
+    // Must match the path the store actually reads/writes (store.rs uses the
+    // same shared constant), otherwise --fix rebuilds a throwaway file.
+    let index_path = trash_dir.join(trashd_common::index::REL_PATH);
 
     // Ensure parent dir exists
     if let Some(parent) = index_path.parent() {
@@ -124,4 +134,41 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
 
     let count = index.rebuild(&entries)?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // C1: `fsck --fix` must NEVER delete the data file just because its
+    // .trashinfo is unparseable — the file in files/<id> is intact and is
+    // exactly what the trash bin exists to protect.
+    #[test]
+    fn fix_preserves_data_on_corrupt_trashinfo() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/fsck-test")
+            .join(format!("d-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_DATA_HOME", &dir);
+
+        let store = TrashStore::open().unwrap();
+        let trash = TrashStore::trash_dir();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::create_dir_all(trash.join("files")).unwrap();
+        // Corrupt sidecar (not a valid [Trash Info] header) + intact data file.
+        fs::write(trash.join("info/keep.trashinfo"), "GARBAGE not a header\n").unwrap();
+        fs::write(trash.join("files/keep"), b"precious").unwrap();
+
+        run(&store, true); // fsck --fix
+
+        assert!(
+            trash.join("files/keep").exists(),
+            "data file must be preserved when its metadata is corrupt"
+        );
+        assert_eq!(fs::read(trash.join("files/keep")).unwrap(), b"precious");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

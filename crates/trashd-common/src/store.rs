@@ -30,6 +30,8 @@ pub enum TrashError {
     EntryNotFound(String),
     #[error("original path already exists: {0}")]
     RestoreConflict(PathBuf),
+    #[error("refusing to restore outside the original location (possible path traversal): {0}")]
+    RestoreTraversal(PathBuf),
     #[error("multiple matches for '{pattern}': {count} items (use trash ID for exact match)")]
     AmbiguousMatch { pattern: String, count: usize },
     #[error("hash mismatch for '{path}': expected {expected}, got {actual}")]
@@ -42,7 +44,10 @@ pub enum TrashError {
 
 pub struct TrashStore {
     config: Config,
-    index: TrashIndex,
+    /// Optional SQLite cache. It is NEVER the source of truth (list() scans
+    /// .trashinfo files), so a failure to open it must not stop trashing —
+    /// otherwise transient lock contention would demote callers to real `rm`.
+    index: Option<TrashIndex>,
 }
 
 /// A single entry in the trash.
@@ -70,7 +75,17 @@ impl TrashStore {
         fs::create_dir_all(home.join("info"))?;
         fs::create_dir_all(home.join(".trashd"))?;
 
-        let index = TrashIndex::open(&home.join(".trashd/index.sqlite"))?;
+        // The index is an optional accelerator. If it can't be opened (lock
+        // contention, corruption, read-only FS) we degrade to no-index rather
+        // than failing — a failed open here would otherwise make the seccomp
+        // supervisor and shim fall back to permanent deletion.
+        let index = match TrashIndex::open(&home.join(crate::index::REL_PATH)) {
+            Ok(idx) => Some(idx),
+            Err(e) => {
+                eprintln!("trashd: warning: trash index unavailable ({e}); continuing without it");
+                None
+            }
+        };
 
         Ok(Self { config, index })
     }
@@ -115,8 +130,19 @@ impl TrashStore {
 
     /// Ensure a trash directory has the required subdirectories.
     fn ensure_trash_dir(trash_dir: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(trash_dir.join("files"))?;
         fs::create_dir_all(trash_dir.join("info"))?;
+        // Topdir trashes (.Trash-$uid / .Trash/$uid) live on shared mounts; the
+        // spec requires them to be private (0700) so other local users cannot
+        // read a victim's deleted files or their original-path metadata. The
+        // home trash already sits inside $HOME, so it is left untouched.
+        if trash_dir != Self::home_trash_dir() {
+            let private = fs::Permissions::from_mode(0o700);
+            let _ = fs::set_permissions(trash_dir, private.clone());
+            let _ = fs::set_permissions(trash_dir.join("files"), private.clone());
+            let _ = fs::set_permissions(trash_dir.join("info"), private);
+        }
         Ok(())
     }
 
@@ -150,11 +176,14 @@ impl TrashStore {
             }
         }
 
-        // Check directory size limit
+        // Check directory size limit. If the directory has more files than the
+        // size walk will count, we cannot know the true size — treat that as
+        // over-limit (the user set this cap precisely to keep huge trees out of
+        // the trash) rather than trusting the partial under-count.
         if meta.is_dir() && self.config.max_dir_size_mb > 0 {
-            let dir_size_bytes = dir_size(&abs_path);
+            let (dir_size_bytes, capped) = dir_size_capped(&abs_path);
             let dir_size_mb = dir_size_bytes / (1024 * 1024);
-            if dir_size_mb > self.config.max_dir_size_mb {
+            if capped || dir_size_mb > self.config.max_dir_size_mb {
                 return Err(TrashError::TooLarge {
                     path: abs_path,
                     size_mb: dir_size_mb,
@@ -284,8 +313,10 @@ impl TrashStore {
             return Err(e);
         }
 
-        // Update index
-        let _ = self.index.insert(&id, &info, &trash_dir);
+        // Update index (best-effort; it's only a cache)
+        if let Some(idx) = self.index.as_ref() {
+            let _ = idx.insert(&id, &info, &trash_dir);
+        }
 
         // Update directorysizes cache if we just trashed a directory
         if meta.is_dir() {
@@ -311,7 +342,7 @@ impl TrashStore {
         }
 
         // Sort newest first
-        entries.sort_by(|a, b| b.info.deletion_date.cmp(&a.info.deletion_date));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.info.deletion_date));
         Ok(entries)
     }
 
@@ -429,6 +460,48 @@ impl TrashStore {
             .map(|t| t.to_path_buf())
             .unwrap_or_else(|| entry.info.original_path.clone());
 
+        // When restoring to the entry's OWN recorded original path (target is
+        // None), that path comes from the .trashinfo, which on removable/shared
+        // media an attacker may have crafted. Refuse destinations that escape
+        // via ".." and, for topdir trashes, require the destination to stay
+        // under that topdir. This blocks path-traversal that would let a
+        // malicious .trashinfo overwrite arbitrary files (~/.bashrc, cron, …)
+        // during an ordinary `restore`/`undo`. An explicit user-supplied
+        // target is trusted and not constrained.
+        if target.is_none() {
+            if restore_to
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                return Err(TrashError::RestoreTraversal(restore_to));
+            }
+            if entry.trash_root != Self::home_trash_dir() {
+                let topdir = Self::topdir_for_trash(&entry.trash_root);
+                if !restore_to.starts_with(&topdir) {
+                    return Err(TrashError::RestoreTraversal(restore_to));
+                }
+            }
+        }
+
+        // If trashd compressed this entry's data (recorded explicitly via the
+        // X-Trashd-Compressed marker — never inferred from magic bytes, which
+        // would corrupt a user's genuine .zst), decompress the in-trash copy
+        // BEFORE moving it out. Doing it here means a decode/write failure
+        // leaves the entry fully intact in the trash (nothing moved, metadata
+        // present) so it stays restorable, and the write is atomic so a
+        // crash/ENOSPC can never truncate the only copy.
+        if entry.info.compressed.as_deref() == Some("zstd") && entry.trashed_path.is_file() {
+            let data = fs::read(&entry.trashed_path)?;
+            let decompressed = zstd::decode_all(data.as_slice())
+                .map_err(|e| io::Error::other(format!("failed to decompress trashed file: {e}")))?;
+            atomic_write(&entry.trashed_path, &decompressed)?;
+            // The data is no longer compressed; clear the marker so a later
+            // failure (or re-restore) can never attempt a second decode.
+            let mut cleared = entry.info.clone();
+            cleared.compressed = None;
+            let _ = write_trashinfo_atomic(&entry.info_path, &cleared);
+        }
+
         // Check for conflicts (use symlink_metadata so dangling symlinks are detected)
         if fs::symlink_metadata(&restore_to).is_ok() {
             return Err(TrashError::RestoreConflict(restore_to));
@@ -439,8 +512,22 @@ impl TrashStore {
             fs::create_dir_all(parent)?;
         }
 
-        // Move back
-        if fs::rename(&entry.trashed_path, &restore_to).is_err() {
+        // Move back. Use a no-clobber rename so the check-then-rename window
+        // above cannot be raced into overwriting a file created in between.
+        // EEXIST → RestoreConflict; EXDEV / unsupported-flag → copy fallback.
+        let needs_copy = match rename_noreplace(&entry.trashed_path, &restore_to) {
+            Ok(()) => false,
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                return Err(TrashError::RestoreConflict(restore_to));
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) => {
+                // Kernel/filesystem without RENAME_NOREPLACE: fall back to a
+                // plain rename (the conflict check above guarded the dest).
+                fs::rename(&entry.trashed_path, &restore_to).is_err()
+            }
+            Err(_) => true, // cross-device or other rename failure
+        };
+        if needs_copy {
             let meta = fs::symlink_metadata(&entry.trashed_path)?;
             if meta.file_type().is_symlink() {
                 let target_link = fs::read_link(&entry.trashed_path)?;
@@ -457,28 +544,7 @@ impl TrashStore {
             }
         }
 
-        // Transparent decompression: if the file was auto-compressed (zstd),
-        // decompress it back to original content before the user sees it.
-        if restore_to.is_file() {
-            if let Ok(data) = fs::read(&restore_to) {
-                if data.len() >= 4 {
-                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    if magic == 0xFD2FB528 {
-                        match zstd::decode_all(data.as_slice()) {
-                            Ok(decompressed) => {
-                                let _ = fs::write(&restore_to, &decompressed);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "trashd: warning: failed to decompress {}: {e}",
-                                    restore_to.display(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // (Decompression already happened in-trash, before the move above.)
 
         // Verify hash against the (now decompressed) restored file content.
         // This catches corruption during storage (bit rot, bad disk, partial copy).
@@ -508,7 +574,14 @@ impl TrashStore {
         let _ = fs::remove_file(&entry.info_path);
 
         // Update index
-        let _ = self.index.delete(&entry.id);
+        if let Some(idx) = self.index.as_ref() {
+            let _ = idx.delete(&entry.id);
+        }
+
+        // Keep the directorysizes cache consistent (spec: an entry MUST be
+        // removed once its directory leaves the trash) for other FreeDesktop
+        // trash tools that read it.
+        let _ = crate::directorysizes::write_cache(&entry.trash_root);
 
         // Log operation
         crate::oplog::log_restore(&entry.id, &restore_to);
@@ -554,7 +627,11 @@ impl TrashStore {
             }
         }
         let _ = fs::remove_file(&entry.info_path);
-        let _ = self.index.delete(&entry.id);
+        if let Some(idx) = self.index.as_ref() {
+            let _ = idx.delete(&entry.id);
+        }
+        // Refresh directorysizes so a purged directory's entry is dropped.
+        let _ = crate::directorysizes::write_cache(&entry.trash_root);
         crate::oplog::log_purge(&entry.id);
         Ok(())
     }
@@ -584,7 +661,9 @@ impl TrashStore {
                 Err(_) => {}
             }
             let _ = fs::remove_file(&entry.info_path);
-            let _ = self.index.delete(&entry.id);
+            if let Some(idx) = self.index.as_ref() {
+                let _ = idx.delete(&entry.id);
+            }
             count += 1;
         }
         if count > 0 {
@@ -644,19 +723,29 @@ impl TrashStore {
         let mut purged = vec![false; entries.len()];
         let mut purge_count = 0u64;
 
-        // Phase 1: purge items older than max_age_days
-        // entries are newest-first, so iterate in reverse (oldest first)
-        for i in (0..entries.len()).rev() {
-            let age = now.signed_duration_since(entries[i].info.deletion_date);
-            if age.num_days() < max_age as i64 {
-                continue; // don't break — multi-partition entries may not be perfectly sorted
+        // Phase 1: purge items older than max_age_days.
+        // max_age_days == 0 means "no age limit" (keep forever) — NOT "purge
+        // everything". Without this guard, `age.num_days() < 0` is false for
+        // every item and the whole trash would be wiped.
+        if max_age > 0 {
+            // entries are newest-first, so iterate in reverse (oldest first)
+            for i in (0..entries.len()).rev() {
+                let age = now.signed_duration_since(entries[i].info.deletion_date);
+                if age.num_days() < max_age as i64 {
+                    continue; // don't break — multi-partition entries may not be perfectly sorted
+                }
+                let _ = self.purge_entry(&entries[i]);
+                purged[i] = true;
+                purge_count += 1;
             }
-            let _ = self.purge_entry(&entries[i]);
-            purged[i] = true;
-            purge_count += 1;
         }
 
         // Phase 2a: auto-compress old uncompressed items before purging by size.
+        // Cap how much we slurp into RAM — this runs (throttled) on routine
+        // deletions, and reading a multi-hundred-MB trashed file fully into a
+        // Vec could OOM the process (and a killed supervisor degrades to
+        // passthrough). Skip anything above the cap.
+        const COMPRESS_MAX_BYTES: u64 = 64 * 1024 * 1024;
         for i in (0..entries.len()).rev() {
             if purged[i] || entries[i].orphaned {
                 continue;
@@ -665,23 +754,38 @@ impl TrashStore {
             if age.num_days() < 7 {
                 continue;
             }
-            let path = &entries[i].trashed_path;
-            if path.is_dir() || !path.exists() {
+            // Already recorded as compressed — don't touch it again.
+            if entries[i].info.compressed.is_some() {
                 continue;
             }
-            if let Ok(data) = fs::read(path) {
-                if data.len() >= 4 {
-                    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    if magic == 0xFD2FB528 {
-                        continue;
-                    }
-                }
-                if data.len() < 1024 {
-                    continue;
-                }
-                if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3) {
-                    if compressed.len() < data.len() {
-                        let _ = fs::write(path, &compressed);
+            let path = &entries[i].trashed_path;
+            let meta = match fs::symlink_metadata(path) {
+                Ok(m) if m.is_file() => m,
+                _ => continue, // missing, dir, or symlink
+            };
+            if meta.len() < 1024 || meta.len() > COMPRESS_MAX_BYTES {
+                continue;
+            }
+            let data = match fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            // Defensive: skip if it already looks compressed (marker missing).
+            if data.len() >= 4
+                && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == 0xFD2FB528
+            {
+                continue;
+            }
+            if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3) {
+                if compressed.len() < data.len() {
+                    // Atomic write: an interrupted compress must never truncate
+                    // the SOLE remaining copy of the user's deleted data.
+                    if atomic_write(path, &compressed).is_ok() {
+                        // Record that WE compressed it so restore decompresses
+                        // by marker, not by guessing magic bytes.
+                        let mut info = entries[i].info.clone();
+                        info.compressed = Some("zstd".into());
+                        let _ = write_trashinfo_atomic(&entries[i].info_path, &info);
                     }
                 }
             }
@@ -695,7 +799,8 @@ impl TrashStore {
             .filter(|(i, _)| !purged[*i])
             .map(|(_, e)| fs::metadata(&e.trashed_path).map(|m| m.len()).unwrap_or(0))
             .sum();
-        if total_size > max_size_bytes {
+        // max_size_gb == 0 means "no size limit", not "trim everything to 0".
+        if max_size_bytes > 0 && total_size > max_size_bytes {
             let mut freed = 0u64;
             let excess = total_size - max_size_bytes;
             for i in (0..entries.len()).rev() {
@@ -741,6 +846,11 @@ impl TrashStore {
 
         // Log and notify if items were auto-purged
         if purge_count > 0 {
+            // Rebuild directorysizes across all trash dirs so purged/compressed
+            // directories are reflected for other FreeDesktop trash tools.
+            for (dir, _) in self.all_trash_dirs() {
+                let _ = crate::directorysizes::write_cache(&dir);
+            }
             crate::oplog::log_empty(purge_count, Some("auto-purge"));
             crate::oplog::notify_desktop(
                 "trashd: auto-purge",
@@ -767,7 +877,9 @@ impl TrashStore {
             Err(_) => {} // already gone
         }
         let _ = fs::remove_file(&entry.info_path);
-        let _ = self.index.delete(&entry.id);
+        if let Some(idx) = self.index.as_ref() {
+            let _ = idx.delete(&entry.id);
+        }
         Ok(())
     }
 
@@ -803,7 +915,7 @@ impl TrashStore {
         }
 
         let mut result: Vec<PartitionStatus> = partitions.into_values().collect();
-        result.sort_by(|a, b| b.total_size.cmp(&a.total_size));
+        result.sort_by_key(|b| std::cmp::Reverse(b.total_size));
         Ok(result)
     }
 
@@ -899,10 +1011,16 @@ pub struct PartitionStatus {
 
 /// Atomically create a unique trashinfo file using O_CREAT|O_EXCL.
 /// Returns (id, info_file_path).
+///
+/// The id is unique against BOTH `info/` (atomically, via O_EXCL) AND `files/`:
+/// an orphaned data file (one in `files/` with no matching `.trashinfo`) is a
+/// recoverable state, so reusing its name would silently overwrite the user's
+/// data when the new file is renamed into `files/<id>`.
 fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBuf), TrashError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let info_dir = trash_dir.join("info");
+    let files_dir = trash_dir.join("files");
 
     // Truncate base_name if it would exceed filesystem filename limits.
     // ".trashinfo" = 10 chars, ".YYYYMMDDHHMMSS.NNNNN" = 21 chars max.
@@ -914,17 +1032,36 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
         base_name
     };
 
+    // Claim `candidate`: create info/<candidate>.trashinfo with O_EXCL AND
+    // verify files/<candidate> is free. Ok(Some) = claimed; Ok(None) = taken,
+    // try another; Err = fatal IO error.
+    let try_claim = |candidate: &str| -> Result<Option<PathBuf>, io::Error> {
+        let info_path = info_dir.join(format!("{candidate}.trashinfo"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&info_path)
+        {
+            Ok(_) => {
+                if files_dir.join(candidate).symlink_metadata().is_ok() {
+                    // The info name was free but an orphaned data file already
+                    // occupies files/<candidate>. Release the info we claimed
+                    // and try a different id rather than overwrite it.
+                    let _ = fs::remove_file(&info_path);
+                    Ok(None)
+                } else {
+                    Ok(Some(info_path))
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+
     // Try base name first
-    let info_path = info_dir.join(format!("{base_name}.trashinfo"));
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&info_path)
-    {
-        Ok(_) => return Ok((base_name.to_string(), info_path)),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(TrashError::Io(e)),
+    if let Some(info_path) = try_claim(base_name)? {
+        return Ok((base_name.to_string(), info_path));
     }
 
     // Append timestamp + counter
@@ -935,16 +1072,8 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
         } else {
             format!("{base_name}.{ts}.{i}")
         };
-        let info_path = info_dir.join(format!("{candidate}.trashinfo"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&info_path)
-        {
-            Ok(_) => return Ok((candidate, info_path)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(TrashError::Io(e)),
+        if let Some(info_path) = try_claim(&candidate)? {
+            return Ok((candidate, info_path));
         }
     }
 
@@ -963,7 +1092,8 @@ fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
         "sha256" => {
             let mut hasher = Sha256::new();
             hasher.update(&data);
-            Ok(format!("{:x}", hasher.finalize()))
+            let digest = hasher.finalize();
+            Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
         }
         _ => {
             // Default: xxhash (XXH3-128)
@@ -977,10 +1107,18 @@ fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
 const DIR_SIZE_MAX_FILES: u64 = 10_000;
 
 fn dir_size(path: &Path) -> u64 {
+    dir_size_capped(path).0
+}
+
+/// Like `dir_size`, but also reports whether the file-count cap was hit. When
+/// it was, the returned size is only a partial sum of the first
+/// `DIR_SIZE_MAX_FILES` entries — callers enforcing a size limit must treat a
+/// capped result as "unknown / over limit" rather than trusting the partial.
+fn dir_size_capped(path: &Path) -> (u64, bool) {
     let mut total = 0u64;
     let mut count = 0u64;
     dir_size_inner(path, &mut total, &mut count);
-    total
+    (total, count >= DIR_SIZE_MAX_FILES)
 }
 
 fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
@@ -1042,19 +1180,86 @@ fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
             std::os::unix::fs::symlink(&link_target, &dest_path)?;
         } else if entry_meta.is_dir() {
             copy_tree_inner(&entry.path(), &dest_path, depth + 1)?;
-        } else if entry_meta.file_type().is_fifo()
-            || entry_meta.file_type().is_char_device()
+        } else if entry_meta.file_type().is_fifo() {
+            // Recreate the named pipe so the directory round-trips on restore.
+            // (A FIFO carries no persistent data; fs::copy on one would block.)
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c) = std::ffi::CString::new(dest_path.as_os_str().as_bytes()) {
+                unsafe {
+                    libc::mkfifo(c.as_ptr(), (entry_meta.mode() & 0o7777) as libc::mode_t);
+                }
+            }
+        } else if entry_meta.file_type().is_char_device()
             || entry_meta.file_type().is_block_device()
             || entry_meta.file_type().is_socket()
         {
-            // Skip special files — fs::copy on FIFOs blocks indefinitely,
-            // and device nodes require mknod to recreate
+            // Device nodes need CAP_MKNOD to recreate and sockets are kernel
+            // rendezvous objects with no persistent data — skip them.
         } else {
             fs::copy(entry.path(), &dest_path)?;
             fs::set_permissions(&dest_path, entry_meta.permissions())?;
         }
     }
     Ok(())
+}
+
+/// Write `data` to `path` atomically: write to a temp file in the same
+/// directory, then rename over `path`. A crash / ENOSPC / kill mid-write can
+/// therefore never leave a truncated file in place (the rename is atomic, and
+/// on failure the original is untouched).
+fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("trashd");
+    let tmp = dir.join(format!(".{stem}.tmp.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp); // clear any leftover from a prior crash
+    if let Err(e) = fs::write(&tmp, data) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Atomically (over)write a `.trashinfo` file. Public so the CLI `compress`
+/// command can record the `X-Trashd-Compressed` marker without re-implementing
+/// the temp-file+rename dance.
+pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<()> {
+    atomic_write(info_path, info.to_trashinfo_string().as_bytes())
+}
+
+/// Rename `src` → `dst` but fail with `EEXIST` instead of clobbering an
+/// existing `dst` (`renameat2(RENAME_NOREPLACE)`), closing the
+/// check-then-rename TOCTOU on restore. Callers inspect the raw OS error
+/// (`EEXIST` → conflict, `EXDEV`/`ENOSYS`/`EINVAL` → copy/plain fallback).
+fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let csrc = std::ffi::CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let cdst = std::ffi::CString::new(dst.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            csrc.as_ptr(),
+            libc::AT_FDCWD,
+            cdst.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Normalize a path: canonicalize the parent (resolving symlinks in directory
@@ -1165,9 +1370,11 @@ pub fn is_parent_bypassed(bypass_list: &[String]) -> bool {
 fn parent_pid(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Format: pid (comm) state ppid ...
-    // Find the closing paren (comm can contain parens/spaces)
+    // Find the closing paren (comm can contain parens/spaces). Use .get()
+    // rather than slicing: a truncated stat (process died mid-read) can end at
+    // ')', making after_comm > len, and slicing would panic.
     let after_comm = stat.rfind(')')? + 2;
-    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    let fields: Vec<&str> = stat.get(after_comm..)?.split_whitespace().collect();
     // fields[0] = state, fields[1] = ppid
     fields.get(1)?.parse().ok()
 }
@@ -1286,7 +1493,7 @@ mod tests {
     #[test]
     fn restore_symlink_recreates_link() {
         let (store, _data, workdir, _lock) = test_store();
-        let target = create_file(workdir.path(), "target.txt", "data");
+        let _target = create_file(workdir.path(), "target.txt", "data");
         let link = workdir.path().join("mylink");
         std::os::unix::fs::symlink("target.txt", &link).unwrap();
 
@@ -1461,7 +1668,7 @@ mod tests {
         let (store, _data, workdir, _lock) = test_store();
         let file = create_file(workdir.path(), "meta.txt", "test data");
 
-        let id = store.trash(&file, Some("rm -f meta.txt")).unwrap();
+        let _id = store.trash(&file, Some("rm -f meta.txt")).unwrap();
         let entries = store.list(None).unwrap();
         let entry = &entries[0];
 
@@ -1659,6 +1866,11 @@ mod tests {
         let compressed = zstd::encode_all(data.as_slice(), 3).unwrap();
         assert!(compressed.len() < data.len(), "should compress");
         fs::write(trashed, &compressed).unwrap();
+        // Record the compression marker, exactly as the real compress/auto-purge
+        // paths do — restore decompresses by marker, never by magic bytes.
+        let mut info = entries[0].info.clone();
+        info.compressed = Some("zstd".into());
+        write_trashinfo_atomic(&entries[0].info_path, &info).unwrap();
 
         let compressed_size = fs::metadata(trashed).unwrap().len();
         assert!(compressed_size < original_size);
@@ -1670,5 +1882,124 @@ mod tests {
             restored_content, content,
             "content should match after decompress"
         );
+    }
+
+    // M3: a user's genuine .zst (zstd magic, but trashd never compressed it, so
+    // no X-Trashd-Compressed marker) must be restored byte-for-byte, NOT
+    // silently decompressed.
+    #[test]
+    fn restore_does_not_decompress_unmarked_zstd_file() {
+        let (store, _data, workdir, _lock) = test_store();
+        let original = zstd::encode_all(b"the user's real data".as_slice(), 3).unwrap();
+        let file = workdir.path().join("real.zst");
+        fs::write(&file, &original).unwrap();
+
+        let id = store.trash(&file, None).unwrap();
+        let restored = store.restore(&id, None).unwrap();
+
+        assert_eq!(
+            fs::read(&restored).unwrap(),
+            original,
+            "a genuine .zst (no compression marker) must not be decompressed"
+        );
+    }
+
+    // H1/H2: a crafted .trashinfo whose Path escapes via ".." must be refused
+    // by restore, and the trashed payload must stay put.
+    #[test]
+    fn restore_refuses_path_traversal() {
+        let (store, _data, _workdir, _lock) = test_store();
+        let trash = TrashStore::home_trash_dir();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::create_dir_all(trash.join("files")).unwrap();
+        // Relative Path is decoded literally (preserving "..") and reconstructed
+        // onto the trash topdir, so the resolved destination keeps ParentDir
+        // components.
+        fs::write(
+            trash.join("info/evil.trashinfo"),
+            "[Trash Info]\nPath=../../../../etc/evil\nDeletionDate=2026-01-01T00:00:00\n",
+        )
+        .unwrap();
+        fs::write(trash.join("files/evil"), b"payload").unwrap();
+
+        let err = store.restore("evil", None).unwrap_err();
+        assert!(
+            matches!(err, TrashError::RestoreTraversal(_)),
+            "expected RestoreTraversal, got {err:?}"
+        );
+        assert!(
+            trash.join("files/evil").exists(),
+            "payload must stay in the trash after a refused restore"
+        );
+    }
+
+    // M1: trashing a file must not overwrite a pre-existing orphaned data file
+    // (one in files/ with no .trashinfo) that happens to share its name.
+    #[test]
+    fn trashing_does_not_overwrite_orphan_file() {
+        let (store, _data, workdir, _lock) = test_store();
+        let trash = TrashStore::home_trash_dir();
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::write(trash.join("files/dup.txt"), b"orphan-data").unwrap();
+
+        let file = create_file(workdir.path(), "dup.txt", "new-data");
+        let id = store.trash(&file, None).unwrap();
+
+        assert_ne!(id, "dup.txt", "must not reuse the orphan's id");
+        assert_eq!(
+            fs::read(trash.join("files/dup.txt")).unwrap(),
+            b"orphan-data",
+            "orphan data must be preserved"
+        );
+        assert_eq!(
+            fs::read(trash.join("files").join(&id)).unwrap(),
+            b"new-data"
+        );
+    }
+
+    // Critical: retention values of 0 mean "disabled", NOT "purge everything".
+    // With the bug, max_age_days=0 made `age.num_days() < 0` false for every
+    // item (so all were purged) and max_size_gb=0 trimmed the trash to nothing.
+    #[test]
+    fn retention_zero_disables_limits_not_wipes_trash() {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-trash");
+        fs::create_dir_all(&base).unwrap();
+        let data_dir = TempDir::with_prefix_in("data0-", &base).unwrap();
+        let config_dir = TempDir::with_prefix_in("cfg0-", &base).unwrap();
+        let workdir = TempDir::with_prefix_in("work0-", &base).unwrap();
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+        std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // All retention limits zero, and auto-purge runs on every deletion.
+        let cfg = config_dir.path().join("trashd/config.toml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg,
+            "auto_purge_interval_secs = 0\n\
+             [retention]\n\
+             max_age_days = 0\n\
+             max_size_gb = 0\n\
+             disk_pressure_percent = 0\n",
+        )
+        .unwrap();
+
+        let store = TrashStore::open().unwrap();
+        assert_eq!(store.config().retention.max_age_days, 0);
+        assert_eq!(store.config().retention.max_size_gb, 0.0);
+
+        // Each trash() triggers maybe_auto_purge -> auto_purge (interval 0).
+        for i in 0..3 {
+            let f = create_file(workdir.path(), &format!("keep{i}.txt"), "data");
+            store.trash(&f, None).unwrap();
+        }
+
+        let entries = store.list(None).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        drop(guard);
+        assert_eq!(entries.len(), 3, "retention=0 must NOT purge the trash");
     }
 }

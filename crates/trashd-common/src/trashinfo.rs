@@ -15,6 +15,11 @@ pub struct TrashInfo {
     pub size: Option<u64>,
     /// trashd extension: SHA-256 of file contents (files only, not dirs)
     pub sha256: Option<String>,
+    /// trashd extension: compression algorithm trashd applied to the stored
+    /// data ("zstd"), or None if uncompressed. Restore decompresses ONLY when
+    /// this is set — never by sniffing magic bytes, which would corrupt a
+    /// user's genuine compressed file.
+    pub compressed: Option<String>,
 }
 
 impl TrashInfo {
@@ -26,6 +31,7 @@ impl TrashInfo {
             pid: None,
             size: None,
             sha256: None,
+            compressed: None,
         }
     }
 
@@ -50,6 +56,9 @@ impl TrashInfo {
             // X-Trashd-SHA256 is still read for backward compatibility.
             s.push_str(&format!("X-Trashd-Hash={hash}\n"));
         }
+        if let Some(ref algo) = self.compressed {
+            s.push_str(&format!("X-Trashd-Compressed={algo}\n"));
+        }
 
         s
     }
@@ -73,6 +82,7 @@ impl TrashInfo {
         let mut pid = None;
         let mut size = None;
         let mut sha256 = None;
+        let mut compressed = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -108,6 +118,7 @@ impl TrashInfo {
                     "X-Trashd-PID" => pid = value.trim().parse().ok(),
                     "X-Trashd-Size" => size = value.trim().parse().ok(),
                     "X-Trashd-Hash" | "X-Trashd-SHA256" => sha256 = Some(value.trim().to_string()),
+                    "X-Trashd-Compressed" => compressed = Some(value.trim().to_string()),
                     _ => {}
                 }
             }
@@ -120,6 +131,7 @@ impl TrashInfo {
             pid,
             size,
             sha256,
+            compressed,
         })
     }
 }
@@ -197,6 +209,7 @@ mod tests {
             pid: Some(1234),
             size: Some(4096),
             sha256: Some("abcdef1234567890".into()),
+            compressed: None,
         };
 
         let serialized = info.to_trashinfo_string();

@@ -21,7 +21,8 @@ pub fn parse_duration_days(s: &str) -> Option<u32> {
     if let Some(d) = s.strip_suffix('d') {
         d.trim().parse().ok()
     } else if let Some(w) = s.strip_suffix('w') {
-        w.trim().parse::<u32>().ok().map(|w| w * 7)
+        // checked_mul so an absurd week count can't silently wrap in release.
+        w.trim().parse::<u32>().ok().and_then(|w| w.checked_mul(7))
     } else {
         s.parse().ok()
     }

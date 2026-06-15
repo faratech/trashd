@@ -32,6 +32,11 @@ use std::sync::OnceLock;
 #[derive(Debug)]
 struct PreloadConfig {
     never_trash: Vec<String>,
+    /// Whitelist mode: if non-empty, ONLY matching paths are trashed; every
+    /// other path is real-deleted (never_trash still wins). Mirrors
+    /// trashd-common so the preload makes the same decision as the other
+    /// layers for a given config.
+    only_trash: Vec<String>,
     bypass_processes: Vec<String>,
 }
 
@@ -39,7 +44,18 @@ struct PreloadConfig {
 #[derive(Debug, Deserialize, Default)]
 struct PartialPreloadConfig {
     never_trash: Option<Vec<String>>,
+    only_trash: Option<Vec<String>>,
     bypass_processes: Option<Vec<String>>,
+}
+
+/// Per-directory `.trashd.toml` overrides (mirrors trashd-common's LocalConfig)
+/// so the preload makes the same decision as the CLI/seccomp layers.
+#[derive(Debug, Deserialize, Default)]
+struct LocalConfig {
+    #[serde(default)]
+    never_trash: Vec<String>,
+    #[serde(default)]
+    only_trash: Vec<String>,
 }
 
 impl Default for PreloadConfig {
@@ -69,6 +85,7 @@ impl Default for PreloadConfig {
                 "target/release/*".into(),
                 "*/.git/*".into(),
             ],
+            only_trash: Vec::new(),
             bypass_processes: vec![
                 "apt".into(),
                 "apt-get".into(),
@@ -100,6 +117,11 @@ impl PreloadConfig {
                     self.never_trash.push(item);
                 }
             }
+        }
+        // only_trash is a whitelist, not additive: a later layer replaces it
+        // (matches trashd-common's Config::merge semantics).
+        if let Some(list) = partial.only_trash {
+            self.only_trash = list;
         }
         if let Some(extra) = partial.bypass_processes {
             for item in extra {
@@ -294,8 +316,11 @@ fn is_parent_bypassed() -> bool {
 
 fn parent_pid(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Use .get() rather than slicing: a truncated /proc/<pid>/stat (the process
+    // died mid-read) can end at ')', making after_comm > len — slicing would
+    // PANIC, which in this LD_PRELOAD library would abort the host process.
     let after_comm = stat.rfind(')')? + 2;
-    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    let fields: Vec<&str> = stat.get(after_comm..)?.split_whitespace().collect();
     fields.get(1)?.parse().ok()
 }
 
@@ -311,21 +336,81 @@ fn process_name(pid: u32) -> Option<String> {
 }
 
 /// Check if a path is inside a trash directory (should never be intercepted).
+///
+/// Matches on whole path COMPONENTS, not raw substrings: a user file such as
+/// `~/my.Trash-backup/x` or `~/foo.local/share/Trash-notes` must NOT be
+/// misclassified as trash-internal (which would make the hook permanently
+/// `rm` it instead of trashing it).
 fn is_inside_trash(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    // Home trash
-    if s.contains("/.local/share/Trash/") {
+    use std::path::Component;
+
+    // Inside the home trash directory tree?
+    if path.starts_with(home_trash_dir()) {
         return true;
     }
-    // Per-mountpoint trash: .Trash-$UID or .Trash/$UID
-    if s.contains("/.Trash-") || s.contains("/.Trash/") {
-        return true;
-    }
-    false
+
+    // Inside a per-mount trash: some ancestor component is exactly ".Trash"
+    // (the shared spec dir) or ".Trash-<uid>" (numeric uid).
+    path.components().any(|comp| {
+        if let Component::Normal(name) = comp {
+            let n = name.to_string_lossy();
+            n == ".Trash"
+                || n.strip_prefix(".Trash-")
+                    .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+        } else {
+            false
+        }
+    })
 }
 
-/// Check if path matches the never-trash list from config.
-/// Uses the same matching logic as trashd-common's Config::should_skip.
+/// Match a single never_trash/only_trash pattern against a path string.
+/// Mirrors trashd-common's `pattern_matches_any` so every layer agrees.
+fn pattern_matches(pattern: &str, s: &str) -> bool {
+    if pattern.starts_with("*/") && pattern.ends_with("/*") {
+        // Infix pattern like "*/.git/*" — match as "contains"
+        let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
+        s.contains(infix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        // "node_modules/*" → match anywhere in path (no leading /)
+        if prefix.starts_with('/') {
+            s.starts_with(prefix)
+        } else {
+            s.starts_with(prefix) || s.contains(&format!("/{prefix}"))
+        }
+    } else if pattern.starts_with("*.") {
+        s.ends_with(&pattern[1..])
+    } else if pattern == "*~" {
+        s.ends_with('~')
+    } else if let Some(suffix) = pattern.strip_prefix("*/") {
+        s.contains(&format!("/{suffix}"))
+            || s.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
+    } else {
+        *pattern == *s
+    }
+}
+
+/// Find the nearest `.trashd.toml` walking up from `path` (≤5 levels), matching
+/// trashd-common's Config::load_local_config.
+fn load_local_config(path: &Path) -> Option<LocalConfig> {
+    let mut dir = path.parent()?;
+    for _ in 0..5 {
+        let cfg_path = dir.join(".trashd.toml");
+        if cfg_path.is_file() {
+            if let Ok(content) = fs::read_to_string(&cfg_path) {
+                if let Ok(local) = toml::from_str::<LocalConfig>(&content) {
+                    return Some(local);
+                }
+            }
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Check if path should skip trash (real-delete instead).
+/// Uses the same matching logic and precedence as trashd-common's
+/// Config::should_skip: per-directory .trashd.toml first, then never_trash
+/// wins, then only_trash narrows.
 fn should_skip_path(path: &Path) -> bool {
     // Never intercept operations inside trash directories themselves
     if is_inside_trash(path) {
@@ -335,39 +420,33 @@ fn should_skip_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let cfg = config();
 
-    for pattern in &cfg.never_trash {
-        if pattern.starts_with("*/") && pattern.ends_with("/*") {
-            // Infix pattern like "*/.git/*" — match as "contains"
-            let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
-            if s.contains(infix) {
-                return true;
-            }
-        } else if let Some(prefix) = pattern.strip_suffix('*') {
-            // "node_modules/*" → match anywhere in path (no leading /)
-            if prefix.starts_with('/') {
-                if s.starts_with(prefix) {
-                    return true;
-                }
-            } else if s.starts_with(prefix) || s.contains(&format!("/{prefix}")) {
-                return true;
-            }
-        } else if pattern.starts_with("*.") {
-            if s.ends_with(&pattern[1..]) {
-                return true;
-            }
-        } else if pattern == "*~" {
-            if s.ends_with('~') {
-                return true;
-            }
-        } else if let Some(suffix) = pattern.strip_prefix("*/") {
-            if s.contains(&format!("/{suffix}"))
-                || s.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
-            {
-                return true;
-            }
-        } else if *pattern == *s {
+    // Per-directory .trashd.toml overrides (same precedence as trashd-common).
+    if let Some(local) = load_local_config(path) {
+        if !local.never_trash.is_empty() && local.never_trash.iter().any(|p| pattern_matches(p, &s))
+        {
             return true;
         }
+        if !local.only_trash.is_empty() {
+            if !local.only_trash.iter().any(|p| pattern_matches(p, &s)) {
+                return true; // doesn't match local whitelist → real-delete
+            }
+            // Matched local whitelist — global never_trash can still veto.
+            if cfg.never_trash.iter().any(|p| pattern_matches(p, &s)) {
+                return true;
+            }
+            return false;
+        }
+    }
+
+    // never_trash always wins
+    if cfg.never_trash.iter().any(|p| pattern_matches(p, &s)) {
+        return true;
+    }
+
+    // only_trash whitelist: if set and the path doesn't match, skip it so the
+    // preload real-deletes it — same as the seccomp/CLI/store layers.
+    if !cfg.only_trash.is_empty() && !cfg.only_trash.iter().any(|p| pattern_matches(p, &s)) {
+        return true;
     }
 
     false
@@ -414,6 +493,12 @@ fn trash_dir_for(path: &Path) -> PathBuf {
                     {
                         // Fall through to .Trash-$UID
                     } else {
+                        // Keep it private (0700) — the parent .Trash is sticky
+                        // and shared by all users.
+                        let priv700 = fs::Permissions::from_mode(0o700);
+                        let _ = fs::set_permissions(&uid_dir, priv700.clone());
+                        let _ = fs::set_permissions(uid_dir.join("files"), priv700.clone());
+                        let _ = fs::set_permissions(uid_dir.join("info"), priv700);
                         return uid_dir;
                     }
                 } else {
@@ -434,6 +519,12 @@ fn trash_dir_for(path: &Path) -> PathBuf {
         if fs::create_dir_all(topdir.join("files")).is_ok()
             && fs::create_dir_all(topdir.join("info")).is_ok()
         {
+            // Private (0700): on a shared mount other users must not be able to
+            // read our deleted files or their original-path metadata.
+            let priv700 = fs::Permissions::from_mode(0o700);
+            let _ = fs::set_permissions(&topdir, priv700.clone());
+            let _ = fs::set_permissions(topdir.join("files"), priv700.clone());
+            let _ = fs::set_permissions(topdir.join("info"), priv700);
             return topdir;
         }
     }
@@ -499,7 +590,7 @@ fn try_trash(path: &Path) -> bool {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".into());
 
-    let (id, info_path) = match unique_id_atomic(&info_dir, &base_name) {
+    let (id, info_path) = match unique_id_atomic(&info_dir, &files_dir, &base_name) {
         Some(v) => v,
         None => return false,
     };
@@ -588,8 +679,15 @@ fn try_trash(path: &Path) -> bool {
                         return false;
                     }
                 };
-                unsafe {
-                    (real_unlink())(cpath.as_ptr());
+                let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
+                if ret != 0 {
+                    // Couldn't remove the original symlink — don't report a
+                    // false success (which would leave the original on disk and
+                    // a duplicate in the trash). Roll back and fall through to
+                    // the real unlink. Matches the regular-file branch below.
+                    let _ = fs::remove_file(&info_path);
+                    let _ = fs::remove_file(&dest);
+                    return false;
                 }
                 log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
                 return true;
@@ -629,7 +727,15 @@ fn try_trash(path: &Path) -> bool {
 }
 
 /// Atomically claim a unique trashinfo filename using O_CREAT|O_EXCL.
-fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf)> {
+///
+/// The id is unique against BOTH `info_dir` and `files_dir`: an orphaned data
+/// file (in `files/` with no matching `.trashinfo`) is recoverable, so reusing
+/// its name would silently overwrite the user's data on the move into `files/`.
+fn unique_id_atomic(
+    info_dir: &Path,
+    files_dir: &Path,
+    base_name: &str,
+) -> Option<(String, PathBuf)> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // Truncate to avoid exceeding filesystem filename limits (255 bytes).
@@ -640,17 +746,35 @@ fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf
         base_name
     };
 
+    // Claim `candidate`: O_EXCL the .trashinfo AND ensure files/<candidate> is
+    // free. Some(path) = claimed; None = taken (try another) or fatal IO error.
+    let try_claim = |candidate: &str| -> Result<Option<PathBuf>, ()> {
+        let path = info_dir.join(format!("{candidate}.trashinfo"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(_) => {
+                if fs::symlink_metadata(files_dir.join(candidate)).is_ok() {
+                    // info name free but an orphaned data file occupies files/.
+                    let _ = fs::remove_file(&path);
+                    Ok(None)
+                } else {
+                    Ok(Some(path))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(_) => Err(()), // real I/O error (disk full, permission denied)
+        }
+    };
+
     // Try base name
-    let path = info_dir.join(format!("{base_name}.trashinfo"));
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(_) => return Some((base_name.to_string(), path)),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {} // retry below
-        Err(_) => return None, // real I/O error (disk full, permission denied)
+    match try_claim(base_name) {
+        Ok(Some(path)) => return Some((base_name.to_string(), path)),
+        Ok(None) => {}
+        Err(()) => return None,
     }
 
     // Append timestamp + counter
@@ -661,16 +785,10 @@ fn unique_id_atomic(info_dir: &Path, base_name: &str) -> Option<(String, PathBuf
         } else {
             format!("{base_name}.{ts}.{i}")
         };
-        let path = info_dir.join(format!("{candidate}.trashinfo"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(_) => return Some((candidate, path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None, // real I/O error
+        match try_claim(&candidate) {
+            Ok(Some(path)) => return Some((candidate, path)),
+            Ok(None) => continue,
+            Err(()) => return None,
         }
     }
     None
@@ -721,10 +839,18 @@ fn resolve_at_path(dirfd: libc::c_int, pathname: *const libc::c_char) -> Option<
     }
 
     let fd_link = format!("/proc/self/fd/{dirfd}");
-    if let Ok(dir_path) = fs::read_link(&fd_link) {
-        Some(dir_path.join(&path))
-    } else {
-        None
+    match fs::read_link(&fd_link) {
+        Ok(dir_path) => Some(dir_path.join(&path)),
+        Err(_) => {
+            // Can't resolve the dirfd (e.g. /proc not mounted). We fall through
+            // to the real syscall — a permanent delete with no trashing. Log it
+            // so operators know interception was silently bypassed here.
+            log_preload(&format!(
+                "could not resolve dirfd {dirfd} via /proc; not intercepting {}",
+                path.display()
+            ));
+            None
+        }
     }
 }
 
@@ -752,6 +878,11 @@ fn should_intercept() -> bool {
 /// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
+    // Capture the caller's errno FIRST — before the guard, should_intercept()
+    // (/proc walks), or path resolution can perturb it — so the success path
+    // restores the caller's true pre-call errno.
+    let saved_errno = *libc::__errno_location();
+
     let _guard = match ReentrancyGuard::enter() {
         Some(g) => g,
         None => return (real_unlink())(pathname),
@@ -760,8 +891,6 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
     if !should_intercept() {
         return (real_unlink())(pathname);
     }
-
-    let saved_errno = *libc::__errno_location();
 
     if let Some(path) = cstr_to_path(pathname) {
         let abs = if path.is_absolute() {
@@ -793,6 +922,9 @@ pub unsafe extern "C" fn unlinkat(
     pathname: *const libc::c_char,
     flags: libc::c_int,
 ) -> libc::c_int {
+    // Capture the caller's errno first (see unlink()).
+    let saved_errno = *libc::__errno_location();
+
     let _guard = match ReentrancyGuard::enter() {
         Some(g) => g,
         None => return (real_unlinkat())(dirfd, pathname, flags),
@@ -802,7 +934,6 @@ pub unsafe extern "C" fn unlinkat(
         return (real_unlinkat())(dirfd, pathname, flags);
     }
 
-    let saved_errno = *libc::__errno_location();
     let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
     if let Some(abs) = resolve_at_path(dirfd, pathname) {
@@ -811,6 +942,10 @@ pub unsafe extern "C" fn unlinkat(
             if !should_skip_path(&abs) {
                 let is_real_dir = meta.is_dir() && !meta.file_type().is_symlink();
                 if is_removedir {
+                    // NOTE: emptiness here then rename in try_trash is a small
+                    // TOCTOU — a sibling could repopulate the dir in between.
+                    // The result is still recoverable from the trash (residual
+                    // L8), so we accept it rather than add fragile locking.
                     if is_real_dir {
                         if let Ok(mut rd) = fs::read_dir(&abs) {
                             if rd.next().is_none() && try_trash(&abs) {
@@ -832,6 +967,9 @@ pub unsafe extern "C" fn unlinkat(
 /// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
+    // Capture the caller's errno first (see unlink()).
+    let saved_errno = *libc::__errno_location();
+
     let _guard = match ReentrancyGuard::enter() {
         Some(g) => g,
         None => return (real_rmdir())(pathname),
@@ -840,8 +978,6 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
     if !should_intercept() {
         return (real_rmdir())(pathname);
     }
-
-    let saved_errno = *libc::__errno_location();
 
     if let Some(path) = cstr_to_path(pathname) {
         let abs = if path.is_absolute() {
