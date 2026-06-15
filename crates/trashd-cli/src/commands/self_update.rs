@@ -238,13 +238,46 @@ pub fn run(check_only: bool) {
     }
 
     println!("\n{}", "Running installer...".bold());
-    let status = std::process::Command::new("sudo")
-        .arg("env")
-        .arg("TRASH_BYPASS=1")
-        .arg("bash")
-        .arg(&install_script)
-        .current_dir(&install_dir)
-        .status();
+    // install.sh expects to run as root and performs its privileged writes
+    // directly (it never calls sudo itself), so the only question is how we get
+    // to root from here.
+    let status = if unsafe { libc::geteuid() } == 0 {
+        // Already root — invoke the installer directly. Going through sudo would
+        // be pointless *and* actively broken: when the calling shell runs under
+        // the seccomp supervisor (trashd-exec, the primary layer for
+        // interactive shells), that supervisor sets PR_SET_NO_NEW_PRIVS, which
+        // is inherited by every descendant and can never be cleared. The setuid
+        // sudo binary then refuses to escalate ("the 'no new privileges' flag
+        // is set"). Running bash directly needs no privilege transition.
+        std::process::Command::new("bash")
+            .arg(&install_script)
+            .env("TRASH_BYPASS", "1")
+            .current_dir(&install_dir)
+            .status()
+    } else if no_new_privs_set() {
+        // Non-root and escalation is blocked by no_new_privs (same seccomp cause
+        // as above). sudo/su are setuid and cannot work here — fail with a clear
+        // message instead of sudo's cryptic container-oriented one.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        fatal(
+            "cannot install the update: privilege escalation is blocked because \
+             the 'no new privileges' flag is set on this process.\n  \
+             This shell is running under the trashd seccomp supervisor, which \
+             sets the flag for all descendants, so sudo/su cannot become root \
+             from here.\n  \
+             Re-run `trash self-update` from a root shell that is not wrapped by \
+             the supervisor.",
+        )
+    } else {
+        // Non-root: escalate via sudo as before.
+        std::process::Command::new("sudo")
+            .arg("env")
+            .arg("TRASH_BYPASS=1")
+            .arg("bash")
+            .arg(&install_script)
+            .current_dir(&install_dir)
+            .status()
+    };
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -259,6 +292,14 @@ pub fn run(check_only: bool) {
         Ok(s) => fatal(format!("installer exited with {s}")),
         Err(e) => fatal(format!("run installer: {e}")),
     }
+}
+
+/// Returns true if the `no_new_privs` flag is set on this process (e.g. because
+/// the shell is running under the seccomp supervisor). Setuid escalation via
+/// sudo/su is impossible while this flag is set.
+fn no_new_privs_set() -> bool {
+    // PR_GET_NO_NEW_PRIVS returns 1 when set, 0 otherwise, -1 on error.
+    unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1 }
 }
 
 fn fetch_release() -> GhRelease {

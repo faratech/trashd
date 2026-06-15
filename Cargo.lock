@@ -1305,6 +1305,7 @@ dependencies = [
  "clap_mangen",
  "colored",
  "flate2",
+ "libc",
  "serde",
  "serde_json",
  "tar",
