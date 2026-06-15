@@ -37,6 +37,13 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if std::env::var("TRASH_BYPASS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        exec_command(&args[1..]);
+    }
+
     match run(&args[1..]) {
         Ok(code) => code,
         Err(e) => {
@@ -240,6 +247,8 @@ fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
         }
         break;
     }
+
+    CHILD_PID.store(0, Ordering::Relaxed);
 
     if libc::WIFEXITED(status) {
         Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))
