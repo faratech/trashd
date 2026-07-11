@@ -39,10 +39,9 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
             } else {
                 0
             }
-        }) {
-            if header == 0xFD2FB528 {
-                continue;
-            }
+        }) && header == 0xFD2FB528
+        {
+            continue;
         }
 
         if dry_run {

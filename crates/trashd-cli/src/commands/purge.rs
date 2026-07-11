@@ -1,7 +1,7 @@
 use crate::util::*;
 use colored::Colorize;
-use trashd_common::store::TrashError;
 use trashd_common::TrashStore;
+use trashd_common::store::TrashError;
 
 pub fn run(store: &TrashStore, target: &str) {
     match store.purge(target) {

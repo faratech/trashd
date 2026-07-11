@@ -1,8 +1,8 @@
 use crate::util::*;
 use colored::Colorize;
 use std::path::Path;
-use trashd_common::store::TrashError;
 use trashd_common::TrashStore;
+use trashd_common::store::TrashError;
 
 pub fn run(store: &TrashStore, target: &str, to: Option<&Path>, force: bool, all: bool) {
     if all {

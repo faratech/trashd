@@ -1,6 +1,6 @@
 # Maintainer: Faratech <dev@faratech.com>
 pkgname=trashd
-pkgver=0.1.0
+pkgver=0.1.2
 pkgrel=1
 pkgdesc='A Linux recycle bin that works in scripts, cron, and at the desktop'
 arch=('x86_64' 'aarch64')

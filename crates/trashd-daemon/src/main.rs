@@ -9,14 +9,14 @@
 
 mod logger;
 
-use logger::{process_name, DeletionEvent};
+use logger::{DeletionEvent, process_name};
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
-use trashd_common::mounts;
 use trashd_common::Config;
+use trashd_common::mounts;
 
 // fanotify constants (from linux/fanotify.h)
 const FAN_CLASS_NOTIF: libc::c_uint = 0;

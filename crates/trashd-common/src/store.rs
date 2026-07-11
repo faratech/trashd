@@ -193,17 +193,17 @@ impl TrashStore {
         }
 
         // Check bypass_paths — if the calling process exe matches, skip trash
-        if !self.config.bypass_paths.is_empty() {
-            if let Ok(exe) = fs::read_link("/proc/self/exe") {
-                let exe_str = exe.to_string_lossy();
-                if self
-                    .config
-                    .bypass_paths
-                    .iter()
-                    .any(|p| exe_str.starts_with(p))
-                {
-                    return Err(TrashError::Excluded(abs_path));
-                }
+        if !self.config.bypass_paths.is_empty()
+            && let Ok(exe) = fs::read_link("/proc/self/exe")
+        {
+            let exe_str = exe.to_string_lossy();
+            if self
+                .config
+                .bypass_paths
+                .iter()
+                .any(|p| exe_str.starts_with(p))
+            {
+                return Err(TrashError::Excluded(abs_path));
             }
         }
 
@@ -244,9 +244,10 @@ impl TrashStore {
                 .strip_prefix(topdir)
                 .map(|rel| {
                     // Spec: relative path MUST NOT contain ".."
-                    debug_assert!(!rel
-                        .components()
-                        .any(|c| c == std::path::Component::ParentDir));
+                    debug_assert!(
+                        !rel.components()
+                            .any(|c| c == std::path::Component::ParentDir)
+                    );
                     rel.to_path_buf()
                 })
                 .unwrap_or_else(|_| abs_path.clone()) // fallback to absolute if strip fails
@@ -263,10 +264,12 @@ impl TrashStore {
         // Compute file hash for small files only (configurable, default 1 MB).
         // Hashing reads the entire file — too expensive for large files on every rm.
         let hash_limit = self.config.sha256_max_size_mb * 1024 * 1024;
-        if meta.is_file() && hash_limit > 0 && meta.size() <= hash_limit {
-            if let Ok(hash) = hash_file(&abs_path, &self.config.hash_algorithm) {
-                info.sha256 = Some(hash);
-            }
+        if meta.is_file()
+            && hash_limit > 0
+            && meta.size() <= hash_limit
+            && let Ok(hash) = hash_file(&abs_path, &self.config.hash_algorithm)
+        {
+            info.sha256 = Some(hash);
         }
 
         let dest = trash_dir.join("files").join(&id);
@@ -425,10 +428,10 @@ impl TrashStore {
                     let name = fe.file_name().to_string_lossy().into_owned();
                     if !known_ids.contains(&name) {
                         // Apply pattern filter to orphans too
-                        if let Some(pat) = pattern {
-                            if !simple_glob_match(pat, &name) {
-                                continue;
-                            }
+                        if let Some(pat) = pattern
+                            && !simple_glob_match(pat, &name)
+                        {
+                            continue;
                         }
                         let trashed_path = files_dir.join(&name);
                         orphans.push(TrashEntry {
@@ -686,14 +689,12 @@ impl TrashStore {
         }
 
         let marker = Self::home_trash_dir().join(".trashd/last_purge");
-        if let Ok(meta) = fs::metadata(&marker) {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(elapsed) = modified.elapsed() {
-                    if elapsed.as_secs() < interval {
-                        return Ok(()); // too soon, skip
-                    }
-                }
-            }
+        if let Ok(meta) = fs::metadata(&marker)
+            && let Ok(modified) = meta.modified()
+            && let Ok(elapsed) = modified.elapsed()
+            && elapsed.as_secs() < interval
+        {
+            return Ok(()); // too soon, skip
         }
 
         // Touch the marker before purging (so concurrent callers also skip)
@@ -776,17 +777,17 @@ impl TrashStore {
             {
                 continue;
             }
-            if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3) {
-                if compressed.len() < data.len() {
-                    // Atomic write: an interrupted compress must never truncate
-                    // the SOLE remaining copy of the user's deleted data.
-                    if atomic_write(path, &compressed).is_ok() {
-                        // Record that WE compressed it so restore decompresses
-                        // by marker, not by guessing magic bytes.
-                        let mut info = entries[i].info.clone();
-                        info.compressed = Some("zstd".into());
-                        let _ = write_trashinfo_atomic(&entries[i].info_path, &info);
-                    }
+            if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3)
+                && compressed.len() < data.len()
+            {
+                // Atomic write: an interrupted compress must never truncate
+                // the SOLE remaining copy of the user's deleted data.
+                if atomic_write(path, &compressed).is_ok() {
+                    // Record that WE compressed it so restore decompresses
+                    // by marker, not by guessing magic bytes.
+                    let mut info = entries[i].info.clone();
+                    info.compressed = Some("zstd".into());
+                    let _ = write_trashinfo_atomic(&entries[i].info_path, &info);
                 }
             }
         }
@@ -823,23 +824,23 @@ impl TrashStore {
         // Phase 3: disk pressure — purge oldest 10% of surviving items
         if pressure_pct > 0 {
             let home = Self::home_trash_dir();
-            if let Some(usage_pct) = disk_usage_percent(&home) {
-                if usage_pct >= pressure_pct as f64 {
-                    let surviving: usize = purged.iter().filter(|&&p| !p).count();
-                    let to_purge = std::cmp::max(1, surviving / 10);
-                    let mut purged_count = 0;
-                    for i in (0..entries.len()).rev() {
-                        if purged_count >= to_purge {
-                            break;
-                        }
-                        if purged[i] {
-                            continue;
-                        }
-                        let _ = self.purge_entry(&entries[i]);
-                        purged[i] = true;
-                        purge_count += 1;
-                        purged_count += 1;
+            if let Some(usage_pct) = disk_usage_percent(&home)
+                && usage_pct >= pressure_pct as f64
+            {
+                let surviving: usize = purged.iter().filter(|&&p| !p).count();
+                let to_purge = std::cmp::max(1, surviving / 10);
+                let mut purged_count = 0;
+                for i in (0..entries.len()).rev() {
+                    if purged_count >= to_purge {
+                        break;
                     }
+                    if purged[i] {
+                        continue;
+                    }
+                    let _ = self.purge_entry(&entries[i]);
+                    purged[i] = true;
+                    purge_count += 1;
+                    purged_count += 1;
                 }
             }
         }
@@ -1266,13 +1267,13 @@ fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
 /// components) but preserve the final component as-is (so symlinks are not
 /// followed for the target file itself).
 fn normalize_path(path: &Path) -> PathBuf {
-    if let Some(parent) = path.parent() {
-        if let Ok(canonical_parent) = fs::canonicalize(parent) {
-            if let Some(file_name) = path.file_name() {
-                return canonical_parent.join(file_name);
-            }
-            return canonical_parent;
+    if let Some(parent) = path.parent()
+        && let Ok(canonical_parent) = fs::canonicalize(parent)
+    {
+        if let Some(file_name) = path.file_name() {
+            return canonical_parent.join(file_name);
         }
+        return canonical_parent;
     }
     // Fallback: lexical normalization
     let mut components = Vec::new();
@@ -1294,15 +1295,15 @@ pub fn simple_glob_match(pattern: &str, text: &str) -> bool {
     }
     // Only use the prefix/suffix shortcuts when there's a single wildcard.
     // Patterns like "*.py*" must fall through to the split_once handler.
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if !suffix.contains('*') {
-            return text.ends_with(suffix);
-        }
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && !suffix.contains('*')
+    {
+        return text.ends_with(suffix);
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        if !prefix.contains('*') {
-            return text.starts_with(prefix);
-        }
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && !prefix.contains('*')
+    {
+        return text.starts_with(prefix);
     }
     if let Some((prefix, suffix)) = pattern.split_once('*') {
         // suffix might contain another '*' (e.g., pattern "*.py*" → prefix="", suffix=".py*")
@@ -1357,10 +1358,10 @@ pub fn is_parent_bypassed(bypass_list: &[String]) -> bool {
             Some(p) if p > 1 => p,
             _ => break,
         };
-        if let Some(name) = process_name(ppid) {
-            if bypass_list.contains(&name) {
-                return true;
-            }
+        if let Some(name) = process_name(ppid)
+            && bypass_list.contains(&name)
+        {
+            return true;
         }
         pid = ppid;
     }
@@ -1381,10 +1382,10 @@ fn parent_pid(pid: u32) -> Option<u32> {
 
 fn process_name(pid: u32) -> Option<String> {
     // Try /proc/pid/exe first (resolves to actual binary)
-    if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-        if let Some(name) = exe.file_name() {
-            return Some(name.to_string_lossy().into_owned());
-        }
+    if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe"))
+        && let Some(name) = exe.file_name()
+    {
+        return Some(name.to_string_lossy().into_owned());
     }
     // Fallback: /proc/pid/comm
     fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -1421,7 +1422,8 @@ mod tests {
 
         let data_dir = TempDir::with_prefix_in("data-", &base).unwrap();
         let workdir = TempDir::with_prefix_in("work-", &base).unwrap();
-        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_DATA_HOME", data_dir.path()) };
 
         let store = TrashStore::open().unwrap();
         (store, data_dir, workdir, guard)
@@ -1500,11 +1502,13 @@ mod tests {
         let id = store.trash(&link, None).unwrap();
         let restored = store.restore(&id, None).unwrap();
 
-        assert!(restored
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            restored
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             fs::read_link(&restored).unwrap(),
             PathBuf::from("target.txt")
@@ -1839,11 +1843,13 @@ mod tests {
 
         let py_entries = store.list(Some("*.py")).unwrap();
         assert_eq!(py_entries.len(), 1);
-        assert!(py_entries[0]
-            .info
-            .original_path
-            .to_string_lossy()
-            .ends_with("keep.py"));
+        assert!(
+            py_entries[0]
+                .info
+                .original_path
+                .to_string_lossy()
+                .ends_with("keep.py")
+        );
     }
 
     // --- Compression roundtrip ---
@@ -1971,8 +1977,10 @@ mod tests {
         let data_dir = TempDir::with_prefix_in("data0-", &base).unwrap();
         let config_dir = TempDir::with_prefix_in("cfg0-", &base).unwrap();
         let workdir = TempDir::with_prefix_in("work0-", &base).unwrap();
-        std::env::set_var("XDG_DATA_HOME", data_dir.path());
-        std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_DATA_HOME", data_dir.path()) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_dir.path()) };
 
         // All retention limits zero, and auto-purge runs on every deletion.
         let cfg = config_dir.path().join("trashd/config.toml");
@@ -1998,7 +2006,8 @@ mod tests {
         }
 
         let entries = store.list(None).unwrap();
-        std::env::remove_var("XDG_CONFIG_HOME");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         drop(guard);
         assert_eq!(entries.len(), 3, "retention=0 must NOT purge the trash");
     }

@@ -204,10 +204,11 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
         let label = format!("{} ({})", mount.path.display(), mount.fstype);
 
         // Check shared .Trash/$UID first (spec §1.2.2a)
-        if let Some(shared) = check_shared_trash(&mount.path, uid) {
-            if shared.exists() && shared.is_dir() {
-                dirs.entry(shared).or_insert(label.clone());
-            }
+        if let Some(shared) = check_shared_trash(&mount.path, uid)
+            && shared.exists()
+            && shared.is_dir()
+        {
+            dirs.entry(shared).or_insert(label.clone());
         }
 
         // Also check .Trash-$UID (spec §1.2.2b)
@@ -227,11 +228,11 @@ fn unescape_octal(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' {
             let oct: String = chars.by_ref().take(3).collect();
-            if oct.len() == 3 {
-                if let Ok(val) = u8::from_str_radix(&oct, 8) {
-                    result.push(val as char);
-                    continue;
-                }
+            if oct.len() == 3
+                && let Ok(val) = u8::from_str_radix(&oct, 8)
+            {
+                result.push(val as char);
+                continue;
             }
             result.push('\\');
             result.push_str(&oct);

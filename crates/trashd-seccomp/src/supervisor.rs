@@ -47,7 +47,7 @@ pub struct SeccompNotifResp {
 // seccomp_notif_resp = 24 bytes (8+8+4+4)
 const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = (3 << 30) | (80 << 16) | (0x21 << 8); // 0xC0502100
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = (3 << 30) | (24 << 16) | (0x21 << 8) | 1; // 0xC0182101
-                                                                                          // NB: ID_VALID is _IOW (direction=1), not _IOWR (direction=3)
+// NB: ID_VALID is _IOW (direction=1), not _IOWR (direction=3)
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = (1 << 30) | (8 << 16) | (0x21 << 8) | 2; // 0x40082102
 
 // Compile-time verification that struct sizes match ioctl constants
@@ -286,10 +286,10 @@ fn process_bypassed(pid: u32, bypass: &[String]) -> bool {
     }
     let mut cur = pid;
     for _ in 0..16 {
-        if let Some(name) = process_name(cur) {
-            if bypass.contains(&name) {
-                return true;
-            }
+        if let Some(name) = process_name(cur)
+            && bypass.contains(&name)
+        {
+            return true;
         }
         match parent_pid(cur) {
             Some(p) if p > 1 && p != cur => cur = p,
@@ -311,10 +311,10 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// Best-effort process name from /proc/{pid}/exe (basename), falling back to
 /// /proc/{pid}/comm.
 fn process_name(pid: u32) -> Option<String> {
-    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
-        if let Some(name) = exe.file_name() {
-            return Some(name.to_string_lossy().into_owned());
-        }
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+        && let Some(name) = exe.file_name()
+    {
+        return Some(name.to_string_lossy().into_owned());
     }
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()

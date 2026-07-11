@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (2026-07-11)
+
+- Upgrade the workspace to Rust 1.97 and Rust edition 2024
+- Refresh all compatible direct and transitive dependencies
+- Pin CI, releases, formatting, and linting to the Rust 1.97 toolchain
+
 ## 0.1.1 (2026-06-15)
 
 Bug-fix release from a full security/correctness audit. Hardens the data-loss

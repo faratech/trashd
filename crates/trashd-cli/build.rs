@@ -1,5 +1,5 @@
 use clap::{Arg, Command};
-use clap_complete::{generate_to, Shell};
+use clap_complete::{Shell, generate_to};
 use std::env;
 use std::fs;
 use std::path::PathBuf;

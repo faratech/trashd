@@ -250,21 +250,27 @@ type UnlinkatFn =
 type RmdirFn = unsafe extern "C" fn(*const libc::c_char) -> libc::c_int;
 
 unsafe fn real_unlink() -> UnlinkFn {
-    let sym = libc::dlsym(libc::RTLD_NEXT, c"unlink".as_ptr() as *const _);
-    assert!(!sym.is_null(), "trashd: dlsym(unlink) failed");
-    std::mem::transmute(sym)
+    unsafe {
+        let sym = libc::dlsym(libc::RTLD_NEXT, c"unlink".as_ptr() as *const _);
+        assert!(!sym.is_null(), "trashd: dlsym(unlink) failed");
+        std::mem::transmute(sym)
+    }
 }
 
 unsafe fn real_unlinkat() -> UnlinkatFn {
-    let sym = libc::dlsym(libc::RTLD_NEXT, c"unlinkat".as_ptr() as *const _);
-    assert!(!sym.is_null(), "trashd: dlsym(unlinkat) failed");
-    std::mem::transmute(sym)
+    unsafe {
+        let sym = libc::dlsym(libc::RTLD_NEXT, c"unlinkat".as_ptr() as *const _);
+        assert!(!sym.is_null(), "trashd: dlsym(unlinkat) failed");
+        std::mem::transmute(sym)
+    }
 }
 
 unsafe fn real_rmdir() -> RmdirFn {
-    let sym = libc::dlsym(libc::RTLD_NEXT, c"rmdir".as_ptr() as *const _);
-    assert!(!sym.is_null(), "trashd: dlsym(rmdir) failed");
-    std::mem::transmute(sym)
+    unsafe {
+        let sym = libc::dlsym(libc::RTLD_NEXT, c"rmdir".as_ptr() as *const _);
+        assert!(!sym.is_null(), "trashd: dlsym(rmdir) failed");
+        std::mem::transmute(sym)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,10 +309,10 @@ fn is_parent_bypassed() -> bool {
                 Some(p) if p > 1 => p,
                 _ => break,
             };
-            if let Some(name) = process_name(ppid) {
-                if bypass.contains(&name) {
-                    return true;
-                }
+            if let Some(name) = process_name(ppid)
+                && bypass.contains(&name)
+            {
+                return true;
             }
             pid = ppid;
         }
@@ -325,10 +331,10 @@ fn parent_pid(pid: u32) -> Option<u32> {
 }
 
 fn process_name(pid: u32) -> Option<String> {
-    if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-        if let Some(name) = exe.file_name() {
-            return Some(name.to_string_lossy().into_owned());
-        }
+    if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe"))
+        && let Some(name) = exe.file_name()
+    {
+        return Some(name.to_string_lossy().into_owned());
     }
     fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
@@ -395,12 +401,11 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
     let mut dir = path.parent()?;
     for _ in 0..5 {
         let cfg_path = dir.join(".trashd.toml");
-        if cfg_path.is_file() {
-            if let Ok(content) = fs::read_to_string(&cfg_path) {
-                if let Ok(local) = toml::from_str::<LocalConfig>(&content) {
-                    return Some(local);
-                }
-            }
+        if cfg_path.is_file()
+            && let Ok(content) = fs::read_to_string(&cfg_path)
+            && let Ok(local) = toml::from_str::<LocalConfig>(&content)
+        {
+            return Some(local);
         }
         dir = dir.parent()?;
     }
@@ -481,36 +486,36 @@ fn trash_dir_for(path: &Path) -> PathBuf {
     if let Some(mountpoint) = find_mount_point(path) {
         // Check shared .Trash/ first (FreeDesktop spec §1.2.2a)
         let shared_trash = mountpoint.join(".Trash");
-        if let Ok(meta) = fs::symlink_metadata(&shared_trash) {
-            if !meta.file_type().is_symlink()
-                && meta.is_dir()
-                && (meta.permissions().mode() & 0o1000) != 0
-            {
-                let uid_dir = shared_trash.join(uid.to_string());
-                if !uid_dir.exists() {
-                    if fs::create_dir_all(uid_dir.join("files")).is_err()
-                        || fs::create_dir_all(uid_dir.join("info")).is_err()
-                    {
-                        // Fall through to .Trash-$UID
-                    } else {
-                        // Keep it private (0700) — the parent .Trash is sticky
-                        // and shared by all users.
-                        let priv700 = fs::Permissions::from_mode(0o700);
-                        let _ = fs::set_permissions(&uid_dir, priv700.clone());
-                        let _ = fs::set_permissions(uid_dir.join("files"), priv700.clone());
-                        let _ = fs::set_permissions(uid_dir.join("info"), priv700);
-                        return uid_dir;
-                    }
+        if let Ok(meta) = fs::symlink_metadata(&shared_trash)
+            && !meta.file_type().is_symlink()
+            && meta.is_dir()
+            && (meta.permissions().mode() & 0o1000) != 0
+        {
+            let uid_dir = shared_trash.join(uid.to_string());
+            if !uid_dir.exists() {
+                if fs::create_dir_all(uid_dir.join("files")).is_err()
+                    || fs::create_dir_all(uid_dir.join("info")).is_err()
+                {
+                    // Fall through to .Trash-$UID
                 } else {
-                    // Verify ownership — don't use a dir pre-created by another user
-                    use std::os::unix::fs::MetadataExt;
-                    if let Ok(m) = fs::symlink_metadata(&uid_dir) {
-                        if m.uid() == uid && !m.file_type().is_symlink() {
-                            return uid_dir;
-                        }
-                    }
-                    // Ownership mismatch or symlink — fall through to .Trash-$UID
+                    // Keep it private (0700) — the parent .Trash is sticky
+                    // and shared by all users.
+                    let priv700 = fs::Permissions::from_mode(0o700);
+                    let _ = fs::set_permissions(&uid_dir, priv700.clone());
+                    let _ = fs::set_permissions(uid_dir.join("files"), priv700.clone());
+                    let _ = fs::set_permissions(uid_dir.join("info"), priv700);
+                    return uid_dir;
                 }
+            } else {
+                // Verify ownership — don't use a dir pre-created by another user
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(m) = fs::symlink_metadata(&uid_dir)
+                    && m.uid() == uid
+                    && !m.file_type().is_symlink()
+                {
+                    return uid_dir;
+                }
+                // Ownership mismatch or symlink — fall through to .Trash-$UID
             }
         }
 
@@ -669,29 +674,29 @@ fn try_trash(path: &Path) -> bool {
 
     if meta.file_type().is_symlink() {
         // Re-create symlink
-        if let Ok(target) = fs::read_link(path) {
-            if std::os::unix::fs::symlink(&target, &dest).is_ok() {
-                let cpath = match CString::new(path.as_os_str().as_bytes()) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        let _ = fs::remove_file(&info_path);
-                        let _ = fs::remove_file(&dest);
-                        return false;
-                    }
-                };
-                let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
-                if ret != 0 {
-                    // Couldn't remove the original symlink — don't report a
-                    // false success (which would leave the original on disk and
-                    // a duplicate in the trash). Roll back and fall through to
-                    // the real unlink. Matches the regular-file branch below.
+        if let Ok(target) = fs::read_link(path)
+            && std::os::unix::fs::symlink(&target, &dest).is_ok()
+        {
+            let cpath = match CString::new(path.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => {
                     let _ = fs::remove_file(&info_path);
                     let _ = fs::remove_file(&dest);
                     return false;
                 }
-                log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
-                return true;
+            };
+            let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
+            if ret != 0 {
+                // Couldn't remove the original symlink — don't report a
+                // false success (which would leave the original on disk and
+                // a duplicate in the trash). Roll back and fall through to
+                // the real unlink. Matches the regular-file branch below.
+                let _ = fs::remove_file(&info_path);
+                let _ = fs::remove_file(&dest);
+                return false;
             }
+            log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
+            return true;
         }
     } else if meta.is_dir() {
         // Cross-device dirs: best-effort. For preload, fall back to real delete.
@@ -876,148 +881,157 @@ fn should_intercept() -> bool {
 
 /// # Safety
 /// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
-    // Capture the caller's errno FIRST — before the guard, should_intercept()
-    // (/proc walks), or path resolution can perturb it — so the success path
-    // restores the caller's true pre-call errno.
-    let saved_errno = *libc::__errno_location();
+    unsafe {
+        // Capture the caller's errno FIRST — before the guard, should_intercept()
+        // (/proc walks), or path resolution can perturb it — so the success path
+        // restores the caller's true pre-call errno.
+        let saved_errno = *libc::__errno_location();
 
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = match ReentrancyGuard::enter() {
-            Some(g) => g,
-            None => return None,
-        };
-
-        if !should_intercept() {
-            return None;
-        }
-
-        if let Some(path) = cstr_to_path(pathname) {
-            let abs = if path.is_absolute() {
-                path.clone()
-            } else {
-                match std::env::current_dir() {
-                    Ok(cwd) => cwd.join(&path),
-                    Err(_) => return None,
-                }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = match ReentrancyGuard::enter() {
+                Some(g) => g,
+                None => return None,
             };
 
-            // Use symlink_metadata to not follow symlinks — dangling symlinks
-            // should be trashed, not permanently deleted via the fallthrough.
-            if let Ok(meta) = fs::symlink_metadata(&abs) {
-                if !should_skip_path(&abs) && !meta.is_dir() && try_trash(&abs) {
+            if !should_intercept() {
+                return None;
+            }
+
+            if let Some(path) = cstr_to_path(pathname) {
+                let abs = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    match std::env::current_dir() {
+                        Ok(cwd) => cwd.join(&path),
+                        Err(_) => return None,
+                    }
+                };
+
+                // Use symlink_metadata to not follow symlinks — dangling symlinks
+                // should be trashed, not permanently deleted via the fallthrough.
+                if let Ok(meta) = fs::symlink_metadata(&abs)
+                    && !should_skip_path(&abs)
+                    && !meta.is_dir()
+                    && try_trash(&abs)
+                {
                     return Some(success_with_errno(saved_errno));
                 }
             }
-        }
-        None
-    }));
+            None
+        }));
 
-    match res {
-        Ok(Some(ret)) => ret,
-        _ => (real_unlink())(pathname),
+        match res {
+            Ok(Some(ret)) => ret,
+            _ => (real_unlink())(pathname),
+        }
     }
 }
 
 /// # Safety
 /// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlinkat(
     dirfd: libc::c_int,
     pathname: *const libc::c_char,
     flags: libc::c_int,
 ) -> libc::c_int {
-    // Capture the caller's errno first (see unlink()).
-    let saved_errno = *libc::__errno_location();
+    unsafe {
+        // Capture the caller's errno first (see unlink()).
+        let saved_errno = *libc::__errno_location();
 
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = match ReentrancyGuard::enter() {
-            Some(g) => g,
-            None => return None,
-        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = match ReentrancyGuard::enter() {
+                Some(g) => g,
+                None => return None,
+            };
 
-        if !should_intercept() {
-            return None;
-        }
+            if !should_intercept() {
+                return None;
+            }
 
-        let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
+            let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
-        if let Some(abs) = resolve_at_path(dirfd, pathname) {
-            // Use symlink_metadata to not follow symlinks
-            if let Ok(meta) = fs::symlink_metadata(&abs) {
-                if !should_skip_path(&abs) {
+            if let Some(abs) = resolve_at_path(dirfd, pathname) {
+                // Use symlink_metadata to not follow symlinks
+                if let Ok(meta) = fs::symlink_metadata(&abs)
+                    && !should_skip_path(&abs)
+                {
                     let is_real_dir = meta.is_dir() && !meta.file_type().is_symlink();
                     if is_removedir {
                         // NOTE: emptiness here then rename in try_trash is a small
                         // TOCTOU — a sibling could repopulate the dir in between.
                         // The result is still recoverable from the trash (residual
                         // L8), so we accept it rather than add fragile locking.
-                        if is_real_dir {
-                            if let Ok(mut rd) = fs::read_dir(&abs) {
-                                if rd.next().is_none() && try_trash(&abs) {
-                                    return Some(success_with_errno(saved_errno));
-                                }
-                            }
+                        if is_real_dir
+                            && let Ok(mut rd) = fs::read_dir(&abs)
+                            && rd.next().is_none()
+                            && try_trash(&abs)
+                        {
+                            return Some(success_with_errno(saved_errno));
                         }
                     } else if !is_real_dir && try_trash(&abs) {
                         return Some(success_with_errno(saved_errno));
                     }
                 }
             }
-        }
-        None
-    }));
+            None
+        }));
 
-    match res {
-        Ok(Some(ret)) => ret,
-        _ => (real_unlinkat())(dirfd, pathname, flags),
+        match res {
+            Ok(Some(ret)) => ret,
+            _ => (real_unlinkat())(dirfd, pathname, flags),
+        }
     }
 }
 
 /// # Safety
 /// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
-    // Capture the caller's errno first (see unlink()).
-    let saved_errno = *libc::__errno_location();
+    unsafe {
+        // Capture the caller's errno first (see unlink()).
+        let saved_errno = *libc::__errno_location();
 
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = match ReentrancyGuard::enter() {
-            Some(g) => g,
-            None => return None,
-        };
-
-        if !should_intercept() {
-            return None;
-        }
-
-        if let Some(path) = cstr_to_path(pathname) {
-            let abs = if path.is_absolute() {
-                path.clone()
-            } else {
-                match std::env::current_dir() {
-                    Ok(cwd) => cwd.join(&path),
-                    Err(_) => return None,
-                }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = match ReentrancyGuard::enter() {
+                Some(g) => g,
+                None => return None,
             };
 
-            // Use symlink_metadata — rmdir only applies to real directories, not symlinks
-            if let Ok(meta) = fs::symlink_metadata(&abs) {
-                if meta.is_dir() && !meta.file_type().is_symlink() && !should_skip_path(&abs) {
-                    if let Ok(mut rd) = fs::read_dir(&abs) {
-                        if rd.next().is_none() && try_trash(&abs) {
-                            return Some(success_with_errno(saved_errno));
-                        }
+            if !should_intercept() {
+                return None;
+            }
+
+            if let Some(path) = cstr_to_path(pathname) {
+                let abs = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    match std::env::current_dir() {
+                        Ok(cwd) => cwd.join(&path),
+                        Err(_) => return None,
                     }
+                };
+
+                // Use symlink_metadata — rmdir only applies to real directories, not symlinks
+                if let Ok(meta) = fs::symlink_metadata(&abs)
+                    && meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && !should_skip_path(&abs)
+                    && let Ok(mut rd) = fs::read_dir(&abs)
+                    && rd.next().is_none()
+                    && try_trash(&abs)
+                {
+                    return Some(success_with_errno(saved_errno));
                 }
             }
-        }
-        None
-    }));
+            None
+        }));
 
-    match res {
-        Ok(Some(ret)) => ret,
-        _ => (real_rmdir())(pathname),
+        match res {
+            Ok(Some(ret)) => ret,
+            _ => (real_rmdir())(pathname),
+        }
     }
 }

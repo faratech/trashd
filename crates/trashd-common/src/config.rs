@@ -334,12 +334,11 @@ impl Config {
         // Walk up at most 5 levels to find .trashd.toml
         for _ in 0..5 {
             let config_path = dir.join(".trashd.toml");
-            if config_path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&config_path) {
-                    if let Ok(local) = toml::from_str::<LocalConfig>(&content) {
-                        return Some(local);
-                    }
-                }
+            if config_path.is_file()
+                && let Ok(content) = std::fs::read_to_string(&config_path)
+                && let Ok(local) = toml::from_str::<LocalConfig>(&content)
+            {
+                return Some(local);
             }
             dir = dir.parent()?;
         }

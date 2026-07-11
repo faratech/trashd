@@ -157,10 +157,10 @@ fn encode_path(path: &Path) -> String {
 
 /// Decode a percent-encoded path from .trashinfo.
 fn decode_path(s: &str) -> PathBuf {
-    if let Ok(url) = Url::parse(&format!("file://{s}")) {
-        if let Ok(path) = url.to_file_path() {
-            return path;
-        }
+    if let Ok(url) = Url::parse(&format!("file://{s}"))
+        && let Ok(path) = url.to_file_path()
+    {
+        return path;
     }
     // Fallback: manual decode — preserve invalid sequences literally
     let mut bytes = Vec::with_capacity(s.len());

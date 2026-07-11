@@ -32,23 +32,23 @@ pub fn run(_store: &TrashStore, fix: bool) {
             }
 
             // Check if trashinfo is parseable
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                if trashd_common::trashinfo::TrashInfo::from_trashinfo(&content).is_none() {
-                    corrupt_info += 1;
-                    println!("  {} corrupt trashinfo: {}", "WARN".yellow(), id);
-                    // NEVER delete the data file just because its metadata is
-                    // unparseable — the file in files/<id> is intact and is
-                    // exactly what the trash bin exists to protect. Quarantine:
-                    // leave both the data and the (still-present) sidecar in
-                    // place so the data is never auto-orphaned, and tell the
-                    // user where to recover it by hand.
-                    if fix {
-                        println!(
-                            "    {} data preserved at {} (metadata unreadable; recover manually)",
-                            "kept".green(),
-                            file_path.display(),
-                        );
-                    }
+            if let Ok(content) = std::fs::read_to_string(entry.path())
+                && trashd_common::trashinfo::TrashInfo::from_trashinfo(&content).is_none()
+            {
+                corrupt_info += 1;
+                println!("  {} corrupt trashinfo: {}", "WARN".yellow(), id);
+                // NEVER delete the data file just because its metadata is
+                // unparseable — the file in files/<id> is intact and is
+                // exactly what the trash bin exists to protect. Quarantine:
+                // leave both the data and the (still-present) sidecar in
+                // place so the data is never auto-orphaned, and tell the
+                // user where to recover it by hand.
+                if fix {
+                    println!(
+                        "    {} data preserved at {} (metadata unreadable; recover manually)",
+                        "kept".green(),
+                        file_path.display(),
+                    );
                 }
             }
         }
@@ -124,10 +124,10 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
                 continue;
             }
             let id = name.strip_suffix(".trashinfo").unwrap_or(&name).to_string();
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                if let Some(info) = trashd_common::trashinfo::TrashInfo::from_trashinfo(&content) {
-                    entries.push((id, info, trash_dir.to_path_buf()));
-                }
+            if let Ok(content) = std::fs::read_to_string(entry.path())
+                && let Some(info) = trashd_common::trashinfo::TrashInfo::from_trashinfo(&content)
+            {
+                entries.push((id, info, trash_dir.to_path_buf()));
             }
         }
     }
@@ -151,7 +151,8 @@ mod tests {
             .join(format!("d-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_DATA_HOME", &dir);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
 
         let store = TrashStore::open().unwrap();
         let trash = TrashStore::trash_dir();

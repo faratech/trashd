@@ -2,8 +2,8 @@ use clap::Parser;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use trashd_common::store::is_parent_bypassed;
 use trashd_common::TrashStore;
+use trashd_common::store::is_parent_bypassed;
 
 /// trashd rm shim — drop-in replacement that moves files to trash instead of deleting.
 ///

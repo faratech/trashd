@@ -52,17 +52,16 @@ pub fn parse_time_spec(
     }
 
     // Absolute: "2026-03-20T14:00:00" or "2026-03-20"
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        if let Some(local) = dt.and_local_timezone(chrono::Local).single() {
-            return local;
-        }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        && let Some(local) = dt.and_local_timezone(chrono::Local).single()
+    {
+        return local;
     }
     if let Ok(dt) =
         chrono::NaiveDateTime::parse_from_str(&format!("{s}T00:00:00"), "%Y-%m-%dT%H:%M:%S")
+        && let Some(local) = dt.and_local_timezone(chrono::Local).single()
     {
-        if let Some(local) = dt.and_local_timezone(chrono::Local).single() {
-            return local;
-        }
+        return local;
     }
 
     eprintln!(

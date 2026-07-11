@@ -1,5 +1,5 @@
 use crate::trashinfo::TrashInfo;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 
 /// Index location relative to a trash directory. Shared so every caller
