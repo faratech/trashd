@@ -12,8 +12,12 @@ pub struct MountPoint {
 }
 
 /// Get the device ID (st_dev) for a path.
+///
+/// symlink_metadata: the device decision must reflect the INODE being moved.
+/// A symlink classified by its TARGET could route the move to the wrong
+/// filesystem's trash (#46).
 pub fn device_id(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|m| m.dev())
+    fs::symlink_metadata(path).ok().map(|m| m.dev())
 }
 
 /// Get the device ID for a path, following through to the parent if needed.
@@ -127,8 +131,9 @@ pub fn trash_dir_for_path(path: &Path, home_trash: &Path) -> PathBuf {
 
     let uid = unsafe { libc::getuid() };
     if let Some(mount) = find_mount_point(&abs) {
-        // Spec §1.2.2a: check $topdir/.Trash/
-        if let Some(shared) = check_shared_trash(&mount.path, uid) {
+        // Spec §1.2.2a: check $topdir/.Trash/ (creating our uid dir is fine —
+        // we're about to write into it)
+        if let Some(shared) = check_shared_trash(&mount.path, uid, true) {
             return shared;
         }
         // Spec §1.2.2b: use $topdir/.Trash-$UID/
@@ -140,8 +145,12 @@ pub fn trash_dir_for_path(path: &Path, home_trash: &Path) -> PathBuf {
 }
 
 /// Check if $topdir/.Trash/ exists, is a real directory (not symlink),
-/// has the sticky bit, and is writable. If so, return $topdir/.Trash/$UID/.
-fn check_shared_trash(topdir: &Path, uid: u32) -> Option<PathBuf> {
+/// has the sticky bit, and is usable. If so, return $topdir/.Trash/$UID/.
+///
+/// `create=false` turns this into a pure PROBE for enumeration
+/// (all_trash_dirs): a read-only `trash ls`/`status` must not scatter
+/// `.Trash/$UID` directories across every mounted filesystem (#38).
+fn check_shared_trash(topdir: &Path, uid: u32, create: bool) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let trash_dir = topdir.join(".Trash");
@@ -164,6 +173,9 @@ fn check_shared_trash(topdir: &Path, uid: u32) -> Option<PathBuf> {
     // Must be writable by us (check by trying to create the uid subdir)
     let uid_dir = trash_dir.join(uid.to_string());
     if !uid_dir.exists() {
+        if !create {
+            return None;
+        }
         if fs::create_dir_all(&uid_dir).is_err() {
             return None;
         }
@@ -178,6 +190,11 @@ fn check_shared_trash(topdir: &Path, uid: u32) -> Option<PathBuf> {
         use std::os::unix::fs::MetadataExt;
         if m.uid() != uid || m.file_type().is_symlink() {
             return None;
+        }
+        // Re-enforce privacy on reuse: an older version could have left the
+        // dir group/other-readable.
+        if create && m.permissions().mode() & 0o077 != 0 {
+            let _ = fs::set_permissions(&uid_dir, fs::Permissions::from_mode(0o700));
         }
         return Some(uid_dir);
     }
@@ -203,8 +220,9 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
 
         let label = format!("{} ({})", mount.path.display(), mount.fstype);
 
-        // Check shared .Trash/$UID first (spec §1.2.2a)
-        if let Some(shared) = check_shared_trash(&mount.path, uid)
+        // Check shared .Trash/$UID first (spec §1.2.2a) — PROBE only: a
+        // read-only enumeration must not create trash dirs on every mount (#38).
+        if let Some(shared) = check_shared_trash(&mount.path, uid, false)
             && shared.exists()
             && shared.is_dir()
         {

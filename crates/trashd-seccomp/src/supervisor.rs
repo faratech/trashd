@@ -198,6 +198,11 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
         return;
     }
 
+    if target_bypassed(notif.pid) {
+        respond_continue(fd, notif.id);
+        return;
+    }
+
     // Honor bypass_paths against the TRAPPING process's executable. Checking
     // the supervisor's own /proc/self/exe (as before) made the whole list
     // inert in this layer — the supervisor is always trashd-exec (#21).
@@ -297,6 +302,21 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
             // Trash failed — fall back to real delete
             respond_continue(fd, notif.id);
         }
+    }
+}
+
+/// True when the TARGET process has TRASH_BYPASS=1 in its environment.
+///
+/// The shim and preload layers check TRASH_BYPASS directly, but this layer
+/// runs OUTSIDE the target process — without reading its environ the variable
+/// was silently ignored here, so e.g. self-update running install.sh with
+/// TRASH_BYPASS=1 still had every old-binary unlink intercepted mid-upgrade
+/// (#18). Reading /proc/<pid>/environ requires same-user or root, which the
+/// supervisor necessarily is (it created the target).
+fn target_bypassed(pid: u32) -> bool {
+    match std::fs::read(format!("/proc/{pid}/environ")) {
+        Ok(data) => data.split(|&b| b == 0).any(|e| e == b"TRASH_BYPASS=1"),
+        Err(_) => false,
     }
 }
 

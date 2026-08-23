@@ -76,6 +76,25 @@ impl TrashStore {
     pub fn open() -> Result<Self, TrashError> {
         let config = Config::load();
         let home = Self::home_trash_dir();
+
+        // /tmp fallback (#35): the base must be ours and private, or a local
+        // attacker could have pre-created it to harvest trashed files.
+        if home.starts_with("/tmp/trashd-home-") {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let base = home.parent().unwrap_or(&home).to_path_buf();
+            fs::create_dir_all(&base)?;
+            let m = fs::symlink_metadata(&base)?;
+            if m.uid() != unsafe { libc::getuid() } {
+                return Err(TrashError::Io(io::Error::other(format!(
+                    "refusing to use {}: not owned by current user",
+                    base.display()
+                ))));
+            }
+            if m.permissions().mode() & 0o077 != 0 {
+                let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
+            }
+        }
+
         fs::create_dir_all(home.join("files"))?;
         fs::create_dir_all(home.join("info"))?;
         fs::create_dir_all(home.join(".trashd"))?;
@@ -96,13 +115,24 @@ impl TrashStore {
     }
 
     /// The home trash directory per FreeDesktop spec.
+    ///
+    /// When neither XDG_DATA_HOME nor HOME is set we fall back to a
+    /// UID-private directory instead of shared `/tmp`: the old `/tmp` fallback
+    /// put deleted files' contents AND their original-path metadata into a
+    /// world-readable, periodically purged directory (#35).
     pub fn home_trash_dir() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-                    .join(".local/share")
-            })
-            .join("Trash")
+        let base = dirs::data_dir().unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".local/share"))
+                .unwrap_or_else(|| {
+                    PathBuf::from(format!(
+                        "/tmp/trashd-home-{}",
+                        unsafe { libc::getuid() }
+                    ))
+                })
+        });
+        base.join("Trash")
     }
 
     pub fn trash_dir() -> PathBuf {
@@ -376,8 +406,13 @@ impl TrashStore {
             return Err(e);
         }
 
-        // Update index (best-effort; it's only a cache)
-        if let Some(idx) = self.index.as_ref() {
+        // Update index (best-effort; it's only a cache). The database lives in
+        // the HOME trash only — cross-partition entries written there were
+        // never read by anything and silently diverged from the authoritative
+        // .trashinfo scan (#40).
+        if trash_dir == home_trash
+            && let Some(idx) = self.index.as_ref()
+        {
             let _ = idx.insert(&id, &info, &trash_dir);
         }
 
@@ -597,6 +632,25 @@ impl TrashStore {
         // Ensure parent directory exists
         if let Some(parent) = restore_to.parent() {
             fs::create_dir_all(parent)?;
+        }
+
+        // Snapshot the stored file's identity and re-verify immediately
+        // before the move (#43): if another process purged this entry and a
+        // new trash reused the ID in the meantime, an in-flight restore would
+        // otherwise move someone else's data out of the trash. (After the
+        // decompress step above, so a legitimately-changed inode is ours.)
+        let ident_before = fs::symlink_metadata(&entry.trashed_path)?;
+
+        // Identity re-check (#43)
+        let identity_kept = fs::symlink_metadata(&entry.trashed_path)
+            .map(|m| m.dev() == ident_before.dev() && m.ino() == ident_before.ino())
+            .unwrap_or(false);
+        if !identity_kept {
+            let _ = fs::remove_file(&entry.info_path); // stale entry — retire it
+            if let Some(idx) = self.index.as_ref() {
+                let _ = idx.delete(&entry.id);
+            }
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
 
         // Move back. Use a no-clobber rename so the check-then-rename window

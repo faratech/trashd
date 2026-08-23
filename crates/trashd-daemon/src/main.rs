@@ -30,10 +30,14 @@ const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
 
 const FAN_DELETE: u64 = 0x0000_0200;
 const FAN_DELETE_SELF: u64 = 0x0000_0400;
-const FAN_MOVED_FROM: u64 = 0x0000_0040;
+// Delete events carry fd = FAN_NOFD (-1) with FAN_REPORT_FID groups — there
+// is no fd to close for them.
+// FAN_MOVED_FROM deliberately NOT watched: without pairing logic every
+// rename logged a bogus DELETE record (#31). This is an audit log — false
+// entries are worse than missing rename coverage.
+const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 
-const FAN_NOFD: i32 = -1;
-
+const FAN_EVENT_INFO_TYPE_DFID: u8 = 1;
 const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
 
 /// fanotify event metadata (struct fanotify_event_metadata).
@@ -112,6 +116,7 @@ fn run() -> io::Result<()> {
     // Mark all real mount points
     let mount_list = mounts::list_mounts();
     let mut marked = 0;
+    let mut marked_paths: Vec<PathBuf> = Vec::new();
     for mount in &mount_list {
         if matches!(
             mount.fstype.as_str(),
@@ -123,7 +128,7 @@ fn run() -> io::Result<()> {
         match fanotify_mark(
             fan_fd,
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-            FAN_DELETE | FAN_DELETE_SELF | FAN_MOVED_FROM,
+            FAN_DELETE | FAN_DELETE_SELF,
             &mount.path,
         ) {
             Ok(()) => {
@@ -133,6 +138,7 @@ fn run() -> io::Result<()> {
                     mount.fstype,
                 );
                 marked += 1;
+                marked_paths.push(mount.path.clone());
             }
             Err(e) => {
                 eprintln!("trashd: failed to mark {}: {e}", mount.path.display(),);
@@ -148,7 +154,7 @@ fn run() -> io::Result<()> {
 
     // Open O_PATH fds to each watched mount point for open_by_handle_at.
     // open_by_handle_at requires a mount fd on the same filesystem as the handle.
-    let mut mount_fds: Vec<RawFd> = Vec::new();
+    let mut mount_fds: Vec<(PathBuf, RawFd)> = Vec::new();
     for mount in &mount_list {
         if matches!(
             mount.fstype.as_str(),
@@ -162,7 +168,7 @@ fn run() -> io::Result<()> {
         };
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
         if fd >= 0 {
-            mount_fds.push(fd);
+            mount_fds.push((mount.path.clone(), fd));
         }
     }
 
@@ -183,6 +189,10 @@ fn run() -> io::Result<()> {
                     revents: 0,
                 };
                 unsafe { libc::poll(&mut pfd, 1, 1000) };
+                // Idle tick: pick up mounts that appeared after startup
+                // (USB sticks, network shares) — the startup snapshot never
+                // watched them (#37).
+                refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
                 continue;
             }
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -208,8 +218,17 @@ fn run() -> io::Result<()> {
                 break;
             }
 
+            // Queue overflow: events were DROPPED by the kernel — say so
+            // loudly instead of silently producing an incomplete audit log
+            // (#32).
+            if event.mask & FAN_Q_OVERFLOW != 0 {
+                eprintln!(
+                    "[trashd] WARNING: fanotify queue overflow — deletion events were lost"
+                );
+            }
+
             // Process event
-            if event.mask & (FAN_DELETE | FAN_DELETE_SELF | FAN_MOVED_FROM) != 0 {
+            if event.mask & (FAN_DELETE | FAN_DELETE_SELF) != 0 {
                 let path = resolve_event_path(&buf[offset..offset + event_len], event, &mount_fds);
                 let pid = event.pid as u32;
                 let proc_name = process_name(pid);
@@ -249,24 +268,23 @@ fn run() -> io::Result<()> {
 /// Falls back to reading /proc/self/fd/{event.fd} for FAN_DELETE_SELF.
 fn resolve_event_path(
     event_buf: &[u8],
-    event: &FanotifyEventMetadata,
-    mount_fds: &[RawFd],
+    _event: &FanotifyEventMetadata,
+    mount_fds: &[(PathBuf, RawFd)],
 ) -> Option<PathBuf> {
-    // Try to extract path from extended FID info (for FAN_DELETE)
-    if let Some(path) = extract_dfid_name_path(event_buf, mount_fds) {
-        return Some(path);
-    }
-
-    // Fallback: use the event fd (works for FAN_DELETE_SELF)
-    if event.fd >= 0 && event.fd != FAN_NOFD {
-        return std::fs::read_link(format!("/proc/self/fd/{}", event.fd)).ok();
-    }
-
-    None
+    // Try to extract path from extended FID info (DFID_NAME for FAN_DELETE,
+    // DFID for FAN_DELETE_SELF). No fd-based fallback: with FAN_REPORT_FID
+    // groups delete events always carry fd=FAN_NOFD, so it was dead code (#29).
+    extract_dfid_name_path(event_buf, mount_fds)
 }
 
-/// Parse the DFID_NAME extended info to get parent_dir + filename.
-fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathBuf> {
+/// Parse extended FID info to get a path.
+///
+/// - DFID_NAME (type 2): parent dir handle + deleted filename → full path.
+/// - DFID (type 1): the inode's OWN handle (FAN_DELETE_SELF) → resolved
+///   directly via open_by_handle_at. Type-1 records were never parsed before,
+///   and with FAN_REPORT_FID groups delete events carry fd=FAN_NOFD, so the
+///   old /proc/self/fd fallback could never fire either (#29).
+fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[(PathBuf, RawFd)]) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
@@ -276,6 +294,25 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathB
         let info_len = hdr.len as usize;
         if info_len < info_hdr_size || offset + info_len > event_buf.len() {
             break;
+        }
+
+        if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID {
+            let fid_hdr_size = std::mem::size_of::<FanotifyEventInfoFid>();
+            if info_len < fid_hdr_size + 8 {
+                break;
+            }
+            let fh_offset = offset + fid_hdr_size;
+            if fh_offset + 8 > event_buf.len() {
+                break;
+            }
+            let handle_bytes = u32::from_ne_bytes([
+                event_buf[fh_offset],
+                event_buf[fh_offset + 1],
+                event_buf[fh_offset + 2],
+                event_buf[fh_offset + 3],
+            ]) as usize;
+            let file_handle_ptr = event_buf[fh_offset..].as_ptr();
+            return resolve_handle_to_path(file_handle_ptr, handle_bytes, mount_fds);
         }
 
         if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
@@ -341,11 +378,12 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[RawFd]) -> Option<PathB
 fn resolve_handle_to_path(
     file_handle_ptr: *const u8,
     _handle_bytes: usize,
-    mount_fds: &[RawFd],
+    mount_fds: &[(PathBuf, RawFd)],
 ) -> Option<PathBuf> {
     // open_by_handle_at requires a mount fd on the same filesystem as the handle.
     // Try each cached mount fd until one succeeds.
-    for &mount_fd in mount_fds {
+    for (_, mount_fd) in mount_fds {
+        let mount_fd = *mount_fd;
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_open_by_handle_at,
@@ -363,6 +401,45 @@ fn resolve_handle_to_path(
     }
 
     None
+}
+
+/// Diff a fresh /proc/mounts scan against the marked set; mark and open
+/// handle-resolution fds for anything new (#37).
+fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<PathBuf>, fds: &mut Vec<(PathBuf, RawFd)>) {
+    for mount in mounts::list_mounts() {
+        if matches!(
+            mount.fstype.as_str(),
+            "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
+        ) {
+            continue;
+        }
+        if !marked.iter().any(|p| p == &mount.path) {
+            match fanotify_mark(
+                fan_fd,
+                FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                FAN_DELETE | FAN_DELETE_SELF,
+                &mount.path,
+            ) {
+                Ok(()) => {
+                    eprintln!(
+                        "trashd: watching {} ({}) [new mount]",
+                        mount.path.display(),
+                        mount.fstype
+                    );
+                    marked.push(mount.path.clone());
+                }
+                Err(_) => continue,
+            }
+        }
+        if !fds.iter().any(|(p, _)| p == &mount.path)
+            && let Ok(c) = std::ffi::CString::new(mount.path.to_string_lossy().as_bytes())
+        {
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
+            if fd >= 0 {
+                fds.push((mount.path.clone(), fd));
+            }
+        }
+    }
 }
 
 fn fanotify_init(flags: libc::c_uint) -> io::Result<RawFd> {

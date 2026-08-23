@@ -21,7 +21,10 @@ pub fn run(_store: &TrashStore, fix: bool) {
             }
             let id = name.strip_suffix(".trashinfo").unwrap_or(&name);
             let file_path = files_dir.join(id);
-            if !file_path.exists() {
+            // symlink_metadata (not exists()): a DANGLING symlink in files/
+            // is still an entry we must not silently discard by declaring its
+            // trashinfo orphaned.
+            if std::fs::symlink_metadata(&file_path).is_err() {
                 orphaned_info += 1;
                 println!("  {} orphaned trashinfo (no file): {}", "WARN".yellow(), id);
                 if fix {
@@ -67,13 +70,36 @@ pub fn run(_store: &TrashStore, fix: bool) {
                     name
                 );
                 if fix {
-                    let meta = entry.metadata();
-                    if meta.map(|m| m.is_dir()).unwrap_or(false) {
-                        let _ = std::fs::remove_dir_all(entry.path());
+                    // Orphaned data may be recoverable user data (a crash or a
+                    // failed restore can produce exactly this state). Deleting
+                    // it permanently in an automatic "fix" is against the
+                    // preserve-data philosophy — require explicit per-item
+                    // confirmation. symlink_metadata so dangling symlinks are
+                    // classified correctly, not followed.
+                    let is_dir = entry
+                        .file_type()
+                        .map(|t| t.is_dir())
+                        .unwrap_or(false);
+                    if crate::util::confirm(&format!(
+                        "    permanently delete orphaned '{}'? This cannot be undone [y/N] ",
+                        entry.path().display()
+                    )) {
+                        let res = if is_dir {
+                            std::fs::remove_dir_all(entry.path())
+                        } else {
+                            std::fs::remove_file(entry.path())
+                        };
+                        match res {
+                            Ok(()) => println!("    {}", "removed".green()),
+                            Err(e) => println!("    {} {e}", "failed:".red()),
+                        }
                     } else {
-                        let _ = std::fs::remove_file(entry.path());
+                        println!(
+                            "    {} data preserved at {} (recover manually)",
+                            "kept".green(),
+                            entry.path().display()
+                        );
                     }
-                    println!("    {}", "removed".green());
                 }
             }
         }

@@ -52,12 +52,15 @@ pub fn read_cache(trash_dir: &Path) -> HashMap<String, DirSizeEntry> {
 }
 
 /// Write/update the directorysizes cache for a trash directory.
-/// Uses temp file + atomic rename per spec.
+/// Uses a unique temp file + atomic rename per spec.
 pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let info_dir = trash_dir.join("info");
     let files_dir = trash_dir.join("files");
     let cache_path = trash_dir.join("directorysizes");
-    let tmp_path = trash_dir.join(".directorysizes.tmp");
+    // Unique per-process temp name: a fixed name made two concurrent writers
+    // clobber each other's staging file and lose entries (#34).
+    let tmp_path = trash_dir.join(format!(".directorysizes.tmp.{}", std::process::id()));
 
     let mut lines = Vec::new();
 
@@ -72,18 +75,23 @@ pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
                 None => continue,
             };
 
-            // Only cache directories
+            // Only cache directories — symlink_metadata so a trashed SYMLINK
+            // to an external directory is never walked through or cached as
+            // a directory.
             let file_path = files_dir.join(id);
-            if !file_path.is_dir() {
+            let is_real_dir = match fs::symlink_metadata(&file_path) {
+                Ok(m) => m.is_dir(),
+                Err(_) => continue,
+            };
+            if !is_real_dir {
                 continue;
             }
 
             // mtime of the .trashinfo file per spec (NOT the directory)
-            let info_meta = match fs::metadata(entry.path()) {
-                Ok(m) => m,
+            let mtime = match entry.metadata() {
+                Ok(m) => m.mtime(),
                 Err(_) => continue,
             };
-            let mtime = info_meta.mtime();
 
             // Size: recursive directory size
             let size = dir_size_bytes(&file_path);
@@ -92,8 +100,23 @@ pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
         }
     }
 
-    // Write to temp file, then atomic rename
-    fs::write(&tmp_path, lines.join("\n") + "\n")?;
+    // Write to a fresh O_EXCL temp file, then atomic rename
+    let data = lines.join("\n") + "\n";
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)
+    {
+        Ok(mut f) => {
+            std::io::Write::write_all(&mut f, data.as_bytes())?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Stale temp from this same pid (crash) — replace content.
+            fs::write(&tmp_path, &data)?;
+        }
+        Err(e) => return Err(e),
+    }
     fs::rename(&tmp_path, &cache_path)?;
 
     Ok(())
@@ -115,12 +138,17 @@ fn dir_size_bytes_inner(path: &Path, depth: u32) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    total = total.saturating_add(dir_size_bytes_inner(&entry.path(), depth + 1));
-                } else {
-                    // Count blocks * 512 for actual disk usage (like du)
-                    // Only for files — directory content is counted by the recursive call
+            // symlink_metadata / file_type(): never follow symlinks —
+            // following made the walk escape into external (possibly huge or
+            // cyclic) trees and count foreign data.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                total = total.saturating_add(dir_size_bytes_inner(&entry.path(), depth + 1));
+            } else if !ft.is_symlink() {
+                // Count blocks * 512 for actual disk usage (like du)
+                if let Ok(meta) = entry.metadata() {
                     total = total.saturating_add(meta.blocks().saturating_mul(512));
                 }
             }

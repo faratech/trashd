@@ -252,28 +252,34 @@ type UnlinkatFn =
     unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int;
 type RmdirFn = unsafe extern "C" fn(*const libc::c_char) -> libc::c_int;
 
+// dlsym(RTLD_NEXT) results are cached: resolving on EVERY passthrough call
+// walks the whole link map each time and dominates latency for programs that
+// delete in a loop.
 unsafe fn real_unlink() -> UnlinkFn {
-    unsafe {
-        let sym = libc::dlsym(libc::RTLD_NEXT, c"unlink".as_ptr() as *const _);
+    static F: OnceLock<UnlinkFn> = OnceLock::new();
+    *F.get_or_init(|| {
+        let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, c"unlink".as_ptr() as *const _) };
         assert!(!sym.is_null(), "trashd: dlsym(unlink) failed");
-        std::mem::transmute(sym)
-    }
+        unsafe { std::mem::transmute(sym) }
+    })
 }
 
 unsafe fn real_unlinkat() -> UnlinkatFn {
-    unsafe {
-        let sym = libc::dlsym(libc::RTLD_NEXT, c"unlinkat".as_ptr() as *const _);
+    static F: OnceLock<UnlinkatFn> = OnceLock::new();
+    *F.get_or_init(|| {
+        let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, c"unlinkat".as_ptr() as *const _) };
         assert!(!sym.is_null(), "trashd: dlsym(unlinkat) failed");
-        std::mem::transmute(sym)
-    }
+        unsafe { std::mem::transmute(sym) }
+    })
 }
 
 unsafe fn real_rmdir() -> RmdirFn {
-    unsafe {
-        let sym = libc::dlsym(libc::RTLD_NEXT, c"rmdir".as_ptr() as *const _);
+    static F: OnceLock<RmdirFn> = OnceLock::new();
+    *F.get_or_init(|| {
+        let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, c"rmdir".as_ptr() as *const _) };
         assert!(!sym.is_null(), "trashd: dlsym(rmdir) failed");
-        std::mem::transmute(sym)
-    }
+        unsafe { std::mem::transmute(sym) }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -665,10 +671,21 @@ fn unescape_octal(s: &str) -> String {
     out
 }
 
-fn home_trash_dir() -> PathBuf {    dirs::data_dir()
+fn home_trash_dir() -> PathBuf {
+    // No shared /tmp fallback: without XDG or HOME the trash would land in a
+    // world-readable, periodically purged directory (#35). A uid-suffixed
+    // path keeps it out of other users' reach.
+    dirs::data_dir()
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-                .join(".local/share")
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".local/share"))
+                .unwrap_or_else(|| {
+                    PathBuf::from(format!(
+                        "/tmp/trashd-home-{}",
+                        unsafe { libc::getuid() }
+                    ))
+                })
         })
         .join("Trash")
 }
@@ -709,7 +726,12 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 // Core trash logic
 // ---------------------------------------------------------------------------
 
-fn try_trash(path: &Path) -> bool {
+/// Move `path` into the appropriate trash. `expect_dev`/`expect_ino` are the
+/// identity captured by the hook's eligibility stat: re-stat immediately
+/// before the move and bail out if the file was REPLACED in between (#44) —
+/// trashing the new inode would capture content the caller never asked to
+/// delete, and then report success for it.
+fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
     let trash_dir = trash_dir_for(path);
 
     let files_dir = trash_dir.join("files");
@@ -780,6 +802,16 @@ fn try_trash(path: &Path) -> bool {
     if fs::write(&info_path, &trashinfo).is_err() {
         let _ = fs::remove_file(&info_path);
         return false;
+    }
+
+    // TOCTOU re-check just before the move (#44)
+    match fs::symlink_metadata(path) {
+        Ok(now) if now.dev() == expect_dev && now.ino() == expect_ino => {}
+        Ok(_) => {
+            let _ = fs::remove_file(&info_path);
+            return false; // replaced — let the real unlink handle the path
+        }
+        Err(_) => {} // vanished; rename below fails cleanly
     }
 
     // Move the file
@@ -1022,6 +1054,14 @@ fn should_intercept() -> bool {
 
 // ---------------------------------------------------------------------------
 // Hooked functions
+//
+// ASYNC-SIGNAL-SAFETY CAVEAT (#36): these hooks do heap allocation, file IO
+// and locks, so unlink()/unlinkat()/rmdir() are NOT async-signal-safe while
+// this library is loaded. A program that deletes files from WITHIN a signal
+// handler takes the real-syscall path (the re-entrancy guard makes the nested
+// hook a no-op) — the deletion still happens, just without trashing. This is
+// the least-bad behavior for an interposer; glibc's own printf-family has the
+// same caveat and programs are expected not to delete from handlers.
 // ---------------------------------------------------------------------------
 
 /// # Safety
@@ -1059,7 +1099,7 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
                 if let Ok(meta) = fs::symlink_metadata(&abs)
                     && !should_skip_path(&abs)
                     && !meta.is_dir()
-                    && try_trash(&abs)
+                    && try_trash(&abs, meta.dev(), meta.ino())
                 {
                     return Some(success_with_errno(saved_errno));
                 }
@@ -1112,11 +1152,11 @@ pub unsafe extern "C" fn unlinkat(
                         if is_real_dir
                             && let Ok(mut rd) = fs::read_dir(&abs)
                             && rd.next().is_none()
-                            && try_trash(&abs)
+                            && try_trash(&abs, meta.dev(), meta.ino())
                         {
                             return Some(success_with_errno(saved_errno));
                         }
-                    } else if !is_real_dir && try_trash(&abs) {
+                    } else if !is_real_dir && try_trash(&abs, meta.dev(), meta.ino()) {
                         return Some(success_with_errno(saved_errno));
                     }
                 }
@@ -1166,7 +1206,7 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                     && !should_skip_path(&abs)
                     && let Ok(mut rd) = fs::read_dir(&abs)
                     && rd.next().is_none()
-                    && try_trash(&abs)
+                    && try_trash(&abs, meta.dev(), meta.ino())
                 {
                     return Some(success_with_errno(saved_errno));
                 }

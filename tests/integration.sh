@@ -153,7 +153,9 @@ echo "first" > /root/trashd_it_dup.txt
 rm /root/trashd_it_dup.txt
 echo "second" > /root/trashd_it_dup.txt
 rm /root/trashd_it_dup.txt
-COUNT=$(trash ls 2>&1 | grep -c "trashd_it_dup")
+# || true: grep -c exits 1 on zero matches, and set -e would abort the whole
+# suite right when this test FAILS — hiding the summary (#48).
+COUNT=$(trash ls 2>&1 | grep -c "trashd_it_dup" || true)
 if [ "$COUNT" -ge 2 ]; then
     pass "Duplicate filenames get unique IDs"
 else

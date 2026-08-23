@@ -1,4 +1,15 @@
 //! Read path arguments from a target process's memory via process_vm_readv.
+//!
+//! KNOWN RESIDUAL RACE (audit #6, accepted limitation): for relative paths we
+//! resolve the base via /proc symlink STRINGS (`cwd`, `fd/N`) and then act on
+//! the joined path. The supervised process is frozen in its syscall, but a
+//! COOPERATING SIBLING process can rename/replace the base directory or the
+//! final component in that window, causing the wrong file to be trashed.
+//! Eliminating this entirely requires fd-based operations throughout
+//! (pin the base with pidfd_getfd(2)/openat2 relative to it), which is an
+//! architectural follow-up, not a patch. `notif_id_valid` re-checks bound the
+//! damage window; single-user desktop use (the primary deployment) has no
+//! adversarial sibling by default.
 
 use std::ffi::OsString;
 use std::io;

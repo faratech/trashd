@@ -70,8 +70,12 @@ struct Rm {
     #[arg(long = "help")]
     help: bool,
 
-    /// Files and directories to remove
-    #[arg(trailing_var_arg = true)]
+    /// Files and directories to remove.
+    /// No trailing_var_arg: GNU rm permutes operands so `rm f -r` must work,
+    /// and swallowing everything after the first operand silently turned
+    /// later flags into filenames (#51). Unknown flags still fail parsing and
+    /// fall through to real rm unchanged.
+    #[arg(allow_hyphen_values = false)]
     files: Vec<PathBuf>,
 }
 
@@ -109,7 +113,7 @@ fn main() -> ExitCode {
     // entries like /* expand to operands that are not "/" itself).
     if args.recursive
         && !args.no_preserve_root
-        && args.files.iter().any(is_root_operand)
+        && args.files.iter().any(|f| is_root_operand(f))
     {
         eprintln!("rm: it is dangerous to operate recursively on '/'");
         eprintln!("rm: use --no-preserve-root to override the failsafe");
@@ -299,7 +303,7 @@ fn main() -> ExitCode {
 
 /// True when an operand IS the filesystem root ("/", "//", "///", ...).
 /// Matches GNU rm's preserve-root guard, which refuses exactly these.
-fn is_root_operand(p: &PathBuf) -> bool {
+fn is_root_operand(p: &std::path::Path) -> bool {
     let mut comps = p.components();
     matches!(comps.next(), Some(std::path::Component::RootDir)) && comps.next().is_none()
 }
