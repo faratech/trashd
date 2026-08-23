@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.1.3 (2026-08-22)
+
+Bug-fix release from a 16-agent adversarially-verified security audit (52
+confirmed findings, all fixed) plus a full fd-based rewrite of the seccomp
+supervisor's path handling. No breaking changes; note the two deliberate
+behavior changes flagged below.
+
+### Fixed — data loss
+
+- `rm --permanent` can no longer fork-bomb when a stale install stashed the
+  shim itself as the "real" rm (both the installer and the shim now detect it).
+- Trashing the trash directory itself, anything inside it, or an ancestor is
+  refused — `rm -rf ~/.local/share/Trash` can no longer destroy the store.
+- GNU rm's `--preserve-root` guard is actually enforced (`rm -rf /` fails).
+- Size-limit (`max_file_size_mb` / `max_dir_size_mb`) and trash-self refusals
+  no longer escalate to permanent deletion; the file is left untouched.
+- A failed removal of the original after a successful cross-device copy keeps
+  the complete trash copy instead of rolling it back (no more losing the only
+  surviving copy of partially-deleted trees).
+- Auto-purge retention accounting uses recorded tree sizes for directories
+  (the old ~4 KB inode-size estimate over-purged far past configured limits)
+  and never follows symlinks.
+- Orphaned entries (no `.trashinfo`) can no longer hijack `trash undo` or be
+  restored to a bogus `(orphaned: …)` path in the CWD.
+- Non-UTF-8 filenames survive a trash/restore round-trip byte-exact (raw-byte
+  percent-encoding); non-UTF-8 argv no longer panics the shim.
+
+### Fixed — security
+
+- seccomp supervisor: race-free fd-pinned interception (#6). The target's
+  root/cwd/dirfd are pinned via pidfd_open/pidfd_getfd, prefixes resolve in a
+  single openat2 walk (RESOLVE_IN_ROOT for absolute paths), and moves happen
+  with renameat against pinned inodes — sibling renames can no longer divert a
+  delete to different content, and chrooted/absolute-path walks stay inside
+  the pinned root. Legacy path flow remains as fallback.
+- The supervisor honors `TRASH_BYPASS=1` by reading the target's environ;
+  `bypass_paths` is checked against the trapping process's executable.
+- `systemd`/`systemctl` removed from the default bypass list — ancestor-name
+  matching silently disabled ALL interception under systemd-launched sessions.
+- Unrecognized glob syntax no longer falls through to exact-match: full glob
+  engine (`?`, `[...]`, `**`) in every layer, brace patterns rejected loudly
+  at load (an inert `only_trash` whitelist used to real-delete everything).
+- install.sh stages binaries/.so atomically (temp + rename), ensures a
+  trailing newline before appending to `/etc/ld.so.preload`, resolves the real
+  rm via `which -a` skipping trashd paths, and heals poisoned real-rm stashes.
+
+### Fixed — correctness
+
+- Glob matcher rewritten (iterative, backtracking): fixes an inverted-slice
+  panic on patterns like `abc*b*bc`, adds classes/ranges/negation.
+- Watchdog forks its own supervisor so `waitpid` targets a child — kills the
+  ECHILD fake-failover that ran two supervisors on one notification fd.
+- Cross-device FIFOs are recreated via mkfifo instead of blocking forever;
+  device nodes/sockets skip to the real unlink instead of unbounded copies.
+- copy_tree applies source directory permissions after populating (read-only
+  trees round-trip across filesystems); restore decompression never follows
+  trashed symlinks; compress never dereferences/replaces trashed symlinks.
+- Compression marker is recorded before data swap with tolerant decode-on-
+  mismatch; `trash compress` streams zstd (bounded memory, any entry size);
+  hashing streams in chunks instead of slurping whole files.
+- trashinfo parser: lexical `..` rejection before decoding, URL decoder only
+  for absolute values (`localhost/x` stays relative), first-wins X-Trashd-*
+  keys, control chars stripped from commands.
+- Exact-ID matches spanning multiple partitions raise AmbiguousMatch;
+  purge/empty keep `.trashinfo` when data removal fails; `.trashd.toml`
+  discovery walks to the filesystem root (not 5 levels).
+- Preload: TOCTOU dev/ino re-check before rename, dlsym caching,
+  /proc/mounts octal unescaping, uid-private HOME fallback instead of /tmp,
+  partial-copy cleanup, async-signal-safety caveat documented.
+- Daemon: renames no longer logged as deletions, FAN_Q_OVERFLOW warns loudly,
+  DELETE_SELF events resolve via DFID records, new mounts picked up at runtime.
+- install.sh atomic artifact replacement; fsck --fix requires confirmation
+  before destroying orphaned data; self-update uses sha2 and numeric version
+  comparison (no more offered downgrades).
+
+### Changed
+
+- Rust toolchain 1.97.0 → 1.98.0; 69 lockfile-only dependency bumps.
+
 ## 0.1.2 (2026-07-11)
 
 - Upgrade the workspace to Rust 1.97 and Rust edition 2024
