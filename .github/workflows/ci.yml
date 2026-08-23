@@ -14,9 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          components: clippy, rustfmt
+      # No dtolnay/rust-toolchain step on purpose: rustup honors rust-toolchain.toml
+      # (channel + clippy/rustfmt components), so the workflow can't drift from the pin.
+      # First cargo/clippy/fmt invocation below installs the pinned toolchain.
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
