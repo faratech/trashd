@@ -177,6 +177,35 @@ fi
 rm -f --permanent ~/.local/share/Trash/files/trashd_it_orphan
 
 # -----------------------------------------------------------------------
+# seccomp layer end-to-end: real rm under trashd-exec must land in trash
+# via the fd-pinned supervisor (TRASHD_SECCOMP_ACTIVE makes the preload
+# defer so this exercises Layer 4 specifically).
+# -----------------------------------------------------------------------
+echo "sec" > /root/trashd_it_sec.txt
+if [ -x /usr/local/bin/trashd-exec ] && [ -x /usr/local/lib/trashd/real/rm ]; then
+    # seccomp(2) allows only ONE NEW_LISTENER filter per chain: inside an
+    # already-filtered environment (some CI sandboxes/containers) the child's
+    # install fails with EBUSY and trashd-exec silently runs unprotected.
+    # Detect that and skip rather than report a bogus failure.
+    PARENT_F=$(grep -s "^Seccomp_filters:" /proc/self/status | tr -dc "0-9")
+    CHILD_F=$(TRASHD_SECCOMP_ACTIVE=1 timeout 10 /usr/local/bin/trashd-exec \
+        /bin/sh -c 'grep -s "^Seccomp_filters:" /proc/self/status | tr -dc "0-9"' 2>/dev/null)
+    if [ -n "$CHILD_F" ] && [ "$CHILD_F" = "$PARENT_F" ]; then
+        echo "SKIP: seccomp e2e (pre-existing filter chain — no new listener allowed)"
+    else
+        TRASHD_SECCOMP_ACTIVE=1 timeout 20 /usr/local/bin/trashd-exec \
+            /usr/local/lib/trashd/real/rm -f /root/trashd_it_sec.txt >/dev/null 2>&1
+        if [ ! -f /root/trashd_it_sec.txt ] && trash ls 2>&1 | grep -q "trashd_it_sec"; then
+            pass "seccomp supervisor trashes rm under trashd-exec"
+        else
+            fail "seccomp supervisor trashes rm under trashd-exec" "file not trashed"
+        fi
+    fi
+else
+    echo "SKIP: trashd-exec or stashed rm not found"
+fi
+
+# -----------------------------------------------------------------------
 # trash restore --force (auto-rename on conflict)
 # -----------------------------------------------------------------------
 echo "force_test" > /root/trashd_it_force.txt

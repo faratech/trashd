@@ -1,15 +1,16 @@
 //! Read path arguments from a target process's memory via process_vm_readv.
 //!
-//! KNOWN RESIDUAL RACE (audit #6, accepted limitation): for relative paths we
-//! resolve the base via /proc symlink STRINGS (`cwd`, `fd/N`) and then act on
-//! the joined path. The supervised process is frozen in its syscall, but a
-//! COOPERATING SIBLING process can rename/replace the base directory or the
-//! final component in that window, causing the wrong file to be trashed.
-//! Eliminating this entirely requires fd-based operations throughout
-//! (pin the base with pidfd_getfd(2)/openat2 relative to it), which is an
-//! architectural follow-up, not a patch. `notif_id_valid` re-checks bound the
-//! damage window; single-user desktop use (the primary deployment) has no
-//! adversarial sibling by default.
+//! RACE MODEL (audit #6): the pathname STRING is read from the frozen target's
+//! memory, but all filesystem ACTION happens through fd-pinned references —
+//! see pin.rs. The historic string-based base resolution (`/proc/<pid>/cwd`,
+//! `/proc/<pid>/fd/N`) survives only inside [`resolve_syscall_path`], which is
+//! now used for BEST-EFFORT display paths (config checks, logging, .trashinfo)
+//! and as the legacy fallback on kernels without pidfd_getfd/openat2.
+//!
+//! Residual micro-race: a sibling sharing the target's memory could mutate the
+//! argument buffer between the kernel's capture and our single read. This is
+//! inherent to every ptrace/seccomp supervisor; the pinned-fd flow eliminates
+//! the filesystem-side race, which was the exploitable one.
 
 use std::ffi::OsString;
 use std::io;
@@ -55,6 +56,18 @@ pub fn read_path_from_process(pid: u32, addr: u64) -> io::Result<PathBuf> {
 
     buf.truncate(len);
     Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+/// Read ONLY the raw pathname argument from the target's memory — no cwd or
+/// dirfd resolution. The fd-pinned flow (pin.rs) joins bases itself.
+pub fn read_arg_path(pid: u32, syscall_nr: i32, args: &[u64; 6]) -> io::Result<PathBuf> {
+    #[cfg(target_arch = "x86_64")]
+    const NR_UNLINKAT: i32 = 263;
+    #[cfg(target_arch = "aarch64")]
+    const NR_UNLINKAT: i32 = 35;
+
+    let path_addr = if syscall_nr == NR_UNLINKAT { args[1] } else { args[0] };
+    read_path_from_process(pid, path_addr)
 }
 
 /// Resolve the path for a given syscall notification.

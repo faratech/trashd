@@ -14,6 +14,7 @@
 
 mod filter;
 mod mem;
+mod pin;
 mod supervisor;
 mod watchdog;
 

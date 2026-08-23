@@ -102,6 +102,32 @@ pub fn find_mount_point(path: &Path) -> Option<MountPoint> {
     None
 }
 
+/// Select the trash directory for an inode identified by DEVICE ID rather
+/// than by re-statting a (possibly raced) path — used by the seccomp
+/// supervisor's fd-based interception, where `display_path` is best-effort
+/// context and `file_dev` is authoritative.
+///
+/// Falls back to the home trash whenever the device can't be matched to a
+/// known mount: the caller detects the resulting cross-device rename (EXDEV)
+/// and applies its legacy path-based fallback.
+pub fn trash_dir_for_device(file_dev: u64, display_path: &Path, home_trash: &Path) -> PathBuf {
+    if device_id_or_parent(home_trash) == Some(file_dev) {
+        return home_trash.to_path_buf();
+    }
+    let uid = unsafe { libc::getuid() };
+    if let Some(mount) = find_mount_point(display_path)
+        && device_id(&mount.path) == Some(file_dev)
+    {
+        // Spec §1.2.2a: shared .Trash/$UID (created on demand — we're about
+        // to write), else §1.2.2b .Trash-$UID.
+        if let Some(shared) = check_shared_trash(&mount.path, uid, true) {
+            return shared;
+        }
+        return mount.path.join(format!(".Trash-{uid}"));
+    }
+    home_trash.to_path_buf()
+}
+
 /// Check if two paths are on the same filesystem.
 pub fn same_filesystem(a: &Path, b: &Path) -> bool {
     match (device_id_or_parent(a), device_id_or_parent(b)) {

@@ -138,6 +138,13 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32) -> ! {
 }
 
 /// Drain all pending notifications by responding CONTINUE.
+///
+/// KNOWN LIMIT: a notification the DEAD supervisor had already dequeued but
+/// not answered cannot be re-received (NOTIF_RECV dequeues); the kernel only
+/// flushes waiters with ENOSYS when the LAST listener fd closes, and this
+/// process deliberately holds one open to stay useful. Such a delete would
+/// hang until the target dies. Accepted: requires a supervisor crash mid-
+/// handle, which is exactly the failure this watchdog exists to bound.
 fn drain_with_continue(fd: i32) {
     loop {
         match supervisor::notif_recv(fd) {

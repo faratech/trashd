@@ -5,6 +5,7 @@
 //! to let the real syscall execute (fail-safe).
 
 use crate::mem;
+use crate::pin;
 use std::io;
 use trashd_common::store::TrashError;
 use trashd_common::{Config, TrashStore};
@@ -79,7 +80,7 @@ fn notif_send(fd: i32, resp: &SeccompNotifResp) -> io::Result<()> {
 }
 
 /// Check if a notification ID is still valid (target is still blocked).
-fn notif_id_valid(fd: i32, id: u64) -> bool {
+pub(crate) fn notif_id_valid(fd: i32, id: u64) -> bool {
     let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id as *const _) };
     ret == 0
 }
@@ -158,11 +159,23 @@ pub fn run_supervisor(fd: i32) -> io::Result<()> {
 
 /// Handle a single notification.
 fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config: &Config) {
-    // Read the path from target's memory
-    let path = match mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args) {
+    // Raw pathname argument from the target's memory. The target is frozen in
+    // its syscall, so this memory is stable against the TARGET; a sibling
+    // sharing its memory could mutate it (documented residual micro-race —
+    // every ptrace/seccomp supervisor has it).
+    let raw = match mem::read_arg_path(notif.pid, notif.data.nr, &notif.data.args) {
         Ok(p) => p,
         Err(_) => {
             // Can't read path → let the real syscall run
+            respond_continue(fd, notif.id);
+            return;
+        }
+    };
+    // Best-effort full path: drives config eligibility, logging and the
+    // .trashinfo Path= field. NEVER used to touch the inode anymore (#6).
+    let display = match mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args) {
+        Ok(p) => p,
+        Err(_) => {
             respond_continue(fd, notif.id);
             return;
         }
@@ -182,30 +195,21 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     // From this point, ALL code paths MUST send a response.
     // Failure to respond will hang the supervised process.
 
-    // Check TRASH_BYPASS env var in the target process
-    // (We can't easily read env vars from another process, so we rely on
-    // the config's skip/bypass lists instead. TRASH_BYPASS is checked in
-    // the shim and preload layers.)
-
     // Honor bypass_processes: if the deleting process (or an ancestor) is in
     // the bypass list (git, cargo, apt, …), let the real delete happen — same
-    // as the shim/preload layers do. Without this, builds/package managers
-    // running under seccomp would flood the trash with artifacts they expect to
-    // be permanently removed. The target thread is frozen in the syscall, so
-    // its /proc tree is stable to walk.
+    // as the shim/preload layers do.
     if process_bypassed(notif.pid, &config.bypass_processes) {
         respond_continue(fd, notif.id);
         return;
     }
 
+    // Honor TRASH_BYPASS=1 in the target's environment (#18).
     if target_bypassed(notif.pid) {
         respond_continue(fd, notif.id);
         return;
     }
 
-    // Honor bypass_paths against the TRAPPING process's executable. Checking
-    // the supervisor's own /proc/self/exe (as before) made the whole list
-    // inert in this layer — the supervisor is always trashd-exec (#21).
+    // Honor bypass_paths against the TRAPPING process's executable (#21).
     if !config.bypass_paths.is_empty()
         && let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid))
     {
@@ -221,14 +225,65 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     }
 
     // Check never-trash list
-    if config.should_skip(&path) {
+    if config.should_skip(&display) {
         respond_continue(fd, notif.id);
         return;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    let is_rmdir = notif.data.nr == 84; // SYS_rmdir
+    #[cfg(target_arch = "aarch64")]
+    let is_rmdir = false;
+    let remove_dir = is_rmdir
+        || (notif.data.nr == libc::SYS_unlinkat as i32
+            && (notif.data.args[2] as i32 & libc::AT_REMOVEDIR) != 0);
+
+    // Preferred path: race-free fd-pinned interception (#6). The kernel walks
+    // prefixes against PINNED directory fds and the move is renameat() on the
+    // same fds, so sibling renames between our stat and our move cannot divert
+    // the operation.
+    match crate::pin::try_pinned(
+        notif.pid,
+        notif.data.nr,
+        &notif.data.args,
+        raw.as_os_str(),
+        &display,
+        remove_dir,
+        fd,
+        notif.id,
+        store,
+    ) {
+        Ok(pin::Decision::Trashed) => {
+            if respond_success(fd, notif.id).is_err() {
+                // Notification expired (target died) — no harm done
+            }
+        }
+        Ok(pin::Decision::Continue) => respond_continue(fd, notif.id),
+        Ok(pin::Decision::Errno(e)) => {
+            let _ = respond_errno(fd, notif.id, e);
+        }
+        // Kernel lacks pidfd_getfd/openat2, fds couldn't be pinned, or the
+        // trash lives on another device (namespaced targets) → historic
+        // path-based flow (fail-open, cross-device copy support).
+        Ok(pin::Decision::FallBack) | Err(_) => {
+            legacy_handle(fd, notif, store, config, &display, remove_dir)
+        }
+    }
+}
+
+/// Historic path-based handling: resolves names through the supervisor's own
+/// mount context. Kept as the fallback for cross-device moves and kernels
+/// without pidfd_getfd/openat2; see pin.rs for why it is not primary (#6).
+fn legacy_handle(
+    fd: i32,
+    notif: &SeccompNotif,
+    store: &TrashStore,
+    _config: &Config,
+    path: &std::path::Path,
+    remove_dir: bool,
+) {
     // Check if the file exists and is appropriate to trash
-    // (For rmdir/unlinkat with AT_REMOVEDIR, the path is a directory)
-    let meta = match std::fs::symlink_metadata(&path) {
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => {
             // File doesn't exist or not accessible → let syscall handle the error
@@ -237,26 +292,15 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
         }
     };
 
-    // For unlinkat with AT_REMOVEDIR flag or rmdir: only trash empty directories
-    #[cfg(target_arch = "x86_64")]
-    let is_rmdir = notif.data.nr == 84; // SYS_rmdir
-    #[cfg(target_arch = "aarch64")]
-    let is_rmdir = false;
-
-    let is_unlinkat_rmdir = notif.data.nr == libc::SYS_unlinkat as i32
-        && (notif.data.args[2] as i32 & libc::AT_REMOVEDIR) != 0;
-
-    if is_rmdir || is_unlinkat_rmdir {
+    if remove_dir {
         if !meta.is_dir() {
             let _ = respond_errno(fd, notif.id, libc::ENOTDIR);
             return;
         }
         // Only trash EMPTY directories (matching rmdir semantics). We must be
         // able to POSITIVELY confirm emptiness — if read_dir errors we cannot,
-        // so fall back to the real syscall instead of trashing. Otherwise a
-        // permission/IO error here would skip the check and recursively trash a
-        // non-empty tree via store.trash().
-        match std::fs::read_dir(&path) {
+        // so fall back to the real syscall instead of trashing.
+        match std::fs::read_dir(path) {
             Ok(mut entries) => {
                 if entries.next().is_some() {
                     let _ = respond_errno(fd, notif.id, libc::ENOTEMPTY);
@@ -264,11 +308,6 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
                 }
             }
             Err(_) => {
-                // Can't verify the directory is empty — let the real rmdir run
-                // (it returns ENOTEMPTY/EACCES correctly). NOTE: a tiny race
-                // remains between this check and store.trash's move where a
-                // sibling process could repopulate the dir; the result is still
-                // recoverable from the trash, so we accept it (residual L2).
                 respond_continue(fd, notif.id);
                 return;
             }
@@ -280,22 +319,18 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     }
 
     // Attempt to trash the file
-    match store.trash(&path, Some("seccomp")) {
+    match store.trash(path, Some("seccomp")) {
         Ok(_id) => {
-            // File moved to trash — tell kernel the syscall "succeeded"
             if respond_success(fd, notif.id).is_err() {
                 // Notification expired (target died) — no harm done
             }
         }
         Err(TrashError::Excluded(_)) => {
-            // In never-trash list — let real syscall run
             respond_continue(fd, notif.id);
         }
         Err(TrashError::Refused(_)) => {
-            // Trash-self-target (store refuses to trash the trash itself or
-            // its ancestors). CONTINUE keeps internal cleanup working: our
-            // own purge/empty legitimately unlink entries INSIDE the trash.
-            // Fail-open here is the documented design for this layer.
+            // Trash-self-target: CONTINUE keeps internal cleanup (purge/empty
+            // deleting entries INSIDE the trash) working. Documented fail-open.
             respond_continue(fd, notif.id);
         }
         Err(_) => {
