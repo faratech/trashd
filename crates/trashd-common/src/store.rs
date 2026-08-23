@@ -45,7 +45,9 @@ pub enum TrashError {
     },
     #[error("entry '{0}' has no .trashinfo metadata and cannot be restored (run `trash fsck`)")]
     OrphanedEntry(String),
-    #[error("refusing to trash '{0}': it is the trash directory itself, inside it, or an ancestor of it")]
+    #[error(
+        "refusing to trash '{0}': it is the trash directory itself, inside it, or an ancestor of it"
+    )]
     Refused(PathBuf),
 }
 
@@ -128,10 +130,7 @@ impl TrashStore {
                 .map(PathBuf::from)
                 .map(|h| h.join(".local/share"))
                 .unwrap_or_else(|| {
-                    PathBuf::from(format!(
-                        "/tmp/trashd-home-{}",
-                        unsafe { libc::getuid() }
-                    ))
+                    PathBuf::from(format!("/tmp/trashd-home-{}", unsafe { libc::getuid() }))
                 })
         });
         base.join("Trash")
@@ -165,38 +164,40 @@ impl TrashStore {
         trash_dir.to_path_buf()
     }
 
-    
-/// Per FreeDesktop spec: home-trash entries store an absolute `Path=`;
-/// topdir-trash entries store a path RELATIVE to the topdir (the parent of
-/// `.Trash-$uid`, or the grandparent for `.Trash/$uid`). Falls back to the
-/// absolute path when the prefix strip fails.
-fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Path) -> PathBuf {
-    if trash_dir == home_trash {
-        return original_abs.to_path_buf();
+    /// Per FreeDesktop spec: home-trash entries store an absolute `Path=`;
+    /// topdir-trash entries store a path RELATIVE to the topdir (the parent of
+    /// `.Trash-$uid`, or the grandparent for `.Trash/$uid`). Falls back to the
+    /// absolute path when the prefix strip fails.
+    fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Path) -> PathBuf {
+        if trash_dir == home_trash {
+            return original_abs.to_path_buf();
+        }
+        let topdir = trash_dir
+            .parent()
+            .and_then(|p| {
+                // .Trash/$uid has one extra level
+                let name = p.file_name()?.to_string_lossy();
+                if name == ".Trash" {
+                    p.parent()
+                } else {
+                    Some(p)
+                }
+            })
+            .unwrap_or(trash_dir);
+        original_abs
+            .strip_prefix(topdir)
+            .map(|rel| {
+                // Spec: relative path MUST NOT contain ".."
+                debug_assert!(
+                    !rel.components()
+                        .any(|c| c == std::path::Component::ParentDir)
+                );
+                rel.to_path_buf()
+            })
+            .unwrap_or_else(|_| original_abs.to_path_buf())
     }
-    let topdir = trash_dir
-        .parent()
-        .and_then(|p| {
-            // .Trash/$uid has one extra level
-            let name = p.file_name()?.to_string_lossy();
-            if name == ".Trash" {
-                p.parent()
-            } else {
-                Some(p)
-            }
-        })
-        .unwrap_or(trash_dir);
-    original_abs
-        .strip_prefix(topdir)
-        .map(|rel| {
-            // Spec: relative path MUST NOT contain ".."
-            debug_assert!(!rel.components().any(|c| c == std::path::Component::ParentDir));
-            rel.to_path_buf()
-        })
-        .unwrap_or_else(|_| original_abs.to_path_buf())
-}
 
-/// Ensure a trash directory has the required subdirectories.
+    /// Ensure a trash directory has the required subdirectories.
     fn ensure_trash_dir(trash_dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(trash_dir.join("files"))?;
@@ -355,7 +356,9 @@ fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Pa
                 {
                     // No CAP_MKNOD / no persistent data — refuse rather than
                     // fall through to fs::copy on a device node.
-                    return Err(io::Error::other("cannot trash device node across filesystems").into());
+                    return Err(
+                        io::Error::other("cannot trash device node across filesystems").into(),
+                    );
                 } else {
                     fs::copy(&abs_path, &dest)?;
                     fs::set_permissions(&dest, meta.permissions())?;
@@ -466,8 +469,14 @@ fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Pa
         let cname = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| TrashError::NotFound(display_path.clone()))?;
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatat(parent_fd, cname.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
-            != 0
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                cname.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
         {
             return Err(TrashError::NotFound(display_path.clone()));
         }
@@ -594,14 +603,13 @@ fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Pa
         let hash_limit = self.config.sha256_max_size_mb * 1024 * 1024;
         if !is_symlink && !is_dir && hash_limit > 0 && stat.st_size as u64 <= hash_limit {
             let rfd = unsafe {
-                libc::openat(
-                    parent_fd,
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC,
-                )
+                libc::openat(parent_fd, cname.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
             };
             if rfd >= 0 {
-                let hash = hash_file(Path::new(&format!("/proc/self/fd/{rfd}")), &self.config.hash_algorithm);
+                let hash = hash_file(
+                    Path::new(&format!("/proc/self/fd/{rfd}")),
+                    &self.config.hash_algorithm,
+                );
                 unsafe { libc::close(rfd) };
                 if let Ok(hash) = hash {
                     info.sha256 = Some(hash);
@@ -621,14 +629,7 @@ fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Pa
         }
 
         // THE MOVE (#6): kernel-resolved against pinned inodes on both sides.
-        let rc = unsafe {
-            libc::renameat(
-                parent_fd,
-                cname.as_ptr(),
-                files_fd,
-                cid.as_ptr(),
-            )
-        };
+        let rc = unsafe { libc::renameat(parent_fd, cname.as_ptr(), files_fd, cid.as_ptr()) };
         if rc != 0 {
             unsafe { libc::close(files_fd) };
             let e = io::Error::last_os_error();
@@ -645,8 +646,14 @@ fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Pa
         // Re-stat by the new id; refresh size and drop the hash if the inode
         // differs (a stale hash would cry wolf on every restore).
         let mut moved_stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatat(files_fd, cid.as_ptr(), &mut moved_stat, libc::AT_SYMLINK_NOFOLLOW) }
-            == 0
+        if unsafe {
+            libc::fstatat(
+                files_fd,
+                cid.as_ptr(),
+                &mut moved_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
         {
             if moved_stat.st_ino != stat.st_ino || moved_stat.st_dev != stat.st_dev {
                 info.size = Some(moved_stat.st_size as u64);
@@ -1349,10 +1356,7 @@ fn compute_trashinfo_path(trash_dir: &Path, original_abs: &Path, home_trash: &Pa
         // partitions can hold entries with the same ID (same filename trashed
         // on two mounts); picking either nondeterministically could restore
         // or purge the WRONG copy (#41).
-        let exact: Vec<&TrashEntry> = entries
-            .iter()
-            .filter(|e| e.id == id_or_pattern)
-            .collect();
+        let exact: Vec<&TrashEntry> = entries.iter().filter(|e| e.id == id_or_pattern).collect();
         if exact.len() == 1 {
             return Ok(exact[0].clone());
         }
@@ -1831,9 +1835,7 @@ fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
 /// itself, not its target.
 fn entry_disk_size(entry: &TrashEntry) -> u64 {
     match fs::symlink_metadata(&entry.trashed_path) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
-            entry.info.size.unwrap_or(m.len())
-        }
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => entry.info.size.unwrap_or(m.len()),
         Ok(m) => m.len(),
         Err(_) => entry.info.size.unwrap_or(0),
     }
@@ -2429,7 +2431,10 @@ mod tests {
         // Direct restore of the orphan is refused
         let err = store.restore("orphan1", None).unwrap_err();
         assert!(matches!(err, TrashError::OrphanedEntry(_)));
-        assert!(trash.join("files/orphan1").exists(), "orphan data preserved");
+        assert!(
+            trash.join("files/orphan1").exists(),
+            "orphan data preserved"
+        );
     }
 
     // Regression (audit #8): trashing the trash directory itself, anything
@@ -2507,7 +2512,12 @@ mod tests {
 
         // unknown final component → NotFound (kernel would ENOENT)
         let err = store
-            .trash_at(parent.as_raw_fd(), OsStr::new("nope"), &dir.join("nope"), None)
+            .trash_at(
+                parent.as_raw_fd(),
+                OsStr::new("nope"),
+                &dir.join("nope"),
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, TrashError::NotFound(_)), "got {err:?}");
     }
@@ -2612,7 +2622,10 @@ mod tests {
         // orphan guard (#16) then refuses to restore — either way the
         // traversal path is never resolved.
         assert!(
-            matches!(err, TrashError::OrphanedEntry(_) | TrashError::EntryNotFound(_)),
+            matches!(
+                err,
+                TrashError::OrphanedEntry(_) | TrashError::EntryNotFound(_)
+            ),
             "traversal entry must not resolve; got {err:?}"
         );
         assert_eq!(
@@ -2622,10 +2635,12 @@ mod tests {
         );
 
         // Ordinary relative paths (topdir trash layout) still parse fine.
-        assert!(TrashInfo::from_trashinfo(
-            "[Trash Info]\nPath=sub/dir/file.txt\nDeletionDate=2026-01-01T00:00:00\n"
-        )
-        .is_some());
+        assert!(
+            TrashInfo::from_trashinfo(
+                "[Trash Info]\nPath=sub/dir/file.txt\nDeletionDate=2026-01-01T00:00:00\n"
+            )
+            .is_some()
+        );
     }
 
     // M1: trashing a file must not overwrite a pre-existing orphaned data file

@@ -111,10 +111,7 @@ fn main() -> ExitCode {
     // the whole tree (#2). Refuse operands that ARE the root unless
     // --no-preserve-root was given (matches GNU semantics — top-level
     // entries like /* expand to operands that are not "/" itself).
-    if args.recursive
-        && !args.no_preserve_root
-        && args.files.iter().any(|f| is_root_operand(f))
-    {
+    if args.recursive && !args.no_preserve_root && args.files.iter().any(|f| is_root_operand(f)) {
         eprintln!("rm: it is dangerous to operate recursively on '/'");
         eprintln!("rm: use --no-preserve-root to override the failsafe");
         return ExitCode::FAILURE;
@@ -282,8 +279,10 @@ fn main() -> ExitCode {
             // Configured guards are REFUSALS, not fallbacks: a size cap or a
             // trash-self-target means "leave the data alone". Escalating to
             // permanent delete would invert the user's intent (#10).
-            Err(e @ (trashd_common::store::TrashError::TooLarge { .. }
-                     | trashd_common::store::TrashError::Refused(_))) => {
+            Err(
+                e @ (trashd_common::store::TrashError::TooLarge { .. }
+                | trashd_common::store::TrashError::Refused(_)),
+            ) => {
                 eprintln!("rm: refusing to remove '{}': {e}", file.display());
                 exit_code = ExitCode::FAILURE;
             }

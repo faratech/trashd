@@ -495,9 +495,7 @@ fn sanitize_only_trash(list: Vec<String>) -> Vec<String> {
     list.into_iter()
         .filter(|p| {
             if p.contains('{') || p.contains('}') {
-                eprintln!(
-                    "trashd-preload: WARNING: dropping unsupported only_trash pattern '{p}'"
-                );
+                eprintln!("trashd-preload: WARNING: dropping unsupported only_trash pattern '{p}'");
                 false
             } else {
                 true
@@ -681,10 +679,7 @@ fn home_trash_dir() -> PathBuf {
                 .map(PathBuf::from)
                 .map(|h| h.join(".local/share"))
                 .unwrap_or_else(|| {
-                    PathBuf::from(format!(
-                        "/tmp/trashd-home-{}",
-                        unsafe { libc::getuid() }
-                    ))
+                    PathBuf::from(format!("/tmp/trashd-home-{}", unsafe { libc::getuid() }))
                 })
         })
         .join("Trash")

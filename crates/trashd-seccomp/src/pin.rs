@@ -39,8 +39,8 @@ use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
-use trashd_common::store::TrashError;
 use trashd_common::TrashStore;
+use trashd_common::store::TrashError;
 
 /// Owned fd guard: closes on drop. The historic code leaked the duplicated
 /// dirfd and the resolved parent fd on EVERY intercepted delete, exhausting
@@ -129,11 +129,7 @@ fn open_proc_dir(path: &str) -> Option<RawFd> {
             libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    if fd < 0 {
-        None
-    } else {
-        Some(fd)
-    }
+    if fd < 0 { None } else { Some(fd) }
 }
 
 /// Resolve every component of `prefix` EXCEPT the final one, in a single
@@ -309,11 +305,10 @@ pub fn try_pinned(
     if stripped.is_empty() || stripped == b"/" {
         return Ok(Decision::Continue);
     }
-    let (mut prefix, final_comp): (&[u8], &[u8]) =
-        match stripped.iter().rposition(|&b| b == b'/') {
-            Some(i) => (&stripped[..=i], &stripped[i + 1..]),
-            None => (b"", stripped),
-        };
+    let (mut prefix, final_comp): (&[u8], &[u8]) = match stripped.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&stripped[..=i], &stripped[i + 1..]),
+        None => (b"", stripped),
+    };
     let name = OsStr::from_bytes(final_comp);
     if name.is_empty() || name == "." || name == ".." {
         // The kernel produces the right errno for these pathological forms.
@@ -336,9 +331,9 @@ pub fn try_pinned(
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no root fd"))?
     } else {
         match dirfd {
-            None | Some(libc::AT_FDCWD) => tfs.cwd().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Unsupported, "no cwd fd")
-            })?,
+            None | Some(libc::AT_FDCWD) => tfs
+                .cwd()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no cwd fd"))?,
             Some(fd) => {
                 let g = FdGuard(tfs.dup_dirfd(fd)?);
                 let raw_fd = g.0;
@@ -350,9 +345,7 @@ pub fn try_pinned(
 
     // Base sanity: whatever we were given must actually be a directory.
     let mut bst: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(base, &mut bst) } != 0
-        || bst.st_mode & libc::S_IFMT != libc::S_IFDIR
-    {
+    if unsafe { libc::fstat(base, &mut bst) } != 0 || bst.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Ok(Decision::Errno(libc::ENOTDIR));
     }
 
@@ -362,7 +355,11 @@ pub fn try_pinned(
     let parent: RawFd = if prefix.is_empty() || prefix == b"/" {
         base
     } else {
-        match resolve_parent(base, OsStr::from_bytes(prefix), bytes.first() == Some(&b'/')) {
+        match resolve_parent(
+            base,
+            OsStr::from_bytes(prefix),
+            bytes.first() == Some(&b'/'),
+        ) {
             Ok(fd) => {
                 let g = FdGuard(fd);
                 let raw_fd = g.0;
@@ -582,7 +579,10 @@ mod tests {
         )
         .expect("pinned prefix attempt");
         assert!(matches!(d, Decision::Trashed), "got {d:?}");
-        assert!(!nested_dir.join("f.txt").exists(), "moved via openat2 prefix walk");
+        assert!(
+            !nested_dir.join("f.txt").exists(),
+            "moved via openat2 prefix walk"
+        );
         c2.kill().unwrap();
         let _ = c2.wait();
     }
@@ -602,8 +602,7 @@ mod tests {
         };
 
         // unlinkat(..., AT_REMOVEDIR) on NON-empty dir → ENOTEMPTY
-        let args_rm: [u64; 6] =
-            [libc::AT_FDCWD as u64, 0, libc::AT_REMOVEDIR as u64, 0, 0, 0];
+        let args_rm: [u64; 6] = [libc::AT_FDCWD as u64, 0, libc::AT_REMOVEDIR as u64, 0, 0, 0];
         let d = try_pinned(
             child.id(),
             nr,
@@ -616,7 +615,10 @@ mod tests {
             &store,
         )
         .unwrap();
-        assert!(matches!(d, Decision::Errno(e) if e == libc::ENOTEMPTY), "got {d:?}");
+        assert!(
+            matches!(d, Decision::Errno(e) if e == libc::ENOTEMPTY),
+            "got {d:?}"
+        );
         assert!(nonempty.exists());
 
         // plain unlinkat on a DIRECTORY → EISDIR
@@ -632,7 +634,10 @@ mod tests {
             &store,
         )
         .unwrap();
-        assert!(matches!(d, Decision::Errno(e) if e == libc::EISDIR), "got {d:?}");
+        assert!(
+            matches!(d, Decision::Errno(e) if e == libc::EISDIR),
+            "got {d:?}"
+        );
 
         // rmdir on an EMPTY dir → Trashed
         let empty = work.join("hollow");
@@ -686,7 +691,10 @@ mod tests {
         )
         .expect("pinned attempt");
         assert!(matches!(d, Decision::Trashed), "got {d:?}");
-        assert!(!victim.exists(), "absolute-path victim moved via pinned root");
+        assert!(
+            !victim.exists(),
+            "absolute-path victim moved via pinned root"
+        );
         child.kill().unwrap();
         let _ = child.wait();
     }
@@ -716,7 +724,10 @@ mod tests {
             &store,
         )
         .expect("pinned attempt");
-        assert!(matches!(d, Decision::Errno(e) if e == libc::ENOTDIR), "got {d:?}");
+        assert!(
+            matches!(d, Decision::Errno(e) if e == libc::ENOTDIR),
+            "got {d:?}"
+        );
         assert!(f.exists(), "file untouched");
         child.kill().unwrap();
         let _ = child.wait();
@@ -768,8 +779,8 @@ mod tests {
                 &path,
                 false,
                 -1,
-            0,
-            &store,
+                0,
+                &store,
             )
             .expect("pinned attempt");
             match d {
@@ -799,12 +810,7 @@ mod tests {
             assert_eq!(
                 data,
                 format!("payload-{}", {
-                    let idx = e
-                        .id
-                        .trim_start_matches("race")
-                        .split('.')
-                        .next()
-                        .unwrap();
+                    let idx = e.id.trim_start_matches("race").split('.').next().unwrap();
                     idx.parse::<usize>().unwrap()
                 }),
                 "entry {} carries the wrong payload",
@@ -816,5 +822,4 @@ mod tests {
         child.kill().unwrap();
         let _ = child.wait();
     }
-
 }

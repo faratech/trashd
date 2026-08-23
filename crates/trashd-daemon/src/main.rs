@@ -222,9 +222,7 @@ fn run() -> io::Result<()> {
             // loudly instead of silently producing an incomplete audit log
             // (#32).
             if event.mask & FAN_Q_OVERFLOW != 0 {
-                eprintln!(
-                    "[trashd] WARNING: fanotify queue overflow — deletion events were lost"
-                );
+                eprintln!("[trashd] WARNING: fanotify queue overflow — deletion events were lost");
             }
 
             // Process event

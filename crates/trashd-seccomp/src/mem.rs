@@ -66,7 +66,11 @@ pub fn read_arg_path(pid: u32, syscall_nr: i32, args: &[u64; 6]) -> io::Result<P
     #[cfg(target_arch = "aarch64")]
     const NR_UNLINKAT: i32 = 35;
 
-    let path_addr = if syscall_nr == NR_UNLINKAT { args[1] } else { args[0] };
+    let path_addr = if syscall_nr == NR_UNLINKAT {
+        args[1]
+    } else {
+        args[0]
+    };
     read_path_from_process(pid, path_addr)
 }
 

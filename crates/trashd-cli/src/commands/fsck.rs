@@ -76,10 +76,7 @@ pub fn run(_store: &TrashStore, fix: bool) {
                     // preserve-data philosophy — require explicit per-item
                     // confirmation. symlink_metadata so dangling symlinks are
                     // classified correctly, not followed.
-                    let is_dir = entry
-                        .file_type()
-                        .map(|t| t.is_dir())
-                        .unwrap_or(false);
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     if crate::util::confirm(&format!(
                         "    permanently delete orphaned '{}'? This cannot be undone [y/N] ",
                         entry.path().display()
