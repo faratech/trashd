@@ -172,7 +172,9 @@ if trash fsck 2>&1 | grep -q "orphan"; then
 else
     fail "trash fsck detects orphans" "orphan not detected"
 fi
-rm -f ~/.local/share/Trash/files/trashd_it_orphan
+# --permanent: the shim now REFUSES plain rm on paths inside the trash
+# (audit #8) — deleting trash internals requires the explicit bypass.
+rm -f --permanent ~/.local/share/Trash/files/trashd_it_orphan
 
 # -----------------------------------------------------------------------
 # trash restore --force (auto-rename on conflict)
