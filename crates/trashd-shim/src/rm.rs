@@ -288,7 +288,16 @@ fn prompt_user(msg: &str) -> bool {
 fn real_rm_path() -> PathBuf {
     let stashed = PathBuf::from("/usr/local/lib/trashd/real/rm");
     if stashed.exists() {
-        return stashed;
+        if !stash_is_shim(&stashed) {
+            return stashed;
+        }
+        // Poisoned stash: executing a copy of THIS SHIM as the "real" rm
+        // recurses without bound (the copy passes through to itself even
+        // with TRASH_BYPASS=1). Fall back to PATH discovery instead.
+        eprintln!(
+            "trashd: warning: {} is a copy of the trashd shim — ignoring it (reinstall to repair)",
+            stashed.display()
+        );
     }
 
     if let Ok(path) = std::env::var("PATH") {
@@ -297,7 +306,7 @@ fn real_rm_path() -> PathBuf {
                 continue;
             }
             let candidate = PathBuf::from(dir).join("rm");
-            if candidate.exists() {
+            if candidate.exists() && !stash_is_shim(&candidate) {
                 return candidate;
             }
         }
@@ -311,6 +320,31 @@ fn real_rm_path() -> PathBuf {
     }
 
     PathBuf::from("/usr/bin/rm")
+}
+
+/// Detect a shim masquerading as the real rm (poisoned stash from an older
+/// installer that resolved `which rm` while the shim was already on PATH).
+/// Probe `--version` ONCE and cache: a genuine rm never mentions "trashd",
+/// while the shim identifies itself. Must NOT be called with TRASH_BYPASS in
+/// the environment — the probe relies on the shim's `--version` short-circuit
+/// (which exits before any passthrough) to avoid recursion.
+fn stash_is_shim(path: &PathBuf) -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .map(|o| {
+                let out = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                out.contains("trashd")
+            })
+            .unwrap_or(true) // unreadable/unrunnable — don't trust it
+    })
 }
 
 fn passthrough() -> ExitCode {

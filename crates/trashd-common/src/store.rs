@@ -5,10 +5,11 @@ use crate::trashinfo::TrashInfo;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::Xxh3;
 
 #[derive(Error, Debug)]
 pub enum TrashError {
@@ -40,6 +41,8 @@ pub enum TrashError {
         expected: String,
         actual: String,
     },
+    #[error("entry '{0}' has no .trashinfo metadata and cannot be restored (run `trash fsck`)")]
+    OrphanedEntry(String),
 }
 
 pub struct TrashStore {
@@ -278,6 +281,7 @@ impl TrashStore {
         fs::write(&info_file, info.to_trashinfo_string())?;
 
         // Try rename (fast, same filesystem — should always work with topdir trash)
+        let mut copy_done = false;
         let move_result: Result<(), TrashError> = (|| {
             if fs::rename(&abs_path, &dest).is_err() {
                 // Cross-filesystem fallback — order matters: check symlink first
@@ -290,6 +294,7 @@ impl TrashStore {
                     fs::copy(&abs_path, &dest)?;
                     fs::set_permissions(&dest, meta.permissions())?;
                 }
+                copy_done = true;
                 // Remove the original
                 if meta.file_type().is_symlink() || meta.is_file() {
                     fs::remove_file(&abs_path)?;
@@ -300,10 +305,32 @@ impl TrashStore {
             Ok(())
         })();
 
-        // On failure, clean up orphaned trashinfo and partial copy.
+        // On failure, decide between a clean rollback and preserving the copy.
         // Use symlink_metadata to avoid following symlinks — remove_dir_all
         // on a symlink-to-directory would delete the target's contents.
         if let Err(e) = move_result {
+            if copy_done {
+                // The copy into the trash SUCCEEDED but removing the original
+                // failed — part of the source may already be unlinked, so
+                // deleting the trash copy now could destroy the only remaining
+                // copy of that data. Keep the entry (data + .trashinfo) fully
+                // intact and surface the error; the caller can clean up the
+                // leftover source once the underlying problem is fixed.
+                eprintln!(
+                    "trashd: warning: copied '{p}' to the trash but could not remove the \
+                     original ({e}); keeping the complete trashed copy — the leftover \
+                     source can be removed manually",
+                    p = abs_path.display()
+                );
+                if let Some(idx) = self.index.as_ref() {
+                    let _ = idx.insert(&id, &info, &trash_dir);
+                }
+                crate::oplog::log_trash(&abs_path, &id, command);
+                return Err(TrashError::Io(io::Error::other(format!(
+                    "copied to trash but failed to remove original: {e}"
+                ))));
+            }
+            // The copy itself failed — nothing was moved; roll back cleanly.
             let _ = fs::remove_file(&info_file);
             if let Ok(meta) = fs::symlink_metadata(&dest) {
                 if meta.is_dir() && !meta.file_type().is_symlink() {
@@ -459,6 +486,13 @@ impl TrashStore {
     ) -> Result<PathBuf, TrashError> {
         let entry = self.find_entry(id_or_pattern)?;
 
+        // Orphaned entries (files/ item with no .trashinfo) carry a synthetic
+        // pseudo-path, not a real original location. Restoring one would move
+        // the data to a garbage "(orphaned: …)" path in the caller's CWD.
+        if entry.orphaned {
+            return Err(TrashError::OrphanedEntry(entry.id));
+        }
+
         let restore_to = target
             .map(|t| t.to_path_buf())
             .unwrap_or_else(|| entry.info.original_path.clone());
@@ -606,8 +640,12 @@ impl TrashStore {
     /// Restore the most recently trashed item.
     pub fn undo(&self) -> Result<PathBuf, TrashError> {
         let entries = self.list(None)?;
+        // Skip orphans: they have no recorded original path, and their
+        // synthetic "now" deletion date would otherwise always sort them as
+        // the newest entry (hijacking undo to materialize a bogus file).
         let newest = entries
-            .first()
+            .iter()
+            .find(|e| !e.orphaned)
             .ok_or_else(|| TrashError::EntryNotFound("(trash is empty)".into()))?;
         self.restore(&newest.id, None)
     }
@@ -1087,18 +1125,40 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
 /// Hash a file using the configured algorithm.
 /// "xxhash" (default): XXH3-128 — extremely fast, non-cryptographic.
 /// "sha256": SHA-256 — cryptographic, slower.
+///
+/// Streams the file in fixed chunks instead of reading it whole: hashing runs
+/// on routine deletions AND on restore verification, where the entry may be
+/// far larger than the size cap that gated hashing at trash time (config
+/// changed between trash and restore) — slurping would then allocate the
+/// entire file in RAM.
 fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
-    let data = fs::read(path)?;
+    const CHUNK: usize = 256 * 1024;
+    let mut file = fs::File::open(path)?;
+    let mut buf = vec![0u8; CHUNK];
     match algorithm {
         "sha256" => {
             let mut hasher = Sha256::new();
-            hasher.update(&data);
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
             let digest = hasher.finalize();
             Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
         }
         _ => {
             // Default: xxhash (XXH3-128)
-            Ok(format!("{:032x}", xxh3_128(&data)))
+            let mut hasher = Xxh3::new();
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Ok(format!("{:032x}", hasher.digest128()))
         }
     }
 }
@@ -1309,10 +1369,20 @@ pub fn simple_glob_match(pattern: &str, text: &str) -> bool {
         // suffix might contain another '*' (e.g., pattern "*.py*" → prefix="", suffix=".py*")
         if let Some((mid, tail)) = suffix.split_once('*') {
             // Three-segment: prefix*mid*tail — text must start with prefix,
-            // contain mid, and end with tail
+            // contain mid, and end with tail. The length guard is mandatory:
+            // a short text whose (overlapping) prefix and tail both match
+            // would otherwise produce an inverted slice range and panic
+            // (e.g. pattern "abc*b*bc" vs text "abc"). Byte offsets may also
+            // split a multibyte char, so slice via get() and treat an
+            // unaligned range as no-match instead of panicking.
+            let body = if text.len() >= prefix.len() + tail.len() {
+                text.get(prefix.len()..text.len() - tail.len())
+            } else {
+                None
+            };
             return text.starts_with(prefix)
                 && text.ends_with(tail)
-                && text[prefix.len()..text.len() - tail.len()].contains(mid);
+                && body.is_some_and(|b| b.contains(mid));
         }
         // Guard: text must be long enough for both prefix and suffix
         return text.len() >= prefix.len() + suffix.len()
@@ -1728,6 +1798,26 @@ mod tests {
         assert!(!simple_glob_match("*.py*", "script.rs"));
     }
 
+    // Regression (audit #50): overlapping prefix/suffix in the three-segment
+    // branch used to produce an inverted slice range and PANIC on short text.
+    #[test]
+    fn glob_overlap_short_text_no_panic() {
+        assert!(!simple_glob_match("abc*b*bc", "abc"));
+        assert!(!simple_glob_match("ab*ba", "aaa"));
+        assert!(!simple_glob_match("日本*語*日本", "日本語")); // multibyte overlap
+    }
+
+    #[test]
+    fn glob_three_segment_matches() {
+        // prefix*mid*tail: mid must appear between an anchored head and tail
+        assert!(simple_glob_match("ab*cd*ef", "abcdef"));
+        assert!(simple_glob_match("ab*cd*ef", "abZZcdYYef"));
+        assert!(!simple_glob_match("ab*cd*ef", "abef"));
+        // multibyte body slicing must stay on char boundaries
+        assert!(simple_glob_match("日*本*語", "日本語"));
+        assert!(!simple_glob_match("日*ほ*語", "日本語"));
+    }
+
     // --- Restore conflict + force ---
 
     #[test]
@@ -1852,8 +1942,31 @@ mod tests {
         );
     }
 
-    // --- Compression roundtrip ---
+    // Regression (audit #16): an orphaned files/ entry (no .trashinfo) must
+    // not hijack `undo` (its synthetic "now" date sorts it newest) nor be
+    // restorable to the bogus "(orphaned: …)" pseudo-path.
+    #[test]
+    fn orphaned_entry_cannot_be_restored() {
+        let (store, _data, workdir, _lock) = test_store();
+        let f = create_file(workdir.path(), "real.txt", "data");
+        store.trash(&f, None).unwrap();
 
+        // Plant an orphan: a data file with no .trashinfo
+        let trash = TrashStore::home_trash_dir();
+        fs::write(trash.join("files/orphan1"), b"orphan").unwrap();
+
+        // undo restores the real newest entry, not the orphan
+        let restored = store.undo().unwrap();
+        assert!(restored.ends_with("real.txt"));
+        assert!(trash.join("files/orphan1").exists(), "orphan stays put");
+
+        // Direct restore of the orphan is refused
+        let err = store.restore("orphan1", None).unwrap_err();
+        assert!(matches!(err, TrashError::OrphanedEntry(_)));
+        assert!(trash.join("files/orphan1").exists(), "orphan data preserved");
+    }
+
+    // --- Compression roundtrip ---
     #[test]
     fn compress_and_restore_roundtrip() {
         let (store, _data, workdir, _lock) = test_store();

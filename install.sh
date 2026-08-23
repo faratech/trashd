@@ -191,8 +191,30 @@ install -Dm755 "${TARGET_DIR}/trashd" "${LIB_DIR}/trashd"
 echo "==> Setting up shim directory..."
 mkdir -p "${SHIM_DIR}" "${REAL_DIR}"
 
-# Stash the real rm binary
-REAL_RM="$(which rm 2>/dev/null || echo /usr/bin/rm)"
+# Stash the real rm binary. Resolve candidates through `which -a` and skip
+# anything inside the trashd tree: if the shim is already on PATH, plain
+# `which rm` would find THE SHIM and stash it as the "real" rm, turning every
+# later `rm --permanent` into an exec loop (the copy is the shim; it sees
+# TRASH_BYPASS=1 and passes through to itself forever).
+REAL_RM=""
+for _cand in $(which -a rm 2>/dev/null) /usr/bin/rm /bin/rm; do
+    [ -x "$_cand" ] || continue
+    _real="$(readlink -f "$_cand" 2>/dev/null || echo "$_cand")"
+    case "$_real" in
+        "${LIB_DIR}"/*|*/lib/trashd/*|"/usr/local/lib/trashd/"*) continue ;;
+    esac
+    REAL_RM="$_cand"
+    break
+done
+[ -n "$REAL_RM" ] || REAL_RM=/usr/bin/rm
+
+# Heal a poisoned stash from an older installer: if the existing stash is
+# byte-identical to this build's shim binary, it IS the shim — replace it.
+if [ -f "${REAL_DIR}/rm" ] && cmp -s "${REAL_DIR}/rm" "${TARGET_DIR}/trashd-rm"; then
+    echo "    Repairing poisoned real-rm stash (it contained the shim)"
+    rm -f "${REAL_DIR}/rm"
+fi
+
 if [ -x "${REAL_RM}" ] && [ ! -f "${REAL_DIR}/rm" ]; then
     cp "${REAL_RM}" "${REAL_DIR}/rm"
     echo "    Saved real rm -> ${REAL_DIR}/rm"
