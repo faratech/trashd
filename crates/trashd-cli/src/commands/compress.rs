@@ -18,17 +18,25 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
     let mut saved = 0u64;
 
     for entry in &entries {
-        if entry.trashed_path.is_dir() || entry.orphaned {
+        if entry.orphaned {
+            continue;
+        }
+        // symlink_metadata: a trashed SYMLINK must never be compressed —
+        // reading through it would slurp its target and renaming the
+        // compressed data over it would replace the link with a regular
+        // file (#45).
+        let stored_meta = match std::fs::symlink_metadata(&entry.trashed_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !stored_meta.is_file() {
             continue;
         }
         let age = now.signed_duration_since(entry.info.deletion_date);
         if age.num_days() < days as i64 {
             continue;
         }
-        let size_before = match std::fs::metadata(&entry.trashed_path) {
-            Ok(m) => m.len(),
-            Err(_) => continue,
-        };
+        let size_before = stored_meta.len();
         if size_before < 1024 {
             continue;
         }
@@ -48,19 +56,17 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
             continue;
         }
 
-        match compress_file_zstd(&entry.trashed_path) {
-            Ok(size_after) => {
-                // Record that trashd compressed this entry so restore
-                // decompresses by marker, never by guessing magic bytes
-                // (which would corrupt a user's genuine .zst file).
-                if size_after < size_before {
-                    let mut info = entry.info.clone();
-                    info.compressed = Some("zstd".into());
-                    let _ = trashd_common::store::write_trashinfo_atomic(&entry.info_path, &info);
-                }
+        match compress_file_zstd(
+            &entry.trashed_path,
+            &entry.info_path,
+            &entry.info,
+            size_before,
+        ) {
+            Ok(Some(size_after)) => {
                 saved += size_before.saturating_sub(size_after);
                 compressed += 1;
             }
+            Ok(None) => {} // not worth compressing; original untouched
             Err(e) => {
                 eprintln!(
                     "  {} {}: {e}",
@@ -104,14 +110,24 @@ fn is_zstd(path: &std::path::Path) -> bool {
         && u32::from_le_bytes(magic) == 0xFD2FB528
 }
 
-/// Compress a file in-place using zstd. Returns the new size.
+/// Compress a trashed entry's data in-place with zstd (streaming, bounded
+/// memory). Returns `Some(new_size)` when swapped, `None` when compression
+/// wasn't worthwhile.
 ///
-/// Streams through `io::copy` into the encoder with a bounded internal buffer:
-/// entry size must never drive memory use (auto-purge caps at 64 MB, but this
-/// command accepts entries of any size). The write still goes through a temp
-/// file + rename so a partial write can't corrupt the sole remaining copy.
-fn compress_file_zstd(path: &std::path::Path) -> std::io::Result<u64> {
-    let size_before = std::fs::metadata(path)?.len();
+/// Crash-safe ordering (#23): the `X-Trashd-Compressed` marker is recorded
+/// BEFORE the compressed data is renamed over the original. A crash in the
+// window then leaves plain data with a stale marker — which restore detects
+/// (decode failure) and recovers from — instead of zstd bytes with NO marker,
+/// which restore would silently serve as "original content". If the final
+/// swap fails, the marker is reverted so the entry stays consistent.
+fn compress_file_zstd(
+    path: &std::path::Path,
+    info_path: &std::path::Path,
+    info: &trashd_common::trashinfo::TrashInfo,
+    size_before: u64,
+) -> std::io::Result<Option<u64>> {
+    use trashd_common::store::write_trashinfo_atomic;
+
     let tmp = path.with_extension("zst.tmp");
     {
         let out = std::fs::File::create(&tmp)?;
@@ -121,12 +137,23 @@ fn compress_file_zstd(path: &std::path::Path) -> std::io::Result<u64> {
         enc.finish()?;
     }
     let compressed_len = std::fs::metadata(&tmp)?.len();
-    if compressed_len < size_before {
-        std::fs::rename(&tmp, path)?;
-        Ok(compressed_len)
-    } else {
+    if compressed_len >= size_before {
         // Incompressible content — discard the attempt, keep the original.
         let _ = std::fs::remove_file(&tmp);
-        Ok(size_before)
+        return Ok(None);
     }
+
+    // 1) Marker first.
+    let mut marked = info.clone();
+    marked.compressed = Some("zstd".into());
+    write_trashinfo_atomic(info_path, &marked)?;
+
+    // 2) Then the atomic data swap.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        // Revert the marker: data is still plaintext.
+        let _ = write_trashinfo_atomic(info_path, info);
+        return Err(e);
+    }
+    Ok(Some(compressed_len))
 }

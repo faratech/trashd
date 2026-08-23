@@ -183,10 +183,22 @@ else
     COMP_DIR="${SCRIPT_DIR}/target/completions"
 fi
 
+# Atomic artifact replacement: install to a temp name in the SAME directory,
+# then rename over the destination. `install` writing a live binary or .so in
+# place crashes running processes mapped to the old inode (and ETXTBSY aborts
+# this script under set -e) (#7). rename() swaps the directory entry atomically
+# and leaves existing mappings on the old inode untouched.
+atomic_install() {
+    _ai_src="$1"; _ai_dst="$2"; _ai_mode="${3:-755}"
+    mkdir -p "$(dirname "$_ai_dst")"
+    _ai_tmp="$(dirname "$_ai_dst")/.trashd-install.$$"
+    install -m "$_ai_mode" "$_ai_src" "$_ai_tmp" && mv -f "$_ai_tmp" "$_ai_dst"
+}
+
 echo "==> Installing binaries..."
-install -Dm755 "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
-install -Dm755 "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
-install -Dm755 "${TARGET_DIR}/trashd" "${LIB_DIR}/trashd"
+atomic_install "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
+atomic_install "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
+atomic_install "${TARGET_DIR}/trashd"      "${LIB_DIR}/trashd"
 
 echo "==> Setting up shim directory..."
 mkdir -p "${SHIM_DIR}" "${REAL_DIR}"
@@ -221,7 +233,7 @@ if [ -x "${REAL_RM}" ] && [ ! -f "${REAL_DIR}/rm" ]; then
 fi
 
 # Install rm shim
-install -Dm755 "${TARGET_DIR}/trashd-rm" "${SHIM_DIR}/rm"
+atomic_install "${TARGET_DIR}/trashd-rm" "${SHIM_DIR}/rm"
 
 # Create convenience symlinks for common destructive commands
 # that just invoke the rm shim
@@ -265,10 +277,15 @@ else
 fi
 
 echo "==> Installing LD_PRELOAD library (Layer 2)..."
-install -Dm755 "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
+atomic_install "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
 echo "    Installed ${LIB_DIR}/libtrashd_preload.so"
-# Enable system-wide: catches unlink/rmdir from any dynamically-linked program
+# Enable system-wide: catches unlink/rmdir from any dynamically-linked program.
+# Ensure a trailing newline first — appending after a file that lacks one would
+# glue our entry onto the previous line and corrupt the whole preload list.
 if ! grep -qs "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
+    if [ -s /etc/ld.so.preload ] && [ "$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then
+        printf '\n' >> /etc/ld.so.preload
+    fi
     echo "${LIB_DIR}/libtrashd_preload.so" >> /etc/ld.so.preload
     echo "    Enabled system-wide via /etc/ld.so.preload"
 else

@@ -140,8 +140,11 @@ fn default_bypass_processes() -> Vec<String> {
         "npm".into(),
         "make".into(),
         "git".into(),
-        "systemd".into(),
-        "systemctl".into(),
+        // NOTE: deliberately NO "systemd"/"systemctl": the ancestor walk
+        // matches ANY ancestor by name, and graphical/systemd-launched
+        // sessions have systemd in their ancestry — which silently disabled
+        // interception AND passed every delete through to permanent removal
+        // (#3). Services that need a bypass should use precise bypass_paths.
         "journald".into(),
         "containerd".into(),
         "dockerd".into(),
@@ -241,9 +244,11 @@ impl Config {
             self.max_dir_size_mb = v;
         }
 
-        // Lists: extend and deduplicate
+        // Lists: extend and deduplicate. only_trash entries are sanitized
+        // aggressively — a pattern that can never match would make the
+        // whitelist real-delete everything (#4).
         if let Some(extra) = partial.never_trash {
-            for item in extra {
+            for item in sanitize_patterns(&extra, "never_trash") {
                 if !self.never_trash.contains(&item) {
                     self.never_trash.push(item);
                 }
@@ -251,7 +256,7 @@ impl Config {
         }
         // only_trash: user config replaces global (not additive — it's a whitelist)
         if let Some(list) = partial.only_trash {
-            self.only_trash = list;
+            self.only_trash = sanitize_patterns(&list, "only_trash");
         }
         if let Some(extra) = partial.bypass_processes {
             for item in extra {
@@ -329,10 +334,15 @@ impl Config {
     }
 
     /// Look for a .trashd.toml in the file's parent directory (or ancestors).
+    ///
+    /// Walks all the way to the filesystem root: a fixed 5-level cap silently
+    /// dropped deep project whitelists (#9), which — via only_trash — meant
+    /// real deletes again. Trust note: a .trashd.toml is repo-controlled
+    /// content; its `only_trash` whitelist can cause REAL DELETES of anything
+    /// not listed. Only place one in trees you control.
     fn load_local_config(path: &Path) -> Option<LocalConfig> {
         let mut dir = path.parent()?;
-        // Walk up at most 5 levels to find .trashd.toml
-        for _ in 0..5 {
+        loop {
             let config_path = dir.join(".trashd.toml");
             if config_path.is_file()
                 && let Ok(content) = std::fs::read_to_string(&config_path)
@@ -340,13 +350,16 @@ impl Config {
             {
                 return Some(local);
             }
-            dir = dir.parent()?;
+            dir = dir.parent()?; // None at the filesystem root
         }
-        None
     }
 }
 
 /// Per-directory config (.trashd.toml).
+///
+/// TRUST: this file is untrusted repo content. A malicious checkout with
+/// `only_trash = []` (or narrow) entries causes every other deletion in the
+/// tree to be a REAL delete. Only place these in trees you control.
 #[derive(Debug, Deserialize, Default)]
 struct LocalConfig {
     #[serde(default)]
@@ -376,12 +389,39 @@ fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
         } else if pattern == "*~" {
             path_str.ends_with('~')
         } else if let Some(suffix) = pattern.strip_prefix("*/") {
-            path_str.contains(&format!("/{suffix}"))
-                || path_str.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
+            // Whole-COMPONENT match only: plain substring matching made
+            // "*/name" match ".../name-x/y", silently converting intended
+            // trashes into permanent deletes when used in never_trash (#17).
+            let suffix = suffix.trim_end_matches('/');
+            !suffix.is_empty() && path_str.split('/').any(|c| c == suffix)
         } else {
-            path_str == *pattern
+            // Full matcher (supports ?, [...], **): unsupported syntax must
+            // never silently degrade to exact-string compare — in only_trash
+            // whitelists that failure mode mass-deletes everything (#4).
+            crate::store::simple_glob_match(pattern, &path_str)
         }
     })
+}
+
+/// Drop patterns containing syntax our matcher cannot honor (`{a,b}` brace
+/// expansion). Such patterns would otherwise silently behave wrong; in an
+/// only_trash whitelist that means nothing matches and EVERY delete becomes
+/// permanent (#4). Warn loudly so misconfiguration is visible.
+fn sanitize_patterns(list: &[String], what: &str) -> Vec<String> {
+    list.iter()
+        .filter(|p| {
+            if p.contains('{') || p.contains('}') {
+                eprintln!(
+                    "trashd: WARNING: dropping unsupported {what} pattern '{p}' \
+                     (brace expansion is not supported)"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

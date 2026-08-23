@@ -94,7 +94,7 @@ fn main() -> ExitCode {
         println!("Use --permanent or TRASH_BYPASS=1 for real deletion");
         println!("Use `trash undo` to restore the last deletion");
         println!("Use `trash ls` to see trashed files\n");
-        return passthrough_with_args(&["--help"]);
+        return passthrough_with_args(&[std::ffi::OsString::from("--help")]);
     }
 
     if args.version {
@@ -102,13 +102,23 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Accepted for GNU rm compatibility — parsed only so these invocations
-    // trash rather than fall through to a permanent delete.
-    let _ = (
-        &args.one_file_system,
-        &args.preserve_root,
-        &args.no_preserve_root,
-    );
+    // GNU rm's preserve-root guard, actually enforced: the flags were parsed
+    // "for compatibility" and discarded, so `rm -rf /` proceeded to destroy
+    // the whole tree (#2). Refuse operands that ARE the root unless
+    // --no-preserve-root was given (matches GNU semantics — top-level
+    // entries like /* expand to operands that are not "/" itself).
+    if args.recursive
+        && !args.no_preserve_root
+        && args.files.iter().any(is_root_operand)
+    {
+        eprintln!("rm: it is dangerous to operate recursively on '/'");
+        eprintln!("rm: use --no-preserve-root to override the failsafe");
+        return ExitCode::FAILURE;
+    }
+
+    // Accepted for GNU rm compatibility — parsed so these invocations trash
+    // rather than fall through to a permanent delete.
+    let _ = (&args.one_file_system, &args.preserve_root);
 
     // Fold --interactive[=WHEN] into the -i / -I behavior. A bare --interactive
     // maps to "always" via default_missing_value.
@@ -125,13 +135,16 @@ fn main() -> ExitCode {
         }
     }
 
-    // If --permanent, pass through to real rm (stripping our custom flags)
+    // If --permanent, pass through to real rm (stripping our custom flags).
+    // args_os (NOT args): argv may contain non-UTF-8 filenames, and
+    // std::env::args() PANICS on them — the file would be neither trashed
+    // nor deleted (#14).
     if args.permanent {
-        let filtered: Vec<String> = std::env::args()
+        let filtered: Vec<std::ffi::OsString> = std::env::args_os()
             .skip(1)
             .filter(|a| a != "--permanent" && a != "--no-trash")
             .collect();
-        return passthrough_with_args(&filtered.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        return passthrough_with_args(&filtered);
     }
 
     if args.files.is_empty() {
@@ -166,13 +179,16 @@ fn main() -> ExitCode {
 
     let cmd_str = format!(
         "rm {}",
-        std::env::args()
+        std::env::args_os()
             .skip(1)
             .map(|a| {
+                // Lossy only for the log line — the actual file operation
+                // uses the original PathBuf.
+                let a = a.to_string_lossy();
                 if a.contains(' ') || a.contains('\'') || a.contains('"') || a.contains('\\') {
                     format!("'{}'", a.replace('\'', "'\\''"))
                 } else {
-                    a
+                    a.into_owned()
                 }
             })
             .collect::<Vec<_>>()
@@ -259,6 +275,14 @@ fn main() -> ExitCode {
                     exit_code = ExitCode::FAILURE;
                 }
             }
+            // Configured guards are REFUSALS, not fallbacks: a size cap or a
+            // trash-self-target means "leave the data alone". Escalating to
+            // permanent delete would invert the user's intent (#10).
+            Err(e @ (trashd_common::store::TrashError::TooLarge { .. }
+                     | trashd_common::store::TrashError::Refused(_))) => {
+                eprintln!("rm: refusing to remove '{}': {e}", file.display());
+                exit_code = ExitCode::FAILURE;
+            }
             Err(e) => {
                 eprintln!("trashd: failed to trash '{}': {e}", file.display());
                 eprintln!("trashd: falling back to real rm for this file");
@@ -271,6 +295,13 @@ fn main() -> ExitCode {
     }
 
     exit_code
+}
+
+/// True when an operand IS the filesystem root ("/", "//", "///", ...).
+/// Matches GNU rm's preserve-root guard, which refuses exactly these.
+fn is_root_operand(p: &PathBuf) -> bool {
+    let mut comps = p.components();
+    matches!(comps.next(), Some(std::path::Component::RootDir)) && comps.next().is_none()
 }
 
 /// Prompt user on stderr, return true if they answer 'y' or 'Y'.
@@ -348,11 +379,12 @@ fn stash_is_shim(path: &PathBuf) -> bool {
 }
 
 fn passthrough() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    passthrough_with_args(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+    // args_os: never panic on non-UTF-8 argv (#14)
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    passthrough_with_args(&args)
 }
 
-fn passthrough_with_args(args: &[&str]) -> ExitCode {
+fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
     let rm = real_rm_path();
     // Set TRASH_BYPASS=1 so the LD_PRELOAD layer doesn't re-intercept
     // the real rm's unlink() calls when we're passing through.
@@ -437,5 +469,17 @@ mod tests {
         let a = Rm::try_parse_from(["rm", "--interactive", "f"]).unwrap();
         assert_eq!(a.interactive.as_deref(), Some("always"));
         assert_eq!(a.files, vec![PathBuf::from("f")]);
+    }
+
+    // Regression (audit #2): the preserve-root guard refuses exactly the
+    // root operand — "/", "//" etc. — never ordinary absolute paths.
+    #[test]
+    fn root_operand_detection() {
+        assert!(is_root_operand(&PathBuf::from("/")));
+        assert!(is_root_operand(&PathBuf::from("//")));
+        assert!(!is_root_operand(&PathBuf::from("/tmp")));
+        assert!(!is_root_operand(&PathBuf::from("/tmp/")));
+        assert!(!is_root_operand(&PathBuf::from("relative")));
+        assert!(!is_root_operand(&PathBuf::from(".")));
     }
 }

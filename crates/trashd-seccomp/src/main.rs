@@ -100,8 +100,13 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
                 }
             };
 
-            // Send notification fd to parent
-            send_fd(sv[1], notif_fd);
+            // Send notification fd to parent. If delivery fails, the parent
+            // can never drain notifications — running on would hang the very
+            // first delete. Abort loudly instead (#13).
+            if !send_fd(sv[1], notif_fd) {
+                eprintln!("trashd-exec: child: could not pass notification fd — aborting");
+                unsafe { libc::_exit(126) };
+            }
             unsafe {
                 libc::close(notif_fd);
                 libc::close(sv[1]);
@@ -116,8 +121,20 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     // --- PARENT (ORCHESTRATOR) PROCESS ---
     unsafe { libc::close(sv[1]) }; // Close child's end
 
-    // Receive notification fd from child
-    let notif_fd = recv_fd(sv[0])?;
+    // Receive notification fd from child. On error, the child may already
+    // have installed its filter: leaving it running with no listener would
+    // hang every delete, so kill + reap it before bailing (#13).
+    let notif_fd = match recv_fd(sv[0]) {
+        Ok(fd) => fd,
+        Err(e) => {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+                libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+                libc::close(sv[0]);
+            }
+            return Err(e);
+        }
+    };
     unsafe { libc::close(sv[0]) };
 
     if notif_fd < 0 {
@@ -133,36 +150,19 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
         return Err(e);
     }
 
-    // Fork the supervisor
-    let supervisor_pid = unsafe { libc::fork() };
-    match supervisor_pid {
-        -1 => {
-            let e = io::Error::last_os_error();
-            unsafe {
-                libc::close(notif_fd);
-                libc::close(watchdog_fd);
-            }
-            return Err(e);
-        }
-        0 => {
-            // --- SUPERVISOR PROCESS ---
-            unsafe { libc::close(watchdog_fd) };
-            if let Err(e) = supervisor::run_supervisor(notif_fd) {
-                eprintln!("trashd-exec: supervisor error: {e}");
-            }
-            unsafe { libc::_exit(0) };
-        }
-        _ => {}
-    }
-
-    // Fork the watchdog
+    // Fork the WATCHDOG first; IT forks (and owns) the supervisor so that
+    // its waitpid() targets a real child. The previous layout made the
+    // supervisor a SIBLING of the watchdog — waitpid always returned ECHILD,
+    // triggering an instant fake failover with two supervisors racing on one
+    // notification fd (#5).
     let watchdog_pid = unsafe { libc::fork() };
     match watchdog_pid {
         -1 => {
             let e = io::Error::last_os_error();
             unsafe {
-                libc::kill(supervisor_pid, libc::SIGTERM);
-                libc::waitpid(supervisor_pid, std::ptr::null_mut(), 0);
+                // No listener exists yet; a filtered child would hang.
+                libc::kill(child_pid, libc::SIGKILL);
+                libc::waitpid(child_pid, std::ptr::null_mut(), 0);
                 libc::close(notif_fd);
                 libc::close(watchdog_fd);
             }
@@ -171,7 +171,7 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
         0 => {
             // --- WATCHDOG PROCESS ---
             unsafe { libc::close(notif_fd) };
-            watchdog::run_watchdog(watchdog_fd, supervisor_pid);
+            watchdog::run_watchdog(watchdog_fd);
             // run_watchdog never returns (it's a ! function)
         }
         _ => {}
@@ -186,19 +186,16 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     // Forward SIGINT and SIGTERM to the child process so Ctrl-C works
     install_signal_forwarder(child_pid);
 
+    // Signals are blocked around the reap inside wait_for_child so a late
+    // signal can't hit a recycled PID (#42).
     let result = wait_for_child(child_pid);
 
-    // The child has been reaped — its PID may now be recycled by the kernel for
-    // an unrelated process. Disable the forwarder BEFORE doing anything else so
-    // a late SIGINT/SIGTERM can't deliver `kill()` to a recycled PID.
-    CHILD_PID.store(0, Ordering::Relaxed);
-
-    // Child is done — clean up supervisor and watchdog
+    // Child is done — tear down the protection tree. The watchdog forwards
+    // SIGTERM to its supervisor child before exiting (#5), so one TERM here
+    // retires both.
     unsafe {
-        libc::kill(supervisor_pid, libc::SIGTERM);
         libc::kill(watchdog_pid, libc::SIGTERM);
         let mut s = 0;
-        libc::waitpid(supervisor_pid, &mut s, 0);
         libc::waitpid(watchdog_pid, &mut s, 0);
     }
 
@@ -234,21 +231,41 @@ fn install_signal_forwarder(child_pid: libc::pid_t) {
 }
 
 /// Wait for the child process and return its exit code.
+///
+/// SIGINT/SIGTERM/SIGHUP are blocked around the waitpid + disarm so a signal
+/// delivered AFTER the child was reaped but BEFORE `CHILD_PID` is cleared can
+/// never `kill()` a recycled PID (#42). The forwarder handler reads the atomic
+/// only while these signals are blocked or already disarmed.
 fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
     let mut status: libc::c_int = 0;
-    loop {
-        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e);
-        }
-        break;
-    }
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGHUP);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old);
 
-    CHILD_PID.store(0, Ordering::Relaxed);
+        loop {
+            let ret = libc::waitpid(pid, &mut status, 0);
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                CHILD_PID.store(0, Ordering::Relaxed);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+                return Err(e);
+            }
+            break;
+        }
+
+        // Disarm the forwarder before unblocking: any pending/late signal now
+        // observes pid==0 and does nothing.
+        CHILD_PID.store(0, Ordering::Relaxed);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+    }
 
     if libc::WIFEXITED(status) {
         Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))
@@ -286,7 +303,9 @@ fn exec_command(args: &[String]) -> ! {
 // fd passing over unix socket (SCM_RIGHTS)
 // ---------------------------------------------------------------------------
 
-fn send_fd(sock: i32, fd: i32) {
+/// Send `fd` over the socket. Returns false when delivery failed — callers
+/// in the child MUST abort (a filter without a listener hangs deletes, #13).
+fn send_fd(sock: i32, fd: i32) -> bool {
     let fd_bytes = fd.to_ne_bytes();
 
     // cmsg buffer: must be aligned and large enough for one fd
@@ -325,7 +344,9 @@ fn send_fd(sock: i32, fd: i32) {
             "trashd-exec: send_fd failed: {}",
             io::Error::last_os_error()
         );
+        return false;
     }
+    true
 }
 
 fn recv_fd(sock: i32) -> io::Result<i32> {

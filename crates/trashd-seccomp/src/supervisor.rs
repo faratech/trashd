@@ -198,6 +198,23 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
         return;
     }
 
+    // Honor bypass_paths against the TRAPPING process's executable. Checking
+    // the supervisor's own /proc/self/exe (as before) made the whole list
+    // inert in this layer — the supervisor is always trashd-exec (#21).
+    if !config.bypass_paths.is_empty()
+        && let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid))
+    {
+        let exe_str = exe.to_string_lossy();
+        if config
+            .bypass_paths
+            .iter()
+            .any(|p| exe_str.starts_with(p.as_str()))
+        {
+            respond_continue(fd, notif.id);
+            return;
+        }
+    }
+
     // Check never-trash list
     if config.should_skip(&path) {
         respond_continue(fd, notif.id);
@@ -267,6 +284,13 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
         }
         Err(TrashError::Excluded(_)) => {
             // In never-trash list — let real syscall run
+            respond_continue(fd, notif.id);
+        }
+        Err(TrashError::Refused(_)) => {
+            // Trash-self-target (store refuses to trash the trash itself or
+            // its ancestors). CONTINUE keeps internal cleanup working: our
+            // own purge/empty legitimately unlink entries INSIDE the trash.
+            // Fail-open here is the documented design for this layer.
             respond_continue(fd, notif.id);
         }
         Err(_) => {

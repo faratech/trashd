@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -99,8 +99,10 @@ impl Default for PreloadConfig {
                 "npm".into(),
                 "make".into(),
                 "git".into(),
-                "systemd".into(),
-                "systemctl".into(),
+                // No "systemd"/"systemctl": the ancestor walk matches ANY
+                // ancestor by name, and systemd-launched sessions would have
+                // the whole layer silently disabled (#22). Use precise
+                // bypass_paths for services instead.
                 "journald".into(),
                 "containerd".into(),
                 "dockerd".into(),
@@ -119,9 +121,10 @@ impl PreloadConfig {
             }
         }
         // only_trash is a whitelist, not additive: a later layer replaces it
-        // (matches trashd-common's Config::merge semantics).
+        // (matches trashd-common's Config::merge semantics). Sanitize first —
+        // an unsupported pattern would make the whitelist real-delete all (#4).
         if let Some(list) = partial.only_trash {
-            self.only_trash = list;
+            self.only_trash = sanitize_only_trash(list);
         }
         if let Some(extra) = partial.bypass_processes {
             for item in extra {
@@ -388,18 +391,121 @@ fn pattern_matches(pattern: &str, s: &str) -> bool {
     } else if pattern == "*~" {
         s.ends_with('~')
     } else if let Some(suffix) = pattern.strip_prefix("*/") {
-        s.contains(&format!("/{suffix}"))
-            || s.ends_with(&format!("/{}", suffix.trim_end_matches('/')))
+        // Whole-component match only — substring matching over-matched
+        // ".../name-x/..." for pattern "*/name" (#17).
+        let suffix = suffix.trim_end_matches('/');
+        !suffix.is_empty() && s.split('/').any(|c| c == suffix)
     } else {
-        *pattern == *s
+        // Full glob matcher: unsupported syntax must not degrade to
+        // exact-string compare (#4).
+        glob_match(pattern, s)
     }
 }
 
-/// Find the nearest `.trashd.toml` walking up from `path` (≤5 levels), matching
-/// trashd-common's Config::load_local_config.
+/// Glob matcher (`*`, `?`, `[...]`, `**`) — same semantics as trashd-common's
+/// `simple_glob_match`; duplicated by design (the preload does not link
+/// trashd-common). Iterative with star backtracking; cannot panic.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+    loop {
+        if pi < p.len() {
+            match p[pi] {
+                '*' => {
+                    star_pi = pi;
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
+                }
+                '?' if ti < t.len() => {
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                '[' if ti < t.len() => {
+                    if let Some(next) = class_match(&p, pi, t[ti]) {
+                        pi = next;
+                        ti += 1;
+                        continue;
+                    }
+                }
+                c if ti < t.len() && c == t[ti] => {
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if pi == p.len() && ti == t.len() {
+            return true;
+        }
+        if star_pi != usize::MAX && star_ti < t.len() {
+            star_ti += 1;
+            pi = star_pi + 1;
+            ti = star_ti;
+            continue;
+        }
+        return false;
+    }
+}
+
+/// Match one char against a `[...]` class at `p[start]`; returns the index
+/// past `]`, or None (no match / unterminated).
+fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
+    let mut i = start + 1;
+    let mut negate = false;
+    if i < p.len() && (p[i] == '!' || p[i] == '^') {
+        negate = true;
+        i += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while i < p.len() {
+        if p[i] == ']' && !first {
+            return if matched != negate { Some(i + 1) } else { None };
+        }
+        first = false;
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            if c >= p[i] && c <= p[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if p[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Drop patterns with syntax we cannot honor ({a,b}) — in an only_trash
+/// whitelist a never-matching pattern real-deletes everything (#4).
+fn sanitize_only_trash(list: Vec<String>) -> Vec<String> {
+    list.into_iter()
+        .filter(|p| {
+            if p.contains('{') || p.contains('}') {
+                eprintln!(
+                    "trashd-preload: WARNING: dropping unsupported only_trash pattern '{p}'"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+/// Find the nearest `.trashd.toml` walking up from `path` to the filesystem
+/// root, matching trashd-common's Config::load_local_config (a fixed 5-level
+/// cap silently dropped deep project whitelists, #9).
 fn load_local_config(path: &Path) -> Option<LocalConfig> {
     let mut dir = path.parent()?;
-    for _ in 0..5 {
+    loop {
         let cfg_path = dir.join(".trashd.toml");
         if cfg_path.is_file()
             && let Ok(content) = fs::read_to_string(&cfg_path)
@@ -407,9 +513,8 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
         {
             return Some(local);
         }
-        dir = dir.parent()?;
+        dir = dir.parent()?; // None at the filesystem root
     }
-    None
 }
 
 /// Check if path should skip trash (real-delete instead).
@@ -537,8 +642,30 @@ fn trash_dir_for(path: &Path) -> PathBuf {
     home_trash
 }
 
-fn home_trash_dir() -> PathBuf {
-    dirs::data_dir()
+/// Unescape /proc/mounts octal sequences (the kernel escapes only whitespace
+/// and backslash, e.g. "\040" for space) so mount paths with spaces resolve.
+fn unescape_octal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let oct: String = chars.by_ref().take(3).collect();
+            if oct.len() == 3
+                && let Ok(val) = u8::from_str_radix(&oct, 8)
+            {
+                out.push(val as char);
+                continue;
+            }
+            out.push('\\');
+            out.push_str(&oct);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn home_trash_dir() -> PathBuf {    dirs::data_dir()
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
                 .join(".local/share")
@@ -567,7 +694,9 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
             Some(m) => m,
             None => continue,
         };
-        let mp = PathBuf::from(mpoint);
+        // /proc/mounts octal-escapes whitespace and backslash in mount paths
+        // (e.g. "\040" for space); unescape so those paths resolve (#47).
+        let mp = PathBuf::from(unescape_octal(mpoint));
         if abs.starts_with(&mp) && mp.as_os_str().len() > best_len {
             best_len = mp.as_os_str().len();
             best = Some(mp);
@@ -702,9 +831,25 @@ fn try_trash(path: &Path) -> bool {
         // Cross-device dirs: best-effort. For preload, fall back to real delete.
         let _ = fs::remove_file(&info_path);
         return false;
+    } else if meta.file_type().is_fifo() || meta.file_type().is_socket() {
+        // fs::copy on a FIFO blocks forever waiting for a writer (#11);
+        // sockets have no persistent data. Let the real unlink proceed.
+        let _ = fs::remove_file(&info_path);
+        return false;
+    } else if meta.file_type().is_char_device() || meta.file_type().is_block_device() {
+        // Copying a device node would read unbounded data from it.
+        let _ = fs::remove_file(&info_path);
+        return false;
     } else {
         // Regular file: copy + delete original
-        if fs::copy(path, &dest).is_ok() {
+        if fs::copy(path, &dest).is_err() {
+            // A partial/failed copy must not strand an orphaned data file
+            // in the trash (#33).
+            let _ = fs::remove_file(&dest);
+            let _ = fs::remove_file(&info_path);
+            return false;
+        }
+        {
             // Preserve permissions
             let _ = fs::set_permissions(&dest, meta.permissions());
             let cpath = match CString::new(path.as_os_str().as_bytes()) {

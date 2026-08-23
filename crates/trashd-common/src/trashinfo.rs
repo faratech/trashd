@@ -43,7 +43,10 @@ impl TrashInfo {
         let mut s = format!("[Trash Info]\nPath={encoded_path}\nDeletionDate={date_str}\n");
 
         if let Some(ref cmd) = self.command {
-            s.push_str(&format!("X-Trashd-Command={cmd}\n"));
+            // Strip control characters: a command containing a newline would
+            // be parsed back as separate key=value lines (metadata injection).
+            let sanitized: String = cmd.chars().filter(|c| !c.is_control()).collect();
+            s.push_str(&format!("X-Trashd-Command={sanitized}\n"));
         }
         if let Some(pid) = self.pid {
             s.push_str(&format!("X-Trashd-PID={pid}\n"));
@@ -95,6 +98,13 @@ impl TrashInfo {
                 match key.trim() {
                     // Spec: first occurrence wins for Path and DeletionDate
                     "Path" if path.is_none() => {
+                        // Reject traversal lexically BEFORE decoding: the URL
+                        // parser normalizes ".." silently, which would defeat
+                        // restore's ParentDir guard and let a crafted
+                        // .trashinfo restore to an arbitrary location (#27).
+                        if value.split('/').any(|seg| seg == "..") {
+                            return None;
+                        }
                         // Spec: Path value is percent-encoded bytes — don't trim
                         // (leading/trailing spaces in encoded form are meaningful)
                         path = Some(decode_path(value));
@@ -114,11 +124,20 @@ impl TrashInfo {
                             };
                         }
                     }
-                    "X-Trashd-Command" => command = Some(value.trim().to_string()),
-                    "X-Trashd-PID" => pid = value.trim().parse().ok(),
-                    "X-Trashd-Size" => size = value.trim().parse().ok(),
-                    "X-Trashd-Hash" | "X-Trashd-SHA256" => sha256 = Some(value.trim().to_string()),
-                    "X-Trashd-Compressed" => compressed = Some(value.trim().to_string()),
+                    // First occurrence wins for the extensions too: a later
+                    // duplicate must never override e.g. the integrity-hash
+                    // marker recorded at trash time (#30).
+                    "X-Trashd-Command" if command.is_none() => {
+                        command = Some(value.trim().to_string())
+                    }
+                    "X-Trashd-PID" if pid.is_none() => pid = value.trim().parse().ok(),
+                    "X-Trashd-Size" if size.is_none() => size = value.trim().parse().ok(),
+                    "X-Trashd-Hash" | "X-Trashd-SHA256" if sha256.is_none() => {
+                        sha256 = Some(value.trim().to_string())
+                    }
+                    "X-Trashd-Compressed" if compressed.is_none() => {
+                        compressed = Some(value.trim().to_string())
+                    }
                     _ => {}
                 }
             }
@@ -137,32 +156,30 @@ impl TrashInfo {
 }
 
 /// Percent-encode a path for .trashinfo (spec requirement).
+///
+/// Encodes the RAW byte representation (`OsStrExt::as_bytes`):
+/// `to_string_lossy()` would replace invalid-UTF-8 filename bytes with
+/// U+FFFD and the original name could never be reconstructed on restore (#15).
 fn encode_path(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    // Encode non-ASCII and special chars per the trash spec
-    let mut encoded = String::with_capacity(s.len());
-    for byte in s.as_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len());
+    for byte in bytes {
         match *byte {
             // Safe chars: unreserved + /
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 encoded.push(*byte as char);
             }
             _ => {
-                encoded.push_str(&format!("%{:02X}", byte));
+                encoded.push_str(&format!("%{byte:02X}"));
             }
         }
     }
     encoded
 }
 
-/// Decode a percent-encoded path from .trashinfo.
-fn decode_path(s: &str) -> PathBuf {
-    if let Ok(url) = Url::parse(&format!("file://{s}"))
-        && let Ok(path) = url.to_file_path()
-    {
-        return path;
-    }
-    // Fallback: manual decode — preserve invalid sequences literally
+/// Decode a percent-encoded path from .trashinfo into raw bytes.
+fn decode_percent(s: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.bytes();
     while let Some(b) = chars.next() {
@@ -193,7 +210,24 @@ fn decode_path(s: &str) -> PathBuf {
             bytes.push(b);
         }
     }
-    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    bytes
+}
+
+/// Decode a percent-encoded path from .trashinfo.
+fn decode_path(s: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let raw = decode_percent(s);
+    // Only consult the URL parser for ABSOLUTE values. For a relative topdir
+    // path like "localhost/foo", `file://localhost/foo` parses with host
+    // "localhost" and to_file_path() happily returns "/foo" — inventing an
+    // absolute path out of a relative one (#25).
+    if raw.first() == Some(&b'/')
+        && let Ok(url) = Url::parse(&format!("file://{s}"))
+        && let Ok(path) = url.to_file_path()
+    {
+        return path;
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(raw))
 }
 
 #[cfg(test)]

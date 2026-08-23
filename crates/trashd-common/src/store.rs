@@ -43,6 +43,8 @@ pub enum TrashError {
     },
     #[error("entry '{0}' has no .trashinfo metadata and cannot be restored (run `trash fsck`)")]
     OrphanedEntry(String),
+    #[error("refusing to trash '{0}': it is the trash directory itself, inside it, or an ancestor of it")]
+    Refused(PathBuf),
 }
 
 pub struct TrashStore {
@@ -212,6 +214,21 @@ impl TrashStore {
 
         // Pick the right trash directory (same-device preferred)
         let trash_dir = self.trash_dir_for(&abs_path);
+
+        // Refuse to trash the trash directory itself, anything inside it, or
+        // any ancestor of it: rename would fail (dest inside src), the
+        // cross-device fallback would copy the store into itself until the
+        // depth cap, and a failed move lets callers fall back to PERMANENT
+        // deletion of the entire store. `rm -rf ~/.local/share/Trash` must
+        // never destroy the trash. Callers treat Refused as a hard stop —
+        // NOT Excluded, which means "real-delete on purpose".
+        if abs_path == trash_dir
+            || abs_path.starts_with(&trash_dir)
+            || trash_dir.starts_with(&abs_path)
+        {
+            return Err(TrashError::Refused(abs_path));
+        }
+
         Self::ensure_trash_dir(&trash_dir)?;
 
         // Generate unique trash ID within that trash dir (atomic)
@@ -290,6 +307,22 @@ impl TrashStore {
                     std::os::unix::fs::symlink(&link_target, &dest)?;
                 } else if meta.is_dir() {
                     copy_tree(&abs_path, &dest)?;
+                } else if meta.file_type().is_fifo() {
+                    // Recreate the FIFO — fs::copy on one blocks forever
+                    // waiting for a writer (#11).
+                    use std::os::unix::ffi::OsStrExt;
+                    if let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+                        unsafe {
+                            libc::mkfifo(c.as_ptr(), (meta.mode() & 0o7777) as libc::mode_t);
+                        }
+                    }
+                } else if meta.file_type().is_char_device()
+                    || meta.file_type().is_block_device()
+                    || meta.file_type().is_socket()
+                {
+                    // No CAP_MKNOD / no persistent data — refuse rather than
+                    // fall through to fs::copy on a device node.
+                    return Err(io::Error::other("cannot trash device node across filesystems").into());
                 } else {
                     fs::copy(&abs_path, &dest)?;
                     fs::set_permissions(&dest, meta.permissions())?;
@@ -527,11 +560,28 @@ impl TrashStore {
         // leaves the entry fully intact in the trash (nothing moved, metadata
         // present) so it stays restorable, and the write is atomic so a
         // crash/ENOSPC can never truncate the only copy.
-        if entry.info.compressed.as_deref() == Some("zstd") && entry.trashed_path.is_file() {
+        // symlink_metadata: never decode THROUGH a trashed symlink onto its
+        // target (#12).
+        let stored_is_regular = fs::symlink_metadata(&entry.trashed_path)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if entry.info.compressed.as_deref() == Some("zstd") && stored_is_regular {
             let data = fs::read(&entry.trashed_path)?;
-            let decompressed = zstd::decode_all(data.as_slice())
-                .map_err(|e| io::Error::other(format!("failed to decompress trashed file: {e}")))?;
-            atomic_write(&entry.trashed_path, &decompressed)?;
+            match zstd::decode_all(data.as_slice()) {
+                Ok(decompressed) => {
+                    atomic_write(&entry.trashed_path, &decompressed)?;
+                }
+                Err(e) => {
+                    // Marker present but payload isn't valid zstd: a crash
+                    // between writing the marker and swapping the data leaves
+                    // exactly this state (#28). Serve the stored bytes as-is
+                    // instead of failing — the entry must stay recoverable.
+                    eprintln!(
+                        "trashd: warning: entry '{}' is marked compressed but not valid zstd ({e}); restoring stored bytes as-is",
+                        entry.id
+                    );
+                }
+            }
             // The data is no longer compressed; clear the marker so a later
             // failure (or re-restore) can never attempt a second decode.
             let mut cleared = entry.info.clone();
@@ -691,15 +741,23 @@ impl TrashStore {
                 }
             }
             // Inline purge to avoid re-scanning list for each entry
-            // Use symlink_metadata so dangling symlinks are removed too
-            match fs::symlink_metadata(&entry.trashed_path) {
+            // Use symlink_metadata so dangling symlinks are removed too.
+            // Only retire the sidecar/index row when the data actually went
+            // away (#49) — otherwise a failed removal strands an invisible
+            // partially-deleted tree.
+            let data_gone = match fs::symlink_metadata(&entry.trashed_path) {
                 Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                    let _ = fs::remove_dir_all(&entry.trashed_path);
+                    fs::remove_dir_all(&entry.trashed_path).is_ok()
                 }
-                Ok(_) => {
-                    let _ = fs::remove_file(&entry.trashed_path);
-                }
-                Err(_) => {}
+                Ok(_) => fs::remove_file(&entry.trashed_path).is_ok(),
+                Err(_) => true, // already gone
+            };
+            if !data_gone {
+                eprintln!(
+                    "trashd: warning: could not fully delete '{}' — keeping its entry",
+                    entry.trashed_path.display()
+                );
+                continue;
             }
             let _ = fs::remove_file(&entry.info_path);
             if let Some(idx) = self.index.as_ref() {
@@ -818,25 +876,33 @@ impl TrashStore {
             if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3)
                 && compressed.len() < data.len()
             {
-                // Atomic write: an interrupted compress must never truncate
-                // the SOLE remaining copy of the user's deleted data.
-                if atomic_write(path, &compressed).is_ok() {
-                    // Record that WE compressed it so restore decompresses
-                    // by marker, not by guessing magic bytes.
-                    let mut info = entries[i].info.clone();
-                    info.compressed = Some("zstd".into());
-                    let _ = write_trashinfo_atomic(&entries[i].info_path, &info);
+                // Record the compression marker BEFORE swapping the data
+                // (#28): a crash in the window then leaves plain data with a
+                // stale marker — which restore detects (decode fails) and
+                // recovers from — instead of zstd bytes with NO marker,
+                // which restore would silently serve as "original content".
+                // Atomic writes throughout: an interrupted compress must
+                // never truncate the SOLE remaining copy of the user's
+                // deleted data. If the swap fails, revert the marker so the
+                // entry stays consistent.
+                let mut info = entries[i].info.clone();
+                info.compressed = Some("zstd".into());
+                if write_trashinfo_atomic(&entries[i].info_path, &info).is_ok()
+                    && atomic_write(path, &compressed).is_err()
+                {
+                    let mut reverted = entries[i].info.clone();
+                    reverted.compressed = None;
+                    let _ = write_trashinfo_atomic(&entries[i].info_path, &reverted);
                 }
             }
         }
 
         // Phase 2b: trim by total size (purge oldest surviving until under limit)
-        // Use actual disk size (not info.size) since compression may have shrunk files.
         let total_size: u64 = entries
             .iter()
             .enumerate()
             .filter(|(i, _)| !purged[*i])
-            .map(|(_, e)| fs::metadata(&e.trashed_path).map(|m| m.len()).unwrap_or(0))
+            .map(|(_, e)| entry_disk_size(e))
             .sum();
         // max_size_gb == 0 means "no size limit", not "trim everything to 0".
         if max_size_bytes > 0 && total_size > max_size_bytes {
@@ -850,9 +916,7 @@ impl TrashStore {
                     break;
                 }
                 // Use actual disk size (may differ from info.size after compression)
-                freed += fs::metadata(&entries[i].trashed_path)
-                    .map(|m| m.len())
-                    .unwrap_or(entries[i].info.size.unwrap_or(0));
+                freed += entry_disk_size(&entries[i]);
                 let _ = self.purge_entry(&entries[i]);
                 purged[i] = true;
                 purge_count += 1;
@@ -906,14 +970,21 @@ impl TrashStore {
     /// Purge a single entry without re-scanning the list.
     fn purge_entry(&self, entry: &TrashEntry) -> Result<(), TrashError> {
         // Use symlink_metadata so dangling symlinks are detected and removed
-        match fs::symlink_metadata(&entry.trashed_path) {
+        let data_gone = match fs::symlink_metadata(&entry.trashed_path) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                let _ = fs::remove_dir_all(&entry.trashed_path);
+                fs::remove_dir_all(&entry.trashed_path).is_ok()
             }
-            Ok(_) => {
-                let _ = fs::remove_file(&entry.trashed_path);
-            }
-            Err(_) => {} // already gone
+            Ok(_) => fs::remove_file(&entry.trashed_path).is_ok(),
+            Err(_) => true, // already gone
+        };
+        if !data_gone {
+            // Keep the .trashinfo so the entry stays listed/restorable;
+            // dropping it would strand a partially-deleted tree as an
+            // invisible orphan (#49).
+            return Err(TrashError::Io(io::Error::other(format!(
+                "failed to delete trashed data for entry '{}'",
+                entry.id
+            ))));
         }
         let _ = fs::remove_file(&entry.info_path);
         if let Some(idx) = self.index.as_ref() {
@@ -948,9 +1019,7 @@ impl TrashStore {
                 });
             ps.count += 1;
             // Use actual disk size (may be smaller than info.size after compression)
-            ps.total_size += fs::metadata(&entry.trashed_path)
-                .map(|m| m.len())
-                .unwrap_or(entry.info.size.unwrap_or(0));
+            ps.total_size += entry_disk_size(entry);
         }
 
         let mut result: Vec<PartitionStatus> = partitions.into_values().collect();
@@ -962,14 +1031,7 @@ impl TrashStore {
     pub fn status(&self) -> Result<(u64, usize), TrashError> {
         let entries = self.list(None)?;
         // Use actual disk size (reflects compression savings)
-        let total_size: u64 = entries
-            .iter()
-            .map(|e| {
-                fs::metadata(&e.trashed_path)
-                    .map(|m| m.len())
-                    .unwrap_or(e.info.size.unwrap_or(0))
-            })
-            .sum();
+        let total_size: u64 = entries.iter().map(entry_disk_size).sum();
         let count = entries.len();
         Ok((total_size, count))
     }
@@ -987,9 +1049,27 @@ impl TrashStore {
     fn find_entry(&self, id_or_pattern: &str) -> Result<TrashEntry, TrashError> {
         let entries = self.list(None)?;
 
-        // Exact ID match (unambiguous)
-        if let Some(entry) = entries.iter().find(|e| e.id == id_or_pattern) {
-            return Ok(entry.clone());
+        // Exact ID match. IDs are unique WITHIN one trash dir, but two
+        // partitions can hold entries with the same ID (same filename trashed
+        // on two mounts); picking either nondeterministically could restore
+        // or purge the WRONG copy (#41).
+        let exact: Vec<&TrashEntry> = entries
+            .iter()
+            .filter(|e| e.id == id_or_pattern)
+            .collect();
+        if exact.len() == 1 {
+            return Ok(exact[0].clone());
+        }
+        if exact.len() > 1 {
+            let roots: std::collections::HashSet<&PathBuf> =
+                exact.iter().map(|e| &e.trash_root).collect();
+            if roots.len() > 1 {
+                return Err(TrashError::AmbiguousMatch {
+                    pattern: id_or_pattern.into(),
+                    count: exact.len(),
+                });
+            }
+            return Ok(exact[0].clone());
         }
 
         // Filename match — check for ambiguity
@@ -1227,8 +1307,6 @@ fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
 
     let meta = fs::symlink_metadata(src)?;
     fs::create_dir_all(dst)?;
-    // Copy permissions of the directory itself
-    fs::set_permissions(dst, meta.permissions())?;
 
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -1261,6 +1339,12 @@ fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
             fs::set_permissions(&dest_path, entry_meta.permissions())?;
         }
     }
+
+    // Copy the directory's own permissions AFTER populating it: applying the
+    // source mode first would make read-only trees (e.g. mode 0555) fail on
+    // their very first child write — both when trashing cross-device and when
+    // restoring — leaving partial copies behind (#24). cp -a does the same.
+    fs::set_permissions(dst, meta.permissions())?;
     Ok(())
 }
 
@@ -1349,47 +1433,114 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+/// Glob matcher: `*` (any sequence), `?` (single char), `[...]` classes with
+/// ranges and `!`/`^` negation, `**` (same as `*`). Iterative with star
+/// backtracking — cannot panic on any input (the previous hand-rolled
+/// prefix/suffix splitter panicked on overlapping prefix/tail, #50) and no
+/// silent exact-compare fallback for syntax it doesn't understand (#4).
 pub fn simple_glob_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    // Only use the prefix/suffix shortcuts when there's a single wildcard.
-    // Patterns like "*.py*" must fall through to the split_once handler.
-    if let Some(suffix) = pattern.strip_prefix('*')
-        && !suffix.contains('*')
-    {
-        return text.ends_with(suffix);
-    }
-    if let Some(prefix) = pattern.strip_suffix('*')
-        && !prefix.contains('*')
-    {
-        return text.starts_with(prefix);
-    }
-    if let Some((prefix, suffix)) = pattern.split_once('*') {
-        // suffix might contain another '*' (e.g., pattern "*.py*" → prefix="", suffix=".py*")
-        if let Some((mid, tail)) = suffix.split_once('*') {
-            // Three-segment: prefix*mid*tail — text must start with prefix,
-            // contain mid, and end with tail. The length guard is mandatory:
-            // a short text whose (overlapping) prefix and tail both match
-            // would otherwise produce an inverted slice range and panic
-            // (e.g. pattern "abc*b*bc" vs text "abc"). Byte offsets may also
-            // split a multibyte char, so slice via get() and treat an
-            // unaligned range as no-match instead of panicking.
-            let body = if text.len() >= prefix.len() + tail.len() {
-                text.get(prefix.len()..text.len() - tail.len())
-            } else {
-                None
-            };
-            return text.starts_with(prefix)
-                && text.ends_with(tail)
-                && body.is_some_and(|b| b.contains(mid));
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Most recent `*` position and the text offset it was matched at — the
+    // sole backtrack point we need for a pattern of `*`, `?`, classes.
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+
+    loop {
+        if pi < p.len() {
+            match p[pi] {
+                '*' => {
+                    star_pi = pi;
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
+                }
+                '?' if ti < t.len() => {
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                '[' if ti < t.len() => {
+                    if let Some(next) = class_match(&p, pi, t[ti]) {
+                        pi = next;
+                        ti += 1;
+                        continue;
+                    }
+                    // No class match (or unterminated class): fall through
+                    // to the mismatch handler / backtrack below.
+                }
+                c if ti < t.len() && c == t[ti] => {
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                _ => {}
+            }
         }
-        // Guard: text must be long enough for both prefix and suffix
-        return text.len() >= prefix.len() + suffix.len()
-            && text.starts_with(prefix)
-            && text.ends_with(suffix);
+        // Mismatch, or pattern exhausted while text remains.
+        if pi == p.len() && ti == t.len() {
+            return true;
+        }
+        if star_pi != usize::MAX && star_ti < t.len() {
+            // Let the last `*` absorb one more character and retry.
+            star_ti += 1;
+            pi = star_pi + 1;
+            ti = star_ti;
+            continue;
+        }
+        return false;
     }
-    text == pattern
+}
+
+/// Match one character against a `[...]` class starting at `p[start]`.
+/// Returns the pattern index just past the closing `]`, or None when the
+/// character isn't matched (or the class is unterminated).
+fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
+    let mut i = start + 1;
+    let mut negate = false;
+    if i < p.len() && (p[i] == '!' || p[i] == '^') {
+        negate = true;
+        i += 1;
+    }
+    let mut matched = false;
+    let mut first = true; // a `]` right after `[` or `[!` is a literal member
+    while i < p.len() {
+        if p[i] == ']' && !first {
+            return if matched != negate { Some(i + 1) } else { None };
+        }
+        first = false;
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            if c >= p[i] && c <= p[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if p[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// On-disk size of a trash entry for retention accounting and status.
+///
+/// `fs::metadata().len()` on a DIRECTORY is the size of its inode (~4 KB),
+/// not the tree — trusting it made auto-purge "free" only 4096 bytes per
+/// purged tree and keep deleting far past the configured excess, and made
+/// directory-heavy trashes look nearly empty. Directory trees therefore use
+/// their recorded recursive size (`info.size`, captured by `dir_size()` at
+/// trash time). Symlinks are never followed: a trashed link must count as
+/// itself, not its target.
+fn entry_disk_size(entry: &TrashEntry) -> u64 {
+    match fs::symlink_metadata(&entry.trashed_path) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+            entry.info.size.unwrap_or(m.len())
+        }
+        Ok(m) => m.len(),
+        Err(_) => entry.info.size.unwrap_or(0),
+    }
 }
 
 /// Get disk usage percentage for the filesystem containing the given path.
@@ -1818,6 +1969,25 @@ mod tests {
         assert!(!simple_glob_match("日*ほ*語", "日本語"));
     }
 
+    // The matcher now supports ? and [...] classes and never silently
+    // degrades unsupported syntax to exact-compare (#4).
+    #[test]
+    fn glob_question_and_classes() {
+        assert!(simple_glob_match("file?.txt", "file1.txt"));
+        assert!(!simple_glob_match("file?.txt", "file10.txt"));
+        assert!(simple_glob_match("[mbc]*.rs", "main.rs"));
+        assert!(!simple_glob_match("[mbc]*.rs", "script.rs"));
+        assert!(simple_glob_match("*.[jp]pg", "a.jpg"));
+        assert!(!simple_glob_match("*.[jp]pg", "a.mpg"));
+        assert!(simple_glob_match("*.[a-z][a-z]g", "file.xyg"));
+        assert!(!simple_glob_match("*.[a-z][a-z]g", "file.x9g"));
+        assert!(simple_glob_match("[!0-9]*.log", "app.log"));
+        assert!(!simple_glob_match("[!0-9]*.log", "9app.log"));
+        assert!(simple_glob_match("**/*.py", "deep/nested/x.py")); // ** behaves like *
+        // Unterminated class degrades to a non-match, never a panic.
+        assert!(!simple_glob_match("[abc", "abc"));
+    }
+
     // --- Restore conflict + force ---
 
     #[test]
@@ -1966,6 +2136,28 @@ mod tests {
         assert!(trash.join("files/orphan1").exists(), "orphan data preserved");
     }
 
+    // Regression (audit #8): trashing the trash directory itself, anything
+    // inside it, or an ancestor of it must be REFUSED — a failed move would
+    // otherwise fall back to permanent deletion of the entire store.
+    #[test]
+    fn refuse_to_trash_the_trash_itself() {
+        let (store, _data, _workdir, _lock) = test_store();
+        let trash = TrashStore::home_trash_dir();
+
+        // The store itself
+        let err = store.trash(&trash, None).unwrap_err();
+        assert!(matches!(err, TrashError::Refused(_)), "got {err:?}");
+
+        // Something inside it
+        let err = store.trash(&trash.join("files"), None).unwrap_err();
+        assert!(matches!(err, TrashError::Refused(_)), "got {err:?}");
+
+        // An ancestor of it
+        let ancestor = trash.parent().unwrap().to_path_buf();
+        let err = store.trash(&ancestor, None).unwrap_err();
+        assert!(matches!(err, TrashError::Refused(_)), "got {err:?}");
+    }
+
     // --- Compression roundtrip ---
     #[test]
     fn compress_and_restore_roundtrip() {
@@ -2023,17 +2215,15 @@ mod tests {
         );
     }
 
-    // H1/H2: a crafted .trashinfo whose Path escapes via ".." must be refused
-    // by restore, and the trashed payload must stay put.
+    // H1/H2 + audit #27: a crafted .trashinfo whose Path escapes via ".." is
+    // rejected at PARSE time (the URL decoder would normalize ".." silently
+    // and defeat restore's ParentDir guard), and the trashed payload stays.
     #[test]
     fn restore_refuses_path_traversal() {
         let (store, _data, _workdir, _lock) = test_store();
         let trash = TrashStore::home_trash_dir();
         fs::create_dir_all(trash.join("info")).unwrap();
         fs::create_dir_all(trash.join("files")).unwrap();
-        // Relative Path is decoded literally (preserving "..") and reconstructed
-        // onto the trash topdir, so the resolved destination keeps ParentDir
-        // components.
         fs::write(
             trash.join("info/evil.trashinfo"),
             "[Trash Info]\nPath=../../../../etc/evil\nDeletionDate=2026-01-01T00:00:00\n",
@@ -2042,14 +2232,24 @@ mod tests {
         fs::write(trash.join("files/evil"), b"payload").unwrap();
 
         let err = store.restore("evil", None).unwrap_err();
+        // The unparseable sidecar leaves files/evil as an orphan, which the
+        // orphan guard (#16) then refuses to restore — either way the
+        // traversal path is never resolved.
         assert!(
-            matches!(err, TrashError::RestoreTraversal(_)),
-            "expected RestoreTraversal, got {err:?}"
+            matches!(err, TrashError::OrphanedEntry(_) | TrashError::EntryNotFound(_)),
+            "traversal entry must not resolve; got {err:?}"
         );
-        assert!(
-            trash.join("files/evil").exists(),
+        assert_eq!(
+            fs::read(trash.join("files/evil")).unwrap(),
+            b"payload",
             "payload must stay in the trash after a refused restore"
         );
+
+        // Ordinary relative paths (topdir trash layout) still parse fine.
+        assert!(TrashInfo::from_trashinfo(
+            "[Trash Info]\nPath=sub/dir/file.txt\nDeletionDate=2026-01-01T00:00:00\n"
+        )
+        .is_some());
     }
 
     // M1: trashing a file must not overwrite a pre-existing orphaned data file
