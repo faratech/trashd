@@ -33,6 +33,7 @@ jobs:
             os: ubuntu-latest
             arch: aarch64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -142,6 +143,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
