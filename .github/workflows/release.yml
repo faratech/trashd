@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -130,6 +132,14 @@ jobs:
           # Create tarball + checksum
           tar czf "${STAGING}.tar.gz" "${STAGING}"
           sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        continue-on-error: true
+        with:
+          subject-path: |
+            trashd-*.tar.gz
+            trashd-*.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
