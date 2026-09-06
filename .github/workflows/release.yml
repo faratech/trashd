@@ -274,6 +274,13 @@ jobs:
           ### Checksums
           \`\`\`
           ${CHECKSUMS}
+          \`\`\`
+
+          ### Verification
+          All release tarballs are verified with GitHub artifact attestation:
+          \`\`\`bash
+          gh attestation verify trashd-${VERSION}-linux-x86_64.tar.gz --owner faratech
+          gh attestation verify trashd-${VERSION}-linux-aarch64.tar.gz --owner faratech
           \`\`\`" \
             ${PRERELEASE} \
             ${ASSETS}
