@@ -9,9 +9,11 @@
 //! Architecture:
 //!   trashd-exec (orchestrator)
 //!     ├── child: installs seccomp filter, exec's command
-//!     ├── supervisor: handles notifications, trashes files
 //!     └── watchdog: monitors supervisor, failover with CONTINUE
+//!          └── supervisor: handles notifications, trashes files
+//! The orchestrator brokers memory/fd access as the stable target ancestor.
 
+mod broker;
 mod filter;
 mod mem;
 mod pin;
@@ -20,8 +22,11 @@ mod watchdog;
 
 use std::ffi::CString;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixDatagram;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicI32, Ordering};
+
+static STARTUP_PROBE: &[u8] = b"trashd-startup-probe\0";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -55,6 +60,12 @@ fn main() -> ExitCode {
 }
 
 fn run(command_args: &[String]) -> io::Result<ExitCode> {
+    // Keep orphaned target descendants in our ancestry: Yama authorizes the
+    // stable ancestor broker even when a target forks and its parent exits.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let signals = SignalWait::new()?;
     // Create a socketpair for passing the notification fd from child to parent.
     let mut sv = [0i32; 2];
     if unsafe {
@@ -75,6 +86,7 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
         -1 => return Err(io::Error::last_os_error()),
         0 => {
             // --- CHILD PROCESS ---
+            signals.restore_mask();
             unsafe { libc::close(sv[0]) }; // Close parent's end
 
             // Required before seccomp
@@ -88,12 +100,11 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
             let notif_fd = match filter::install_filter() {
                 Ok(fd) => fd,
                 Err(e) => {
-                    // EBUSY means a seccomp listener already exists in this filter
-                    // chain (common in Docker, WSL2, etc.) — fall through silently.
-                    if e.raw_os_error() != Some(libc::EBUSY) {
-                        eprintln!("trashd-exec: seccomp filter install failed: {e}");
-                        eprintln!("trashd-exec: running command without protection");
-                    }
+                    eprintln!("trashd-exec: seccomp filter install failed: {e}");
+                    eprintln!("trashd-exec: continuing with preload/shim fallback, if available");
+                    // Only an established listener may disable preload. A
+                    // stale inherited marker must never survive fallback.
+                    unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
                     // Send -1 to signal failure, then exec without protection
                     send_fd(sv[1], -1);
                     unsafe { libc::close(sv[1]) };
@@ -110,7 +121,18 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
             }
             unsafe {
                 libc::close(notif_fd);
+            }
+
+            // Do not announce protection or start deleting until the parent
+            // has verified memory access and started the supervisor tree.
+            let mut ready = 0u8;
+            if unsafe { libc::read(sv[1], (&mut ready as *mut u8).cast(), 1) } != 1 || ready != 1 {
+                eprintln!("trashd-exec: supervisor startup failed — aborting");
+                unsafe { libc::_exit(126) };
+            }
+            unsafe {
                 libc::close(sv[1]);
+                std::env::set_var("TRASHD_SECCOMP_ACTIVE", "1");
             }
 
             // Exec the command
@@ -121,35 +143,48 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
 
     // --- PARENT (ORCHESTRATOR) PROCESS ---
     unsafe { libc::close(sv[1]) }; // Close child's end
+    let startup = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+    let mut child = ChildProcess(child_pid);
+    if let Some(exit) = wait_for_startup(startup.as_raw_fd(), &mut child, &signals)? {
+        return Ok(exit);
+    }
 
     // Receive notification fd from child. On error, the child may already
     // have installed its filter: leaving it running with no listener would
     // hang every delete, so kill + reap it before bailing (#13).
-    let notif_fd = match recv_fd(sv[0]) {
-        Ok(fd) => fd,
-        Err(e) => {
-            unsafe {
-                libc::kill(child_pid, libc::SIGKILL);
-                libc::waitpid(child_pid, std::ptr::null_mut(), 0);
-                libc::close(sv[0]);
-            }
-            return Err(e);
-        }
-    };
-    unsafe { libc::close(sv[0]) };
-
+    let notif_fd = recv_fd(startup.as_raw_fd())?;
     if notif_fd < 0 {
         // Child couldn't install seccomp — just wait for it
-        return wait_for_child(child_pid);
+        return child.wait(None, &signals);
     }
+    let listener = unsafe { OwnedFd::from_raw_fd(notif_fd) };
 
-    // Dup the fd for the watchdog
-    let watchdog_fd = unsafe { libc::dup(notif_fd) };
-    if watchdog_fd < 0 {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(notif_fd) };
-        return Err(e);
+    // Verify actual ptrace permission before releasing the filtered child.
+    if let Err(e) = mem::read_path_locally(child_pid as u32, STARTUP_PROBE.as_ptr() as u64) {
+        child.terminate(libc::SIGKILL);
+        drop(listener);
+        drop(startup);
+        eprintln!("trashd-exec: cannot inspect protected child: {e}");
+        eprintln!("trashd-exec: continuing with preload/shim fallback, if available");
+        // A filter cannot be removed. Replace the waiting filtered child
+        // with one forked from this unfiltered parent before fallback exec.
+        let fallback = unsafe { libc::fork() };
+        if fallback < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if fallback == 0 {
+            signals.restore_mask();
+            unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
+            exec_command(command_args);
+        }
+        return ChildProcess(fallback).wait(None, &signals);
     }
+    let (broker_server, broker_client) = UnixDatagram::pair()?;
+    let (ready_server, ready_client) = UnixDatagram::pair()?;
+    ready_server.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+
+    // fork duplicates the listener reference; the parent drops its copy
+    // once the watchdog has started the supervisor.
 
     // Fork the WATCHDOG first; IT forks (and owns) the supervisor so that
     // its waitpid() targets a real child. The previous layout made the
@@ -158,123 +193,354 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     // notification fd (#5).
     let watchdog_pid = unsafe { libc::fork() };
     match watchdog_pid {
-        -1 => {
-            let e = io::Error::last_os_error();
-            unsafe {
-                // No listener exists yet; a filtered child would hang.
-                libc::kill(child_pid, libc::SIGKILL);
-                libc::waitpid(child_pid, std::ptr::null_mut(), 0);
-                libc::close(notif_fd);
-                libc::close(watchdog_fd);
-            }
-            return Err(e);
-        }
+        -1 => return Err(io::Error::last_os_error()),
         0 => {
             // --- WATCHDOG PROCESS ---
-            unsafe { libc::close(notif_fd) };
-            watchdog::run_watchdog(watchdog_fd);
+            signals.restore_mask();
+            drop(startup);
+            drop(broker_server);
+            drop(ready_server);
+            watchdog::run_watchdog(
+                notif_fd,
+                broker_client.as_raw_fd(),
+                ready_client.as_raw_fd(),
+            );
             // run_watchdog never returns (it's a ! function)
         }
         _ => {}
     }
-
-    // Orchestrator: close fds we don't need, wait for the child
-    unsafe {
-        libc::close(notif_fd);
-        libc::close(watchdog_fd);
+    let mut watchdog = ChildProcess(watchdog_pid);
+    drop(ready_client);
+    if let Some(exit) = wait_for_startup(ready_server.as_raw_fd(), &mut child, &signals)? {
+        return Ok(exit);
+    }
+    let mut ready = [0u8];
+    if ready_server.recv(&mut ready)? != 1 || ready[0] != 1 {
+        return Err(io::Error::other(
+            "supervisor could not establish protection",
+        ));
     }
 
-    // Forward SIGINT and SIGTERM to the child process so Ctrl-C works
-    install_signal_forwarder(child_pid);
+    // Orchestrator: close fds we don't need, wait for the child
+    if unsafe {
+        libc::send(
+            startup.as_raw_fd(),
+            ready.as_ptr().cast(),
+            1,
+            libc::MSG_NOSIGNAL,
+        )
+    } != 1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    drop(startup);
+    drop(listener);
+    drop(broker_client);
 
-    // Signals are blocked around the reap inside wait_for_child so a late
-    // signal can't hit a recycled PID (#42).
-    let result = wait_for_child(child_pid);
+    let result = wait_for_children(
+        &mut child,
+        Some(broker_server.as_raw_fd()),
+        &signals,
+        Some(watchdog_pid),
+    );
 
     // Child is done — tear down the protection tree. The watchdog forwards
     // SIGTERM to its supervisor child before exiting (#5), so one TERM here
     // retires both.
-    unsafe {
-        libc::kill(watchdog_pid, libc::SIGTERM);
-        let mut s = 0;
-        libc::waitpid(watchdog_pid, &mut s, 0);
-    }
+    watchdog.terminate(libc::SIGTERM);
 
     result
 }
 
-/// Global child PID for signal forwarding (signal handlers can't capture closures).
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// Own a child until it is reaped. Startup failures must never strand a
+/// filtered child waiting forever for a listener or a readiness message.
+struct ChildProcess(libc::pid_t);
 
-extern "C" fn forward_signal(sig: libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::Relaxed);
-    if pid > 0 {
-        unsafe { libc::kill(pid, sig) };
+impl ChildProcess {
+    fn wait(&mut self, broker: Option<i32>, signals: &SignalWait) -> io::Result<ExitCode> {
+        wait_for_children(self, broker, signals, None)
+    }
+
+    fn terminate(&mut self, signal: i32) {
+        if self.0 <= 0 {
+            return;
+        }
+        unsafe { libc::kill(self.0, signal) };
+        while unsafe { libc::waitpid(self.0, std::ptr::null_mut(), 0) } < 0 {
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        self.0 = 0;
     }
 }
 
-fn install_signal_forwarder(child_pid: libc::pid_t) {
-    CHILD_PID.store(child_pid, Ordering::Relaxed);
-    unsafe {
-        libc::signal(
-            libc::SIGHUP,
-            forward_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            forward_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            forward_signal as *const () as libc::sighandler_t,
-        );
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        self.terminate(libc::SIGKILL);
     }
 }
 
-/// Wait for the child process and return its exit code.
-///
-/// SIGINT/SIGTERM/SIGHUP are blocked around the waitpid + disarm so a signal
-/// delivered AFTER the child was reaped but BEFORE `CHILD_PID` is cleared can
-/// never `kill()` a recycled PID (#42). The forwarder handler reads the atomic
-/// only while these signals are blocked or already disarmed.
-fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
-    let mut status: libc::c_int = 0;
-    unsafe {
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGINT);
-        libc::sigaddset(&mut mask, libc::SIGTERM);
-        libc::sigaddset(&mut mask, libc::SIGHUP);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old);
+/// Consume termination signals synchronously while servicing broker requests.
+/// Signals target a pidfd, never a potentially recycled numeric PID.
+struct SignalWait {
+    fd: OwnedFd,
+    old: libc::sigset_t,
+}
 
-        loop {
-            let ret = libc::waitpid(pid, &mut status, 0);
-            if ret < 0 {
+impl SignalWait {
+    fn new() -> io::Result<Self> {
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            let mut old = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGCHLD] {
+                libc::sigaddset(&mut mask, sig);
+            }
+            let result = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old);
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result));
+            }
+            let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+            if fd < 0 {
                 let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                CHILD_PID.store(0, Ordering::Relaxed);
                 libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
                 return Err(e);
             }
-            break;
+            Ok(Self {
+                fd: OwnedFd::from_raw_fd(fd),
+                old,
+            })
         }
-
-        // Disarm the forwarder before unblocking: any pending/late signal now
-        // observes pid==0 and does nothing.
-        CHILD_PID.store(0, Ordering::Relaxed);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
     }
 
+    fn restore_mask(&self) {
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    }
+
+    fn next(&self) -> Option<u32> {
+        let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                (&mut info as *mut libc::signalfd_siginfo).cast(),
+                std::mem::size_of_val(&info),
+            )
+        };
+        (n == std::mem::size_of_val(&info) as isize).then_some(info.ssi_signo)
+    }
+}
+
+impl Drop for SignalWait {
+    fn drop(&mut self) {
+        while self.next().is_some() {}
+        self.restore_mask();
+    }
+}
+
+fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+    }
+}
+
+fn signal_pidfd(fd: i32, signal: u32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+}
+
+/// Wait for either startup message while remaining responsive to cancellation.
+/// A stopped startup child cannot handle TERM yet, so abort and reap it after
+/// forwarding the requested signal, preserving the requested exit status.
+fn wait_for_startup(
+    fd: i32,
+    child: &mut ChildProcess,
+    signals: &SignalWait,
+) -> io::Result<Option<ExitCode>> {
+    let pidfd = open_pidfd(child.0)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
+        if result < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        while let Some(sig) = signals.next() {
+            if sig != libc::SIGCHLD as u32 {
+                signal_pidfd(pidfd.as_raw_fd(), sig);
+                child.terminate(libc::SIGKILL);
+                return Ok(Some(ExitCode::from((128 + sig) as u8)));
+            }
+        }
+        if fds[0].revents != 0 {
+            return Ok(None);
+        }
+        if fds[2].revents != 0 {
+            let mut status = 0;
+            if unsafe { libc::waitpid(child.0, &mut status, 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            child.0 = 0;
+            return Ok(Some(exit_status(status)));
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "supervisor startup timed out",
+            ));
+        }
+    }
+}
+
+/// Wait for the original command and all protected descendants. Subreaper
+/// adoption keeps them in the broker's ancestry even after their parents exit.
+///
+/// A pidfd stays bound to the original process after exit and reap (#42).
+/// Polling signalfd keeps HUP/INT/TERM responsive for both protected and
+/// fallback execution, instead of blocking them throughout waitpid (#64).
+fn wait_for_children(
+    child: &mut ChildProcess,
+    broker_fd: Option<i32>,
+    signals: &SignalWait,
+    watchdog_pid: Option<i32>,
+) -> io::Result<ExitCode> {
+    let original = child.0;
+    let mut original_status = None;
+    let mut targets = std::collections::BTreeMap::<i32, OwnedFd>::new();
+    let mut refresh = true;
+    let mut pending_signals = Vec::new();
+    loop {
+        if refresh {
+            let mut reaped = false;
+            let children =
+                std::fs::read_to_string(format!("/proc/self/task/{}/children", unsafe {
+                    libc::getpid()
+                }))?;
+            for pid in children
+                .split_whitespace()
+                .filter_map(|p| p.parse::<i32>().ok())
+            {
+                if Some(pid) == watchdog_pid {
+                    continue;
+                }
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == pid {
+                    reaped = true;
+                    targets.remove(&pid);
+                    if pid == original {
+                        child.0 = 0; // disarm cleanup immediately after reap
+                        original_status = Some(exit_status(status));
+                    }
+                } else if waited == 0 && !targets.contains_key(&pid) {
+                    targets.insert(pid, open_pidfd(pid)?);
+                } else if waited < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            // Reparenting may have happened after this /proc snapshot but
+            // before waitpid. Rescan after every reap before declaring the
+            // protected tree empty, including newly adopted descendants.
+            if reaped {
+                continue;
+            }
+            if targets.is_empty()
+                && let Some(status) = original_status
+            {
+                return Ok(status);
+            }
+            refresh = false;
+        }
+        for sig in pending_signals.drain(..) {
+            if let Some(fd) = targets.get(&original) {
+                signal_pidfd(fd.as_raw_fd(), sig);
+            } else {
+                for fd in targets.values() {
+                    signal_pidfd(fd.as_raw_fd(), sig);
+                }
+            }
+        }
+        let mut fds = vec![
+            libc::pollfd {
+                fd: signals.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: broker_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        fds.extend(targets.values().map(|fd| libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        while let Some(sig) = signals.next() {
+            refresh = true;
+            if sig != libc::SIGCHLD as u32 {
+                // Refresh before forwarding: the original may have just
+                // exited, in which case its adopted roots receive the signal.
+                pending_signals.push(sig);
+            }
+        }
+        refresh |= fds.iter().skip(2).any(|fd| fd.revents != 0);
+        if fds[1].revents & libc::POLLIN != 0 {
+            broker::serve(fds[1].fd)?;
+        }
+    }
+}
+
+fn exit_status(status: i32) -> ExitCode {
     if libc::WIFEXITED(status) {
-        Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))
+        ExitCode::from(libc::WEXITSTATUS(status) as u8)
     } else if libc::WIFSIGNALED(status) {
         // Killed by signal — convention is 128 + signal number
-        Ok(ExitCode::from((128 + libc::WTERMSIG(status)) as u8))
+        ExitCode::from((128 + libc::WTERMSIG(status)) as u8)
     } else {
-        Ok(ExitCode::from(1))
+        ExitCode::from(1)
     }
 }
 
@@ -366,7 +632,7 @@ fn recv_fd(sock: i32) -> io::Result<i32> {
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_space;
 
-    let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+    let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -390,6 +656,161 @@ fn recv_fd(sock: i32) -> io::Result<i32> {
             Ok(fd)
         } else {
             Ok(-1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn isolated_case(case: impl FnOnce() + std::panic::UnwindSafe) {
+        let helper = unsafe { libc::fork() };
+        assert!(helper >= 0);
+        if helper == 0 {
+            unsafe { libc::alarm(10) };
+            let result = std::panic::catch_unwind(case);
+            unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(helper, &mut status, 0) }, helper);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn adopted_children_finish_before_original_status_is_returned() {
+        isolated_case(|| {
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+                0
+            );
+            let signals = SignalWait::new().unwrap();
+            let (report, writer) = UnixDatagram::pair().unwrap();
+            report.set_nonblocking(true).unwrap();
+            let original = unsafe { libc::fork() };
+            assert!(original >= 0);
+            if original == 0 {
+                let descendant = unsafe { libc::fork() };
+                assert!(descendant >= 0);
+                if descendant == 0 {
+                    // Guarantee adoption happens while the original is being
+                    // reaped, and that the descendant outlives the original.
+                    unsafe { libc::usleep(150_000) };
+                    writer.send(b"finished").unwrap();
+                    unsafe { libc::_exit(0) };
+                }
+                unsafe { libc::_exit(37) };
+            }
+            let mut child = ChildProcess(original);
+            assert_eq!(child.wait(None, &signals).unwrap(), ExitCode::from(37));
+            assert_eq!(child.0, 0);
+            let mut bytes = [0u8; 8];
+            assert_eq!(report.recv(&mut bytes).unwrap(), 8);
+            assert_eq!(&bytes, b"finished");
+            assert_eq!(
+                unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        });
+    }
+
+    #[test]
+    fn startup_cancellation_reaps_even_a_stopped_child() {
+        isolated_case(|| {
+            let signals = SignalWait::new().unwrap();
+            let (server, _client) = UnixDatagram::pair().unwrap();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                unsafe {
+                    libc::raise(libc::SIGSTOP);
+                    libc::_exit(0)
+                };
+            }
+            let wrapper = unsafe { libc::getpid() };
+            let sender = unsafe { libc::fork() };
+            assert!(sender >= 0);
+            if sender == 0 {
+                unsafe {
+                    libc::usleep(20_000);
+                    libc::kill(wrapper, libc::SIGTERM);
+                    libc::_exit(0)
+                };
+            }
+            let mut child = ChildProcess(pid);
+            let start = std::time::Instant::now();
+            assert_eq!(
+                wait_for_startup(server.as_raw_fd(), &mut child, &signals).unwrap(),
+                Some(ExitCode::from(143))
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(child.0, 0);
+            unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
+        });
+    }
+
+    #[test]
+    fn forwards_hup_int_term_without_recycled_pids() {
+        const CHILD: &str = "TRASHD_TEST_SIGNAL_CHILD";
+        if let Ok(signal) = std::env::var(CHILD) {
+            // The Rust test harness has an unblocked main thread. Run the
+            // event loop in a fresh single-threaded process, like the binary.
+            let harness_child = unsafe { libc::fork() };
+            assert!(harness_child >= 0);
+            if harness_child > 0 {
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(harness_child, &mut status, 0) },
+                    harness_child
+                );
+                assert_eq!(status, 0);
+                return;
+            }
+            let signal: i32 = signal.parse().unwrap();
+            let signals = SignalWait::new().unwrap();
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                    unsafe { libc::signal(sig, libc::SIG_DFL) };
+                }
+                signals.restore_mask();
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            let wrapper = unsafe { libc::getpid() };
+            let sender = unsafe { libc::fork() };
+            assert!(sender >= 0);
+            if sender == 0 {
+                unsafe {
+                    libc::usleep(20_000);
+                    libc::kill(wrapper, signal);
+                    libc::_exit(0);
+                }
+            }
+            assert_eq!(
+                ChildProcess(child).wait(None, &signals).unwrap(),
+                ExitCode::from((128 + signal) as u8)
+            );
+            unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
+            unsafe { libc::_exit(0) };
+        }
+        for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::forwards_hup_int_term_without_recycled_pids",
+                    "--nocapture",
+                ])
+                .env(CHILD, signal.to_string())
+                .status()
+                .unwrap();
+            assert!(status.success(), "signal {signal}");
         }
     }
 }

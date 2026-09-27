@@ -8,13 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build --release              # full workspace build
 cargo build -p trashd-cli           # single crate
 TRASH_BYPASS=1 cargo test           # run all tests (bypass preload to avoid interference)
-cargo test -p trashd-common --lib   # run just the 32 unit tests
+TRASH_BYPASS=1 cargo test -p trashd-common --lib
 sudo ./install.sh                   # build + install all layers + man pages + completions
 sudo ./install.sh --uninstall       # remove all components (preserves trash; add --purge to delete trash too)
-sudo ./tests/integration.sh         # 12 end-to-end integration tests (requires install)
+sudo ./tests/integration.sh target/release  # sandboxed end-to-end checks; no installation
+sudo python3 tests/shim_regression.py target/release/trashd-rm
 ```
 
-Tests require `TRASH_BYPASS=1` when LD_PRELOAD is system-wide (prevents the preload from intercepting test operations). Unit tests use a mutex guard for serialization (they share `XDG_DATA_HOME` env var). Test files are placed under `crates/trashd-common/target/test-trash/`, not `/tmp` (which is in the never-trash list).
+Tests require `TRASH_BYPASS=1` when LD_PRELOAD is system-wide. Destructive unit tests use `TrashStore::open_isolated` with explicit temporary roots and configuration; `XDG_DATA_HOME` alone still exposes mounted trash through a production store. Never use `TrashStore::open()` for destructive unit tests.
+
+Subprocess suites enter `tests/sandbox.py`, which requires Linux mount privileges and creates a disposable chroot in private mount/PID namespaces. It exposes system runtimes read-only, copies the requested built binaries, isolates HOME/XDG/configuration and `/proc`, and verifies external mounted trash sentinels remain unchanged. It fails closed if isolation cannot be established. Do not run legacy tests against installed binaries, source the installed profile, or empty host trash for test setup. Use `sudo env REQUIRE_SECCOMP=1 ...` to require a real seccomp notification listener; otherwise unsupported hosts report a skip. `TRASHD_TEST_NETWORK=1` enables the optional self-update network check.
 
 ## Architecture
 
@@ -27,7 +30,7 @@ Layer 3: fanotify daemon (trashd) — detection/audit only (systemd service, Lin
 Layer 4: seccomp supervisor (trashd-seccomp) — traps syscalls at kernel boundary (interactive shells, Linux 5.5+)
 ```
 
-Layer 4 (seccomp) is the primary layer for interactive shells. Layer 2 (LD_PRELOAD) is the fallback for daemons/cron/non-interactive processes. The preload checks `TRASHD_SECCOMP_ACTIVE` env var and defers when seccomp is handling it.
+Layer 4 (seccomp) is the primary layer for interactive shells. Layer 2 (LD_PRELOAD) is the fallback for daemons/cron/non-interactive processes. The preload checks `TRASHD_SECCOMP_ACTIVE` and defers only after the wrapper successfully installs the listener and completes its startup handshake.
 
 ### Crate dependency graph
 
@@ -59,14 +62,13 @@ Key safety mechanisms:
 - Defers to seccomp when `TRASHD_SECCOMP_ACTIVE=1` is set
 - Sets `TRASH_BYPASS=1` checked on every call
 
-### trashd-seccomp — three-process architecture
+### trashd-seccomp — supervisor and ancestor broker
 
-`trashd-exec <command>` forks three processes:
-1. **Child**: installs BPF seccomp filter, passes notification fd via SCM_RIGHTS, exec's command
-2. **Supervisor**: reads notifications, moves files to trash, responds to kernel
-3. **Watchdog**: holds `dup(fd)`, monitors supervisor. On crash: drains with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (graceful degradation), respawns supervisor.
-
-Orchestrator forwards SIGINT/SIGTERM to child process.
+`trashd-exec <command>` runs an orchestrator, target child, supervisor, and watchdog:
+1. **Child**: installs the BPF seccomp filter, passes the notification fd via SCM_RIGHTS, waits for startup acknowledgement, then sets `TRASHD_SECCOMP_ACTIVE=1` and execs the command. Failed setup clears the flag so preload can protect the fallback.
+2. **Orchestrator**: remains the target's ancestor/subreaper and brokers process-memory reads for the supervisor, preserving Yama `ptrace_scope=1` restrictions. It forwards SIGHUP/SIGINT/SIGTERM through pidfds while serving broker requests, and waits for surviving descendants before returning the original command's status.
+3. **Supervisor**: reads notifications, obtains pathname bytes through the ancestor broker, moves files to trash, and responds to the kernel.
+4. **Watchdog**: holds a duplicate notification fd, drains notifications on supervisor failure, and respawns the supervisor with the broker connection.
 
 BPF filter (`filter.rs`): architecture-specific — x86_64 traps `SYS_unlink`/`SYS_unlinkat`/`SYS_rmdir`; aarch64 traps only `SYS_unlinkat`.
 
@@ -76,7 +78,7 @@ Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Resolves parent via `
 
 ## Key design decisions
 
-- **Fail-safe**: every layer falls back to real delete on error
+- **Failure handling**: storage failures can fall back to real deletion. Invalid shim arguments fail without deleting; a filtered target is released only after its supervisor is ready.
 - **Atomic IDs**: `O_CREAT|O_EXCL` on `.trashinfo`. Filename truncated to 223 chars for filesystem limits
 - **Symlink-safe**: `normalize_path()` canonicalizes parent only. Symlinks re-created in cross-device copies
 - **Process bypass**: walks `/proc/{pid}/stat` up the tree. Also checks `bypass_paths` against `/proc/self/exe`
@@ -101,7 +103,7 @@ Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Resolves parent via `
 
 - `rm --permanent` / `rm --no-trash` — shim passes through to real rm (with `TRASH_BYPASS=1`)
 - `TRASH_BYPASS=1` — env var checked by shim, preload, and seccomp
-- Config `bypass_processes` — auto-detected via `/proc` tree walk (includes git, systemd, apt, cargo, etc.)
+- Config `bypass_processes` — auto-detected via `/proc` tree walk (includes git, apt, cargo, etc.; systemd/systemctl are deliberately excluded)
 - Config `bypass_paths` — exe path prefix match for more precise control
 - Config `never_trash` — glob patterns for paths/extensions that skip trash
 - Config `only_trash` — whitelist mode (if set, only matching files are trashed)

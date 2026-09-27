@@ -27,7 +27,7 @@ extern "C" fn forward_term_and_exit(sig: libc::c_int) {
 /// Run the watchdog loop. This never returns under normal operation.
 ///
 /// - `notif_fd`: a dup'd copy of the seccomp notification fd
-pub fn run_watchdog(notif_fd: i32) -> ! {
+pub fn run_watchdog(notif_fd: i32, broker_fd: i32, ready_fd: i32) -> ! {
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
         libc::signal(
@@ -44,6 +44,7 @@ pub fn run_watchdog(notif_fd: i32) -> ! {
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => {
+            supervisor::signal_ready(ready_fd, false);
             eprintln!(
                 "trashd-exec: watchdog: initial supervisor fork failed: {}",
                 io::Error::last_os_error()
@@ -55,21 +56,22 @@ pub fn run_watchdog(notif_fd: i32) -> ! {
         }
         0 => {
             // Supervisor child
-            if let Err(e) = supervisor::run_supervisor(notif_fd) {
+            if let Err(e) = supervisor::run_supervisor(notif_fd, broker_fd, ready_fd) {
                 eprintln!("trashd-exec: supervisor error: {e}");
             }
             unsafe { libc::_exit(1) }
         }
         supervisor_pid => {
+            unsafe { libc::close(ready_fd) };
             SUPERVISOR_PID.store(supervisor_pid, Ordering::Relaxed);
             eprintln!("trashd-exec: watchdog: supervisor spawned (pid {supervisor_pid})");
-            supervise_loop(supervisor_pid, notif_fd)
+            supervise_loop(supervisor_pid, notif_fd, broker_fd)
         }
     }
 }
 
 /// Wait for our supervisor child; on death, fail over to a fresh one.
-fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32) -> ! {
+fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32) -> ! {
     loop {
         let mut status: libc::c_int = 0;
         let waited = unsafe { libc::waitpid(supervisor_pid, &mut status, 0) };
@@ -118,7 +120,7 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32) -> ! {
                     "trashd-exec: watchdog: new supervisor started (pid {})",
                     unsafe { libc::getpid() }
                 );
-                if let Err(e) = supervisor::run_supervisor(notif_fd) {
+                if let Err(e) = supervisor::run_supervisor(notif_fd, broker_fd, -1) {
                     eprintln!("trashd-exec: supervisor error: {e}");
                 }
                 unsafe { libc::_exit(1) };
@@ -147,6 +149,16 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32) -> ! {
 /// handle, which is exactly the failure this watchdog exists to bound.
 fn drain_with_continue(fd: i32) {
     loop {
+        // Older notification ioctls ignore O_NONBLOCK. Check readiness before
+        // RECV so an idle listener cannot prevent supervisor replacement.
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut ready, 1, 0) } <= 0 || ready.revents & libc::POLLIN == 0 {
+            break;
+        }
         match supervisor::notif_recv(fd) {
             Ok(notif) => {
                 supervisor::respond_continue(fd, notif.id);

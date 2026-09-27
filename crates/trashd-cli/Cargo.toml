@@ -27,6 +27,7 @@ flate2 = "1"
 tar = "0.4"
 libc = "0.2"
 sha2 = "0.11"
+tempfile = "3"
 
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }

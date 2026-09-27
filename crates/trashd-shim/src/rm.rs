@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -10,7 +10,7 @@ use trashd_common::store::is_parent_bypassed;
 /// Supports all standard rm flags. Files are moved to ~/.local/share/Trash/
 /// and can be restored with `trash restore` or `trash undo`.
 #[derive(Parser)]
-#[command(name = "rm", disable_help_flag = true)]
+#[command(name = "rm", disable_help_flag = true, args_override_self = true)]
 struct Rm {
     /// Remove directories and their contents recursively
     #[arg(short = 'r', short_alias = 'R', long = "recursive")]
@@ -24,7 +24,7 @@ struct Rm {
     #[arg(short = 'i')]
     interactive_always: bool,
 
-    /// Prompt once before removing more than three files
+    /// Prompt once before recursive removal or removing more than three files
     #[arg(short = 'I')]
     interactive_once: bool,
 
@@ -33,8 +33,8 @@ struct Rm {
     /// PERMANENT delete instead of trashing. require_equals matches GNU's
     /// optional-argument convention and stops a following filename being eaten
     /// as the WHEN value.
-    #[arg(long = "interactive", num_args = 0..=1, default_missing_value = "always", require_equals = true, value_name = "WHEN")]
-    interactive: Option<String>,
+    #[arg(long = "interactive", num_args = 0..=1, default_missing_value = "always", require_equals = true, value_name = "WHEN", value_parser = ["never", "once", "always"], action = clap::ArgAction::Append)]
+    interactive: Vec<String>,
 
     /// Remove empty directories
     #[arg(short = 'd', long = "dir")]
@@ -73,8 +73,7 @@ struct Rm {
     /// Files and directories to remove.
     /// No trailing_var_arg: GNU rm permutes operands so `rm f -r` must work,
     /// and swallowing everything after the first operand silently turned
-    /// later flags into filenames (#51). Unknown flags still fail parsing and
-    /// fall through to real rm unchanged.
+    /// later flags into filenames (#51). Invalid options fail without deleting.
     #[arg(allow_hyphen_values = false)]
     files: Vec<PathBuf>,
 }
@@ -85,13 +84,17 @@ fn main() -> ExitCode {
         return passthrough();
     }
 
-    let args = match Rm::try_parse() {
-        Ok(a) => a,
+    let matches = match Rm::command().try_get_matches() {
+        Ok(matches) => matches,
         Err(e) => {
             eprintln!("{e}");
-            return passthrough();
+            // Parsing a flag must never escalate a protected removal into a
+            // permanent deletion. Valid repeated flags are accepted above.
+            return ExitCode::FAILURE;
         }
     };
+    let args = Rm::from_arg_matches(&matches).expect("validated rm arguments");
+    let behavior = RemovalBehavior::from_matches(&matches);
 
     if args.help {
         println!("trashd rm — files are moved to trash instead of deleted");
@@ -121,21 +124,6 @@ fn main() -> ExitCode {
     // rather than fall through to a permanent delete.
     let _ = (&args.one_file_system, &args.preserve_root);
 
-    // Fold --interactive[=WHEN] into the -i / -I behavior. A bare --interactive
-    // maps to "always" via default_missing_value.
-    let mut interactive_always = args.interactive_always;
-    let mut interactive_once = args.interactive_once;
-    match args.interactive.as_deref() {
-        Some("always") => interactive_always = true,
-        Some("once") => interactive_once = true,
-        Some("never") | None => {}
-        Some(other) => {
-            eprintln!("rm: invalid argument '{other}' for '--interactive'");
-            eprintln!("Valid arguments are: 'never', 'once', 'always'");
-            return ExitCode::FAILURE;
-        }
-    }
-
     // If --permanent, pass through to real rm (stripping our custom flags).
     // args_os (NOT args): argv may contain non-UTF-8 filenames, and
     // std::env::args() PANICS on them — the file would be neither trashed
@@ -149,7 +137,7 @@ fn main() -> ExitCode {
     }
 
     if args.files.is_empty() {
-        if args.force {
+        if behavior.ignore_missing {
             return ExitCode::SUCCESS;
         }
         eprintln!("rm: missing operand");
@@ -170,9 +158,13 @@ fn main() -> ExitCode {
         return passthrough();
     }
 
-    // Handle -I: prompt once if more than 3 files
-    if interactive_once && !args.force && args.files.len() > 3 {
-        let msg = format!("rm: remove {} arguments? [y/N] ", args.files.len());
+    // GNU -I prompts for recursive removal even with one operand.
+    if behavior.prompt_once(args.recursive, args.files.len()) {
+        let recursive = if args.recursive { "recursively " } else { "" };
+        let msg = format!(
+            "rm: {recursive}remove {} arguments? [y/N] ",
+            args.files.len()
+        );
         if !prompt_user(&msg) {
             return ExitCode::SUCCESS;
         }
@@ -201,7 +193,9 @@ fn main() -> ExitCode {
     for file in &args.files {
         let meta = match file.symlink_metadata() {
             Ok(m) => m,
-            Err(_) if args.force => continue,
+            Err(e) if behavior.ignore_missing && e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
                     "rm: cannot remove '{}': No such file or directory",
@@ -243,7 +237,7 @@ fn main() -> ExitCode {
         }
 
         // Handle -i: prompt before each removal
-        if interactive_always && !args.force {
+        if behavior.interaction == Interaction::Always {
             let kind = if meta.file_type().is_symlink() {
                 "symbolic link"
             } else if is_dir {
@@ -298,6 +292,77 @@ fn main() -> ExitCode {
     }
 
     exit_code
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Interaction {
+    #[default]
+    Never,
+    Once,
+    Always,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct RemovalBehavior {
+    interaction: Interaction,
+    ignore_missing: bool,
+}
+
+impl RemovalBehavior {
+    fn from_matches(matches: &clap::ArgMatches) -> Self {
+        // Clap indices preserve ordering within short groups (-fi vs -if)
+        // and across long options. Keep every --interactive occurrence:
+        // `-f --interactive=always --interactive=never` must still report a
+        // missing operand, because `always` cancelled force along the way.
+        let mut options = Vec::new();
+        for (name, value) in [
+            ("force", "force"),
+            ("interactive_always", "always"),
+            ("interactive_once", "once"),
+        ] {
+            if matches.get_flag(name) {
+                options.push((matches.index_of(name).unwrap(), value));
+            }
+        }
+        if let Some(indices) = matches.indices_of("interactive") {
+            options.extend(
+                indices.zip(
+                    matches
+                        .get_many::<String>("interactive")
+                        .unwrap()
+                        .map(String::as_str),
+                ),
+            );
+        }
+        options.sort_unstable_by_key(|(index, _)| *index);
+
+        let mut behavior = Self::default();
+        for (_, option) in options {
+            match option {
+                "force" => {
+                    behavior.ignore_missing = true;
+                    behavior.interaction = Interaction::Never;
+                }
+                "always" | "once" => {
+                    behavior.ignore_missing = false;
+                    behavior.interaction = if option == "always" {
+                        Interaction::Always
+                    } else {
+                        Interaction::Once
+                    };
+                }
+                // GNU --interactive=never cancels prompting but preserves
+                // the current missing-file policy, unlike --force.
+                "never" => behavior.interaction = Interaction::Never,
+                _ => unreachable!("clap validated the interactive option"),
+            }
+        }
+        behavior
+    }
+
+    fn prompt_once(&self, recursive: bool, operands: usize) -> bool {
+        self.interaction == Interaction::Once && (recursive || operands > 3)
+    }
 }
 
 /// True when an operand IS the filesystem root ("/", "//", "///", ...).
@@ -470,8 +535,108 @@ mod tests {
     #[test]
     fn bare_interactive_defaults_to_always_and_keeps_file() {
         let a = Rm::try_parse_from(["rm", "--interactive", "f"]).unwrap();
-        assert_eq!(a.interactive.as_deref(), Some("always"));
+        assert_eq!(a.interactive, vec!["always"]);
         assert_eq!(a.files, vec![PathBuf::from("f")]);
+    }
+
+    fn behavior(argv: &[&str]) -> RemovalBehavior {
+        let matches = Rm::command().try_get_matches_from(argv).unwrap();
+        RemovalBehavior::from_matches(&matches)
+    }
+
+    #[test]
+    fn repeated_standard_flags_remain_protected() {
+        for argv in [
+            &["rm", "-ff", "file"][..],
+            &["rm", "-r", "--recursive", "dir"][..],
+            &["rm", "-rRr", "dir"][..],
+            &["rm", "-vv", "--verbose", "file"][..],
+            &["rm", "-dd", "--dir", "dir"][..],
+            &["rm", "-iiII", "file"][..],
+            &["rm", "--force", "--force", "file"][..],
+            &["rm", "--one-file-system", "--one-file-system", "file"][..],
+            &["rm", "--preserve-root=all", "--preserve-root=all", "file"][..],
+            &["rm", "--no-preserve-root", "--no-preserve-root", "file"][..],
+            &["rm", "--interactive=once", "--interactive=once", "file"][..],
+        ] {
+            let args = Rm::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert_eq!(args.files.len(), 1);
+        }
+    }
+
+    #[test]
+    fn force_and_interactive_follow_argument_order() {
+        for (flags, interaction, ignore_missing) in [
+            (vec!["-fi"], Interaction::Always, false),
+            (vec!["-if"], Interaction::Never, true),
+            (vec!["-f", "-i"], Interaction::Always, false),
+            (vec!["-i", "-f"], Interaction::Never, true),
+            (vec!["-fI"], Interaction::Once, false),
+            (vec!["-If"], Interaction::Never, true),
+            (vec!["-iI"], Interaction::Once, false),
+            (vec!["-Ii"], Interaction::Always, false),
+            (vec!["--force", "--interactive"], Interaction::Always, false),
+            (vec!["--interactive", "--force"], Interaction::Never, true),
+            (
+                vec!["--force", "--interactive=once"],
+                Interaction::Once,
+                false,
+            ),
+            (
+                vec!["--interactive=once", "--force"],
+                Interaction::Never,
+                true,
+            ),
+            (vec!["-i", "--interactive=never"], Interaction::Never, false),
+            (vec!["-f", "--interactive=never"], Interaction::Never, true),
+            (
+                vec!["-f", "--interactive=always", "--interactive=never"],
+                Interaction::Never,
+                false,
+            ),
+            (
+                vec!["--interactive=always", "-f", "--interactive=never"],
+                Interaction::Never,
+                true,
+            ),
+            (vec!["-fif"], Interaction::Never, true),
+            (vec!["-ifi"], Interaction::Always, false),
+        ] {
+            let argv: Vec<_> = ["rm"].into_iter().chain(flags).chain(["file"]).collect();
+            assert_eq!(
+                behavior(&argv),
+                RemovalBehavior {
+                    interaction,
+                    ignore_missing
+                },
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn once_prompts_for_recursive_or_more_than_three_operands() {
+        for flags in [vec!["-I"], vec!["--interactive=once"], vec!["-f", "-I"]] {
+            let argv: Vec<_> = ["rm"].into_iter().chain(flags).collect();
+            let behavior = behavior(&argv);
+            for operands in 1..=3 {
+                assert!(behavior.prompt_once(true, operands));
+                assert!(!behavior.prompt_once(false, operands));
+            }
+            assert!(behavior.prompt_once(false, 4));
+        }
+        assert!(!behavior(&["rm", "-If"]).prompt_once(true, 4));
+    }
+
+    #[test]
+    fn arguments_after_separator_are_not_prompt_options() {
+        let argv = ["rm", "-f", "--", "-i", "--interactive=always"];
+        assert_eq!(behavior(&argv).interaction, Interaction::Never);
+        let args = Rm::try_parse_from(argv).unwrap();
+        assert_eq!(
+            args.files,
+            vec![PathBuf::from("-i"), PathBuf::from("--interactive=always")]
+        );
     }
 
     // Regression (audit #2): the preserve-root guard refuses exactly the

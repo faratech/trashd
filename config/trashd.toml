@@ -8,16 +8,8 @@
 # Lists (never_trash, bypass_processes): user extends global — admin-set
 # patterns cannot be removed by individual users.
 
-[retention]
-# Auto-purge items older than this
-max_age_days = 30
-# Maximum total trash size
-max_size_gb = 10.0
-# Purge oldest items when disk usage exceeds this
-disk_pressure_percent = 90
-
 # Paths that should never be trashed (use real delete instead).
-# Supports trailing * and leading *. wildcards.
+# Supports *, **, ?, and [...] wildcards; relative patterns match path components.
 # User configs extend this list (they cannot remove entries set here).
 never_trash = [
     "/tmp/*",
@@ -53,13 +45,13 @@ never_trash = [
 only_trash = []
 
 # Per-directory overrides: place a .trashd.toml in any directory with
-# `never_trash` and/or `only_trash` lists. Searched up to 5 parent levels.
+# `never_trash` and/or `only_trash` lists. Searched through all parent directories.
 # Example .trashd.toml:
 #   never_trash = ["build/*", "dist/*"]
 #   only_trash = ["src/*", "*.config"]
 
 # Processes that bypass trash automatically.
-# When these commands invoke rm, files are really deleted.
+# The deleting process and its ancestors are checked.
 # User configs extend this list (they cannot remove entries set here).
 bypass_processes = [
     "apt",
@@ -74,8 +66,6 @@ bypass_processes = [
     "npm",
     "make",
     "git",
-    "systemd",
-    "systemctl",
     "journald",
     "containerd",
     "dockerd",
@@ -87,7 +77,7 @@ bypass_processes = [
 bypass_paths = []
 
 # Files larger than this (in MB) skip trash to avoid filling disk.
-# Set to 0 to disable.
+# Set to 0 to disable the size limit.
 max_file_size_mb = 1024
 
 # Directories larger than this (in MB) skip trash (real-deleted).
@@ -107,3 +97,11 @@ sha256_max_size_mb = 1
 # policy (age, size, disk pressure) but scanning the entire trash on every
 # deletion is expensive. Default: 60 seconds.
 auto_purge_interval_secs = 60
+
+[retention]
+# Auto-purge items older than this
+max_age_days = 30
+# Maximum total trash size
+max_size_gb = 10.0
+# Purge oldest items when disk usage exceeds this
+disk_pressure_percent = 90

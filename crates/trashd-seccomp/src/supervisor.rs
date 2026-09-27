@@ -122,17 +122,28 @@ fn respond_errno(fd: i32, id: u64, errno: i32) -> io::Result<()> {
 ///
 /// This blocks forever, handling notifications until the fd is closed
 /// or an unrecoverable error occurs.
-pub fn run_supervisor(fd: i32) -> io::Result<()> {
+pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> {
+    // The watchdog's death must also retire its supervisor on startup errors.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    if let Err(e) = crate::broker::connect(broker_fd) {
+        signal_ready(ready_fd, false);
+        return Err(e);
+    }
     let store = match TrashStore::open() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("trashd-exec: supervisor: failed to open trash store: {e}");
+            signal_ready(ready_fd, false);
+            if ready_fd >= 0 {
+                return Err(io::Error::other(e));
+            }
             eprintln!("trashd-exec: supervisor: falling back to CONTINUE-only mode");
             return run_passthrough(fd);
         }
     };
 
     let config = Config::load();
+    signal_ready(ready_fd, true);
 
     loop {
         // Block until a notification arrives
@@ -154,6 +165,16 @@ pub fn run_supervisor(fd: i32) -> io::Result<()> {
 
         // Handle this notification (fail-safe: any error → CONTINUE)
         handle_notification(fd, &notif, &store, &config);
+    }
+}
+
+pub(crate) fn signal_ready(fd: i32, ready: bool) {
+    if fd >= 0 {
+        let byte = u8::from(ready);
+        unsafe {
+            libc::send(fd, (&byte as *const u8).cast(), 1, libc::MSG_NOSIGNAL);
+            libc::close(fd);
+        }
     }
 }
 

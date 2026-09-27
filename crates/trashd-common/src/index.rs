@@ -79,6 +79,29 @@ impl TrashIndex {
         Ok(())
     }
 
+    pub fn delete_in(&self, id: &str, root: &Path) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM trash_entries WHERE id = ?1 AND trash_dir = ?2",
+            params![id, root.to_string_lossy().as_ref()],
+        )?;
+        Ok(())
+    }
+
+    /// Retire a restored batch with a single commit rather than N fsyncs.
+    pub fn delete_many(
+        &self,
+        entries: &[(String, std::path::PathBuf)],
+    ) -> Result<(), rusqlite::Error> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, root) in entries {
+            self.delete_in(id, root)?;
+        }
+        tx.commit()
+    }
+
     /// Number of rows currently in the index (test/diagnostic helper).
     #[cfg(test)]
     pub fn count(&self) -> Result<i64, rusqlite::Error> {

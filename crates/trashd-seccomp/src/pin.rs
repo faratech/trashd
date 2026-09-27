@@ -62,6 +62,7 @@ impl std::os::unix::io::AsRawFd for FdGuard {
 /// An O_PATH/O_DIRECTORY reference to the supervised process's filesystem
 /// context. Owns its fds; `Drop` closes them.
 pub struct TargetFs {
+    pid: u32,
     pidfd: RawFd,
     root_fd: Option<RawFd>,
     cwd_fd: Option<RawFd>,
@@ -92,6 +93,7 @@ impl TargetFs {
         let root_fd = open_proc_dir(&format!("/proc/{pid}/root"));
         let cwd_fd = open_proc_dir(&format!("/proc/{pid}/cwd"));
         Ok(Self {
+            pid,
             pidfd: pidfd as RawFd,
             root_fd,
             cwd_fd,
@@ -113,6 +115,9 @@ impl TargetFs {
     /// references the same directory inode even if the target (or a sibling)
     /// closes or renames things afterwards.
     pub fn dup_dirfd(&self, dirfd: i32) -> io::Result<RawFd> {
+        if crate::broker::is_connected() {
+            return crate::broker::duplicate_fd(self.pid, dirfd);
+        }
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, self.pidfd, dirfd as i64, 0i64) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -150,14 +155,13 @@ pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, in_root: bool) -> io::Resu
 
     let c = CString::new(prefix.as_bytes())?;
     // RESOLVE_NO_XDEV is deliberately NOT set: crossing mounts is legal.
-    const RESOLVE_IN_ROOT: u64 = 0x04;
     let how = OpenHow {
         flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0,
         // Default: follow symlinks, permit ".." and mount crossings — what a
         // plain path walk does. IN_ROOT (absolute/target-root case only)
         // matches how the TARGET'S OWN root would have clamped the walk.
-        resolve: if in_root { RESOLVE_IN_ROOT } else { 0 },
+        resolve: if in_root { libc::RESOLVE_IN_ROOT } else { 0 },
     };
     let fd = unsafe {
         libc::syscall(
@@ -343,6 +347,13 @@ pub fn try_pinned(
         }
     };
 
+    // The ancestor broker obtains its own pidfd when duplicating an explicit
+    // dirfd. Revalidate after that round trip so PID reuse cannot select a
+    // descriptor belonging to a different process (#6).
+    if notify_fd >= 0 && !crate::supervisor::notif_id_valid(notify_fd, notify_id) {
+        return Ok(Decision::Continue);
+    }
+
     // Base sanity: whatever we were given must actually be a directory.
     let mut bst: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(base, &mut bst) } != 0 || bst.st_mode & libc::S_IFMT != libc::S_IFDIR {
@@ -415,21 +426,18 @@ pub fn try_pinned(
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    /// Isolated store + workdir (XDG_DATA_HOME is process-global).
-    fn setup(dir_name: &str) -> (TrashStore, PathBuf, std::sync::MutexGuard<'static, ()>) {
-        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pin-test");
-        std::fs::create_dir_all(&base).unwrap();
-        let data = base.join(format!("{dir_name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&data);
+    /// No ambient configuration, environment mutation or mount discovery.
+    fn setup(dir_name: &str) -> (TrashStore, PathBuf, tempfile::TempDir) {
+        let fixture = tempfile::Builder::new().prefix(dir_name).tempdir().unwrap();
+        let data = fixture.path();
         std::fs::create_dir_all(data.join("work")).unwrap();
-        // SAFETY: single-threaded test guarded by LOCK.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
-        (TrashStore::open().unwrap(), data.join("work"), guard)
+        let config = trashd_common::Config {
+            never_trash: Vec::new(),
+            only_trash: Vec::new(),
+            ..Default::default()
+        };
+        let store = TrashStore::open_isolated(&data.join("trash"), config).unwrap();
+        (store, data.join("work"), fixture)
     }
 
     /// Spawn a child whose CWD is `dir`, wait until /proc/<pid>/cwd agrees.
@@ -462,6 +470,36 @@ mod tests {
 
     const NR_UNLINKAT_X86_64: i32 = 263;
     const NR_UNLINKAT_AARCH64: i32 = 35;
+
+    #[test]
+    fn root_resolution_clamps_dotdot_and_follows_symlinks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("outside")).unwrap();
+        std::fs::create_dir(fixture.path().join("outside")).unwrap();
+        symlink("outside", root.join("relative")).unwrap();
+        symlink("/outside", root.join("absolute")).unwrap();
+        let base = FdGuard(open_proc_dir(root.to_str().unwrap()).unwrap());
+        let expected = std::fs::metadata(root.join("outside")).unwrap().ino();
+        for path in ["a/../../outside", "relative", "absolute"] {
+            let result = FdGuard(resolve_parent(base.0, OsStr::new(path), true).unwrap());
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(result.0, &mut stat) }, 0);
+            assert_eq!(stat.st_ino, expected, "{path}");
+        }
+        // A cwd/dirfd is not a root: the same relative walk must leave it.
+        let outside = FdGuard(resolve_parent(base.0, OsStr::new("../outside"), false).unwrap());
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(outside.0, &mut stat) }, 0);
+        assert_eq!(
+            stat.st_ino,
+            std::fs::metadata(fixture.path().join("outside"))
+                .unwrap()
+                .ino()
+        );
+    }
 
     #[test]
     fn pinned_flow_trashes_via_cwd_fd() {
