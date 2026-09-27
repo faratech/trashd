@@ -82,19 +82,19 @@ Runs as a systemd service with `AmbientCapabilities=CAP_SYS_ADMIN`. Skips virtua
 
 The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the kernel syscall boundary using a BPF seccomp filter with `SECCOMP_RET_USER_NOTIF`. Catches everything — statically-linked binaries, setuid programs, programs that clear `LD_PRELOAD`, and raw syscalls.
 
-**Three-process architecture:**
+**Process architecture:**
 
 1. **Child** — Installs the BPF seccomp filter via `syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ...)`, passes the notification file descriptor to the parent via `SCM_RIGHTS` over a Unix socketpair, then `execvp()`'s the target command. Requires `prctl(PR_SET_NO_NEW_PRIVS, 1)` before installing the filter.
 
-2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, reads the target process's path argument from memory via `process_vm_readv()`, resolves relative paths using `/proc/{pid}/cwd` or `/proc/{pid}/fd/{dirfd}`, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Validates notification IDs to mitigate TOCTOU races.
+2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Validates notification IDs to mitigate TOCTOU races.
 
 3. **Watchdog** — Holds a `dup()`'d copy of the notification fd. Monitors the supervisor via `waitpid()`. On supervisor death: immediately drains all pending notifications with `CONTINUE` (fail-safe — blocked processes resume with real deletes), then forks a new supervisor. If fork fails, enters emergency passthrough mode (responds `CONTINUE` to everything forever).
 
-The orchestrator forwards `SIGINT` and `SIGTERM` to the child process, then waits for it and cleans up the supervisor and watchdog.
+4. **Orchestrator** — Remains an ancestor and subreaper for the command and its descendants. It brokers `process_vm_readv()` and `pidfd_getfd()` over a private socket, preserving access under Yama `ptrace_scope=1` across child forks and supervisor restarts. It forwards `SIGHUP`, `SIGINT`, and `SIGTERM` through pidfds and reaps exited children. Protection remains available until all descendants finish; the wrapper then returns the original command's exit status. Background descendants therefore keep the wrapper running after their parent exits.
 
 The BPF filter is architecture-specific: x86_64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84). aarch64 traps only `SYS_unlinkat` (35) since the other two syscalls don't exist on that architecture.
 
-Interactive shells are automatically wrapped via `/etc/profile.d/trashd.sh`, which detects interactive mode (`case "$-" in *i*`), sets `TRASHD_SECCOMP_ACTIVE=1`, and `exec`'s the shell under `trashd-exec`. A guard variable prevents infinite re-exec.
+Interactive shells are automatically wrapped via `/etc/profile.d/trashd.sh`, which detects interactive mode (`case "$-" in *i*`) and sets `TRASHD_SECCOMP_ATTEMPTED=1` to prevent repeated wrapping. `trashd-exec` sets `TRASHD_SECCOMP_ACTIVE=1` only after listener installation, memory-access verification, and supervisor startup succeed. If listener installation or memory access is unavailable, the command runs with the marker cleared so preload fallback remains available. Failure to start the supervisor aborts the command.
 
 ### How the layers interact
 
@@ -111,7 +111,7 @@ Layer 3 (daemon) runs independently as an audit trail — it sees everything, in
 | Statically-linked binary | — | Misses | Catches |
 | `setuid` program (LD_PRELOAD stripped) | — | Misses | Catches |
 | Cron job | Catches (rm) | Catches (unlink) | Misses |
-| Systemd service | — | Bypassed | — |
+| Systemd service | — | Catches (unless explicitly bypassed) | — |
 
 ## Install
 
@@ -294,11 +294,6 @@ Four layers, each optional, merged in order:
 ### Full config reference
 
 ```toml
-[retention]
-max_age_days = 30           # auto-purge items older than this (default: 30)
-max_size_gb = 10.0          # cap total trash size (default: 10.0)
-disk_pressure_percent = 90  # purge oldest when disk usage exceeds this (default: 90)
-
 # Paths that should never be trashed (real-deleted instead).
 # User configs extend this list — admin patterns can't be removed.
 never_trash = [
@@ -332,14 +327,14 @@ never_trash = [
 # Empty (default) means all files are eligible for trash.
 only_trash = []
 
-# Parent processes that bypass trash automatically.
-# Detected by walking /proc/{pid}/stat up the process tree.
+# Processes that bypass trash automatically.
+# Checks the deleting process and its ancestors via /proc.
 bypass_processes = [
     "apt", "apt-get", "dpkg",
     "yum", "dnf", "pacman", "rpm",
     "pip", "cargo", "npm", "make",
     "git",
-    "systemd", "systemctl", "journald",
+    "journald",
     "containerd", "dockerd",
 ]
 
@@ -347,11 +342,16 @@ bypass_processes = [
 # More precise than bypass_processes — matches the full exe path.
 bypass_paths = []
 
-max_file_size_mb = 1024        # files over this skip trash (default: 1024)
+max_file_size_mb = 1024        # files over this skip trash (0 = no limit)
 max_dir_size_mb = 0            # directories over this skip trash (0 = no limit)
 hash_algorithm = "xxhash"      # "xxhash" (XXH3-128, ~10x faster) or "sha256" (cryptographic)
 sha256_max_size_mb = 1         # only hash files smaller than this (default: 1 MB)
 auto_purge_interval_secs = 60  # min seconds between auto-purge scans (default: 60)
+
+[retention]
+max_age_days = 30           # auto-purge items older than this (default: 30)
+max_size_gb = 10.0          # cap total trash size (default: 10.0)
+disk_pressure_percent = 90  # purge oldest when disk usage exceeds this (default: 90)
 ```
 
 ### Pattern matching syntax
@@ -361,11 +361,14 @@ auto_purge_interval_secs = 60  # min seconds between auto-purge scans (default: 
 | `prefix/*` | `/tmp/*` | Anything starting with `/tmp/` |
 | `*.ext` | `*.pyc` | Anything ending with `.pyc` |
 | `*/.infix/*` | `*/.git/*` | Anything containing `/.git/` in the path |
-| `*/name` | `*/core` | Anything with `/core` in the path or ending with `/core` |
+| `*/name` | `*/core` | The exact `core` path component and its descendants |
 | `*~` | `*~` | Anything ending with `~` (editor backups) |
+| `?`, `[...]` | `file?.[ch]` | One character, or a character class/range |
+| `**` | `src/**/*.rs` | Like `*`, spans directory separators |
+| `~/prefix/*` | `~/docs/*` | Expands the current user’s home directory |
 | exact | `/var/run/lock` | Exact string match |
 
-Patterns are matched against the file's absolute path. The same syntax works in `never_trash`, `only_trash`, per-directory `.trashd.toml`, and `trash ls` pattern arguments.
+Policy patterns are matched against the file’s absolute path; relative patterns such as `src/*` can start at any path-component boundary. Wildcards may appear anywhere in a pattern, and `*` and `**` can span directory separators. Brace expansion (`{a,b}`) is unsupported and produces a warning. `trash ls` uses the same wildcard syntax against names and absolute paths.
 
 ### Per-directory overrides
 
@@ -377,7 +380,7 @@ never_trash = ["build/*", "dist/*", "*.log"]
 only_trash = ["src/*", "*.config", "*.env"]
 ```
 
-Searched up to 5 parent levels from the file being deleted. Global `never_trash` still wins over local `only_trash` — an admin-excluded pattern can't be overridden by a project config.
+Searched through all parent directories from the file being deleted. Global `never_trash` still wins over local `only_trash` — an admin-excluded pattern can't be overridden by a project config.
 
 ## Auto-purge and compression
 
@@ -435,13 +438,13 @@ Changing `hash_algorithm` in the config does **not** require rehashing existing 
 
 ### Fail-safe design
 
-Every interception layer falls back to the real delete operation on any error:
-- **Shim** — Calls real `rm` via `passthrough()` on parse errors, missing files, or excluded paths
+Interception failures can fall back to permanent deletion:
+- **Shim** — Uses real deletion for explicit bypasses, excluded paths, and storage failures. Invalid options return an error without deleting; repeated valid flags retain trash protection.
 - **Preload** — Returns the result of the real `unlink()`/`rmdir()` if trash fails
 - **Seccomp** — Responds with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (execute real syscall)
 - **Watchdog** — On supervisor crash, drains all pending notifications with `CONTINUE`
 
-trashd will never block, hang, or prevent a deletion. If everything fails, the delete just works normally.
+These fallback paths preserve the calling program's ability to delete, but the files may be unrecoverable. The seccomp wrapper aborts if it installs a filter but cannot establish a supervisor, preventing the command from running with a stranded listener.
 
 ### Confirmation on empty
 
@@ -459,7 +462,7 @@ Use `-y`/`--yes` to skip the prompt (for scripts).
 |-----------|-------|-----|
 | `rm --permanent` / `rm --no-trash` | Single command | Shim strips flag, passes to real `rm` with `TRASH_BYPASS=1` |
 | `TRASH_BYPASS=1` | Environment | Checked by shim, preload, and seccomp init |
-| `bypass_processes` | Process tree | Walks `/proc/{pid}/stat` up to 10 levels, checks each ancestor's name |
+| `bypass_processes` | Process tree | Checks the deleting process and its ancestors via `/proc/{pid}/stat` |
 | `bypass_paths` | Executable path | Matches `/proc/self/exe` against prefix list |
 | `never_trash` | File path patterns | Glob matching (global + per-directory) |
 | `only_trash` | File path whitelist | If set, only matching files are trashed |
@@ -594,7 +597,7 @@ trashd/
 | `trash` | trashd-cli | CLI: ls, find, info, restore, undo, purge, empty, compress, du, status, log, fsck |
 | `trashd-rm` | trashd-shim | Drop-in `rm` replacement (installed as `rm` in shim PATH) |
 | `libtrashd_preload.so` | trashd-preload | LD_PRELOAD shared library (~870 KB, no SQLite) |
-| `trashd-exec` | trashd-seccomp | Seccomp supervisor wrapper (three-process architecture) |
+| `trashd-exec` | trashd-seccomp | Seccomp supervisor, watchdog, and ancestor broker |
 | `trashd` | trashd | fanotify filesystem monitor (systemd service) |
 
 ## Testing

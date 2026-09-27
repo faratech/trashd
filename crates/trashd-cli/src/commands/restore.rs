@@ -55,8 +55,8 @@ fn run_all(store: &TrashStore, target: &str, to: Option<&Path>, force: bool) {
     }
     let mut restored = 0;
     let mut failed = 0;
-    for entry in &entries {
-        match restore_entry(store, &entry.id, to, force) {
+    for (entry, result) in entries.iter().zip(store.restore_batch(&entries, to, force)) {
+        match result {
             Ok(path) => {
                 println!("{} {}", "Restored:".green().bold(), path.display());
                 restored += 1;
@@ -86,9 +86,10 @@ fn restore_entry(
         Ok(path) => Ok(path),
         Err(TrashError::RestoreConflict(path)) if force => {
             // Auto-rename: try .1, .2, .3, ...
-            let stem = path.to_string_lossy().to_string();
             for i in 1..1000 {
-                let renamed = PathBuf::from(format!("{stem}.{i}"));
+                let mut name = path.as_os_str().to_os_string();
+                name.push(format!(".{i}"));
+                let renamed = PathBuf::from(name);
                 if std::fs::symlink_metadata(&renamed).is_err() {
                     return store.restore(target, Some(&renamed));
                 }

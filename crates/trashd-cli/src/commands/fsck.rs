@@ -1,8 +1,8 @@
 use colored::Colorize;
 use trashd_common::TrashStore;
 
-pub fn run(_store: &TrashStore, fix: bool) {
-    let home_trash = TrashStore::trash_dir();
+pub fn run(store: &TrashStore, fix: bool) {
+    let home_trash = store.home_dir();
     let info_dir = home_trash.join("info");
     let files_dir = home_trash.join("files");
 
@@ -118,7 +118,7 @@ pub fn run(_store: &TrashStore, fix: bool) {
     // Rebuild SQLite index from .trashinfo files
     if fix {
         print!("\nRebuilding index... ");
-        match rebuild_index(&home_trash) {
+        match rebuild_index(home_trash) {
             Ok(count) => println!("{} ({count} entries)", "done".green()),
             Err(e) => println!("{} {e}", "failed".red()),
         }
@@ -169,16 +169,9 @@ mod tests {
     // exactly what the trash bin exists to protect.
     #[test]
     fn fix_preserves_data_on_corrupt_trashinfo() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/fsck-test")
-            .join(format!("d-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
-
-        let store = TrashStore::open().unwrap();
-        let trash = TrashStore::trash_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&trash, trashd_common::Config::default()).unwrap();
         fs::create_dir_all(trash.join("info")).unwrap();
         fs::create_dir_all(trash.join("files")).unwrap();
         // Corrupt sidecar (not a valid [Trash Info] header) + intact data file.
@@ -192,7 +185,5 @@ mod tests {
             "data file must be preserved when its metadata is corrupt"
         );
         assert_eq!(fs::read(trash.join("files/keep")).unwrap(), b"precious");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

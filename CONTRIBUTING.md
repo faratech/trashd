@@ -6,7 +6,7 @@
 git clone https://github.com/faratech/trashd.git
 cd trashd
 cargo build
-cargo test --workspace
+TRASH_BYPASS=1 cargo test --workspace
 ```
 
 ## Code style
@@ -18,11 +18,18 @@ cargo test --workspace
 ## Running tests
 
 ```bash
-cargo test -p trashd-common --lib   # core tests (32 tests)
-cargo test --workspace              # all workspace tests
+TRASH_BYPASS=1 cargo test -p trashd-common --lib
+TRASH_BYPASS=1 cargo test --workspace
+cargo build --workspace
+sudo ./tests/integration.sh target/debug
+sudo python3 tests/shim_regression.py target/debug/trashd-rm
 ```
 
-Tests use isolated temp directories (not `/tmp`, which is in the never-trash list). A mutex serializes tests that share `XDG_DATA_HOME`.
+Store tests use `TrashStore::open_isolated` with an explicit temporary trash root and configuration. This constructor disables mount discovery and ambient configuration; setting `XDG_DATA_HOME` alone does **not** isolate a production store from trash on other mounts. Do not use `TrashStore::open()` in destructive unit tests. `TRASH_BYPASS=1` prevents any installed preload library from interfering with fixture cleanup.
+
+Subprocess suites automatically enter `tests/sandbox.py`: a disposable root in private mount and PID namespaces, with isolated HOME/XDG paths, read-only system runtimes, and explicit built binaries. They require Linux mount privileges (usually `sudo`), fail before testing when unavailable, and verify that mounted trash sentinels outside the sandbox remain unchanged. No installation is required. Never source the installed trashd profile or empty the host trash to prepare tests.
+
+Use `target/release` instead of `target/debug` after `cargo build --workspace --release`. Set `REQUIRE_SECCOMP=1` on hosts that support seccomp notification listeners to make an unavailable listener a failure. The self-update network check is opt-in with `TRASHD_TEST_NETWORK=1`; pass these variables through `sudo` explicitly, for example `sudo env REQUIRE_SECCOMP=1 ./tests/integration.sh target/release`.
 
 ## Project structure
 
@@ -41,7 +48,7 @@ Tests use isolated temp directories (not `/tmp`, which is in the never-trash lis
 
 1. Fork and create a feature branch
 2. Make your changes
-3. Run `cargo fmt`, `cargo clippy`, `cargo test --workspace`
+3. Run `cargo fmt`, `cargo clippy`, `TRASH_BYPASS=1 cargo test --workspace`, and the sandboxed integration suite
 4. Open a PR against `main`
 
 ## Adding a new CLI subcommand

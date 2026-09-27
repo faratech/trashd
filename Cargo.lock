@@ -1251,6 +1251,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "toml",
  "trashd-common",
  "ureq",
@@ -1291,6 +1292,7 @@ name = "trashd-seccomp"
 version = "0.1.3"
 dependencies = [
  "libc",
+ "tempfile",
  "trashd-common",
 ]
 

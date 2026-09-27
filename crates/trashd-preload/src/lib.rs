@@ -38,6 +38,9 @@ struct PreloadConfig {
     /// layers for a given config.
     only_trash: Vec<String>,
     bypass_processes: Vec<String>,
+    bypass_paths: Vec<String>,
+    /// Maximum regular-file size in MiB. Zero disables the limit.
+    max_file_size_mb: u64,
 }
 
 /// Partial config for layered merge — all fields optional.
@@ -46,6 +49,23 @@ struct PartialPreloadConfig {
     never_trash: Option<Vec<String>>,
     only_trash: Option<Vec<String>>,
     bypass_processes: Option<Vec<String>>,
+    bypass_paths: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+    // Validate this table even though the preload does not run retention.
+    // A misplaced root policy key must not be silently ignored (#63).
+    #[serde(rename = "retention")]
+    _retention: Option<RetentionConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionConfig {
+    #[serde(rename = "max_age_days")]
+    _max_age_days: Option<u32>,
+    #[serde(rename = "max_size_gb")]
+    _max_size_gb: Option<f64>,
+    #[serde(rename = "disk_pressure_percent")]
+    _disk_pressure_percent: Option<u8>,
 }
 
 /// Per-directory `.trashd.toml` overrides (mirrors trashd-common's LocalConfig)
@@ -107,6 +127,8 @@ impl Default for PreloadConfig {
                 "containerd".into(),
                 "dockerd".into(),
             ],
+            bypass_paths: Vec::new(),
+            max_file_size_mb: 1024,
         }
     }
 }
@@ -114,7 +136,7 @@ impl Default for PreloadConfig {
 impl PreloadConfig {
     fn merge(&mut self, partial: PartialPreloadConfig) {
         if let Some(extra) = partial.never_trash {
-            for item in extra {
+            for item in sanitize_patterns(extra, "never_trash") {
                 if !self.never_trash.contains(&item) {
                     self.never_trash.push(item);
                 }
@@ -124,7 +146,7 @@ impl PreloadConfig {
         // (matches trashd-common's Config::merge semantics). Sanitize first —
         // an unsupported pattern would make the whitelist real-delete all (#4).
         if let Some(list) = partial.only_trash {
-            self.only_trash = sanitize_only_trash(list);
+            self.only_trash = sanitize_patterns(list, "only_trash");
         }
         if let Some(extra) = partial.bypass_processes {
             for item in extra {
@@ -132,6 +154,16 @@ impl PreloadConfig {
                     self.bypass_processes.push(item);
                 }
             }
+        }
+        if let Some(extra) = partial.bypass_paths {
+            for item in extra {
+                if !self.bypass_paths.contains(&item) {
+                    self.bypass_paths.push(item);
+                }
+            }
+        }
+        if let Some(limit) = partial.max_file_size_mb {
+            self.max_file_size_mb = limit;
         }
     }
 }
@@ -213,7 +245,13 @@ fn config_mtime() -> i64 {
 
 fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {
     let content = fs::read_to_string(path).ok()?;
-    toml::from_str::<PartialPreloadConfig>(&content).ok()
+    match toml::from_str::<PartialPreloadConfig>(&content) {
+        Ok(partial) => Some(partial),
+        Err(error) => {
+            eprintln!("trashd-preload: bad config {}: {error}", path.display());
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,30 +341,50 @@ fn is_seccomp_active() -> bool {
     })
 }
 
-/// Check if a parent process is in the bypass list.
-fn is_parent_bypassed() -> bool {
-    let bypass = &config().bypass_processes;
-    if bypass.is_empty() {
+/// Cache by PID, so children of a fork re-evaluate their own process tree.
+fn is_process_bypassed() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached >> 1 == u64::from(pid) {
+        return cached & 1 != 0;
+    }
+    let bypassed = process_is_bypassed(config(), pid);
+    CACHED.store(
+        (u64::from(pid) << 1) | u64::from(bypassed),
+        Ordering::Relaxed,
+    );
+    bypassed
+}
+
+/// Executable prefixes apply to the deleting process. Name rules apply to
+/// that process itself and up to ten ancestors, excluding init/session PID 1.
+fn process_is_bypassed(cfg: &PreloadConfig, mut pid: u32) -> bool {
+    if !cfg.bypass_paths.is_empty()
+        && let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe"))
+        && cfg
+            .bypass_paths
+            .iter()
+            .any(|prefix| exe.as_os_str().as_bytes().starts_with(prefix.as_bytes()))
+    {
+        return true;
+    }
+    if cfg.bypass_processes.is_empty() {
         return false;
     }
-    // Check bypass lazily — cache result per-process (PID won't change)
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let mut pid = std::process::id();
-        for _ in 0..10 {
-            let ppid = match parent_pid(pid) {
-                Some(p) if p > 1 => p,
-                _ => break,
-            };
-            if let Some(name) = process_name(ppid)
-                && bypass.contains(&name)
-            {
-                return true;
-            }
-            pid = ppid;
+    for _ in 0..=10 {
+        if let Some(name) = process_name(pid)
+            && cfg.bypass_processes.contains(&name)
+        {
+            return true;
         }
-        false
-    })
+        pid = match parent_pid(pid) {
+            Some(parent) if parent > 1 && parent != pid => parent,
+            _ => break,
+        };
+    }
+    false
 }
 
 fn parent_pid(pid: u32) -> Option<u32> {
@@ -380,32 +438,46 @@ fn is_inside_trash(path: &Path) -> bool {
 
 /// Match a single never_trash/only_trash pattern against a path string.
 /// Mirrors trashd-common's `pattern_matches_any` so every layer agrees.
-fn pattern_matches(pattern: &str, s: &str) -> bool {
-    if pattern.starts_with("*/") && pattern.ends_with("/*") {
-        // Infix pattern like "*/.git/*" — match as "contains"
-        let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
-        s.contains(infix)
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        // "node_modules/*" → match anywhere in path (no leading /)
-        if prefix.starts_with('/') {
-            s.starts_with(prefix)
-        } else {
-            s.starts_with(prefix) || s.contains(&format!("/{prefix}"))
-        }
-    } else if pattern.starts_with("*.") {
-        s.ends_with(&pattern[1..])
-    } else if pattern == "*~" {
-        s.ends_with('~')
-    } else if let Some(suffix) = pattern.strip_prefix("*/") {
-        // Whole-component match only — substring matching over-matched
-        // ".../name-x/..." for pattern "*/name" (#17).
-        let suffix = suffix.trim_end_matches('/');
-        !suffix.is_empty() && s.split('/').any(|c| c == suffix)
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let expanded;
+    let pattern = if let Some(rest) = pattern.strip_prefix("~/") {
+        let Some(home) = dirs::home_dir() else {
+            return false;
+        };
+        expanded = home.join(rest).to_string_lossy().into_owned();
+        expanded.as_str()
     } else {
-        // Full glob matcher: unsupported syntax must not degrade to
-        // exact-string compare (#4).
-        glob_match(pattern, s)
+        pattern
+    };
+    // Keep common literal prefix/suffix rules allocation-free, but only
+    // after excluding interior wildcard syntax (#4).
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && !prefix.contains(['*', '?', '['])
+    {
+        return path.starts_with(prefix)
+            || (!prefix.starts_with('/')
+                && path
+                    .match_indices('/')
+                    .any(|(index, _)| path[index + 1..].starts_with(prefix)));
     }
+    if let Some(component) = pattern.strip_prefix("*/")
+        && !component.is_empty()
+        && !component.contains(['/', '*', '?', '['])
+    {
+        return path.split('/').any(|part| part == component);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && !suffix.contains(['*', '?', '['])
+    {
+        return path.ends_with(suffix);
+    }
+    if glob_match(pattern, path) {
+        return true;
+    }
+    !pattern.starts_with(['/', '*'])
+        && path
+            .match_indices('/')
+            .any(|(index, _)| glob_match(pattern, &path[index + 1..]))
 }
 
 /// Glob matcher (`*`, `?`, `[...]`, `**`) — same semantics as trashd-common's
@@ -491,11 +563,11 @@ fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
 
 /// Drop patterns with syntax we cannot honor ({a,b}) — in an only_trash
 /// whitelist a never-matching pattern real-deletes everything (#4).
-fn sanitize_only_trash(list: Vec<String>) -> Vec<String> {
+fn sanitize_patterns(list: Vec<String>, what: &str) -> Vec<String> {
     list.into_iter()
         .filter(|p| {
             if p.contains('{') || p.contains('}') {
-                eprintln!("trashd-preload: WARNING: dropping unsupported only_trash pattern '{p}'");
+                eprintln!("trashd-preload: WARNING: dropping unsupported {what} pattern '{p}'");
                 false
             } else {
                 true
@@ -513,8 +585,10 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
         let cfg_path = dir.join(".trashd.toml");
         if cfg_path.is_file()
             && let Ok(content) = fs::read_to_string(&cfg_path)
-            && let Ok(local) = toml::from_str::<LocalConfig>(&content)
+            && let Ok(mut local) = toml::from_str::<LocalConfig>(&content)
         {
+            local.never_trash = sanitize_patterns(local.never_trash, "never_trash");
+            local.only_trash = sanitize_patterns(local.only_trash, "only_trash");
             return Some(local);
         }
         dir = dir.parent()?; // None at the filesystem root
@@ -721,12 +795,27 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 // Core trash logic
 // ---------------------------------------------------------------------------
 
+fn exceeds_file_size_limit(cfg: &PreloadConfig, meta: &fs::Metadata) -> bool {
+    meta.is_file()
+        && cfg.max_file_size_mb != 0
+        && meta.len() > cfg.max_file_size_mb.saturating_mul(1024 * 1024)
+}
+
 /// Move `path` into the appropriate trash. `expect_dev`/`expect_ino` are the
 /// identity captured by the hook's eligibility stat: re-stat immediately
 /// before the move and bail out if the file was REPLACED in between (#44) —
 /// trashing the new inode would capture content the caller never asked to
 /// delete, and then report success for it.
 fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.dev() != expect_dev
+        || meta.ino() != expect_ino
+        || exceeds_file_size_limit(config(), &meta)
+    {
+        return false;
+    }
     let trash_dir = trash_dir_for(path);
 
     let files_dir = trash_dir.join("files");
@@ -757,7 +846,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
         }
     };
 
-    let size = fs::symlink_metadata(&abs_path).ok().map(|m| m.len());
+    let size = meta.len();
 
     // Per FreeDesktop spec, topdir trash stores relative paths from the mount point.
     let home_trash = home_trash_dir();
@@ -786,12 +875,10 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
 
     let now = chrono::Local::now();
     let trashinfo = format!(
-        "[Trash Info]\nPath={}\nDeletionDate={}\nX-Trashd-Command=preload\nX-Trashd-PID={}\n{}\n",
+        "[Trash Info]\nPath={}\nDeletionDate={}\nX-Trashd-Command=preload\nX-Trashd-PID={}\nX-Trashd-Size={size}\n",
         encode_path(&trashinfo_path),
         now.format("%Y-%m-%dT%H:%M:%S"),
         std::process::id(),
-        size.map(|s| format!("X-Trashd-Size={s}"))
-            .unwrap_or_default(),
     );
 
     if fs::write(&info_path, &trashinfo).is_err() {
@@ -972,9 +1059,9 @@ fn unique_id_atomic(
 }
 
 fn encode_path(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let mut encoded = String::with_capacity(s.len());
-    for byte in s.as_bytes() {
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len());
+    for byte in bytes {
         match *byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 encoded.push(*byte as char);
@@ -1044,7 +1131,7 @@ fn success_with_errno(saved_errno: libc::c_int) -> libc::c_int {
 }
 
 fn should_intercept() -> bool {
-    !is_bypass_active() && !is_seccomp_active() && !is_parent_bypassed()
+    !is_bypass_active() && !is_seccomp_active() && !is_process_bypassed()
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,5 +1300,113 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
             Ok(Some(ret)) => ret,
             _ => (real_rmdir())(pathname),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_globs_match_complete_patterns() {
+        let home = dirs::home_dir().expect("test user has a home directory");
+        assert!(pattern_matches(
+            "~/docs/*",
+            &home.join("docs/report.txt").to_string_lossy()
+        ));
+        let cases = [
+            ("*.py*", "/home/user/main.py", true),
+            ("*.py*", "/home/user/main.py.txt", true),
+            ("*.py*", "/home/user/main.rs", false),
+            ("*.[ch]", "/home/user/main.c", true),
+            ("*.[ch]", "/home/user/main.rs", false),
+            ("/home/*/docs/*", "/home/alice/docs/report.pdf", true),
+            ("/home/*/docs/*", "/home/alice/pics/report.pdf", false),
+            (
+                "*/project?/docs/*",
+                "/home/alice/project1/docs/report",
+                true,
+            ),
+            ("src/**/*.rs", "/home/user/project/src/nested/main.rs", true),
+            ("src/file?.[ch]", "/home/user/project/src/file1.c", true),
+            ("src/file?.[ch]", "/home/user/project/notsrc/file1.c", false),
+            (
+                "node_modules/*",
+                "/home/user/project/node_modules/pkg/index.js",
+                true,
+            ),
+            (
+                "target/debug/*",
+                "/home/user/project/target/debug/deps/bin",
+                true,
+            ),
+            ("*/.git/*", "/home/user/project/.git/HEAD", true),
+            ("*/name", "/home/user/name/file", true),
+            ("*/name", "/home/user/name-x/file", false),
+            ("*~", "/home/user/backup~", true),
+            ("[a-z]?*.txt", "/home/user/report.txt", true),
+        ];
+        for (pattern, path, expected) in cases {
+            assert_eq!(
+                pattern_matches(pattern, path),
+                expected,
+                "{pattern}: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_template_loads_preload_policy() {
+        let edited = include_str!("../../../config/trashd.toml")
+            .replace("max_file_size_mb = 1024", "max_file_size_mb = 5")
+            .replace("only_trash = []", "only_trash = [\"*.py\"]")
+            .replace("bypass_paths = []", "bypass_paths = [\"/opt/test/\"]");
+        let mut cfg = PreloadConfig::default();
+        cfg.merge(toml::from_str(&edited).unwrap());
+        assert_eq!(cfg.max_file_size_mb, 5);
+        assert_eq!(cfg.only_trash, ["*.py"]);
+        assert_eq!(cfg.bypass_paths, ["/opt/test/"]);
+        assert!(
+            !cfg.bypass_processes
+                .iter()
+                .any(|p| p == "systemd" || p == "systemctl")
+        );
+    }
+
+    #[test]
+    fn misplaced_policy_in_retention_is_rejected() {
+        for key in [
+            "only_trash = [\"*.py\"]",
+            "max_file_size_mb = 5",
+            "bypass_paths = []",
+        ] {
+            assert!(
+                toml::from_str::<PartialPreloadConfig>(&format!("[retention]\n{key}\n")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn process_bypass_includes_self_and_executable_path() {
+        let pid = std::process::id();
+        let mut cfg = PreloadConfig::default();
+        cfg.bypass_processes.clear();
+        assert!(!process_is_bypassed(&cfg, pid));
+        cfg.bypass_processes.push(process_name(pid).unwrap());
+        assert!(process_is_bypassed(&cfg, pid));
+        cfg.bypass_processes.clear();
+        cfg.bypass_paths.push(
+            fs::read_link("/proc/self/exe")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(process_is_bypassed(&cfg, pid));
+    }
+
+    #[test]
+    fn encode_path_preserves_non_utf8_bytes() {
+        let path = Path::new(OsStr::from_bytes(b"/home/user/name-\xff \n%?#"));
+        assert_eq!(encode_path(path), "/home/user/name-%FF%20%0A%25%3F%23");
     }
 }

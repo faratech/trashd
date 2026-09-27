@@ -12,11 +12,13 @@ fi
 # binaries, programs that bypass LD_PRELOAD, and anything else.
 # The LD_PRELOAD layer (Layer 2) defers to seccomp when this is active,
 # so there's no double interception.
-if [ -z "${TRASHD_SECCOMP_ACTIVE:-}" ] && [ -x /usr/local/bin/trashd-exec ]; then
+if [ -z "${TRASHD_SECCOMP_ACTIVE:-}" ] && [ -z "${TRASHD_SECCOMP_ATTEMPTED:-}" ] && [ -x /usr/local/bin/trashd-exec ]; then
     # Only wrap interactive login shells (not scripts, not subshells)
     case "$-" in
         *i*)
-            export TRASHD_SECCOMP_ACTIVE=1
+            # Prevent login-shell recursion if listener installation fails.
+            # Only trashd-exec sets ACTIVE, after protection is established.
+            export TRASHD_SECCOMP_ATTEMPTED=1
             exec /usr/local/bin/trashd-exec "$SHELL" -l
             ;;
     esac

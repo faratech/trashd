@@ -13,6 +13,7 @@ pub struct Config {
     pub only_trash: Vec<String>,
     #[serde(default)]
     pub bypass_processes: Vec<String>,
+    /// Maximum regular-file size in MiB. `0` disables the limit.
     #[serde(default = "default_size_limit")]
     pub max_file_size_mb: u64,
     /// Maximum file size (in MB) for SHA-256 computation on trash.
@@ -37,6 +38,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
     /// Auto-purge items older than this many days. `0` disables the age limit
     /// (items are kept until trimmed by size or purged manually).
@@ -159,6 +161,7 @@ fn default_max_dir_size() -> u64 {
 /// distinguish "not set" from "set to default". Used for merging global
 /// and user configs.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct PartialRetention {
     max_age_days: Option<u32>,
     max_size_gb: Option<f64>,
@@ -320,6 +323,12 @@ impl Config {
             }
         }
 
+        self.should_skip_configured(path)
+    }
+
+    /// Evaluate only this configuration's rules, without reading local files.
+    /// Useful when the caller supplies an explicit, isolated configuration.
+    pub fn should_skip_configured(&self, path: &Path) -> bool {
         // Global never_trash always wins
         if pattern_matches_any(&self.never_trash, path) {
             return true;
@@ -346,8 +355,10 @@ impl Config {
             let config_path = dir.join(".trashd.toml");
             if config_path.is_file()
                 && let Ok(content) = std::fs::read_to_string(&config_path)
-                && let Ok(local) = toml::from_str::<LocalConfig>(&content)
+                && let Ok(mut local) = toml::from_str::<LocalConfig>(&content)
             {
+                local.never_trash = sanitize_patterns(&local.never_trash, "never_trash");
+                local.only_trash = sanitize_patterns(&local.only_trash, "only_trash");
                 return Some(local);
             }
             dir = dir.parent()?; // None at the filesystem root
@@ -371,36 +382,54 @@ struct LocalConfig {
 /// Check if a path matches any pattern in the list.
 fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
     let path_str = path.to_string_lossy();
-    patterns.iter().any(|pattern| {
-        if pattern.starts_with("*/") && pattern.ends_with("/*") {
-            // Infix pattern like "*/.git/*" — match as "contains"
-            let infix = &pattern[1..pattern.len() - 1]; // "/.git/"
-            path_str.contains(infix)
-        } else if let Some(prefix) = pattern.strip_suffix('*') {
-            // "/tmp/*" → absolute prefix match
-            // "node_modules/*" → match anywhere in path (no leading /)
-            if prefix.starts_with('/') {
-                path_str.starts_with(prefix)
-            } else {
-                path_str.starts_with(prefix) || path_str.contains(&format!("/{prefix}"))
-            }
-        } else if pattern.starts_with("*.") {
-            path_str.ends_with(&pattern[1..])
-        } else if pattern == "*~" {
-            path_str.ends_with('~')
-        } else if let Some(suffix) = pattern.strip_prefix("*/") {
-            // Whole-COMPONENT match only: plain substring matching made
-            // "*/name" match ".../name-x/y", silently converting intended
-            // trashes into permanent deletes when used in never_trash (#17).
-            let suffix = suffix.trim_end_matches('/');
-            !suffix.is_empty() && path_str.split('/').any(|c| c == suffix)
-        } else {
-            // Full matcher (supports ?, [...], **): unsupported syntax must
-            // never silently degrade to exact-string compare — in only_trash
-            // whitelists that failure mode mass-deletes everything (#4).
-            crate::store::simple_glob_match(pattern, &path_str)
-        }
-    })
+    patterns
+        .iter()
+        .any(|pattern| pattern_matches(pattern, &path_str))
+}
+
+/// Match the complete glob, including wildcards inside directory prefixes.
+/// Relative patterns may begin at any path-component boundary. A literal
+/// `*/name` also matches descendants of that exact component (#17).
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let expanded;
+    let pattern = if let Some(rest) = pattern.strip_prefix("~/") {
+        let Some(home) = dirs::home_dir() else {
+            return false;
+        };
+        expanded = home.join(rest).to_string_lossy().into_owned();
+        expanded.as_str()
+    } else {
+        pattern
+    };
+    // Keep common literal prefix/suffix rules allocation-free, but only
+    // after excluding interior wildcard syntax (#4).
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && !prefix.contains(['*', '?', '['])
+    {
+        return path.starts_with(prefix)
+            || (!prefix.starts_with('/')
+                && path
+                    .match_indices('/')
+                    .any(|(index, _)| path[index + 1..].starts_with(prefix)));
+    }
+    if let Some(component) = pattern.strip_prefix("*/")
+        && !component.is_empty()
+        && !component.contains(['/', '*', '?', '['])
+    {
+        return path.split('/').any(|part| part == component);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && !suffix.contains(['*', '?', '['])
+    {
+        return path.ends_with(suffix);
+    }
+    if crate::store::simple_glob_match(pattern, path) {
+        return true;
+    }
+    !pattern.starts_with(['/', '*'])
+        && path
+            .match_indices('/')
+            .any(|(index, _)| crate::store::simple_glob_match(pattern, &path[index + 1..]))
 }
 
 /// Drop patterns containing syntax our matcher cannot honor (`{a,b}` brace
@@ -431,6 +460,111 @@ mod tests {
 
     fn default_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn policy_globs_match_complete_patterns() {
+        let home = dirs::home_dir().expect("test user has a home directory");
+        assert!(pattern_matches(
+            "~/docs/*",
+            &home.join("docs/report.txt").to_string_lossy()
+        ));
+        let cases = [
+            ("*.py*", "/home/user/main.py", true),
+            ("*.py*", "/home/user/main.py.txt", true),
+            ("*.py*", "/home/user/main.rs", false),
+            ("*.[ch]", "/home/user/main.c", true),
+            ("*.[ch]", "/home/user/main.rs", false),
+            ("/home/*/docs/*", "/home/alice/docs/report.pdf", true),
+            ("/home/*/docs/*", "/home/alice/pics/report.pdf", false),
+            (
+                "*/project?/docs/*",
+                "/home/alice/project1/docs/report",
+                true,
+            ),
+            ("src/**/*.rs", "/home/user/project/src/nested/main.rs", true),
+            ("src/file?.[ch]", "/home/user/project/src/file1.c", true),
+            ("src/file?.[ch]", "/home/user/project/notsrc/file1.c", false),
+            (
+                "node_modules/*",
+                "/home/user/project/node_modules/pkg/index.js",
+                true,
+            ),
+            (
+                "target/debug/*",
+                "/home/user/project/target/debug/deps/bin",
+                true,
+            ),
+            ("*/.git/*", "/home/user/project/.git/HEAD", true),
+            ("*/name", "/home/user/name/file", true),
+            ("*/name", "/home/user/name-x/file", false),
+            ("*~", "/home/user/backup~", true),
+            ("[a-z]?*.txt", "/home/user/report.txt", true),
+        ];
+        for (pattern, path, expected) in cases {
+            assert_eq!(
+                pattern_matches(pattern, path),
+                expected,
+                "{pattern}: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_template_and_readme_load_root_policy() {
+        let template = include_str!("../../../config/trashd.toml");
+        let readme = include_str!("../../../README.md");
+        let config_section = readme.split("## Configuration").nth(1).unwrap();
+        let example = config_section
+            .split("```toml\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        for content in [template, example] {
+            let edited = content
+                .replace("max_file_size_mb = 1024", "max_file_size_mb = 5")
+                .replace("hash_algorithm = \"xxhash\"", "hash_algorithm = \"sha256\"")
+                .replace("only_trash = []", "only_trash = [\"*.py\"]")
+                .replace("bypass_paths = []", "bypass_paths = [\"/opt/test/\"]");
+            let mut cfg = Config::default();
+            cfg.merge(toml::from_str(&edited).unwrap());
+            assert_eq!(cfg.max_file_size_mb, 5);
+            assert_eq!(cfg.hash_algorithm, "sha256");
+            assert_eq!(cfg.only_trash, ["*.py"]);
+            assert_eq!(cfg.bypass_paths, ["/opt/test/"]);
+            assert!(
+                !cfg.bypass_processes
+                    .iter()
+                    .any(|p| p == "systemd" || p == "systemctl")
+            );
+        }
+    }
+
+    #[test]
+    fn misplaced_policy_in_retention_is_rejected() {
+        for key in [
+            "only_trash = [\"*.py\"]",
+            "max_file_size_mb = 5",
+            "bypass_paths = []",
+        ] {
+            assert!(toml::from_str::<PartialConfig>(&format!("[retention]\n{key}\n")).is_err());
+        }
+    }
+
+    #[test]
+    fn configured_whitelist_honors_complex_globs() {
+        let cfg = Config {
+            never_trash: vec!["*/generated/*".into()],
+            only_trash: vec!["*.[ch]".into(), "*.py*".into(), "src/file?.rs".into()],
+            ..Config::default()
+        };
+        assert!(!cfg.should_skip_configured(Path::new("/home/user/main.c")));
+        assert!(!cfg.should_skip_configured(Path::new("/home/user/main.py.txt")));
+        assert!(!cfg.should_skip_configured(Path::new("/home/user/src/file1.rs")));
+        assert!(cfg.should_skip_configured(Path::new("/home/user/generated/main.c")));
+        assert!(cfg.should_skip_configured(Path::new("/home/user/main.txt")));
     }
 
     #[test]

@@ -19,6 +19,14 @@ use std::path::PathBuf;
 
 /// Read a NUL-terminated string from the target process's address space.
 pub fn read_path_from_process(pid: u32, addr: u64) -> io::Result<PathBuf> {
+    if crate::broker::is_connected() {
+        return crate::broker::read_path(pid, addr);
+    }
+    read_path_locally(pid, addr)
+}
+
+/// Called by the stable ancestor, which has Yama access to all descendants.
+pub(crate) fn read_path_locally(pid: u32, addr: u64) -> io::Result<PathBuf> {
     if addr == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "null pointer"));
     }

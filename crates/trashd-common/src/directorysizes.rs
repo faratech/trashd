@@ -54,14 +54,14 @@ pub fn read_cache(trash_dir: &Path) -> HashMap<String, DirSizeEntry> {
 /// Write/update the directorysizes cache for a trash directory.
 /// Uses a unique temp file + atomic rename per spec.
 pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    write_cache_with(trash_dir, dir_size_bytes)
+}
+
+fn write_cache_with(trash_dir: &Path, mut measure: impl FnMut(&Path) -> u64) -> io::Result<()> {
+    let previous = read_cache(trash_dir);
     let info_dir = trash_dir.join("info");
     let files_dir = trash_dir.join("files");
     let cache_path = trash_dir.join("directorysizes");
-    // Unique per-process temp name: a fixed name made two concurrent writers
-    // clobber each other's staging file and lose entries (#34).
-    let tmp_path = trash_dir.join(format!(".directorysizes.tmp.{}", std::process::id()));
-
     let mut lines = Vec::new();
 
     if let Ok(entries) = fs::read_dir(&info_dir) {
@@ -94,30 +94,20 @@ pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
             };
 
             // Size: recursive directory size
-            let size = dir_size_bytes(&file_path);
+            let size = match previous.get(id) {
+                Some(cached) if cached.mtime == mtime => cached.size,
+                _ => measure(&file_path),
+            };
 
             lines.push(format!("{} {} {}", size, mtime, encode_name(id)));
         }
     }
 
-    // Write to a fresh O_EXCL temp file, then atomic rename
+    // Exclusive staging remains safe even for concurrent threads in one PID.
     let data = lines.join("\n") + "\n";
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp_path)
-    {
-        Ok(mut f) => {
-            std::io::Write::write_all(&mut f, data.as_bytes())?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // Stale temp from this same pid (crash) — replace content.
-            fs::write(&tmp_path, &data)?;
-        }
-        Err(e) => return Err(e),
-    }
-    fs::rename(&tmp_path, &cache_path)?;
+    let mut staging = tempfile::NamedTempFile::new_in(trash_dir)?;
+    std::io::Write::write_all(&mut staging, data.as_bytes())?;
+    staging.persist(&cache_path).map_err(|e| e.error)?;
 
     Ok(())
 }
@@ -209,4 +199,75 @@ fn decode_name(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn cache_reuses_unchanged_trees_and_refreshes_only_invalid_entries() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir(root.join("info")).unwrap();
+        for name in ["first", "second"] {
+            fs::create_dir_all(root.join("files").join(name)).unwrap();
+            fs::write(root.join("files").join(name).join("payload"), b"data").unwrap();
+            fs::write(
+                root.join("info").join(format!("{name}.trashinfo")),
+                b"metadata",
+            )
+            .unwrap();
+        }
+        let mut measured = Vec::new();
+        write_cache_with(root, |p| {
+            measured.push(p.to_path_buf());
+            dir_size_bytes(p)
+        })
+        .unwrap();
+        assert_eq!(measured.len(), 2);
+        measured.clear();
+        write_cache_with(root, |p| {
+            measured.push(p.to_path_buf());
+            dir_size_bytes(p)
+        })
+        .unwrap();
+        assert!(
+            measured.is_empty(),
+            "unchanged cache must not walk any tree"
+        );
+        let original = read_cache(root)["first"].size;
+        fs::write(root.join("files/first/extra"), vec![1u8; 8192]).unwrap();
+        let sidecar = fs::File::open(root.join("info/first.trashinfo")).unwrap();
+        sidecar
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        write_cache_with(root, |p| {
+            measured.push(p.to_path_buf());
+            dir_size_bytes(p)
+        })
+        .unwrap();
+        assert_eq!(measured, [root.join("files/first")]);
+        assert!(read_cache(root)["first"].size > original);
+        fs::remove_file(root.join("info/second.trashinfo")).unwrap();
+        measured.clear();
+        write_cache_with(root, |p| {
+            measured.push(p.to_path_buf());
+            dir_size_bytes(p)
+        })
+        .unwrap();
+        assert!(measured.is_empty());
+        assert!(!read_cache(root).contains_key("second"));
+        fs::create_dir(root.join("files/third")).unwrap();
+        fs::write(root.join("info/third.trashinfo"), b"metadata").unwrap();
+        write_cache_with(root, |p| {
+            measured.push(p.to_path_buf());
+            dir_size_bytes(p)
+        })
+        .unwrap();
+        assert_eq!(measured, [root.join("files/third")]);
+    }
 }

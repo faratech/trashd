@@ -11,30 +11,59 @@ use std::path::{Path, PathBuf};
 
 /// Log a trash operation.
 pub fn log_trash(original_path: &Path, trash_id: &str, command: Option<&str>) {
+    log_trash_in(
+        &crate::TrashStore::home_trash_dir(),
+        original_path,
+        trash_id,
+        command,
+    );
+}
+
+pub(crate) fn log_trash_in(
+    home: &Path,
+    original_path: &Path,
+    trash_id: &str,
+    command: Option<&str>,
+) {
     let cmd = command.unwrap_or("-");
-    write_log(&format!(
-        "TRASH id={trash_id} path={} cmd={cmd}",
-        original_path.display(),
-    ));
+    write_log(
+        home,
+        &format!(
+            "TRASH id={trash_id} path={} cmd={cmd}",
+            original_path.display(),
+        ),
+    );
 }
 
 /// Log a restore operation.
 pub fn log_restore(trash_id: &str, restored_to: &Path) {
-    write_log(&format!(
-        "RESTORE id={trash_id} to={}",
-        restored_to.display(),
-    ));
+    log_restore_in(&crate::TrashStore::home_trash_dir(), trash_id, restored_to);
+}
+
+pub(crate) fn log_restore_in(home: &Path, trash_id: &str, restored_to: &Path) {
+    write_log(
+        home,
+        &format!("RESTORE id={trash_id} to={}", restored_to.display(),),
+    );
 }
 
 /// Log a purge operation.
 pub fn log_purge(trash_id: &str) {
-    write_log(&format!("PURGE id={trash_id}"));
+    log_purge_in(&crate::TrashStore::home_trash_dir(), trash_id);
+}
+
+pub(crate) fn log_purge_in(home: &Path, trash_id: &str) {
+    write_log(home, &format!("PURGE id={trash_id}"));
 }
 
 /// Log an empty operation.
 pub fn log_empty(count: u64, filter: Option<&str>) {
+    log_empty_in(&crate::TrashStore::home_trash_dir(), count, filter);
+}
+
+pub(crate) fn log_empty_in(home: &Path, count: u64, filter: Option<&str>) {
     let filter_str = filter.unwrap_or("all");
-    write_log(&format!("EMPTY count={count} filter={filter_str}"));
+    write_log(home, &format!("EMPTY count={count} filter={filter_str}"));
 }
 
 /// Read the last N lines of the operation log.
@@ -81,8 +110,8 @@ pub fn notify_desktop(summary: &str, body: &str) {
         .spawn();
 }
 
-fn write_log(message: &str) {
-    let path = log_path();
+fn write_log(home: &Path, message: &str) {
+    let path = home.join(".trashd/operations.log");
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {

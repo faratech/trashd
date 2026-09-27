@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -53,6 +53,12 @@ pub enum TrashError {
 
 pub struct TrashStore {
     config: Config,
+    home: PathBuf,
+    isolated: bool,
+    #[cfg(test)]
+    sidecar_reads: std::cell::Cell<usize>,
+    #[cfg(test)]
+    cache_refreshes: std::cell::Cell<usize>,
     /// Optional SQLite cache. It is NEVER the source of truth (list() scans
     /// .trashinfo files), so a failure to open it must not stop trashing —
     /// otherwise transient lock contention would demote callers to real `rm`.
@@ -74,13 +80,26 @@ pub struct TrashEntry {
     pub trash_root: PathBuf,
     /// True if this entry has no .trashinfo (emergency/orphaned per spec)
     pub orphaned: bool,
+    identity: Option<(u64, u64)>,
+    sidecar_version: Option<SidecarVersion>,
 }
 
 impl TrashStore {
     pub fn open() -> Result<Self, TrashError> {
-        let config = Config::load();
-        let home = Self::home_trash_dir();
+        Self::open_with(Self::home_trash_dir(), Config::load(), false)
+    }
 
+    /// Open an explicitly configured store that never discovers other mounts
+    /// or reads ambient global/user/project configuration.
+    pub fn open_isolated(home: &Path, config: Config) -> Result<Self, TrashError> {
+        Self::open_with(home.to_path_buf(), config, true)
+    }
+
+    pub fn home_dir(&self) -> &Path {
+        &self.home
+    }
+
+    fn open_with(home: PathBuf, config: Config, isolated: bool) -> Result<Self, TrashError> {
         // /tmp fallback (#35): the base must be ours and private, or a local
         // attacker could have pre-created it to harvest trashed files.
         if home.starts_with("/tmp/trashd-home-") {
@@ -115,7 +134,17 @@ impl TrashStore {
             }
         };
 
-        Ok(Self { config, index })
+        let home = fs::canonicalize(home)?;
+        Ok(Self {
+            config,
+            index,
+            home,
+            isolated,
+            #[cfg(test)]
+            sidecar_reads: std::cell::Cell::new(0),
+            #[cfg(test)]
+            cache_refreshes: std::cell::Cell::new(0),
+        })
     }
 
     /// The home trash directory per FreeDesktop spec.
@@ -142,7 +171,11 @@ impl TrashStore {
 
     /// Determine the correct trash directory for a file (same-device or topdir).
     fn trash_dir_for(&self, path: &Path) -> PathBuf {
-        mounts::trash_dir_for_path(path, &Self::home_trash_dir())
+        if self.isolated {
+            self.home.clone()
+        } else {
+            mounts::trash_dir_for_path(path, &self.home)
+        }
     }
 
     /// Get the topdir (mount point) for a trash directory.
@@ -198,7 +231,7 @@ impl TrashStore {
     }
 
     /// Ensure a trash directory has the required subdirectories.
-    fn ensure_trash_dir(trash_dir: &Path) -> io::Result<()> {
+    fn ensure_trash_dir(&self, trash_dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(trash_dir.join("files"))?;
         fs::create_dir_all(trash_dir.join("info"))?;
@@ -206,7 +239,7 @@ impl TrashStore {
         // spec requires them to be private (0700) so other local users cannot
         // read a victim's deleted files or their original-path metadata. The
         // home trash already sits inside $HOME, so it is left untouched.
-        if trash_dir != Self::home_trash_dir() {
+        if trash_dir != self.home {
             let private = fs::Permissions::from_mode(0o700);
             let _ = fs::set_permissions(trash_dir, private.clone());
             let _ = fs::set_permissions(trash_dir.join("files"), private.clone());
@@ -229,14 +262,16 @@ impl TrashStore {
             fs::symlink_metadata(&abs_path).map_err(|_| TrashError::NotFound(abs_path.clone()))?;
 
         // Check never-trash list
-        if self.config.should_skip(&abs_path) {
+        if self.should_skip(&abs_path) {
             return Err(TrashError::Excluded(abs_path));
         }
 
         // Check size limit (for files only)
         if meta.is_file() {
             let size_mb = meta.size() / (1024 * 1024);
-            if size_mb > self.config.max_file_size_mb {
+            if self.config.max_file_size_mb > 0
+                && meta.size() > self.config.max_file_size_mb.saturating_mul(1024 * 1024)
+            {
                 return Err(TrashError::TooLarge {
                     path: abs_path,
                     size_mb,
@@ -293,7 +328,7 @@ impl TrashStore {
             return Err(TrashError::Refused(abs_path));
         }
 
-        Self::ensure_trash_dir(&trash_dir)?;
+        self.ensure_trash_dir(&trash_dir)?;
 
         // Generate unique trash ID within that trash dir (atomic)
         let file_name = abs_path
@@ -304,7 +339,7 @@ impl TrashStore {
 
         // Build trashinfo — per spec, topdir trash should use relative paths
         // from the topdir mount point, not absolute paths.
-        let home_trash = Self::home_trash_dir();
+        let home_trash = self.home.clone();
         let trashinfo_path = Self::compute_trashinfo_path(&trash_dir, &abs_path, &home_trash);
         let mut info = TrashInfo::new(trashinfo_path);
         info.command = command.map(|s| s.to_string());
@@ -317,7 +352,7 @@ impl TrashStore {
 
         // Compute file hash for small files only (configurable, default 1 MB).
         // Hashing reads the entire file — too expensive for large files on every rm.
-        let hash_limit = self.config.sha256_max_size_mb * 1024 * 1024;
+        let hash_limit = self.config.sha256_max_size_mb.saturating_mul(1024 * 1024);
         if meta.is_file()
             && hash_limit > 0
             && meta.size() <= hash_limit
@@ -394,7 +429,7 @@ impl TrashStore {
                 if let Some(idx) = self.index.as_ref() {
                     let _ = idx.insert(&id, &info, &trash_dir);
                 }
-                crate::oplog::log_trash(&abs_path, &id, command);
+                crate::oplog::log_trash_in(&self.home, &abs_path, &id, command);
                 return Err(TrashError::Io(io::Error::other(format!(
                     "copied to trash but failed to remove original: {e}"
                 ))));
@@ -428,7 +463,7 @@ impl TrashStore {
         }
 
         // Log operation
-        crate::oplog::log_trash(&abs_path, &id, command);
+        crate::oplog::log_trash_in(&self.home, &abs_path, &id, command);
 
         // Run auto-purge if enough time has passed since the last one.
         // Scanning the entire trash on every deletion is O(n) — throttle it.
@@ -481,19 +516,20 @@ impl TrashStore {
             return Err(TrashError::NotFound(display_path.clone()));
         }
         let fmt = stat.st_mode & libc::S_IFMT;
-        let is_symlink = fmt == libc::S_IFLNK;
         let is_dir = fmt == libc::S_IFDIR;
         let file_dev = stat.st_dev as u64;
 
         // Eligibility on the display path (config semantics are path-based).
-        if self.config.should_skip(&display_path) {
+        if self.should_skip(&display_path) {
             return Err(TrashError::Excluded(display_path.clone()));
         }
 
         // Size limits — parity with trash().
-        if !is_symlink && !is_dir {
+        if fmt == libc::S_IFREG {
             let size_mb = stat.st_size as u64 / (1024 * 1024);
-            if size_mb > self.config.max_file_size_mb {
+            if self.config.max_file_size_mb > 0
+                && stat.st_size as u64 > self.config.max_file_size_mb.saturating_mul(1024 * 1024)
+            {
                 return Err(TrashError::TooLarge {
                     path: display_path.clone(),
                     size_mb,
@@ -527,8 +563,12 @@ impl TrashStore {
             }
         }
 
-        let home_trash = Self::home_trash_dir();
-        let trash_dir = mounts::trash_dir_for_device(file_dev, &display_path, &home_trash);
+        let home_trash = self.home.clone();
+        let trash_dir = if self.isolated {
+            home_trash.clone()
+        } else {
+            mounts::trash_dir_for_device(file_dev, &display_path, &home_trash)
+        };
 
         // Trash-self-target parity with trash() (#8).
         if display_path == trash_dir
@@ -538,7 +578,7 @@ impl TrashStore {
             return Err(TrashError::Refused(display_path.clone()));
         }
 
-        Self::ensure_trash_dir(&trash_dir)?;
+        self.ensure_trash_dir(&trash_dir)?;
 
         // The trash files/ dir must be on the SAME filesystem as the pinned
         // inode or renameat would cross devices; surface that distinctly so
@@ -600,18 +640,30 @@ impl TrashStore {
 
         // Hash small regular files — read via an fd opened under the pinned
         // parent.
-        let hash_limit = self.config.sha256_max_size_mb * 1024 * 1024;
-        if !is_symlink && !is_dir && hash_limit > 0 && stat.st_size as u64 <= hash_limit {
+        let hash_limit = self.config.sha256_max_size_mb.saturating_mul(1024 * 1024);
+        if fmt == libc::S_IFREG && hash_limit > 0 && stat.st_size as u64 <= hash_limit {
+            // Pin without opening the object for IO: even a replacement
+            // FIFO/device must not be opened before its type is verified.
+            use std::os::fd::FromRawFd;
             let rfd = unsafe {
-                libc::openat(parent_fd, cname.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+                libc::openat(
+                    parent_fd,
+                    cname.as_ptr(),
+                    libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
             };
             if rfd >= 0 {
-                let hash = hash_file(
-                    Path::new(&format!("/proc/self/fd/{rfd}")),
-                    &self.config.hash_algorithm,
-                );
-                unsafe { libc::close(rfd) };
-                if let Ok(hash) = hash {
+                let file = unsafe { fs::File::from_raw_fd(rfd) };
+                if let Ok(m) = file.metadata()
+                    && m.is_file()
+                    && m.dev() == stat.st_dev as u64
+                    && m.ino() == stat.st_ino as u64
+                    && m.len() <= hash_limit
+                    && let Ok(hash) = hash_file(
+                        Path::new(&format!("/proc/self/fd/{rfd}")),
+                        &self.config.hash_algorithm,
+                    )
+                {
                     info.sha256 = Some(hash);
                 }
             }
@@ -674,7 +726,7 @@ impl TrashStore {
         if is_dir {
             let _ = crate::directorysizes::write_cache(&trash_dir);
         }
-        crate::oplog::log_trash(&display_path, &id, command);
+        crate::oplog::log_trash_in(&self.home, &display_path, &id, command);
         let _ = self.maybe_auto_purge();
 
         Ok(id)
@@ -718,10 +770,17 @@ impl TrashStore {
                 .strip_suffix(".trashinfo")
                 .unwrap_or(&filename)
                 .to_string();
+            #[cfg(test)]
+            self.sidecar_reads.set(self.sidecar_reads.get() + 1);
+            let sidecar_version = sidecar_version(&entry.path());
             let content = match fs::read_to_string(entry.path()) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
+            if sidecar_version.is_none() || sidecar_version != self::sidecar_version(&entry.path())
+            {
+                continue;
+            }
 
             let mut info = match TrashInfo::from_trashinfo(&content) {
                 Some(i) => i,
@@ -750,7 +809,10 @@ impl TrashStore {
             }
 
             let trashed_path = files_dir.join(&id);
+            let identity = file_identity(&trashed_path);
             entries.push(TrashEntry {
+                identity,
+                sidecar_version,
                 id,
                 info,
                 trashed_path,
@@ -779,6 +841,8 @@ impl TrashStore {
                         }
                         let trashed_path = files_dir.join(&name);
                         orphans.push(TrashEntry {
+                            identity: file_identity(&trashed_path),
+                            sidecar_version: None,
                             id: name.clone(),
                             info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
                             trashed_path,
@@ -801,13 +865,86 @@ impl TrashStore {
         id_or_pattern: &str,
         target: Option<&Path>,
     ) -> Result<PathBuf, TrashError> {
-        let entry = self.find_entry(id_or_pattern)?;
+        let mut entry = self.find_entry(id_or_pattern)?;
+        self.restore_resolved(&mut entry, target, true)
+    }
 
+    /// Restore a previously resolved batch without re-enumerating the store.
+    /// Each result corresponds to the entry at the same index. Failed items
+    /// retain their metadata; cache/index maintenance is batched per store.
+    pub fn restore_batch(
+        &self,
+        entries: &[TrashEntry],
+        target: Option<&Path>,
+        force: bool,
+    ) -> Vec<Result<PathBuf, TrashError>> {
+        let mut roots = std::collections::HashSet::new();
+        let mut retired_ids = Vec::new();
+        let results = entries
+            .iter()
+            .map(|listed| {
+                let mut entry = listed.clone();
+                let mut result = self.restore_resolved(&mut entry, target, false);
+                if force && let Err(TrashError::RestoreConflict(ref destination)) = result {
+                    let destination = destination.clone();
+                    for i in 1..1000 {
+                        let mut candidate = destination.as_os_str().to_os_string();
+                        candidate.push(format!(".{i}"));
+                        let candidate = PathBuf::from(candidate);
+                        result = self.restore_resolved(&mut entry, Some(&candidate), false);
+                        if !matches!(result, Err(TrashError::RestoreConflict(_))) {
+                            break;
+                        }
+                    }
+                }
+                if result.is_ok() {
+                    roots.insert(entry.trash_root.clone());
+                    retired_ids.push((entry.id.clone(), entry.trash_root.clone()));
+                }
+                result
+            })
+            .collect();
+        if let Some(index) = &self.index {
+            let _ = index.delete_many(&retired_ids);
+        }
+        for root in roots {
+            self.refresh_cache(&root);
+        }
+        results
+    }
+
+    fn refresh_cache(&self, root: &Path) {
+        #[cfg(test)]
+        self.cache_refreshes.set(self.cache_refreshes.get() + 1);
+        let _ = crate::directorysizes::write_cache(root);
+    }
+
+    fn restore_resolved(
+        &self,
+        entry: &mut TrashEntry,
+        target: Option<&Path>,
+        maintain: bool,
+    ) -> Result<PathBuf, TrashError> {
+        if (self.isolated && entry.trash_root != self.home)
+            || entry.trashed_path != entry.trash_root.join("files").join(&entry.id)
+            || entry.info_path
+                != entry
+                    .trash_root
+                    .join("info")
+                    .join(format!("{}.trashinfo", entry.id))
+            || Path::new(&entry.id).components().count() != 1
+            || !matches!(
+                Path::new(&entry.id).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
         // Orphaned entries (files/ item with no .trashinfo) carry a synthetic
         // pseudo-path, not a real original location. Restoring one would move
         // the data to a garbage "(orphaned: …)" path in the caller's CWD.
         if entry.orphaned {
-            return Err(TrashError::OrphanedEntry(entry.id));
+            return Err(TrashError::OrphanedEntry(entry.id.clone()));
         }
 
         let restore_to = target
@@ -829,12 +966,24 @@ impl TrashStore {
             {
                 return Err(TrashError::RestoreTraversal(restore_to));
             }
-            if entry.trash_root != Self::home_trash_dir() {
+            if entry.trash_root != self.home {
                 let topdir = Self::topdir_for_trash(&entry.trash_root);
                 if !restore_to.starts_with(&topdir) {
                     return Err(TrashError::RestoreTraversal(restore_to));
                 }
             }
+        }
+
+        // Check before decoding so a normal conflict never rewrites the entry.
+        if fs::symlink_metadata(&restore_to).is_ok() {
+            return Err(TrashError::RestoreConflict(restore_to));
+        }
+        if entry.identity.is_none()
+            || file_identity(&entry.trashed_path) != entry.identity
+            || entry.sidecar_version.is_none()
+            || sidecar_version(&entry.info_path) != entry.sidecar_version
+        {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
 
         // If trashd compressed this entry's data (recorded explicitly via the
@@ -871,6 +1020,9 @@ impl TrashStore {
             let mut cleared = entry.info.clone();
             cleared.compressed = None;
             let _ = write_trashinfo_atomic(&entry.info_path, &cleared);
+            entry.info = cleared;
+            entry.identity = file_identity(&entry.trashed_path);
+            entry.sidecar_version = sidecar_version(&entry.info_path);
         }
 
         // Check for conflicts (use symlink_metadata so dangling symlinks are detected)
@@ -883,22 +1035,11 @@ impl TrashStore {
             fs::create_dir_all(parent)?;
         }
 
-        // Snapshot the stored file's identity and re-verify immediately
-        // before the move (#43): if another process purged this entry and a
-        // new trash reused the ID in the meantime, an in-flight restore would
-        // otherwise move someone else's data out of the trash. (After the
-        // decompress step above, so a legitimately-changed inode is ours.)
-        let ident_before = fs::symlink_metadata(&entry.trashed_path)?;
-
-        // Identity re-check (#43)
-        let identity_kept = fs::symlink_metadata(&entry.trashed_path)
-            .map(|m| m.dev() == ident_before.dev() && m.ino() == ident_before.ino())
-            .unwrap_or(false);
-        if !identity_kept {
-            let _ = fs::remove_file(&entry.info_path); // stale entry — retire it
-            if let Some(idx) = self.index.as_ref() {
-                let _ = idx.delete(&entry.id);
-            }
+        if file_identity(&entry.trashed_path) != entry.identity
+            || sidecar_version(&entry.info_path) != entry.sidecar_version
+        {
+            // A replaced ID belongs to another operation; leave its data and
+            // sidecar alone instead of retiring somebody else's new entry.
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
 
@@ -961,20 +1102,19 @@ impl TrashStore {
         };
 
         // Remove trashinfo
-        let _ = fs::remove_file(&entry.info_path);
-
-        // Update index
-        if let Some(idx) = self.index.as_ref() {
-            let _ = idx.delete(&entry.id);
+        if sidecar_version(&entry.info_path) == entry.sidecar_version {
+            let _ = fs::remove_file(&entry.info_path);
         }
 
-        // Keep the directorysizes cache consistent (spec: an entry MUST be
-        // removed once its directory leaves the trash) for other FreeDesktop
-        // trash tools that read it.
-        let _ = crate::directorysizes::write_cache(&entry.trash_root);
+        if maintain {
+            if let Some(idx) = self.index.as_ref() {
+                let _ = idx.delete_in(&entry.id, &entry.trash_root);
+            }
+            self.refresh_cache(&entry.trash_root);
+        }
 
         // Log operation
-        crate::oplog::log_restore(&entry.id, &restore_to);
+        crate::oplog::log_restore_in(&self.home, &entry.id, &restore_to);
 
         // Report hash mismatch as a warning after successful restore
         if let Some((expected, actual)) = hash_warning {
@@ -1026,7 +1166,7 @@ impl TrashStore {
         }
         // Refresh directorysizes so a purged directory's entry is dropped.
         let _ = crate::directorysizes::write_cache(&entry.trash_root);
-        crate::oplog::log_purge(&entry.id);
+        crate::oplog::log_purge_in(&self.home, &entry.id);
         Ok(())
     }
 
@@ -1070,7 +1210,7 @@ impl TrashStore {
         }
         if count > 0 {
             let filter_desc = max_age_days.map(|d| format!("older than {d}d"));
-            crate::oplog::log_empty(count, filter_desc.as_deref());
+            crate::oplog::log_empty_in(&self.home, count, filter_desc.as_deref());
             // Refresh directorysizes cache after purging
             for (dir, _) in self.all_trash_dirs() {
                 let _ = crate::directorysizes::write_cache(&dir);
@@ -1087,7 +1227,7 @@ impl TrashStore {
             return self.auto_purge();
         }
 
-        let marker = Self::home_trash_dir().join(".trashd/last_purge");
+        let marker = self.home.join(".trashd/last_purge");
         if let Ok(meta) = fs::metadata(&marker)
             && let Ok(modified) = meta.modified()
             && let Ok(elapsed) = modified.elapsed()
@@ -1228,7 +1368,7 @@ impl TrashStore {
 
         // Phase 3: disk pressure — purge oldest 10% of surviving items
         if pressure_pct > 0 {
-            let home = Self::home_trash_dir();
+            let home = self.home.clone();
             if let Some(usage_pct) = disk_usage_percent(&home)
                 && usage_pct >= pressure_pct as f64
             {
@@ -1257,14 +1397,16 @@ impl TrashStore {
             for (dir, _) in self.all_trash_dirs() {
                 let _ = crate::directorysizes::write_cache(&dir);
             }
-            crate::oplog::log_empty(purge_count, Some("auto-purge"));
-            crate::oplog::notify_desktop(
-                "trashd: auto-purge",
-                &format!(
-                    "{purge_count} item{} permanently deleted by retention policy",
-                    if purge_count == 1 { "" } else { "s" }
-                ),
-            );
+            crate::oplog::log_empty_in(&self.home, purge_count, Some("auto-purge"));
+            if !self.isolated {
+                crate::oplog::notify_desktop(
+                    "trashd: auto-purge",
+                    &format!(
+                        "{purge_count} item{} permanently deleted by retention policy",
+                        if purge_count == 1 { "" } else { "s" }
+                    ),
+                );
+            }
         }
 
         Ok(())
@@ -1341,7 +1483,19 @@ impl TrashStore {
 
     /// All known trash directories (home + per-mountpoint).
     fn all_trash_dirs(&self) -> Vec<(PathBuf, String)> {
-        mounts::all_trash_dirs(&Self::home_trash_dir())
+        if self.isolated {
+            vec![(self.home.clone(), "home".into())]
+        } else {
+            mounts::all_trash_dirs(&self.home)
+        }
+    }
+
+    fn should_skip(&self, path: &Path) -> bool {
+        if self.isolated {
+            self.config.should_skip_configured(path)
+        } else {
+            self.config.should_skip(path)
+        }
     }
 
     /// Access config (for shim process bypass checking).
@@ -1502,6 +1656,34 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
     )))
 }
 
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Detect replacement and in-place edits without rereading each sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidecarVersion {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn sidecar_version(path: &Path) -> Option<SidecarVersion> {
+    let m = fs::symlink_metadata(path).ok()?;
+    if !m.is_file() {
+        return None;
+    }
+    Some(SidecarVersion {
+        device: m.dev(),
+        inode: m.ino(),
+        size: m.len(),
+        modified: (m.mtime(), m.mtime_nsec()),
+        changed: (m.ctime(), m.ctime_nsec()),
+    })
+}
+
 /// Hash a file using the configured algorithm.
 /// "xxhash" (default): XXH3-128 — extremely fast, non-cryptographic.
 /// "sha256": SHA-256 — cryptographic, slower.
@@ -1512,8 +1694,11 @@ fn unique_id_atomic(trash_dir: &Path, base_name: &str) -> Result<(String, PathBu
 /// changed between trash and restore) — slurping would then allocate the
 /// entire file in RAM.
 fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
+    hash_reader(fs::File::open(path)?, algorithm)
+}
+
+fn hash_reader(mut file: impl Read, algorithm: &str) -> io::Result<String> {
     const CHUNK: usize = 256 * 1024;
-    let mut file = fs::File::open(path)?;
     let mut buf = vec![0u8; CHUNK];
     match algorithm {
         "sha256" => {
@@ -1654,23 +1839,26 @@ fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
 /// on failure the original is untouched).
 fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("trashd");
-    let tmp = dir.join(format!(".{stem}.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&tmp); // clear any leftover from a prior crash
-    if let Err(e) = fs::write(&tmp, data) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic replacement requires a regular file",
+        ));
     }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
+    let mut staging = tempfile::NamedTempFile::new_in(dir)?;
+    staging.write_all(data)?;
+    let staged_meta = staging.as_file().metadata()?;
+    if staged_meta.uid() != meta.uid() || staged_meta.gid() != meta.gid() {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fchown(staging.as_file().as_raw_fd(), meta.uid(), meta.gid()) } != 0 {
+            return Err(io::Error::last_os_error());
         }
     }
+    staging.as_file().set_permissions(meta.permissions())?;
+    staging.as_file().sync_all()?;
+    staging.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Atomically (over)write a `.trashinfo` file. Public so the CLI `compress`
@@ -1916,36 +2104,19 @@ fn process_name(pid: u32) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // Tests must run single-threaded because TrashStore::open() reads
-    // XDG_DATA_HOME from the environment (process-global state).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Create a TrashStore with isolated trash + work directories.
-    /// Places files under the project root (not /tmp, which is in never_trash).
-    /// Returns a MutexGuard that serializes tests sharing the env var.
-    fn test_store() -> (
-        TrashStore,
-        TempDir,
-        TempDir,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-trash");
+    fn test_store() -> (TrashStore, TempDir, TempDir, ()) {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
         fs::create_dir_all(&base).unwrap();
-
         let data_dir = TempDir::with_prefix_in("data-", &base).unwrap();
         let workdir = TempDir::with_prefix_in("work-", &base).unwrap();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("XDG_DATA_HOME", data_dir.path()) };
-
-        let store = TrashStore::open().unwrap();
-        (store, data_dir, workdir, guard)
+        let mut config = Config::default();
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        let store = TrashStore::open_isolated(&data_dir.path().join("Trash"), config).unwrap();
+        (store, data_dir, workdir, ())
     }
 
     /// Create a temp file with content in a given directory.
@@ -2420,7 +2591,7 @@ mod tests {
         store.trash(&f, None).unwrap();
 
         // Plant an orphan: a data file with no .trashinfo
-        let trash = TrashStore::home_trash_dir();
+        let trash = store.home.clone();
         fs::write(trash.join("files/orphan1"), b"orphan").unwrap();
 
         // undo restores the real newest entry, not the orphan
@@ -2443,7 +2614,7 @@ mod tests {
     #[test]
     fn refuse_to_trash_the_trash_itself() {
         let (store, _data, _workdir, _lock) = test_store();
-        let trash = TrashStore::home_trash_dir();
+        let trash = store.home.clone();
 
         // The store itself
         let err = store.trash(&trash, None).unwrap_err();
@@ -2535,7 +2706,7 @@ mod tests {
 
         // Display path pointing INTO the trash must be refused (#8 parity),
         // even though the actual move targets an unrelated pinned directory.
-        let fake = TrashStore::home_trash_dir().join("files").join("evil");
+        let fake = store.home.clone().join("files").join("evil");
         let parent = File::open(&dir).unwrap();
         let err = store
             .trash_at(parent.as_raw_fd(), OsStr::new("x"), &fake, None)
@@ -2607,7 +2778,7 @@ mod tests {
     #[test]
     fn restore_refuses_path_traversal() {
         let (store, _data, _workdir, _lock) = test_store();
-        let trash = TrashStore::home_trash_dir();
+        let trash = store.home.clone();
         fs::create_dir_all(trash.join("info")).unwrap();
         fs::create_dir_all(trash.join("files")).unwrap();
         fs::write(
@@ -2648,7 +2819,7 @@ mod tests {
     #[test]
     fn trashing_does_not_overwrite_orphan_file() {
         let (store, _data, workdir, _lock) = test_store();
-        let trash = TrashStore::home_trash_dir();
+        let trash = store.home.clone();
         fs::create_dir_all(trash.join("files")).unwrap();
         fs::write(trash.join("files/dup.txt"), b"orphan-data").unwrap();
 
@@ -2672,47 +2843,266 @@ mod tests {
     // item (so all were purged) and max_size_gb=0 trimmed the trash to nothing.
     #[test]
     fn retention_zero_disables_limits_not_wipes_trash() {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-trash");
-        fs::create_dir_all(&base).unwrap();
-        let data_dir = TempDir::with_prefix_in("data0-", &base).unwrap();
-        let config_dir = TempDir::with_prefix_in("cfg0-", &base).unwrap();
-        let workdir = TempDir::with_prefix_in("work0-", &base).unwrap();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("XDG_DATA_HOME", data_dir.path()) };
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_dir.path()) };
-
-        // All retention limits zero, and auto-purge runs on every deletion.
-        let cfg = config_dir.path().join("trashd/config.toml");
-        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
-        fs::write(
-            &cfg,
-            "auto_purge_interval_secs = 0\n\
-             [retention]\n\
-             max_age_days = 0\n\
-             max_size_gb = 0\n\
-             disk_pressure_percent = 0\n",
-        )
-        .unwrap();
-
-        let store = TrashStore::open().unwrap();
-        assert_eq!(store.config().retention.max_age_days, 0);
-        assert_eq!(store.config().retention.max_size_gb, 0.0);
-
-        // Each trash() triggers maybe_auto_purge -> auto_purge (interval 0).
+        let (mut store, _data, workdir, _) = test_store();
+        store.config.auto_purge_interval_secs = 0;
         for i in 0..3 {
             let f = create_file(workdir.path(), &format!("keep{i}.txt"), "data");
             store.trash(&f, None).unwrap();
         }
+        assert_eq!(store.list(None).unwrap().len(), 3);
+    }
 
+    #[test]
+    fn isolated_store_retention_never_touches_another_root_or_log() {
+        let (mut local, _local_data, local_work, _) = test_store();
+        let (external, _external_data, external_work, _) = test_store();
+        let sentinel = create_file(external_work.path(), "external-sentinel", "keep me");
+        let id = external.trash(&sentinel, None).unwrap();
+        let before = external.list(None).unwrap().remove(0);
+        let bytes = fs::read(&before.trashed_path).unwrap();
+        let info = fs::read(&before.info_path).unwrap();
+        let log = fs::read(external.home.join(".trashd/operations.log")).unwrap();
+        local.config.auto_purge_interval_secs = 0;
+        local.config.retention.max_age_days = 1;
+        local.config.retention.max_size_gb = 0.000_001;
+        let victim = create_file(local_work.path(), "local", "data");
+        local.trash(&victim, None).unwrap();
+        local.empty(None).unwrap();
+        assert_eq!(
+            local.all_trash_dirs(),
+            [(local.home.clone(), "home".into())]
+        );
+        assert_eq!(fs::read(&before.trashed_path).unwrap(), bytes);
+        assert_eq!(fs::read(&before.info_path).unwrap(), info);
+        assert_eq!(
+            fs::read(external.home.join(".trashd/operations.log")).unwrap(),
+            log
+        );
+        assert_eq!(external.list(None).unwrap()[0].id, id);
+    }
+
+    #[test]
+    fn pinned_special_files_complete_without_reading_and_regular_file_still_hashes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let (store, _data, work, _) = test_store();
+            let parent = fs::File::open(work.path()).unwrap();
+            let fifo = work.path().join("named-pipe");
+            let cname = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(cname.as_ptr(), 0o600) }, 0);
+            let fifo_id = store
+                .trash_at(parent.as_raw_fd(), OsStr::new("named-pipe"), &fifo, None)
+                .unwrap();
+            let socket = work.path().join("endpoint");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            store
+                .trash_at(parent.as_raw_fd(), OsStr::new("endpoint"), &socket, None)
+                .unwrap();
+            let file = create_file(work.path(), "regular", "hash this");
+            let regular_id = store
+                .trash_at(parent.as_raw_fd(), OsStr::new("regular"), &file, None)
+                .unwrap();
+            let entries = store.list(None).unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .find(|e| e.id == fifo_id)
+                    .unwrap()
+                    .info
+                    .sha256
+                    .is_none()
+            );
+            assert!(
+                entries
+                    .iter()
+                    .find(|e| e.id == regular_id)
+                    .unwrap()
+                    .info
+                    .sha256
+                    .is_some()
+            );
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("special-file trash must not block");
+    }
+
+    #[test]
+    fn compressed_restore_preserves_private_and_executable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (store, _data, work, _) = test_store();
+        for mode in [0o600, 0o700, 0o640] {
+            let file = create_file(
+                work.path(),
+                &format!("mode-{mode:o}"),
+                &"payload".repeat(2048),
+            );
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+            let id = store.trash(&file, None).unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            let data = fs::read(&entry.trashed_path).unwrap();
+            atomic_write(
+                &entry.trashed_path,
+                &zstd::encode_all(data.as_slice(), 3).unwrap(),
+            )
+            .unwrap();
+            let mut info = entry.info.clone();
+            info.compressed = Some("zstd".into());
+            write_trashinfo_atomic(&entry.info_path, &info).unwrap();
+            assert_eq!(
+                fs::metadata(&entry.trashed_path).unwrap().mode() & 0o777,
+                mode
+            );
+            store.restore(&id, None).unwrap();
+            assert_eq!(fs::read(&file).unwrap(), data);
+            assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, mode);
+        }
+    }
+
+    fn seed_batch(store: &TrashStore, work: &Path, count: usize) {
+        for i in 0..count {
+            let name = format!("batch-{i}");
+            fs::write(store.home.join("files").join(&name), format!("payload-{i}")).unwrap();
+            let info = TrashInfo::new(work.join(&name));
+            fs::write(
+                store.home.join("info").join(format!("{name}.trashinfo")),
+                info.to_trashinfo_string(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn batch_restore_reads_sidecars_once_and_refreshes_cache_once() {
+        for count in [32, 64] {
+            let (store, _data, work, _) = test_store();
+            seed_batch(&store, work.path(), count);
+            let entries = store.list(None).unwrap();
+            assert_eq!(store.sidecar_reads.get(), count);
+            let results = store.restore_batch(&entries, None, false);
+            assert!(results.iter().all(Result::is_ok));
+            assert_eq!(
+                store.sidecar_reads.get(),
+                count,
+                "batch must not rescan sidecars"
+            );
+            assert_eq!(store.cache_refreshes.get(), 1);
+            for i in 0..count {
+                assert_eq!(
+                    fs::read_to_string(work.path().join(format!("batch-{i}"))).unwrap(),
+                    format!("payload-{i}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_restore_preserves_conflicts_replaced_ids_and_partial_success() {
+        let (store, _data, work, _) = test_store();
+        seed_batch(&store, work.path(), 3);
         let entries = store.list(None).unwrap();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        drop(guard);
-        assert_eq!(entries.len(), 3, "retention=0 must NOT purge the trash");
+        fs::write(work.path().join("batch-0"), b"conflict").unwrap();
+        let second = entries.iter().find(|e| e.id == "batch-1").unwrap();
+        // Keep the original inode alive to avoid inode-number reuse in this test.
+        fs::rename(&second.trashed_path, work.path().join("old-inode")).unwrap();
+        fs::write(&second.trashed_path, b"replacement").unwrap();
+        let results = store.restore_batch(&entries, None, false);
+        for (entry, result) in entries.iter().zip(&results) {
+            match entry.id.as_str() {
+                "batch-0" => assert!(matches!(result, Err(TrashError::RestoreConflict(_)))),
+                "batch-1" => assert!(matches!(result, Err(TrashError::EntryNotFound(_)))),
+                _ => assert!(result.is_ok()),
+            }
+        }
+        assert_eq!(fs::read(&second.trashed_path).unwrap(), b"replacement");
+        assert!(second.info_path.exists());
+        let first = entries.iter().find(|e| e.id == "batch-0").unwrap();
+        let results = store.restore_batch(std::slice::from_ref(first), None, true);
+        assert_eq!(results[0].as_ref().unwrap(), &work.path().join("batch-0.1"));
+        assert_eq!(fs::read(work.path().join("batch-0")).unwrap(), b"conflict");
+        assert_eq!(
+            fs::read(work.path().join("batch-0.1")).unwrap(),
+            b"payload-0"
+        );
+    }
+
+    #[test]
+    fn batch_restore_rejects_changed_sidecars_and_foreign_isolated_entries() {
+        let (store, _data, work, _) = test_store();
+        let (other, _other_data, _other_work, _) = test_store();
+        seed_batch(&store, work.path(), 2);
+        let entries = store.list(None).unwrap();
+        assert!(
+            other
+                .restore_batch(&entries, None, false)
+                .iter()
+                .all(Result::is_err)
+        );
+        for (i, entry) in entries.iter().enumerate() {
+            let mut changed = entry.info.clone();
+            changed.original_path = work.path().join(format!("changed-{i}"));
+            if i == 0 {
+                write_trashinfo_atomic(&entry.info_path, &changed).unwrap();
+            } else {
+                fs::write(&entry.info_path, changed.to_trashinfo_string()).unwrap();
+            }
+        }
+        let contents: Vec<_> = entries
+            .iter()
+            .map(|e| fs::read(&e.info_path).unwrap())
+            .collect();
+        assert!(
+            store
+                .restore_batch(&entries, None, false)
+                .iter()
+                .all(Result::is_err)
+        );
+        for (entry, info) in entries.iter().zip(contents) {
+            assert_eq!(fs::read(&entry.info_path).unwrap(), info);
+            assert!(entry.trashed_path.exists());
+            assert!(!entry.info.original_path.exists());
+        }
+    }
+
+    #[test]
+    fn batch_restore_retires_topdir_index_rows_without_removing_other_roots() {
+        let (mut store, _data, work, _) = test_store();
+        let (external, _external_data, _, _) = test_store();
+        seed_batch(&external, work.path(), 2);
+        let entries = external.list(None).unwrap();
+        let index = store.index.as_ref().unwrap();
+        index
+            .insert(&entries[0].id, &entries[0].info, &external.home)
+            .unwrap();
+        index
+            .insert(&entries[1].id, &entries[1].info, &store.home)
+            .unwrap();
+        // Deliberately permit externally resolved entries as a production
+        // store does. Explicit targets avoid topdir path restrictions here.
+        store.isolated = false;
+        for (i, entry) in entries.iter().enumerate() {
+            let target = work.path().join(format!("restored-{i}"));
+            assert!(
+                store.restore_batch(std::slice::from_ref(entry), Some(&target), false)[0].is_ok()
+            );
+        }
+        assert_eq!(store.index.as_ref().unwrap().count().unwrap(), 1);
+    }
+
+    #[test]
+    fn file_size_limits_use_exact_bytes_and_zero_disables_limit() {
+        let (mut store, _data, work, _) = test_store();
+        store.config.max_file_size_mb = 1;
+        let path = work.path().join("oversize");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        assert!(matches!(
+            store.trash(&path, None),
+            Err(TrashError::TooLarge { .. })
+        ));
+        store.config.max_file_size_mb = 0;
+        assert!(store.trash(&path, None).is_ok());
     }
 }
