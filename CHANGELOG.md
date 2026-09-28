@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 (2026-09-27)
+
+- Accept legacy configuration files that placed global settings under
+  `[retention]`, preserving policy values in both the common and preload loaders.
+  Explicit top-level settings take precedence.
+- Expose the monitoring daemon as `trashd` on PATH and support `trashd --version`.
+- Remove the daemon PATH entry during uninstall.
+
 ## 0.1.4 (2026-09-27)
 
 ### Fixed — deletion and restore safety

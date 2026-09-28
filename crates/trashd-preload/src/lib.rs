@@ -12,6 +12,9 @@
 //!   TRASH_BYPASS=1       — disable interception entirely
 //!   TRASHD_PRELOAD_LOG=1 — log interceptions to stderr
 
+#[path = "../../trashd-common/src/legacy_config.rs"]
+mod legacy_config;
+
 use serde::Deserialize;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
@@ -246,7 +249,9 @@ fn config_mtime() -> i64 {
 
 fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {
     let content = fs::read_to_string(path).ok()?;
-    match toml::from_str::<PartialPreloadConfig>(&content) {
+    match legacy_config::normalize(&content)
+        .and_then(|value| value.try_into::<PartialPreloadConfig>())
+    {
         Ok(partial) => Some(partial),
         Err(error) => {
             eprintln!("trashd-preload: bad config {}: {error}", path.display());
@@ -1516,6 +1521,17 @@ mod tests {
                 .iter()
                 .any(|p| p == "systemd" || p == "systemctl")
         );
+    }
+
+    #[test]
+    fn loader_preserves_policy_from_legacy_retention_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[retention]\nmax_age_days = 7\nonly_trash = [\"*.txt\"]\nmax_file_size_mb = 9\nauto_purge_interval_secs = 123\n").unwrap();
+        let mut config = PreloadConfig::default();
+        config.merge(load_partial_config(&path).expect("legacy config must load"));
+        assert_eq!(config.only_trash, ["*.txt"]);
+        assert_eq!(config.max_file_size_mb, 9);
     }
 
     #[test]

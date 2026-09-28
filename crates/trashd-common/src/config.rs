@@ -1,3 +1,6 @@
+#[path = "legacy_config.rs"]
+mod legacy_config;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -209,7 +212,9 @@ impl Config {
             Ok(c) => c,
             Err(_) => return None,
         };
-        match toml::from_str::<PartialConfig>(&contents) {
+        match legacy_config::normalize(&contents)
+            .and_then(|value| value.try_into::<PartialConfig>())
+        {
             Ok(partial) => Some(partial),
             Err(e) => {
                 eprintln!("trashd: bad config {}: {}", path.display(), e);
@@ -540,6 +545,17 @@ mod tests {
                     .any(|p| p == "systemd" || p == "systemctl")
             );
         }
+    }
+
+    #[test]
+    fn loader_preserves_policy_from_legacy_retention_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[retention]\nmax_age_days = 7\nonly_trash = [\"*.txt\"]\nmax_file_size_mb = 9\nauto_purge_interval_secs = 123\n").unwrap();
+        let mut config = Config::default();
+        config.merge(Config::load_partial(&path).expect("legacy config must load"));
+        assert_eq!(config.only_trash, ["*.txt"]);
+        assert_eq!(config.max_file_size_mb, 9);
     }
 
     #[test]

@@ -85,7 +85,7 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     fi
 
     # 3. Remove CLI binaries (current + legacy locations/names).
-    "$RM" -f "${BIN_DIR}/trash" "${BIN_DIR}/trashd-exec" "${BIN_DIR}/trashd-daemon"
+    "$RM" -f "${BIN_DIR}/trash" "${BIN_DIR}/trashd-exec" "${BIN_DIR}/trashd" "${BIN_DIR}/trashd-daemon"
     echo "    Removed binaries from ${BIN_DIR}"
 
     # 4. Remove the entire trashd lib tree in one shot: the rm shim (bin/), the
@@ -257,6 +257,7 @@ echo "==> Installing binaries..."
 atomic_install "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
 atomic_install "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
 atomic_install "${TARGET_DIR}/trashd"      "${LIB_DIR}/trashd"
+ln -sfn "${LIB_DIR}/trashd" "${BIN_DIR}/trashd"
 
 echo "==> Setting up shim directory..."
 mkdir -p "${SHIM_DIR}" "${REAL_DIR}"
