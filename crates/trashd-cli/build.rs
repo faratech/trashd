@@ -4,6 +4,19 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+fn target_dir() -> PathBuf {
+    if let Some(path) = env::var_os("CARGO_TARGET_DIR") {
+        return PathBuf::from(path);
+    }
+
+    PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target")
+}
+
 fn build_cli() -> Command {
     Command::new("trash")
         .version(option_env!("TRASHD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))
@@ -213,13 +226,10 @@ fn build_cli() -> Command {
 }
 
 fn main() {
-    let out_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("completions");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+
+    let target_dir = target_dir();
+    let out_dir = target_dir.join("completions");
 
     fs::create_dir_all(&out_dir).unwrap();
 
@@ -229,13 +239,7 @@ fn main() {
     }
 
     // Generate man page
-    let man_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("man");
+    let man_dir = target_dir.join("man");
 
     fs::create_dir_all(&man_dir).unwrap();
 

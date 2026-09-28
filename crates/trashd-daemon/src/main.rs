@@ -9,7 +9,7 @@
 
 mod logger;
 
-use logger::{DeletionEvent, process_name};
+use logger::{DeletionEvent, escape_path, process_name};
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -133,15 +133,18 @@ fn run() -> io::Result<()> {
         ) {
             Ok(()) => {
                 eprintln!(
-                    "trashd: watching {} ({})",
-                    mount.path.display(),
+                    "trashd: watching \"{}\" ({})",
+                    escape_path(&mount.path),
                     mount.fstype,
                 );
                 marked += 1;
                 marked_paths.push(mount.path.clone());
             }
             Err(e) => {
-                eprintln!("trashd: failed to mark {}: {e}", mount.path.display(),);
+                eprintln!(
+                    "trashd: failed to mark \"{}\": {e}",
+                    escape_path(&mount.path),
+                );
             }
         }
     }
@@ -233,17 +236,20 @@ fn run() -> io::Result<()> {
                 if let Some(ref p) = path {
                     let skipped = config.should_skip(p);
                     let ev = DeletionEvent {
-                        path: p.clone(),
+                        path: Some(p.clone()),
                         pid,
                         process: proc_name,
                     };
                     ev.log(skipped);
                 } else {
-                    // Could not resolve path — log with what we have
-                    eprintln!(
-                        "[trashd] DELETE pid={} proc={} path=(unresolved)",
-                        pid, proc_name,
-                    );
+                    // Could not resolve path — log with what we have through
+                    // the same byte-safe, single-line formatter.
+                    DeletionEvent {
+                        path: None,
+                        pid,
+                        process: proc_name,
+                    }
+                    .log(false);
                 }
             }
 
@@ -420,8 +426,8 @@ fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<PathBuf>, fds: &mut Vec<(PathB
             ) {
                 Ok(()) => {
                     eprintln!(
-                        "trashd: watching {} ({}) [new mount]",
-                        mount.path.display(),
+                        "trashd: watching \"{}\" ({}) [new mount]",
+                        escape_path(&mount.path),
                         mount.fstype
                     );
                     marked.push(mount.path.clone());

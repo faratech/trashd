@@ -16,8 +16,9 @@ use serde::Deserialize;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -644,10 +645,11 @@ fn should_skip_path(path: &Path) -> bool {
 // Trash directory selection (same-device or topdir)
 // ---------------------------------------------------------------------------
 
-fn trash_dir_for(path: &Path) -> PathBuf {
+fn trash_dir_for(path: &Path) -> Result<PathBuf, ()> {
     let home_trash = home_trash_dir();
+    prepare_home_trash(&home_trash)?;
 
-    let file_dev = fs::metadata(path)
+    let file_dev = fs::symlink_metadata(path)
         .or_else(|_| {
             path.parent()
                 .map(fs::metadata)
@@ -656,68 +658,178 @@ fn trash_dir_for(path: &Path) -> PathBuf {
         .ok()
         .map(|m| m.dev());
 
-    let home_dev = fs::metadata(&home_trash)
-        .or_else(|_| fs::metadata(home_trash.parent().unwrap_or(Path::new("/"))))
-        .ok()
-        .map(|m| m.dev());
+    let home_dev = fs::metadata(&home_trash).ok().map(|m| m.dev());
 
     if file_dev == home_dev {
-        return home_trash;
+        return Ok(home_trash);
     }
 
-    let uid = unsafe { libc::getuid() };
+    let uid = unsafe { libc::geteuid() };
     if let Some(mountpoint) = find_mount_point(path) {
         // Check shared .Trash/ first (FreeDesktop spec §1.2.2a)
         let shared_trash = mountpoint.join(".Trash");
-        if let Ok(meta) = fs::symlink_metadata(&shared_trash)
+        if trusted_topdir(&mountpoint, uid)
+            && let Ok(meta) = fs::symlink_metadata(&shared_trash)
             && !meta.file_type().is_symlink()
             && meta.is_dir()
+            && (meta.uid() == 0 || meta.uid() == uid)
             && (meta.permissions().mode() & 0o1000) != 0
         {
             let uid_dir = shared_trash.join(uid.to_string());
-            if !uid_dir.exists() {
-                if fs::create_dir_all(uid_dir.join("files")).is_err()
-                    || fs::create_dir_all(uid_dir.join("info")).is_err()
-                {
-                    // Fall through to .Trash-$UID
-                } else {
-                    // Keep it private (0700) — the parent .Trash is sticky
-                    // and shared by all users.
-                    let priv700 = fs::Permissions::from_mode(0o700);
-                    let _ = fs::set_permissions(&uid_dir, priv700.clone());
-                    let _ = fs::set_permissions(uid_dir.join("files"), priv700.clone());
-                    let _ = fs::set_permissions(uid_dir.join("info"), priv700);
-                    return uid_dir;
-                }
-            } else {
-                // Verify ownership — don't use a dir pre-created by another user
-                use std::os::unix::fs::MetadataExt;
-                if let Ok(m) = fs::symlink_metadata(&uid_dir)
-                    && m.uid() == uid
-                    && !m.file_type().is_symlink()
-                {
-                    return uid_dir;
-                }
-                // Ownership mismatch or symlink — fall through to .Trash-$UID
+            if ensure_private_dir(&uid_dir, uid, true).is_ok()
+                && ensure_private_dir(&uid_dir.join("files"), uid, true).is_ok()
+                && ensure_private_dir(&uid_dir.join("info"), uid, true).is_ok()
+            {
+                return Ok(uid_dir);
             }
         }
 
         // Fallback: .Trash-$UID (spec §1.2.2b)
         let topdir = mountpoint.join(format!(".Trash-{uid}"));
-        if fs::create_dir_all(topdir.join("files")).is_ok()
-            && fs::create_dir_all(topdir.join("info")).is_ok()
+        if trusted_topdir(&mountpoint, uid)
+            && ensure_private_dir(&topdir, uid, true).is_ok()
+            && ensure_private_dir(&topdir.join("files"), uid, true).is_ok()
+            && ensure_private_dir(&topdir.join("info"), uid, true).is_ok()
         {
-            // Private (0700): on a shared mount other users must not be able to
-            // read our deleted files or their original-path metadata.
-            let priv700 = fs::Permissions::from_mode(0o700);
-            let _ = fs::set_permissions(&topdir, priv700.clone());
-            let _ = fs::set_permissions(topdir.join("files"), priv700.clone());
-            let _ = fs::set_permissions(topdir.join("info"), priv700);
-            return topdir;
+            return Ok(topdir);
         }
     }
 
-    home_trash
+    Ok(home_trash)
+}
+
+fn trusted_topdir(path: &Path, uid: u32) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        let mode = meta.permissions().mode();
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && (meta.uid() == 0 || meta.uid() == uid)
+            && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+    })
+}
+
+fn prepare_home_trash(home: &Path) -> Result<(), ()> {
+    let uid = unsafe { libc::geteuid() };
+    let fallback = PathBuf::from(format!("/tmp/trashd-home-{uid}"));
+    if home == fallback.join("Trash") {
+        ensure_trusted_parent(&fallback, uid).map_err(|_| ())?;
+        ensure_private_dir(&fallback, uid, true).map_err(|_| ())?;
+    } else if let Some(parent) = home.parent() {
+        ensure_trusted_ancestors(parent, uid).map_err(|_| ())?;
+    }
+    ensure_private_dir(home, uid, true).map_err(|_| ())?;
+    ensure_private_dir(&home.join("files"), uid, true).map_err(|_| ())?;
+    ensure_private_dir(&home.join("info"), uid, true).map_err(|_| ())?;
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    let mut meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe trash directory ownership or type",
+        ));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        meta = fs::symlink_metadata(path)?;
+    }
+    if meta.uid() != uid
+        || !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "trash directory is not private",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_trusted_parent(path: &Path, uid: u32) -> io::Result<()> {
+    let mut current = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent"))?;
+    loop {
+        let metadata = fs::symlink_metadata(current)?;
+        let mode = metadata.permissions().mode();
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trash ancestor can be replaced by another user",
+            ));
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
+    use std::path::Component;
+
+    let directory = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(directory)
+    };
+    let mut current = PathBuf::from("/");
+    for component in directory.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => current.push(name),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsafe trash ancestor path",
+                ));
+            }
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::DirBuilder::new().mode(0o700).create(&current) {
+                    Ok(()) => {}
+                    Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        let mode = metadata.permissions().mode();
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trash ancestor can be replaced by another user",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Unescape /proc/mounts octal sequences (the kernel escapes only whitespace
@@ -753,7 +865,7 @@ fn home_trash_dir() -> PathBuf {
                 .map(PathBuf::from)
                 .map(|h| h.join(".local/share"))
                 .unwrap_or_else(|| {
-                    PathBuf::from(format!("/tmp/trashd-home-{}", unsafe { libc::getuid() }))
+                    PathBuf::from(format!("/tmp/trashd-home-{}", unsafe { libc::geteuid() }))
                 })
         })
         .join("Trash")
@@ -801,27 +913,43 @@ fn exceeds_file_size_limit(cfg: &PreloadConfig, meta: &fs::Metadata) -> bool {
         && meta.len() > cfg.max_file_size_mb.saturating_mul(1024 * 1024)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrashAttempt {
+    Trashed,
+    NotTrashed,
+    /// The selected store failed its ownership/type/privacy checks. Falling
+    /// through to libc here would turn an attack on the store into permanent
+    /// deletion, so hooks return EACCES instead.
+    UnsafeStore,
+}
+
 /// Move `path` into the appropriate trash. `expect_dev`/`expect_ino` are the
 /// identity captured by the hook's eligibility stat: re-stat immediately
 /// before the move and bail out if the file was REPLACED in between (#44) —
 /// trashing the new inode would capture content the caller never asked to
 /// delete, and then report success for it.
-fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
+fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
     let Ok(meta) = fs::symlink_metadata(path) else {
-        return false;
+        return TrashAttempt::NotTrashed;
     };
     if meta.dev() != expect_dev
         || meta.ino() != expect_ino
         || exceeds_file_size_limit(config(), &meta)
     {
-        return false;
+        return TrashAttempt::NotTrashed;
     }
-    let trash_dir = trash_dir_for(path);
+    let trash_dir = match trash_dir_for(path) {
+        Ok(path) => path,
+        Err(()) => return TrashAttempt::UnsafeStore,
+    };
 
     let files_dir = trash_dir.join("files");
     let info_dir = trash_dir.join("info");
-    if fs::create_dir_all(&files_dir).is_err() || fs::create_dir_all(&info_dir).is_err() {
-        return false;
+    let uid = unsafe { libc::geteuid() };
+    if ensure_private_dir(&files_dir, uid, false).is_err()
+        || ensure_private_dir(&info_dir, uid, false).is_err()
+    {
+        return TrashAttempt::UnsafeStore;
     }
 
     // Atomic unique ID via O_CREAT|O_EXCL
@@ -832,7 +960,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
 
     let (id, info_path) = match unique_id_atomic(&info_dir, &files_dir, &base_name) {
         Some(v) => v,
-        None => return false,
+        None => return TrashAttempt::NotTrashed,
     };
 
     let dest = files_dir.join(&id);
@@ -842,7 +970,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
     } else {
         match std::env::current_dir() {
             Ok(cwd) => cwd.join(path),
-            Err(_) => return false,
+            Err(_) => return TrashAttempt::NotTrashed,
         }
     };
 
@@ -883,7 +1011,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
 
     if fs::write(&info_path, &trashinfo).is_err() {
         let _ = fs::remove_file(&info_path);
-        return false;
+        return TrashAttempt::NotTrashed;
     }
 
     // TOCTOU re-check just before the move (#44)
@@ -891,7 +1019,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
         Ok(now) if now.dev() == expect_dev && now.ino() == expect_ino => {}
         Ok(_) => {
             let _ = fs::remove_file(&info_path);
-            return false; // replaced — let the real unlink handle the path
+            return TrashAttempt::NotTrashed; // replaced — let the real unlink handle the path
         }
         Err(_) => {} // vanished; rename below fails cleanly
     }
@@ -903,7 +1031,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
             path.display(),
             dest.display()
         ));
-        return true;
+        return TrashAttempt::Trashed;
     }
 
     // Cross-device: copy preserving symlinks, then remove original
@@ -911,7 +1039,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
         Ok(m) => m,
         Err(_) => {
             let _ = fs::remove_file(&info_path);
-            return false;
+            return TrashAttempt::NotTrashed;
         }
     };
 
@@ -925,7 +1053,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
                 Err(_) => {
                     let _ = fs::remove_file(&info_path);
                     let _ = fs::remove_file(&dest);
-                    return false;
+                    return TrashAttempt::NotTrashed;
                 }
             };
             let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
@@ -936,24 +1064,24 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
                 // the real unlink. Matches the regular-file branch below.
                 let _ = fs::remove_file(&info_path);
                 let _ = fs::remove_file(&dest);
-                return false;
+                return TrashAttempt::NotTrashed;
             }
             log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
-            return true;
+            return TrashAttempt::Trashed;
         }
     } else if meta.is_dir() {
         // Cross-device dirs: best-effort. For preload, fall back to real delete.
         let _ = fs::remove_file(&info_path);
-        return false;
+        return TrashAttempt::NotTrashed;
     } else if meta.file_type().is_fifo() || meta.file_type().is_socket() {
         // fs::copy on a FIFO blocks forever waiting for a writer (#11);
         // sockets have no persistent data. Let the real unlink proceed.
         let _ = fs::remove_file(&info_path);
-        return false;
+        return TrashAttempt::NotTrashed;
     } else if meta.file_type().is_char_device() || meta.file_type().is_block_device() {
         // Copying a device node would read unbounded data from it.
         let _ = fs::remove_file(&info_path);
-        return false;
+        return TrashAttempt::NotTrashed;
     } else {
         // Regular file: copy + delete original
         if fs::copy(path, &dest).is_err() {
@@ -961,7 +1089,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
             // in the trash (#33).
             let _ = fs::remove_file(&dest);
             let _ = fs::remove_file(&info_path);
-            return false;
+            return TrashAttempt::NotTrashed;
         }
         {
             // Preserve permissions
@@ -971,7 +1099,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
                 Err(_) => {
                     let _ = fs::remove_file(&info_path);
                     let _ = fs::remove_file(&dest);
-                    return false;
+                    return TrashAttempt::NotTrashed;
                 }
             };
             let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
@@ -979,15 +1107,15 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> bool {
                 // Unlink of original failed — clean up the copy to avoid orphan
                 let _ = fs::remove_file(&info_path);
                 let _ = fs::remove_file(&dest);
-                return false;
+                return TrashAttempt::NotTrashed;
             }
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
-            return true;
+            return TrashAttempt::Trashed;
         }
     }
 
     let _ = fs::remove_file(&info_path);
-    false
+    TrashAttempt::NotTrashed
 }
 
 /// Atomically claim a unique trashinfo filename using O_CREAT|O_EXCL.
@@ -1130,6 +1258,17 @@ fn success_with_errno(saved_errno: libc::c_int) -> libc::c_int {
     0
 }
 
+fn finish_attempt(attempt: TrashAttempt, saved_errno: libc::c_int) -> Option<libc::c_int> {
+    match attempt {
+        TrashAttempt::Trashed => Some(success_with_errno(saved_errno)),
+        TrashAttempt::NotTrashed => None,
+        TrashAttempt::UnsafeStore => {
+            unsafe { *libc::__errno_location() = libc::EACCES };
+            Some(-1)
+        }
+    }
+}
+
 fn should_intercept() -> bool {
     !is_bypass_active() && !is_seccomp_active() && !is_process_bypassed()
 }
@@ -1181,9 +1320,10 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
                 if let Ok(meta) = fs::symlink_metadata(&abs)
                     && !should_skip_path(&abs)
                     && !meta.is_dir()
-                    && try_trash(&abs, meta.dev(), meta.ino())
+                    && let Some(result) =
+                        finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
                 {
-                    return Some(success_with_errno(saved_errno));
+                    return Some(result);
                 }
             }
             None
@@ -1234,12 +1374,16 @@ pub unsafe extern "C" fn unlinkat(
                         if is_real_dir
                             && let Ok(mut rd) = fs::read_dir(&abs)
                             && rd.next().is_none()
-                            && try_trash(&abs, meta.dev(), meta.ino())
+                            && let Some(result) =
+                                finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
                         {
-                            return Some(success_with_errno(saved_errno));
+                            return Some(result);
                         }
-                    } else if !is_real_dir && try_trash(&abs, meta.dev(), meta.ino()) {
-                        return Some(success_with_errno(saved_errno));
+                    } else if !is_real_dir
+                        && let Some(result) =
+                            finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                    {
+                        return Some(result);
                     }
                 }
             }
@@ -1288,9 +1432,10 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                     && !should_skip_path(&abs)
                     && let Ok(mut rd) = fs::read_dir(&abs)
                     && rd.next().is_none()
-                    && try_trash(&abs, meta.dev(), meta.ino())
+                    && let Some(result) =
+                        finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
                 {
-                    return Some(success_with_errno(saved_errno));
+                    return Some(result);
                 }
             }
             None
@@ -1408,5 +1553,25 @@ mod tests {
     fn encode_path_preserves_non_utf8_bytes() {
         let path = Path::new(OsStr::from_bytes(b"/home/user/name-\xff \n%?#"));
         assert_eq!(encode_path(path), "/home/user/name-%FF%20%0A%25%3F%23");
+    }
+
+    #[test]
+    fn private_trash_directory_rejects_symlink_and_repairs_mode() {
+        let base = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let private = base.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&private, uid, true).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(ensure_private_dir(&link, uid, true).is_err());
+        assert!(ensure_trusted_ancestors(&link.join("new"), uid).is_err());
+        assert!(!private.join("new").exists());
     }
 }

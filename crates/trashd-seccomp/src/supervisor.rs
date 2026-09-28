@@ -7,7 +7,6 @@
 use crate::mem;
 use crate::pin;
 use std::io;
-use trashd_common::store::TrashError;
 use trashd_common::{Config, TrashStore};
 
 // ---------------------------------------------------------------------------
@@ -284,80 +283,10 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
             let _ = respond_errno(fd, notif.id, e);
         }
         // Kernel lacks pidfd_getfd/openat2, fds couldn't be pinned, or the
-        // trash lives on another device (namespaced targets) → historic
-        // path-based flow (fail-open, cross-device copy support).
-        Ok(pin::Decision::FallBack) | Err(_) => {
-            legacy_handle(fd, notif, store, config, &display, remove_dir)
-        }
-    }
-}
-
-/// Historic path-based handling: resolves names through the supervisor's own
-/// mount context. Kept as the fallback for cross-device moves and kernels
-/// without pidfd_getfd/openat2; see pin.rs for why it is not primary (#6).
-fn legacy_handle(
-    fd: i32,
-    notif: &SeccompNotif,
-    store: &TrashStore,
-    _config: &Config,
-    path: &std::path::Path,
-    remove_dir: bool,
-) {
-    // Check if the file exists and is appropriate to trash
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => {
-            // File doesn't exist or not accessible → let syscall handle the error
-            respond_continue(fd, notif.id);
-            return;
-        }
-    };
-
-    if remove_dir {
-        if !meta.is_dir() {
-            let _ = respond_errno(fd, notif.id, libc::ENOTDIR);
-            return;
-        }
-        // Only trash EMPTY directories (matching rmdir semantics). We must be
-        // able to POSITIVELY confirm emptiness — if read_dir errors we cannot,
-        // so fall back to the real syscall instead of trashing.
-        match std::fs::read_dir(path) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    let _ = respond_errno(fd, notif.id, libc::ENOTEMPTY);
-                    return;
-                }
-            }
-            Err(_) => {
-                respond_continue(fd, notif.id);
-                return;
-            }
-        }
-    } else if meta.is_dir() {
-        // unlink on a directory → EISDIR
-        let _ = respond_errno(fd, notif.id, libc::EISDIR);
-        return;
-    }
-
-    // Attempt to trash the file
-    match store.trash(path, Some("seccomp")) {
-        Ok(_id) => {
-            if respond_success(fd, notif.id).is_err() {
-                // Notification expired (target died) — no harm done
-            }
-        }
-        Err(TrashError::Excluded(_)) => {
-            respond_continue(fd, notif.id);
-        }
-        Err(TrashError::Refused(_)) => {
-            // Trash-self-target: CONTINUE keeps internal cleanup (purge/empty
-            // deleting entries INSIDE the trash) working. Documented fail-open.
-            respond_continue(fd, notif.id);
-        }
-        Err(_) => {
-            // Trash failed — fall back to real delete
-            respond_continue(fd, notif.id);
-        }
+        // trash lives on another device: execute the original syscall in the
+        // target's namespace. A supervisor-side path fallback could resolve
+        // the same string to an unrelated host inode.
+        Err(_) => respond_continue(fd, notif.id),
     }
 }
 

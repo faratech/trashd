@@ -4,8 +4,8 @@
 //! memory, but all filesystem ACTION happens through fd-pinned references —
 //! see pin.rs. The historic string-based base resolution (`/proc/<pid>/cwd`,
 //! `/proc/<pid>/fd/N`) survives only inside [`resolve_syscall_path`], which is
-//! now used for BEST-EFFORT display paths (config checks, logging, .trashinfo)
-//! and as the legacy fallback on kernels without pidfd_getfd/openat2.
+//! now used for BEST-EFFORT display paths (config checks, logging, .trashinfo).
+//! It is never used for a supervisor-side filesystem mutation.
 //!
 //! Residual micro-race: a sibling sharing the target's memory could mutate the
 //! argument buffer between the kernel's capture and our single read. This is

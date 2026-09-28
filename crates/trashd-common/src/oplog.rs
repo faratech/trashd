@@ -7,6 +7,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Log a trash operation.
@@ -125,8 +126,12 @@ fn write_log(home: &Path, message: &str) {
     let result = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+        .and_then(|mut f| {
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(line.as_bytes())
+        });
 
     if let Err(e) = result {
         eprintln!("trashd: failed to write operation log: {e}");

@@ -18,7 +18,7 @@ trashd-common = { path = "../trashd-common" }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 colored = "3"
-zstd = "0.13"
+zstd = "0.14"
 toml = "1"
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

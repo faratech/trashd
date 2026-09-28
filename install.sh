@@ -169,18 +169,76 @@ if [ -f "${SCRIPT_DIR}/bin/trash" ]; then
     COMP_DIR="${SCRIPT_DIR}/share/completions"
     echo "==> Installing from pre-built release..."
 else
-    # Source install — build from cargo
-    echo "==> Updating Rust toolchain and dependencies..."
-    rustup update stable 2>/dev/null || true
-    cargo update --manifest-path="${SCRIPT_DIR}/Cargo.toml" 2>/dev/null || true
+    # Source install — build the locked dependency graph without root privileges.
+    # Build scripts and proc macros execute arbitrary code, so a sudo install must
+    # delegate compilation to the account that invoked sudo.
+    BUILD_STAGE="$(mktemp -d /tmp/trashd-build.XXXXXXXX)"
+    cleanup_build_stage() {
+        if [ -n "${BUILD_STAGE:-}" ]; then
+            if [ -x /usr/bin/rm ]; then
+                /usr/bin/rm -rf -- "${BUILD_STAGE}"
+            else
+                command rm -rf -- "${BUILD_STAGE}"
+            fi
+        fi
+    }
+    trap cleanup_build_stage EXIT
 
-    echo "==> Building trashd..."
-    cargo build --release --manifest-path="${SCRIPT_DIR}/Cargo.toml"
+    BUILD_TARGET="${BUILD_STAGE}/target"
+    if [ "$(id -u)" -eq 0 ]; then
+        case "${SUDO_UID:-}" in
+            ''|*[!0-9]*|0)
+                echo "error: refusing to compile source as root." >&2
+                echo "Run this installer through sudo from a non-root account: sudo ./install.sh" >&2
+                exit 1
+                ;;
+        esac
 
-    TARGET_DIR="${SCRIPT_DIR}/target/release"
+        command -v getent >/dev/null 2>&1 || {
+            echo "error: getent is required to identify the invoking account" >&2
+            exit 1
+        }
+        command -v runuser >/dev/null 2>&1 || {
+            echo "error: runuser is required for an unprivileged source build" >&2
+            exit 1
+        }
+
+        BUILD_PASSWD="$(getent passwd "${SUDO_UID}" || true)"
+        if [ -z "${BUILD_PASSWD}" ]; then
+            echo "error: sudo invoking account UID ${SUDO_UID} does not exist" >&2
+            exit 1
+        fi
+        IFS=: read -r BUILD_USER _ BUILD_UID BUILD_GID _ BUILD_HOME _ <<<"${BUILD_PASSWD}"
+        if [ "${BUILD_UID}" != "${SUDO_UID}" ] || [ "${BUILD_UID}" -eq 0 ] || [ -z "${BUILD_HOME}" ]; then
+            echo "error: invalid non-root sudo invoking account" >&2
+            exit 1
+        fi
+        chown "${BUILD_UID}:${BUILD_GID}" "${BUILD_STAGE}"
+        chmod 0700 "${BUILD_STAGE}"
+
+        if ! runuser -u "${BUILD_USER}" -- test -r "${SCRIPT_DIR}/Cargo.toml"; then
+            echo "error: ${BUILD_USER} cannot read the source tree at ${SCRIPT_DIR}" >&2
+            exit 1
+        fi
+
+        echo "==> Building trashd as ${BUILD_USER} with locked dependencies..."
+        runuser -u "${BUILD_USER}" -- env \
+            -u CARGO_HOME \
+            -u RUSTUP_HOME \
+            HOME="${BUILD_HOME}" \
+            PATH="${BUILD_HOME}/.cargo/bin:${PATH}" \
+            CARGO_TARGET_DIR="${BUILD_TARGET}" \
+            cargo build --release --locked --manifest-path="${SCRIPT_DIR}/Cargo.toml"
+    else
+        echo "==> Building trashd with locked dependencies..."
+        CARGO_TARGET_DIR="${BUILD_TARGET}" \
+            cargo build --release --locked --manifest-path="${SCRIPT_DIR}/Cargo.toml"
+    fi
+
+    TARGET_DIR="${BUILD_TARGET}/release"
     PRELOAD_DIR="${TARGET_DIR}"
-    MAN_SRC="${SCRIPT_DIR}/target/man"
-    COMP_DIR="${SCRIPT_DIR}/target/completions"
+    MAN_SRC="${BUILD_TARGET}/man"
+    COMP_DIR="${BUILD_TARGET}/completions"
 fi
 
 # Atomic artifact replacement: install to a temp name in the SAME directory,

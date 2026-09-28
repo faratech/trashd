@@ -121,7 +121,7 @@ fn is_zstd(path: &std::path::Path) -> bool {
 /// Crash-safe ordering (#23): the `X-Trashd-Compressed` marker is recorded
 /// BEFORE the compressed data is renamed over the original. A crash in the
 // window then leaves plain data with a stale marker — which restore detects
-/// (decode failure) and recovers from — instead of zstd bytes with NO marker,
+/// from the missing zstd magic and recovers from — instead of zstd bytes with NO marker,
 /// which restore would silently serve as "original content". If the final
 /// swap fails, the marker is reverted so the entry stays consistent.
 fn compress_file_zstd(

@@ -86,7 +86,7 @@ The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the k
 
 1. **Child** — Installs the BPF seccomp filter via `syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ...)`, passes the notification file descriptor to the parent via `SCM_RIGHTS` over a Unix socketpair, then `execvp()`'s the target command. Requires `prctl(PR_SET_NO_NEW_PRIVS, 1)` before installing the filter.
 
-2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Validates notification IDs to mitigate TOCTOU races.
+2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Absolute paths are confined to the target's pinned root. Relative walks that escape a pinned cwd/dirfd are handed back to the target kernel; the supervisor never retries them through a host-namespace display path. Validates notification IDs to mitigate TOCTOU races.
 
 3. **Watchdog** — Holds a `dup()`'d copy of the notification fd. Monitors the supervisor via `waitpid()`. On supervisor death: immediately drains all pending notifications with `CONTINUE` (fail-safe — blocked processes resume with real deletes), then forks a new supervisor. If fork fails, enters emergency passthrough mode (responds `CONTINUE` to everything forever).
 
@@ -121,19 +121,21 @@ cd trashd
 sudo ./install.sh
 ```
 
-Requires Rust (cargo). The install script:
+Requires Rust (cargo). For a source checkout, run the installer through `sudo`
+from the non-root account that owns the checkout. Compilation runs as that
+account in a private staging directory and uses the committed `Cargo.lock`.
+The install script:
 
-1. Updates the Rust toolchain and workspace dependencies
-2. Builds all crates in release mode
-3. Installs binaries to `/usr/local/bin/` and `/usr/local/lib/trashd/`
-4. Stashes the real `rm` binary at `/usr/local/lib/trashd/real/rm`
-5. Creates the PATH shim at `/usr/local/lib/trashd/bin/rm` (+ `unlink` symlink)
-6. Adds `libtrashd_preload.so` to `/etc/ld.so.preload` (system-wide)
-7. Installs `/etc/profile.d/trashd.sh` (PATH shim + seccomp wrapper)
-8. Installs and starts the `trashd` systemd service
-9. Installs man pages to `/usr/local/share/man/man1/`
-10. Installs shell completions for bash, zsh, and fish
-11. Creates global config at `/etc/trashd/config.toml`
+1. Builds all crates in release mode with locked dependencies
+2. Installs binaries to `/usr/local/bin/` and `/usr/local/lib/trashd/`
+3. Stashes the real `rm` binary at `/usr/local/lib/trashd/real/rm`
+4. Creates the PATH shim at `/usr/local/lib/trashd/bin/rm` (+ `unlink` symlink)
+5. Adds `libtrashd_preload.so` to `/etc/ld.so.preload` (system-wide)
+6. Installs `/etc/profile.d/trashd.sh` (PATH shim + seccomp wrapper)
+7. Installs and starts the `trashd` systemd service
+8. Installs man pages to `/usr/local/share/man/man1/`
+9. Installs shell completions for bash, zsh, and fish
+10. Creates global config at `/etc/trashd/config.toml`
 
 Start a new shell or run:
 ```bash
@@ -154,7 +156,7 @@ Pass `--purge` to also remove **all FreeDesktop.org trash directories** across a
 ### Manual install
 
 ```bash
-cargo build --release
+cargo build --release --locked
 cp target/release/trash /usr/local/bin/
 cp target/release/trashd-rm /usr/local/lib/trashd/bin/rm
 cp target/release/libtrashd_preload.so /usr/local/lib/trashd/
@@ -439,9 +441,9 @@ Changing `hash_algorithm` in the config does **not** require rehashing existing 
 ### Fail-safe design
 
 Interception failures can fall back to permanent deletion:
-- **Shim** — Uses real deletion for explicit bypasses, excluded paths, and storage failures. Invalid options return an error without deleting; repeated valid flags retain trash protection.
-- **Preload** — Returns the result of the real `unlink()`/`rmdir()` if trash fails
-- **Seccomp** — Responds with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (execute real syscall)
+- **Shim** — Uses real deletion only for explicit bypasses and configured excluded paths. Unsafe or unavailable trash storage returns an error without deleting.
+- **Preload** — Rejects an unsafe trash directory with `EACCES`; other operational failures return the result of the real `unlink()`/`rmdir()`.
+- **Seccomp** — Responds with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` when pinned resolution or storage is unavailable, so the target kernel executes the syscall in the target's own namespace.
 - **Watchdog** — On supervisor crash, drains all pending notifications with `CONTINUE`
 
 These fallback paths preserve the calling program's ability to delete, but the files may be unrecoverable. The seccomp wrapper aborts if it installs a filter but cannot establish a supervisor, preventing the command from running with a stranded listener.
@@ -500,9 +502,9 @@ Per the FreeDesktop spec: "If info file corresponding to file in $trash/files is
 trashd implements the complete [FreeDesktop.org Trash specification v1.0](https://specifications.freedesktop.org/trash/latest/):
 
 ### Directory structure
-- `$XDG_DATA_HOME/Trash/` home directory trash with `files/` and `info/` subdirectories
-- `$topdir/.Trash/$UID/` shared topdir trash (validated: must be a real directory, not a symlink, with sticky bit set)
-- `$topdir/.Trash-$UID/` per-user topdir trash (fallback when shared trash validation fails)
+- `$XDG_DATA_HOME/Trash/` home directory trash with private, current-user-owned `files/` and `info/` subdirectories
+- `$topdir/.Trash/$UID/` shared topdir trash (the shared parent must be root/current-user owned, real, and sticky; the UID directory is owner-validated and mode `0700`)
+- `$topdir/.Trash-$UID/` private, owner-validated per-user topdir trash (fallback when shared trash validation fails; unsafe candidates fall back to the home trash)
 - `$trash/directorysizes` cache (size, trashinfo mtime, percent-encoded name — updated via atomic rename)
 
 ### .trashinfo format

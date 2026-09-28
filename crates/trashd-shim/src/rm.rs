@@ -148,8 +148,8 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!("trashd: failed to open trash store: {e}");
-            eprintln!("trashd: falling back to real rm");
-            return passthrough();
+            eprintln!("trashd: refusing removal because protected storage is unavailable");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -282,11 +282,8 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("trashd: failed to trash '{}': {e}", file.display());
-                eprintln!("trashd: falling back to real rm for this file");
-                if let Err(e) = real_rm(file, args.recursive) {
-                    eprintln!("rm: cannot remove '{}': {e}", file.display());
-                    exit_code = ExitCode::FAILURE;
-                }
+                eprintln!("trashd: refusing permanent removal; use --permanent to bypass trash");
+                exit_code = ExitCode::FAILURE;
             }
         }
     }

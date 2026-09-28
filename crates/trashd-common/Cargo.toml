@@ -11,13 +11,13 @@ categories.workspace = true
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zstd = "0.13"
+zstd = "0.14"
 toml = "1"
 thiserror = "2"
 url = "2"

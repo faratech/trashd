@@ -6,8 +6,7 @@ on:
   workflow_dispatch:       # manual trigger
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: deps-update-${{ github.ref }}
@@ -17,13 +16,16 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.97.0
-
-      - name: Update Rust toolchain
-        run: rustup update stable
+      - uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Update dependencies
         run: cargo update
@@ -39,16 +41,69 @@ jobs:
 
       - name: Build with updated deps
         if: steps.diff.outputs.changed == 'true'
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Run tests
         if: steps.diff.outputs.changed == 'true'
-        run: TRASH_BYPASS=1 cargo test --workspace -- --test-threads=1
+        run: TRASH_BYPASS=1 cargo test --workspace --locked -- --test-threads=1
+
+      - name: Validate updated lockfile
+        if: steps.diff.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Cargo.lock
+          test ! -L Cargo.lock
+          test "$(git diff --name-only --diff-filter=ACDMRTUXB | sort -u)" = "Cargo.lock"
+          cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Upload validated lockfile
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
+
+  create-pr:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download validated lockfile
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-cargo-lock
+          path: ${{ runner.temp }}/updated-cargo-lock
+
+      - name: Install validated lockfile
+        shell: bash
+        env:
+          LOCK_ARTIFACT_DIR: ${{ runner.temp }}/updated-cargo-lock
+        run: |
+          set -euo pipefail
+          lock="${LOCK_ARTIFACT_DIR}/Cargo.lock"
+          test "$(find "${LOCK_ARTIFACT_DIR}" -mindepth 1 -maxdepth 1 -printf x | wc -c)" -eq 1
+          test -f "${lock}"
+          test ! -L "${lock}"
+          test "$(stat -c %h "${lock}")" -eq 1
+          test -f Cargo.lock
+          test ! -L Cargo.lock
+          install -m 0644 -- "${lock}" Cargo.lock
 
       - name: Create PR
-        if: steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
+          token: ${{ github.token }}
           commit-message: 'chore: update dependencies'
           title: 'chore: weekly dependency update'
           body: |

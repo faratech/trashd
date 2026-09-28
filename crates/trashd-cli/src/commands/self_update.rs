@@ -1,5 +1,12 @@
 use crate::util::*;
 use colored::Colorize;
+use std::ffi::{CString, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 const GITHUB_REPO: &str = "faratech/trashd";
 
@@ -19,33 +26,223 @@ struct GhAsset {
     size: u64,
 }
 
-/// Path to the update check marker file.
-fn update_check_marker() -> PathBuf {
-    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+/// Path to the update check marker file. The cache is optional: when neither
+/// XDG_CACHE_HOME nor HOME is available, do not fall back to a shared location.
+fn update_check_marker() -> Option<PathBuf> {
+    update_check_marker_from(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+}
+
+fn update_check_marker_from(
+    xdg_cache_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    let cache_dir = xdg_cache_home
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache")
-        });
-    cache_dir.join("trashd").join("last-update-check")
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|path| path.join(".cache"))
+        })?;
+    Some(cache_dir.join("trashd").join("last-update-check"))
 }
 
 fn cached_update_check() -> Option<String> {
-    let marker = update_check_marker();
-    let meta = std::fs::metadata(&marker).ok()?;
-    let age = meta.modified().ok()?.elapsed().ok()?;
-    if age.as_secs() < 86400 {
-        std::fs::read_to_string(&marker).ok()
-    } else {
-        None
+    let marker = update_check_marker()?;
+    validate_cache_parent(marker.parent()?).ok()?;
+
+    // O_NOFOLLOW rejects a marker symlink instead of reading an attacker-chosen
+    // target. Limit the tiny cache record so a corrupted file cannot allocate
+    // arbitrary memory during an update check.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&marker)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return None;
     }
+    let age = meta.modified().ok()?.elapsed().ok()?;
+    if age.as_secs() >= 86400 {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(256)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn write_update_check_cache(version: &str) {
-    let marker = update_check_marker();
-    if let Some(parent) = marker.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let Some(marker) = update_check_marker() else {
+        return;
+    };
+    let _ = write_update_check_cache_at(&marker, version);
+}
+
+/// Validate the application-owned cache directory before using it. A symlink
+/// here could redirect a privileged invocation into an attacker-selected tree.
+fn validate_cache_parent(parent: &Path) -> std::io::Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    let mut current = parent;
+    loop {
+        let meta = fs::symlink_metadata(current)?;
+        let mode = meta.permissions().mode();
+        let is_app_dir = current == parent;
+        if !meta.file_type().is_dir()
+            || meta.file_type().is_symlink()
+            || (is_app_dir && meta.uid() != uid)
+            || (!is_app_dir && meta.uid() != 0 && meta.uid() != uid)
+            || (is_app_dir && mode & 0o022 != 0)
+            || (!is_app_dir && mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "update cache path has an unsafe owner, mode, or symlink ancestor",
+            ));
+        }
+        match current.parent() {
+            Some(next) if next != current => current = next,
+            _ => break,
+        }
     }
-    let _ = std::fs::write(&marker, version);
+    Ok(())
+}
+
+/// Create a cache parent by walking from a pinned root/cwd descriptor. Each
+/// component is opened with O_NOFOLLOW before the next one is created, so an
+/// attacker cannot redirect recursive creation through a raced symlink.
+fn ensure_cache_parent(path: &Path) -> std::io::Result<()> {
+    use std::path::Component;
+
+    let uid = unsafe { libc::geteuid() };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let components: Vec<_> = absolute
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir | Component::CurDir => None,
+            Component::Normal(name) => Some(Ok(name)),
+            Component::ParentDir | Component::Prefix(_) => Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe update cache path",
+            ))),
+        })
+        .collect::<std::io::Result<_>>()?;
+
+    let root = CString::new("/").expect("static CString");
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut directory = unsafe { fs::File::from_raw_fd(root_fd) };
+
+    for (index, component) in components.iter().enumerate() {
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let open_component = || unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+
+        let mut child_fd = open_component();
+        if child_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "update cache path contains a symlink or non-directory component",
+                ));
+            }
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
+            let created =
+                unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o700) };
+            if created != 0 {
+                let mkdir_error = std::io::Error::last_os_error();
+                if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(mkdir_error);
+                }
+            }
+            child_fd = open_component();
+            if child_fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                ) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "update cache path contains a raced symlink or non-directory component",
+                    ));
+                }
+                return Err(error);
+            }
+        }
+
+        let child = unsafe { fs::File::from_raw_fd(child_fd) };
+        let meta = child.metadata()?;
+        let mode = meta.permissions().mode();
+        let is_app_dir = index + 1 == components.len();
+        if !meta.is_dir()
+            || (is_app_dir && meta.uid() != uid)
+            || (!is_app_dir && meta.uid() != 0 && meta.uid() != uid)
+            || (is_app_dir && mode & 0o022 != 0)
+            || (!is_app_dir && mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "update cache path has an unsafe owner or mode",
+            ));
+        }
+        directory = child;
+    }
+
+    // The descriptor walk establishes that every name is stable against other
+    // users. Keep the ordinary path validator as a final defense before the
+    // tempfile API reopens the application directory by name.
+    validate_cache_parent(&absolute)
+}
+
+fn write_update_check_cache_at(marker: &Path, version: &str) -> std::io::Result<()> {
+    let parent = marker.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cache marker has no parent",
+        )
+    })?;
+
+    ensure_cache_parent(parent)?;
+
+    // Write beside the marker and atomically rename it into place. rename(2)
+    // replaces a marker symlink itself; it never follows the symlink and writes
+    // through to its target.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(version.as_bytes())?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(marker).map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub fn run(check_only: bool) {
@@ -439,4 +636,77 @@ fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<
     let mut archive = tar::Archive::new(gz);
     archive.unpack(dest).map_err(|e| format!("extract: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn update_cache_has_no_shared_tmp_fallback() {
+        assert_eq!(update_check_marker_from(None, None), None);
+        assert_eq!(
+            update_check_marker_from(None, Some(OsString::from("/home/alice"))),
+            Some(PathBuf::from("/home/alice/.cache/trashd/last-update-check"))
+        );
+        assert_eq!(
+            update_check_marker_from(
+                Some(OsString::from("/var/cache/alice")),
+                Some(OsString::from("/home/alice")),
+            ),
+            Some(PathBuf::from("/var/cache/alice/trashd/last-update-check"))
+        );
+    }
+
+    #[test]
+    fn cache_write_replaces_marker_symlink_without_touching_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("cache").join("trashd");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "do not replace").unwrap();
+        let marker = parent.join("last-update-check");
+        symlink(&victim, &marker).unwrap();
+
+        write_update_check_cache_at(&marker, "9.9.9").unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "do not replace");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "9.9.9");
+        assert!(fs::symlink_metadata(&marker).unwrap().file_type().is_file());
+        assert_eq!(
+            fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn cache_write_rejects_symlinked_application_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let redirected = temp.path().join("redirected");
+        fs::create_dir(&redirected).unwrap();
+        let cache_dir = temp.path().join("trashd");
+        symlink(&redirected, &cache_dir).unwrap();
+
+        let marker = cache_dir.join("last-update-check");
+        let error = write_update_check_cache_at(&marker, "9.9.9").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!redirected.join("last-update-check").exists());
+    }
+
+    #[test]
+    fn cache_write_rejects_symlinked_missing_path_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let redirected = temp.path().join("redirected");
+        fs::create_dir(&redirected).unwrap();
+        let link = temp.path().join("cache-link");
+        symlink(&redirected, &link).unwrap();
+        let marker = link.join("new").join("trashd").join("last-update-check");
+
+        assert!(write_update_check_cache_at(&marker, "9.9.9").is_err());
+        assert!(!redirected.join("new").exists());
+    }
 }

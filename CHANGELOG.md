@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.1.4 (2026-09-27)
+
+### Fixed — deletion and restore safety
+
+- The `rm` shim now reports an error and leaves files in place if the trash
+  store cannot be opened or a trash operation fails. Explicit `--permanent`
+  remains available for intentional permanent removal.
+- Trash roots and their `files`/`info` directories are checked for ownership,
+  symlinks, and private permissions before use. Unsafe mount trash locations
+  fall back to the home trash; read and destructive scans skip unsafe stores.
+  The preload hook returns `EACCES` for an unsafe store instead of deleting.
+- Restore pins the destination and source directories, refuses to overwrite a
+  newly created destination, and copies across filesystems through exclusively
+  claimed entries. Failed copies keep the trash source and avoid removing
+  entries that another process replaced or added.
+- Compressed restore bounds decompression memory and output, retains corrupt
+  zstd payloads for recovery, and clears a stale compression marker when the
+  stored content is still plain text.
+- Seccomp path handling confines absolute paths to the target root and relative
+  paths to the pinned base. When pinning, resolution, or storage fails, the
+  target's own syscall runs in its namespace; the supervisor no longer retries
+  a deletion through a path in its host namespace.
+
+### Fixed — installation and diagnostics
+
+- Source installs build with the committed `Cargo.lock` in a private staging
+  directory. Under `sudo`, compilation runs as the invoking non-root account;
+  the installer no longer updates Rust or dependencies during installation.
+  CLI man page and completion generation honors `CARGO_TARGET_DIR`.
+- The self-update check cache uses a private, validated path and an atomic
+  marker replacement, rejecting symlinked directories without writing through
+  them or falling back to a shared temporary location.
+- Deletion and mount logs escape arbitrary filename and process-name bytes on
+  one line, and the operation log is restricted to mode `0600`.
+
+### Dependencies and tooling
+
+- Pin Rust 1.98.1 for local builds and release/dependency workflows while
+  retaining Rust 1.97 as the minimum supported version.
+- Update `dirs` to 7 and `zstd` to 0.14, along with compatible locked
+  dependencies. The weekly dependency workflow validates its lockfile before
+  opening an update pull request.
+- Update the README's install, fallback, and trash-directory guidance to match
+  these changes.
+
 ## 0.1.3 (2026-08-22)
 
 Bug-fix release from a 16-agent adversarially-verified security audit (52

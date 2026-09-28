@@ -3,12 +3,13 @@ use crate::index::TrashIndex;
 use crate::mounts;
 use crate::trashinfo::TrashInfo;
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
-use std::os::fd::RawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use xxhash_rust::xxh3::Xxh3;
@@ -100,32 +101,28 @@ impl TrashStore {
     }
 
     fn open_with(home: PathBuf, config: Config, isolated: bool) -> Result<Self, TrashError> {
-        // /tmp fallback (#35): the base must be ours and private, or a local
-        // attacker could have pre-created it to harvest trashed files.
-        if home.starts_with("/tmp/trashd-home-") {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let base = home.parent().unwrap_or(&home).to_path_buf();
-            fs::create_dir_all(&base)?;
-            let m = fs::symlink_metadata(&base)?;
-            if m.uid() != unsafe { libc::getuid() } {
-                return Err(TrashError::Io(io::Error::other(format!(
-                    "refusing to use {}: not owned by current user",
-                    base.display()
-                ))));
-            }
-            if m.permissions().mode() & 0o077 != 0 {
-                let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
-            }
+        let uid = unsafe { libc::geteuid() };
+
+        // /tmp fallback (#35): validate the exact uid-specific base, not the
+        // child `Trash` path (which never starts with `/tmp/trashd-home-` as a
+        // path component). It must be a private real directory owned by the
+        // effective user before anything sensitive is written below it.
+        let fallback_base = PathBuf::from(format!("/tmp/trashd-home-{uid}"));
+        if home == fallback_base.join("Trash") {
+            ensure_trusted_parent(&fallback_base, uid)?;
+            ensure_private_dir(&fallback_base, uid, true)?;
+        } else if let Some(parent) = home.parent() {
+            ensure_trusted_ancestors(parent, uid)?;
         }
 
-        fs::create_dir_all(home.join("files"))?;
-        fs::create_dir_all(home.join("info"))?;
-        fs::create_dir_all(home.join(".trashd"))?;
+        ensure_private_dir(&home, uid, true)?;
+        ensure_private_dir(&home.join("files"), uid, true)?;
+        ensure_private_dir(&home.join("info"), uid, true)?;
+        ensure_private_dir(&home.join(".trashd"), uid, true)?;
 
         // The index is an optional accelerator. If it can't be opened (lock
         // contention, corruption, read-only FS) we degrade to no-index rather
-        // than failing — a failed open here would otherwise make the seccomp
-        // supervisor and shim fall back to permanent deletion.
+        // than failing — the authoritative files and sidecars remain usable.
         let index = match TrashIndex::open(&home.join(crate::index::REL_PATH)) {
             Ok(idx) => Some(idx),
             Err(e) => {
@@ -159,7 +156,7 @@ impl TrashStore {
                 .map(PathBuf::from)
                 .map(|h| h.join(".local/share"))
                 .unwrap_or_else(|| {
-                    PathBuf::from(format!("/tmp/trashd-home-{}", unsafe { libc::getuid() }))
+                    PathBuf::from(format!("/tmp/trashd-home-{}", unsafe { libc::geteuid() }))
                 })
         });
         base.join("Trash")
@@ -232,19 +229,10 @@ impl TrashStore {
 
     /// Ensure a trash directory has the required subdirectories.
     fn ensure_trash_dir(&self, trash_dir: &Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        fs::create_dir_all(trash_dir.join("files"))?;
-        fs::create_dir_all(trash_dir.join("info"))?;
-        // Topdir trashes (.Trash-$uid / .Trash/$uid) live on shared mounts; the
-        // spec requires them to be private (0700) so other local users cannot
-        // read a victim's deleted files or their original-path metadata. The
-        // home trash already sits inside $HOME, so it is left untouched.
-        if trash_dir != self.home {
-            let private = fs::Permissions::from_mode(0o700);
-            let _ = fs::set_permissions(trash_dir, private.clone());
-            let _ = fs::set_permissions(trash_dir.join("files"), private.clone());
-            let _ = fs::set_permissions(trash_dir.join("info"), private);
-        }
+        let uid = unsafe { libc::geteuid() };
+        ensure_private_dir(trash_dir, uid, false)?;
+        ensure_private_dir(&trash_dir.join("files"), uid, true)?;
+        ensure_private_dir(&trash_dir.join("info"), uid, true)?;
         Ok(())
     }
 
@@ -317,8 +305,7 @@ impl TrashStore {
         // Refuse to trash the trash directory itself, anything inside it, or
         // any ancestor of it: rename would fail (dest inside src), the
         // cross-device fallback would copy the store into itself until the
-        // depth cap, and a failed move lets callers fall back to PERMANENT
-        // deletion of the entire store. `rm -rf ~/.local/share/Trash` must
+        // depth cap. `rm -rf ~/.local/share/Trash` must
         // never destroy the trash. Callers treat Refused as a hard stop —
         // NOT Excluded, which means "real-delete on purpose".
         if abs_path == trash_dir
@@ -487,8 +474,8 @@ impl TrashStore {
     /// never re-looked-up through it.
     ///
     /// Errors with EXDEV when the selected trash lives on another filesystem
-    /// than the pinned inode (namespaced targets, device mismatch): callers
-    /// fall back to the legacy path-based [`Self::trash`].
+    /// than the pinned inode (namespaced targets, device mismatch) are surfaced
+    /// so the target can execute its original syscall inside its namespace.
     pub fn trash_at(
         &self,
         parent_fd: RawFd,
@@ -582,7 +569,7 @@ impl TrashStore {
 
         // The trash files/ dir must be on the SAME filesystem as the pinned
         // inode or renameat would cross devices; surface that distinctly so
-        // the caller can apply its legacy fallback.
+        // the supervisor can continue the target's original syscall.
         let files_dir = trash_dir.join("files");
         let c_files_dir = match std::ffi::CString::new(files_dir.as_os_str().as_bytes()) {
             Ok(c) => c,
@@ -974,8 +961,25 @@ impl TrashStore {
             }
         }
 
+        // Resolve the destination parent once, then keep that exact directory
+        // pinned for every subsequent check and publication syscall. Recorded
+        // paths are untrusted metadata, so their ancestors may not be
+        // symlinks. Explicit --to paths are user-selected and may follow
+        // symlinks, but the directory reached here is still pinned against a
+        // later ancestor swap.
+        let destination =
+            resolve_restore_destination(&restore_to, target.is_none()).map_err(|e| {
+                if target.is_none()
+                    && matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
+                {
+                    TrashError::RestoreTraversal(restore_to.clone())
+                } else {
+                    TrashError::Io(e)
+                }
+            })?;
+
         // Check before decoding so a normal conflict never rewrites the entry.
-        if fs::symlink_metadata(&restore_to).is_ok() {
+        if destination_exists(&destination)? {
             return Err(TrashError::RestoreConflict(restore_to));
         }
         if entry.identity.is_none()
@@ -999,40 +1003,21 @@ impl TrashStore {
             .map(|m| m.is_file())
             .unwrap_or(false);
         if entry.info.compressed.as_deref() == Some("zstd") && stored_is_regular {
-            let data = fs::read(&entry.trashed_path)?;
-            match zstd::decode_all(data.as_slice()) {
-                Ok(decompressed) => {
-                    atomic_write(&entry.trashed_path, &decompressed)?;
-                }
-                Err(e) => {
-                    // Marker present but payload isn't valid zstd: a crash
-                    // between writing the marker and swapping the data leaves
-                    // exactly this state (#28). Serve the stored bytes as-is
-                    // instead of failing — the entry must stay recoverable.
-                    eprintln!(
-                        "trashd: warning: entry '{}' is marked compressed but not valid zstd ({e}); restoring stored bytes as-is",
-                        entry.id
-                    );
-                }
-            }
-            // The data is no longer compressed; clear the marker so a later
-            // failure (or re-restore) can never attempt a second decode.
-            let mut cleared = entry.info.clone();
-            cleared.compressed = None;
-            let _ = write_trashinfo_atomic(&entry.info_path, &cleared);
-            entry.info = cleared;
-            entry.identity = file_identity(&entry.trashed_path);
-            entry.sidecar_version = sidecar_version(&entry.info_path);
+            let configured = self.config.max_file_size_mb.saturating_mul(1024 * 1024);
+            const HARD_DECOMPRESS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+            let max_output = if configured == 0 {
+                HARD_DECOMPRESS_LIMIT
+            } else {
+                configured.min(HARD_DECOMPRESS_LIMIT)
+            };
+            decompress_zstd_entry(entry, max_output)?;
         }
 
-        // Check for conflicts (use symlink_metadata so dangling symlinks are detected)
-        if fs::symlink_metadata(&restore_to).is_ok() {
+        // Re-check through the pinned parent after decompression. The publish
+        // syscall below is also no-clobber, so a creation after this check is
+        // still reported as a conflict rather than overwritten.
+        if destination_exists(&destination)? {
             return Err(TrashError::RestoreConflict(restore_to));
-        }
-
-        // Ensure parent directory exists
-        if let Some(parent) = restore_to.parent() {
-            fs::create_dir_all(parent)?;
         }
 
         if file_identity(&entry.trashed_path) != entry.identity
@@ -1043,36 +1028,53 @@ impl TrashStore {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
 
-        // Move back. Use a no-clobber rename so the check-then-rename window
-        // above cannot be raced into overwriting a file created in between.
-        // EEXIST → RestoreConflict; EXDEV / unsupported-flag → copy fallback.
-        let needs_copy = match rename_noreplace(&entry.trashed_path, &restore_to) {
-            Ok(()) => false,
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+        let source_parent = open_directory_nofollow(&entry.trash_root.join("files"))?;
+        let source_name = CString::new(entry.id.as_bytes())
+            .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
+        let source_stat = stat_at(
+            source_parent.as_raw_fd(),
+            &source_name,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )?;
+        let expected_identity = entry
+            .identity
+            .ok_or_else(|| TrashError::EntryNotFound(entry.id.clone()))?;
+        if stat_identity(&source_stat) != expected_identity {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
+        let source_is_regular = source_stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+
+        // Publish relative to pinned source and destination directories. There
+        // is deliberately no plain-rename fallback: every path either uses
+        // RENAME_NOREPLACE or creates the destination with an exclusive *at
+        // syscall before streaming a copy.
+        match rename_noreplace_at(
+            source_parent.as_raw_fd(),
+            &source_name,
+            destination.parent.as_raw_fd(),
+            &destination.name,
+        ) {
+            Ok(()) => {}
+            Err(e) if is_conflict_error(&e) => {
                 return Err(TrashError::RestoreConflict(restore_to));
             }
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) => {
-                // Kernel/filesystem without RENAME_NOREPLACE: fall back to a
-                // plain rename (the conflict check above guarded the dest).
-                fs::rename(&entry.trashed_path, &restore_to).is_err()
+            Err(e) if is_copy_fallback_error(&e) => {
+                publish_copy_noreplace(
+                    source_parent.as_raw_fd(),
+                    &source_name,
+                    destination.parent.as_raw_fd(),
+                    &destination.name,
+                    expected_identity,
+                )
+                .map_err(|copy_error| {
+                    if is_conflict_error(&copy_error) {
+                        TrashError::RestoreConflict(restore_to.clone())
+                    } else {
+                        TrashError::Io(copy_error)
+                    }
+                })?;
             }
-            Err(_) => true, // cross-device or other rename failure
-        };
-        if needs_copy {
-            let meta = fs::symlink_metadata(&entry.trashed_path)?;
-            if meta.file_type().is_symlink() {
-                let target_link = fs::read_link(&entry.trashed_path)?;
-                std::os::unix::fs::symlink(&target_link, &restore_to)?;
-                fs::remove_file(&entry.trashed_path)?;
-            } else if meta.is_dir() {
-                copy_tree(&entry.trashed_path, &restore_to)?;
-                fs::remove_dir_all(&entry.trashed_path)?;
-            } else {
-                fs::copy(&entry.trashed_path, &restore_to)?;
-                let perms = meta.permissions();
-                fs::set_permissions(&restore_to, perms)?;
-                fs::remove_file(&entry.trashed_path)?;
-            }
+            Err(e) => return Err(TrashError::Io(e)),
         }
 
         // (Decompression already happened in-trash, before the move above.)
@@ -1082,10 +1084,12 @@ impl TrashStore {
         // We verify AFTER restore so the file is already in place — a mismatch is
         // reported as a warning, not a rollback (the user can decide what to do).
         let hash_warning = if let Some(ref expected_hash) = entry.info.sha256 {
-            if restore_to.is_file() {
+            if source_is_regular {
                 // Try both algorithms — we don't know which was used originally
-                let xxhash = hash_file(&restore_to, "xxhash").ok();
-                let sha256 = hash_file(&restore_to, "sha256").ok();
+                let xxhash =
+                    hash_file_at(destination.parent.as_raw_fd(), &destination.name, "xxhash").ok();
+                let sha256 =
+                    hash_file_at(destination.parent.as_raw_fd(), &destination.name, "sha256").ok();
                 if xxhash.as_deref() == Some(expected_hash.as_str())
                     || sha256.as_deref() == Some(expected_hash.as_str())
                 {
@@ -1321,8 +1325,8 @@ impl TrashStore {
             {
                 // Record the compression marker BEFORE swapping the data
                 // (#28): a crash in the window then leaves plain data with a
-                // stale marker — which restore detects (decode fails) and
-                // recovers from — instead of zstd bytes with NO marker,
+                // stale marker — which restore recognizes by the missing zstd
+                // magic and recovers from — instead of zstd bytes with NO marker,
                 // which restore would silently serve as "original content".
                 // Atomic writes throughout: an interrupted compress must
                 // never truncate the SOLE remaining copy of the user's
@@ -1660,6 +1664,247 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
+/// Create or validate one directory in the authenticated trash hierarchy.
+/// Every writable store component is a real directory, owned by the effective
+/// user, with no group/other permissions. A failed chmod is fatal: silently
+/// accepting the old mode would expose deleted data and metadata.
+fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    let mut meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be a real directory owned by uid {uid}",
+                path.display()
+            ),
+        ));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        meta = fs::symlink_metadata(path)?;
+    }
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != uid
+        || meta.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a private trash directory", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_trusted_parent(path: &Path, uid: u32) -> io::Result<()> {
+    let mut current = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent"))?;
+    loop {
+        let metadata = fs::symlink_metadata(current)?;
+        let mode = metadata.permissions().mode();
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} can be replaced by another user and is not a safe trash ancestor",
+                    current.display()
+                ),
+            ));
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// Create missing ancestors one component at a time and authenticate every
+/// component before descending through it. This avoids following an
+/// attacker-provided symlink while preparing a configured XDG/HOME path.
+fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
+    use std::path::Component;
+
+    let directory = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(directory)
+    };
+    let mut current = PathBuf::from("/");
+    for component in directory.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => current.push(name),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsafe trash ancestor path",
+                ));
+            }
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::DirBuilder::new().mode(0o700).create(&current) {
+                    Ok(()) => {}
+                    Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+
+        let metadata = fs::symlink_metadata(&current)?;
+        let mode = metadata.permissions().mode();
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} can be replaced by another user and is not a safe trash ancestor",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decompress a marked entry with bounded memory and bounded output. The
+/// compressed source remains untouched until a complete plaintext sibling has
+/// been written, synced, and the entry identity has been revalidated.
+fn decompress_zstd_entry(entry: &mut TrashEntry, max_output: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let expected_identity = entry
+        .identity
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "trash entry was replaced"))?;
+    let expected_sidecar = entry
+        .sidecar_version
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "trash metadata was replaced"))?;
+    let mut input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&entry.trashed_path)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "trash entry was replaced during decompression",
+        ));
+    }
+    input.lock()?;
+    if file_identity(&entry.trashed_path) != Some(expected_identity)
+        || sidecar_version(&entry.info_path) != Some(expected_sidecar)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "trash entry changed during decompression",
+        ));
+    }
+
+    let mut magic = [0u8; 4];
+    let has_zstd_magic = match input.read_exact(&mut magic) {
+        Ok(()) => u32::from_le_bytes(magic) == 0xFD2FB528,
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => false,
+        Err(error) => return Err(error),
+    };
+    input.seek(SeekFrom::Start(0))?;
+
+    let mut cleared = entry.info.clone();
+    cleared.compressed = None;
+    if !has_zstd_magic {
+        // Compression records the marker first. A crash in that narrow window
+        // leaves ordinary plaintext plus a stale marker; clear only that known
+        // state. A payload with real zstd magic must decode successfully.
+        write_trashinfo_atomic(&entry.info_path, &cleared)?;
+        entry.info = cleared;
+        entry.sidecar_version = sidecar_version(&entry.info_path);
+        return Ok(());
+    }
+
+    let parent = entry
+        .trashed_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "entry has no parent"))?;
+    let mut staging = tempfile::Builder::new()
+        .prefix(".trashd-decompress-")
+        .tempfile_in(parent)?;
+    let mut decoder = zstd::stream::Decoder::new(&mut input)?;
+    // Cap decoder history to 8 MiB so a hostile frame cannot request an
+    // attacker-controlled allocation even before output accounting starts.
+    decoder.window_log_max(23)?;
+    let written = io::copy(
+        &mut decoder.take(max_output.saturating_add(1)),
+        &mut staging,
+    )?;
+    if written > max_output {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("decompressed entry exceeds {max_output} bytes"),
+        ));
+    }
+
+    let staged_metadata = staging.as_file().metadata()?;
+    if (staged_metadata.uid(), staged_metadata.gid()) != (metadata.uid(), metadata.gid())
+        && unsafe {
+            libc::fchown(
+                staging.as_file().as_raw_fd(),
+                metadata.uid(),
+                metadata.gid(),
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    staging.as_file().set_permissions(metadata.permissions())?;
+    staging.as_file().sync_all()?;
+
+    if file_identity(&entry.trashed_path) != Some(expected_identity)
+        || sidecar_version(&entry.info_path) != Some(expected_sidecar)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "trash entry changed before decompression commit",
+        ));
+    }
+    staging
+        .persist(&entry.trashed_path)
+        .map_err(|error| error.error)?;
+    entry.identity = file_identity(&entry.trashed_path);
+
+    // Treat marker retirement as part of the transaction. If it fails, leave
+    // the recoverable plaintext+marker state; the next restore recognizes the
+    // missing magic and retries this write without decoding the file again.
+    write_trashinfo_atomic(&entry.info_path, &cleared)?;
+    entry.info = cleared;
+    entry.sidecar_version = sidecar_version(&entry.info_path);
+    Ok(())
+}
+
 /// Detect replacement and in-place edits without rereading each sidecar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SidecarVersion {
@@ -1868,23 +2113,237 @@ pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<
     atomic_write(info_path, info.to_trashinfo_string().as_bytes())
 }
 
-/// Rename `src` → `dst` but fail with `EEXIST` instead of clobbering an
-/// existing `dst` (`renameat2(RENAME_NOREPLACE)`), closing the
-/// check-then-rename TOCTOU on restore. Callers inspect the raw OS error
-/// (`EEXIST` → conflict, `EXDEV`/`ENOSYS`/`EINVAL` → copy/plain fallback).
-fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
+struct RestoreDestination {
+    parent: fs::File,
+    name: CString,
+}
+
+/// Resolve (and, when needed, create) a restore destination's parent one
+/// component at a time. The returned fd pins the exact parent directory so a
+/// later rename of an ancestor cannot redirect publication.
+fn resolve_restore_destination(
+    destination: &Path,
+    reject_symlink_ancestors: bool,
+) -> io::Result<RestoreDestination> {
+    let name = destination.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "restore destination has no final component",
+        )
+    })?;
+    let name =
+        CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let parent_path = destination.parent().unwrap_or_else(|| Path::new("."));
+    let mut parent = if parent_path.is_absolute() {
+        open_directory_path(Path::new("/"), false)?
+    } else {
+        open_directory_path(Path::new("."), false)?
+    };
+
+    for component in parent_path.components() {
+        use std::path::Component;
+        let component = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir if reject_symlink_ancestors => {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            Component::ParentDir => CString::new("..").expect("static CString"),
+            Component::Normal(component) => CString::new(component.as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+            Component::Prefix(_) => {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+        };
+
+        if reject_symlink_ancestors {
+            match stat_at(parent.as_raw_fd(), &component, libc::AT_SYMLINK_NOFOLLOW) {
+                Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+                    return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                }
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        match open_directory_at(
+            parent.as_raw_fd(),
+            &component,
+            reject_symlink_ancestors,
+            true,
+        ) {
+            Ok(next) => parent = next,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                let created =
+                    unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o777) };
+                if created != 0 {
+                    let mkdir_error = io::Error::last_os_error();
+                    if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(mkdir_error);
+                    }
+                }
+                parent = open_directory_at(
+                    parent.as_raw_fd(),
+                    &component,
+                    reject_symlink_ancestors,
+                    true,
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(RestoreDestination { parent, name })
+}
+
+fn open_directory_path(path: &Path, nofollow: bool) -> io::Result<fs::File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn open_directory_nofollow(path: &Path) -> io::Result<fs::File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn open_directory_at(
+    parent: RawFd,
+    name: &CStr,
+    nofollow: bool,
+    path_only: bool,
+) -> io::Result<fs::File> {
+    let mut flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
+    flags |= if path_only {
+        libc::O_PATH
+    } else {
+        libc::O_RDONLY
+    };
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn stat_at(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<libc::stat> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(parent, name.as_ptr(), &mut stat, flags) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(stat)
+    }
+}
+
+fn stat_fd(fd: RawFd) -> io::Result<libc::stat> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(stat)
+    }
+}
+
+fn stat_identity(stat: &libc::stat) -> (u64, u64) {
+    (stat.st_dev, stat.st_ino)
+}
+
+fn same_source_version(left: &libc::stat, right: &libc::stat) -> bool {
+    stat_identity(left) == stat_identity(right)
+        && left.st_mode == right.st_mode
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+fn validate_copy_destination_parent(fd: RawFd) -> io::Result<()> {
+    let stat = stat_fd(fd)?;
+    let uid = unsafe { libc::geteuid() };
+    let mode = stat.st_mode;
+    let trusted_owner = stat.st_uid == uid || stat.st_uid == 0;
+    let shared_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if mode & libc::S_IFMT != libc::S_IFDIR || !trusted_owner || (shared_writable && !sticky) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "copy fallback requires a destination parent protected from entry replacement",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_created_node(
+    parent: RawFd,
+    name: &CStr,
+    expected_type: libc::mode_t,
+    expected_identity: (u64, u64),
+) -> io::Result<()> {
+    let stat = stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW)?;
+    if stat_identity(&stat) != expected_identity
+        || stat.st_mode & libc::S_IFMT != expected_type
+        || stat.st_uid != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "created restore destination was replaced",
+        ));
+    }
+    Ok(())
+}
+
+fn destination_exists(destination: &RestoreDestination) -> io::Result<bool> {
+    match stat_at(
+        destination.parent.as_raw_fd(),
+        &destination.name,
+        libc::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rename between pinned directories, failing instead of replacing anything
+/// that appeared at the destination.
+fn rename_noreplace_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+) -> io::Result<()> {
     const RENAME_NOREPLACE: libc::c_uint = 1;
-    let csrc = std::ffi::CString::new(src.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let cdst = std::ffi::CString::new(dst.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let ret = unsafe {
         libc::renameat2(
-            libc::AT_FDCWD,
-            csrc.as_ptr(),
-            libc::AT_FDCWD,
-            cdst.as_ptr(),
+            src_parent,
+            src_name.as_ptr(),
+            dst_parent,
+            dst_name.as_ptr(),
             RENAME_NOREPLACE,
         )
     };
@@ -1893,6 +2352,761 @@ fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn is_conflict_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EEXIST) | Some(libc::ENOTEMPTY)
+    )
+}
+
+fn is_copy_fallback_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EXDEV) | Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+/// Cross-device/unsupported-rename publication. Every destination node is
+/// claimed exclusively, and the source is retained until the entire copy is
+/// complete.
+fn publish_copy_noreplace(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    expected_identity: (u64, u64),
+) -> io::Result<()> {
+    validate_copy_destination_parent(dst_parent)?;
+    let stat = stat_at(src_parent, src_name, libc::AT_SYMLINK_NOFOLLOW)?;
+    if stat_identity(&stat) != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "trash entry changed before copy fallback",
+        ));
+    }
+
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => {
+            let destination_identity =
+                copy_regular_at(src_parent, src_name, dst_parent, dst_name, &stat)?;
+            unlink_source_or_rollback(
+                src_parent,
+                src_name,
+                dst_parent,
+                dst_name,
+                expected_identity,
+                destination_identity,
+            )
+        }
+        libc::S_IFLNK => {
+            let destination_identity =
+                copy_symlink_at(src_parent, src_name, dst_parent, dst_name, &stat)?;
+            unlink_source_or_rollback(
+                src_parent,
+                src_name,
+                dst_parent,
+                dst_name,
+                expected_identity,
+                destination_identity,
+            )
+        }
+        libc::S_IFDIR => {
+            let before = snapshot_directory_at(src_parent, src_name)?;
+            let destination_identity =
+                copy_directory_at(src_parent, src_name, dst_parent, dst_name, &stat, 0)?;
+            let current = stat_at(src_parent, src_name, libc::AT_SYMLINK_NOFOLLOW);
+            if !matches!(current, Ok(ref current) if stat_identity(current) == expected_identity) {
+                let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "trash entry changed before source retirement",
+                ));
+            }
+            if !identity_matches_at(dst_parent, dst_name, destination_identity) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "restore destination changed before source retirement",
+                ));
+            }
+            if snapshot_directory_at(src_parent, src_name)? != before {
+                eprintln!(
+                    "trashd: warning: restored a stable snapshot but the trash directory changed during the copy; keeping the remaining trash copy as an orphan"
+                );
+                return Ok(());
+            }
+            // Retire only the exact source nodes captured before the copy.
+            // New or replaced children are left in a residual orphan instead
+            // of being deleted without ever reaching the destination.
+            match retire_directory_snapshot_at(src_parent, src_name, expected_identity, &before) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "trashd: warning: restored directory but its trash copy changed during retirement; keeping the unmatched remainder as an orphan"
+                ),
+                Err(e) => eprintln!(
+                    "trashd: warning: restored directory but could not completely retire its trash copy: {e}"
+                ),
+            }
+            Ok(())
+        }
+        libc::S_IFIFO => {
+            if unsafe {
+                libc::mkfifoat(
+                    dst_parent,
+                    dst_name.as_ptr(),
+                    (stat.st_mode & 0o7777) as libc::mode_t,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let destination_identity =
+                stat_identity(&stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW)?);
+            validate_created_node(dst_parent, dst_name, libc::S_IFIFO, destination_identity)?;
+            if let Err(error) = apply_node_metadata_at(dst_parent, dst_name, &stat) {
+                let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+                return Err(error);
+            }
+            unlink_source_or_rollback(
+                src_parent,
+                src_name,
+                dst_parent,
+                dst_name,
+                expected_identity,
+                destination_identity,
+            )
+        }
+        _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+    }
+}
+
+fn unlink_source_or_rollback(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    expected_identity: (u64, u64),
+    destination_identity: (u64, u64),
+) -> io::Result<()> {
+    let current = stat_at(src_parent, src_name, libc::AT_SYMLINK_NOFOLLOW);
+    if !matches!(current, Ok(ref current) if stat_identity(current) == expected_identity) {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "trash entry changed before source retirement",
+        ));
+    }
+    if !identity_matches_at(dst_parent, dst_name, destination_identity) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "restore destination changed before source retirement",
+        ));
+    }
+    if unsafe { libc::unlinkat(src_parent, src_name.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+    Err(error)
+}
+
+fn copy_regular_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    expected: &libc::stat,
+) -> io::Result<(u64, u64)> {
+    let src_fd = unsafe {
+        libc::openat(
+            src_parent,
+            src_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if src_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut source = unsafe { fs::File::from_raw_fd(src_fd) };
+    let actual = stat_fd(source.as_raw_fd())?;
+    if actual.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat_identity(&actual) != stat_identity(expected)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "source changed while opening regular file",
+        ));
+    }
+
+    let dst_fd = unsafe {
+        libc::openat(
+            dst_parent,
+            dst_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if dst_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut destination = unsafe { fs::File::from_raw_fd(dst_fd) };
+    let destination_stat = stat_fd(destination.as_raw_fd())?;
+    let destination_identity = stat_identity(&destination_stat);
+    if destination_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || destination_stat.st_uid != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "created restore file was replaced",
+        ));
+    }
+    let copied = (|| {
+        io::copy(&mut source, &mut destination)?;
+        let after = stat_fd(source.as_raw_fd())?;
+        if !same_source_version(&actual, &after) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "source file changed while it was being copied",
+            ));
+        }
+        apply_fd_metadata(destination.as_raw_fd(), expected)?;
+        destination.sync_all()
+    })();
+    drop(destination);
+    if let Err(error) = copied {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(error);
+    }
+    Ok(destination_identity)
+}
+
+fn copy_symlink_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    expected: &libc::stat,
+) -> io::Result<(u64, u64)> {
+    let target = readlink_at(src_parent, src_name)?;
+    if stat_identity(&stat_at(src_parent, src_name, libc::AT_SYMLINK_NOFOLLOW)?)
+        != stat_identity(expected)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "source symlink changed while reading it",
+        ));
+    }
+    if unsafe { libc::symlinkat(target.as_ptr(), dst_parent, dst_name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let destination_identity =
+        stat_identity(&stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW)?);
+    validate_created_node(dst_parent, dst_name, libc::S_IFLNK, destination_identity)?;
+    if readlink_at(dst_parent, dst_name)? != target {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "created restore symlink was replaced",
+        ));
+    }
+    if let Err(error) = apply_symlink_owner(dst_parent, dst_name, expected) {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(error);
+    }
+    Ok(destination_identity)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DirectorySnapshotEntry {
+    path: Vec<u8>,
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    mode: libc::mode_t,
+    size: libc::off_t,
+    modified: (libc::time_t, libc::c_long),
+    changed: (libc::time_t, libc::c_long),
+}
+
+fn snapshot_directory_at(parent: RawFd, name: &CStr) -> io::Result<Vec<DirectorySnapshotEntry>> {
+    let directory = open_directory_at(parent, name, true, false)?;
+    let mut snapshot = Vec::new();
+    snapshot_directory_fd(directory.as_raw_fd(), &[], 0, &mut snapshot)?;
+    snapshot.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(snapshot)
+}
+
+fn snapshot_directory_fd(
+    directory: RawFd,
+    prefix: &[u8],
+    depth: u32,
+    snapshot: &mut Vec<DirectorySnapshotEntry>,
+) -> io::Result<()> {
+    if depth > COPY_TREE_MAX_DEPTH {
+        return Err(io::Error::other(format!(
+            "directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"
+        )));
+    }
+    let mut names = read_directory_names(directory)?;
+    names.sort_by(|left, right| left.to_bytes().cmp(right.to_bytes()));
+    for name in names {
+        let stat = stat_at(directory, &name, libc::AT_SYMLINK_NOFOLLOW)?;
+        let mut path = prefix.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name.to_bytes());
+        snapshot.push(DirectorySnapshotEntry {
+            path: path.clone(),
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            mode: stat.st_mode,
+            size: stat.st_size,
+            modified: (stat.st_mtime, stat.st_mtime_nsec),
+            changed: (stat.st_ctime, stat.st_ctime_nsec),
+        });
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = open_directory_at(directory, &name, true, false)?;
+            let opened = stat_fd(child.as_raw_fd())?;
+            if stat_identity(&opened) != stat_identity(&stat) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "source directory changed while taking restore snapshot",
+                ));
+            }
+            snapshot_directory_fd(child.as_raw_fd(), &path, depth + 1, snapshot)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_directory_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    expected: &libc::stat,
+    depth: u32,
+) -> io::Result<(u64, u64)> {
+    if depth > COPY_TREE_MAX_DEPTH {
+        return Err(io::Error::other(format!(
+            "directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"
+        )));
+    }
+    if unsafe { libc::mkdirat(dst_parent, dst_name.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let destination_identity = {
+        let stat = stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW)?;
+        stat_identity(&stat)
+    };
+    validate_created_node(dst_parent, dst_name, libc::S_IFDIR, destination_identity)?;
+    let destination = match open_directory_at(dst_parent, dst_name, true, false) {
+        Ok(destination) => destination,
+        Err(error) => {
+            let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+            return Err(error);
+        }
+    };
+    if stat_identity(&stat_fd(destination.as_raw_fd())?) != destination_identity {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "restore destination changed while opening directory",
+        ));
+    }
+    let copied = (|| {
+        let source = open_directory_at(src_parent, src_name, true, false)?;
+        let actual = stat_fd(source.as_raw_fd())?;
+        if actual.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || stat_identity(&actual) != stat_identity(expected)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "source directory changed while opening it",
+            ));
+        }
+        for child in read_directory_names(source.as_raw_fd())? {
+            copy_node_at(
+                source.as_raw_fd(),
+                &child,
+                destination.as_raw_fd(),
+                &child,
+                depth + 1,
+            )?;
+        }
+        apply_fd_metadata(destination.as_raw_fd(), expected)
+    })();
+
+    drop(destination);
+    if let Err(error) = copied {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(error);
+    }
+    Ok(destination_identity)
+}
+
+fn copy_node_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    depth: u32,
+) -> io::Result<()> {
+    let stat = stat_at(src_parent, src_name, libc::AT_SYMLINK_NOFOLLOW)?;
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => {
+            copy_regular_at(src_parent, src_name, dst_parent, dst_name, &stat).map(|_| ())
+        }
+        libc::S_IFLNK => {
+            copy_symlink_at(src_parent, src_name, dst_parent, dst_name, &stat).map(|_| ())
+        }
+        libc::S_IFDIR => {
+            copy_directory_at(src_parent, src_name, dst_parent, dst_name, &stat, depth).map(|_| ())
+        }
+        libc::S_IFIFO => {
+            if unsafe {
+                libc::mkfifoat(
+                    dst_parent,
+                    dst_name.as_ptr(),
+                    (stat.st_mode & 0o7777) as libc::mode_t,
+                )
+            } != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                let identity =
+                    stat_identity(&stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW)?);
+                validate_created_node(dst_parent, dst_name, libc::S_IFIFO, identity)?;
+                apply_node_metadata_at(dst_parent, dst_name, &stat)
+            }
+        }
+        // Silently skipping one of these and then retiring the source tree
+        // would lose a node. Abort the whole fallback so its newly-created
+        // destination is cleaned up and the complete trash entry remains.
+        libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK => {
+            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        }
+        _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+    }
+}
+
+fn apply_fd_metadata(fd: RawFd, source: &libc::stat) -> io::Result<()> {
+    if unsafe { libc::fchown(fd, source.st_uid, source.st_gid) } != 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+            || unsafe { libc::geteuid() } == 0
+        {
+            return Err(error);
+        }
+    }
+    // chown may clear set-id bits, so permissions are always applied last.
+    if unsafe { libc::fchmod(fd, source.st_mode & 0o7777) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn apply_node_metadata_at(parent: RawFd, name: &CStr, source: &libc::stat) -> io::Result<()> {
+    if unsafe { libc::fchownat(parent, name.as_ptr(), source.st_uid, source.st_gid, 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+            || unsafe { libc::geteuid() } == 0
+        {
+            return Err(error);
+        }
+    }
+    if unsafe { libc::fchmodat(parent, name.as_ptr(), source.st_mode & 0o7777, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn apply_symlink_owner(parent: RawFd, name: &CStr, source: &libc::stat) -> io::Result<()> {
+    if unsafe {
+        libc::fchownat(
+            parent,
+            name.as_ptr(),
+            source.st_uid,
+            source.st_gid,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+            || unsafe { libc::geteuid() } == 0
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn readlink_at(parent: RawFd, name: &CStr) -> io::Result<CString> {
+    let mut capacity = 256usize;
+    loop {
+        let mut bytes = vec![0u8; capacity];
+        let length = unsafe {
+            libc::readlinkat(
+                parent,
+                name.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < bytes.len() {
+            bytes.truncate(length);
+            return CString::new(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidData));
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|next| *next <= 1024 * 1024)
+            .ok_or_else(|| io::Error::other("symlink target is too long"))?;
+    }
+}
+
+fn read_directory_names(fd: RawFd) -> io::Result<Vec<CString>> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+
+    let result = (|| {
+        let mut names = Vec::new();
+        loop {
+            unsafe { *libc::__errno_location() = 0 };
+            let entry = unsafe { libc::readdir(directory) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(0) {
+                    return Ok(names);
+                }
+                return Err(error);
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(name.to_owned());
+            }
+        }
+    })();
+    unsafe { libc::closedir(directory) };
+    result
+}
+
+fn identity_matches_at(parent: RawFd, name: &CStr, expected: (u64, u64)) -> bool {
+    matches!(
+        stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW),
+        Ok(ref stat) if stat_identity(stat) == expected
+    )
+}
+
+/// Remove a rollback destination only while the directory entry still names
+/// the inode created by this restore attempt. If another actor replaced the
+/// name, leave that unrelated object untouched. Non-empty directories are
+/// deliberately retained: recursively walking a partially published tree on
+/// an error could erase children inserted by somebody else.
+fn remove_created_at(parent: RawFd, name: &CStr, expected: (u64, u64)) -> io::Result<()> {
+    let stat = match stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) if stat_identity(&stat) == expected => stat,
+        Ok(_) => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let flags = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        libc::AT_REMOVEDIR
+    } else {
+        0
+    };
+    if !identity_matches_at(parent, name, expected) {
+        return Ok(());
+    }
+    if unsafe { libc::unlinkat(parent, name.as_ptr(), flags) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if flags == libc::AT_REMOVEDIR && error.raw_os_error() == Some(libc::ENOTEMPTY) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn snapshot_entry_matches(entry: &DirectorySnapshotEntry, stat: &libc::stat) -> bool {
+    entry.device == stat.st_dev
+        && entry.inode == stat.st_ino
+        && entry.mode == stat.st_mode
+        && entry.size == stat.st_size
+        && entry.modified == (stat.st_mtime, stat.st_mtime_nsec)
+        && entry.changed == (stat.st_ctime, stat.st_ctime_nsec)
+}
+
+fn child_snapshot_path(prefix: &[u8], name: &CStr) -> Vec<u8> {
+    let mut path = prefix.to_vec();
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name.to_bytes());
+    path
+}
+
+fn is_direct_snapshot_child(path: &[u8], prefix: &[u8]) -> bool {
+    let remainder = if prefix.is_empty() {
+        path
+    } else {
+        let Some(remainder) = path.strip_prefix(prefix) else {
+            return false;
+        };
+        let Some(remainder) = remainder.strip_prefix(b"/") else {
+            return false;
+        };
+        remainder
+    };
+    !remainder.is_empty() && !remainder.contains(&b'/')
+}
+
+fn retire_directory_snapshot_at(
+    parent: RawFd,
+    name: &CStr,
+    expected_root: (u64, u64),
+    snapshot: &[DirectorySnapshotEntry],
+) -> io::Result<bool> {
+    let stat = stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW)?;
+    if stat_identity(&stat) != expected_root || stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Ok(false);
+    }
+    let directory = open_directory_at(parent, name, true, false)?;
+    if stat_identity(&stat_fd(directory.as_raw_fd())?) != expected_root {
+        return Ok(false);
+    }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let complete = retire_snapshot_directory_fd(directory.as_raw_fd(), &[], snapshot)?;
+    drop(directory);
+    if !complete || !identity_matches_at(parent, name, expected_root) {
+        return Ok(false);
+    }
+    if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::ENOENT)
+        ) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn retire_snapshot_directory_fd(
+    directory: RawFd,
+    prefix: &[u8],
+    snapshot: &[DirectorySnapshotEntry],
+) -> io::Result<bool> {
+    let expected_children: std::collections::BTreeSet<Vec<u8>> = snapshot
+        .iter()
+        .filter(|entry| is_direct_snapshot_child(&entry.path, prefix))
+        .map(|entry| entry.path.clone())
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut complete = true;
+
+    for name in read_directory_names(directory)? {
+        let path = child_snapshot_path(prefix, &name);
+        let Some(expected) = snapshot.iter().find(|entry| entry.path == path) else {
+            complete = false;
+            continue;
+        };
+        seen.insert(path.clone());
+        if !retire_snapshot_node_at(directory, &name, &path, expected, snapshot)? {
+            complete = false;
+        }
+    }
+    if seen != expected_children {
+        complete = false;
+    }
+    Ok(complete)
+}
+
+fn retire_snapshot_node_at(
+    parent: RawFd,
+    name: &CStr,
+    path: &[u8],
+    expected: &DirectorySnapshotEntry,
+    snapshot: &[DirectorySnapshotEntry],
+) -> io::Result<bool> {
+    let stat = match stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) if snapshot_entry_matches(expected, &stat) => stat,
+        Ok(_) => return Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        let directory = open_directory_at(parent, name, true, false)?;
+        if stat_identity(&stat_fd(directory.as_raw_fd())?) != stat_identity(&stat) {
+            return Ok(false);
+        }
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let complete = retire_snapshot_directory_fd(directory.as_raw_fd(), path, snapshot)?;
+        drop(directory);
+        if !complete || !identity_matches_at(parent, name, stat_identity(&stat)) {
+            return Ok(false);
+        }
+        if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+            return Ok(true);
+        }
+    } else {
+        let current = stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW)?;
+        if !snapshot_entry_matches(expected, &current) {
+            return Ok(false);
+        }
+        if unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } == 0 {
+            return Ok(true);
+        }
+    }
+
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::ENOENT)
+    ) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn hash_file_at(parent: RawFd, name: &CStr, algorithm: &str) -> io::Result<String> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if stat_fd(file.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    hash_reader(file, algorithm)
 }
 
 /// Normalize a path: canonicalize the parent (resolving symlinks in directory
@@ -2127,6 +3341,51 @@ mod tests {
     }
 
     #[test]
+    fn store_hierarchy_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, _data, _workdir, _lock) = test_store();
+        for path in [
+            store.home.clone(),
+            store.home.join("files"),
+            store.home.join("info"),
+            store.home.join(".trashd"),
+        ] {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        }
+    }
+
+    #[test]
+    fn store_rejects_symlink_root_without_touching_target() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"safe").unwrap();
+        let root = base.path().join("Trash");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+
+        assert!(TrashStore::open_isolated(&root, Config::default()).is_err());
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"safe");
+        assert!(!target.join("files").exists());
+    }
+
+    #[test]
+    fn store_rejects_symlinked_missing_ancestor_without_creating_through_it() {
+        let base = tempfile::tempdir().unwrap();
+        let redirected = base.path().join("redirected");
+        fs::create_dir(&redirected).unwrap();
+        let link = base.path().join("data-link");
+        std::os::unix::fs::symlink(&redirected, &link).unwrap();
+        let root = link.join("new").join("Trash");
+
+        assert!(TrashStore::open_isolated(&root, Config::default()).is_err());
+        assert!(!redirected.join("new").exists());
+    }
+
+    #[test]
     fn trash_and_restore_file() {
         let (store, _data, workdir, _lock) = test_store();
         let file = create_file(workdir.path(), "hello.txt", "hello world");
@@ -2293,6 +3552,113 @@ mod tests {
 
         let result = store.restore(&id, None);
         assert!(matches!(result, Err(TrashError::RestoreConflict(_))));
+    }
+
+    #[test]
+    fn restore_refuses_intermediate_symlink_in_recorded_path() {
+        let (store, _data, workdir, _lock) = test_store();
+        let recorded_parent = workdir.path().join("recorded-parent");
+        let escape = workdir.path().join("escape");
+        fs::create_dir(&recorded_parent).unwrap();
+        fs::create_dir(&escape).unwrap();
+        let original = create_file(&recorded_parent, "payload.txt", "secret");
+        let id = store.trash(&original, None).unwrap();
+        let stored = store.home.join("files").join(&id);
+
+        fs::remove_dir(&recorded_parent).unwrap();
+        std::os::unix::fs::symlink(&escape, &recorded_parent).unwrap();
+
+        let result = store.restore(&id, None);
+        assert!(matches!(result, Err(TrashError::RestoreTraversal(_))));
+        assert!(!escape.join("payload.txt").exists());
+        assert_eq!(fs::read(stored).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn explicit_restore_target_may_follow_ancestor_symlink() {
+        let (store, _data, workdir, _lock) = test_store();
+        let original = create_file(workdir.path(), "source.txt", "payload");
+        let id = store.trash(&original, None).unwrap();
+        let actual_parent = workdir.path().join("actual-parent");
+        let alias = workdir.path().join("alias");
+        fs::create_dir(&actual_parent).unwrap();
+        std::os::unix::fs::symlink(&actual_parent, &alias).unwrap();
+        let requested = alias.join("restored.txt");
+
+        assert_eq!(store.restore(&id, Some(&requested)).unwrap(), requested);
+        assert_eq!(
+            fs::read(actual_parent.join("restored.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn copy_fallback_never_clobbers_existing_destination() {
+        let (_store, _data, workdir, _lock) = test_store();
+        let source_dir = workdir.path().join("fallback-source");
+        let destination_dir = workdir.path().join("fallback-destination");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination_dir).unwrap();
+        fs::write(source_dir.join("item"), b"trash payload").unwrap();
+        fs::write(destination_dir.join("item"), b"existing data").unwrap();
+
+        let source_parent = open_directory_nofollow(&source_dir).unwrap();
+        let destination_parent = open_directory_nofollow(&destination_dir).unwrap();
+        let name = CString::new("item").unwrap();
+        let source_stat =
+            stat_at(source_parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        let error = publish_copy_noreplace(
+            source_parent.as_raw_fd(),
+            &name,
+            destination_parent.as_raw_fd(),
+            &name,
+            stat_identity(&source_stat),
+        )
+        .unwrap_err();
+
+        assert!(is_conflict_error(&error));
+        assert_eq!(fs::read(source_dir.join("item")).unwrap(), b"trash payload");
+        assert_eq!(
+            fs::read(destination_dir.join("item")).unwrap(),
+            b"existing data"
+        );
+    }
+
+    #[test]
+    fn copy_fallback_publishes_directory_from_pinned_fds() {
+        let (_store, _data, workdir, _lock) = test_store();
+        let source_dir = workdir.path().join("directory-source");
+        let destination_dir = workdir.path().join("directory-destination");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination_dir).unwrap();
+        let tree = source_dir.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("file"), b"payload").unwrap();
+        std::os::unix::fs::symlink("file", tree.join("link")).unwrap();
+
+        let source_parent = open_directory_nofollow(&source_dir).unwrap();
+        let destination_parent = open_directory_nofollow(&destination_dir).unwrap();
+        let name = CString::new("tree").unwrap();
+        let source_stat =
+            stat_at(source_parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        publish_copy_noreplace(
+            source_parent.as_raw_fd(),
+            &name,
+            destination_parent.as_raw_fd(),
+            &name,
+            stat_identity(&source_stat),
+        )
+        .unwrap();
+
+        assert!(!tree.exists());
+        assert_eq!(
+            fs::read(destination_dir.join("tree/file")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read_link(destination_dir.join("tree/link")).unwrap(),
+            PathBuf::from("file")
+        );
     }
 
     #[test]
@@ -2750,6 +4116,74 @@ mod tests {
             restored_content, content,
             "content should match after decompress"
         );
+    }
+
+    #[test]
+    fn compressed_restore_rejects_output_over_limit_without_changing_entry() {
+        let (mut store, _data, workdir, _lock) = test_store();
+        let original = vec![b'A'; 2 * 1024 * 1024];
+        let file = workdir.path().join("oversized-output");
+        fs::write(&file, &original).unwrap();
+        let id = store.trash(&file, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let compressed = zstd::encode_all(original.as_slice(), 3).unwrap();
+        fs::write(&entry.trashed_path, &compressed).unwrap();
+        let mut info = entry.info.clone();
+        info.compressed = Some("zstd".into());
+        write_trashinfo_atomic(&entry.info_path, &info).unwrap();
+        store.config.max_file_size_mb = 1;
+
+        assert!(store.restore(&id, None).is_err());
+        assert!(
+            !file.exists(),
+            "failed restore must not publish partial data"
+        );
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), compressed);
+        assert_eq!(
+            TrashInfo::from_trashinfo(&fs::read_to_string(&entry.info_path).unwrap())
+                .unwrap()
+                .compressed
+                .as_deref(),
+            Some("zstd")
+        );
+    }
+
+    #[test]
+    fn compressed_restore_keeps_corrupt_zstd_payload_and_marker() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "corrupt-compressed", "original");
+        let id = store.trash(&file, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let corrupt = [0x28, 0xb5, 0x2f, 0xfd, 0xff, 0xff, 0xff, 0xff];
+        fs::write(&entry.trashed_path, corrupt).unwrap();
+        let mut info = entry.info.clone();
+        info.compressed = Some("zstd".into());
+        write_trashinfo_atomic(&entry.info_path, &info).unwrap();
+
+        assert!(store.restore(&id, None).is_err());
+        assert!(!file.exists());
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), corrupt);
+        assert_eq!(
+            TrashInfo::from_trashinfo(&fs::read_to_string(&entry.info_path).unwrap())
+                .unwrap()
+                .compressed
+                .as_deref(),
+            Some("zstd")
+        );
+    }
+
+    #[test]
+    fn stale_compression_marker_on_plaintext_is_cleared_and_restored() {
+        let (store, _data, workdir, _lock) = test_store();
+        let file = create_file(workdir.path(), "stale-marker", "plain data");
+        let id = store.trash(&file, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let mut info = entry.info.clone();
+        info.compressed = Some("zstd".into());
+        write_trashinfo_atomic(&entry.info_path, &info).unwrap();
+
+        store.restore(&id, None).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"plain data");
     }
 
     // M3: a user's genuine .zst (zstd magic, but trashd never compressed it, so

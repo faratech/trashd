@@ -17,18 +17,16 @@
 //! kernel does the walking while holding the pinned inode; a sibling process
 //! renaming directories in between can no longer divert the operation.
 //!
-//! Fallback: on kernels lacking pidfd_getfd (5.14+) / openat2 (5.6+), or when
-//! the target's fds can't be duplicated, callers use the legacy path-based
-//! flow (fail-open, as everywhere else in this layer).
+//! If fd pinning or confined resolution is unavailable, the supervisor lets
+//! the target's kernel execute the original syscall. It must never re-resolve
+//! a target pathname through the supervisor's mount namespace.
 //!
 //! Residuals (accepted, documented):
 //! * Absolute-path walks use RESOLVE_IN_ROOT, so `..` and absolute symlinks
 //!   clamp at the target's pinned root — matching what the target's own
-//!   kernel would do. CWD/dirfd-relative walks keep plain semantics (the
-//!   target's cwd is not a root), so an ABSOLUTE symlink met inside such a
-//!   walk restarts from THIS process's root; cross-namespace moves fail
-//!   EXDEV and fall back to the legacy flow either way. Fully closing the
-//!   relative-walk corner needs component-by-component manual walking.
+//!   kernel would do. CWD/dirfd-relative walks use RESOLVE_BENEATH. A walk
+//!   that would leave the pinned base (through `..` or an absolute symlink)
+//!   is not trashed; the original target syscall executes instead.
 //! * The leaf component may be swapped by a sibling between fstatat and
 //!   renameat — identical to what plain unlink(2) acts on; trash_at re-stats
 //!   post-move so recorded metadata always matches the trashed inode.
@@ -138,13 +136,14 @@ fn open_proc_dir(path: &str) -> Option<RawFd> {
 }
 
 /// Resolve every component of `prefix` EXCEPT the final one, in a single
-/// `openat2(2)` call relative to `base_fd` (Linux 5.6+). Symlinks in
-/// intermediate components are followed; `in_root` clamps `..` and absolute
-/// symlink restarts at `base_fd` — pass true when the base is the TARGET'S
-/// ROOT, because the target's own fs->root would clamp identically, and
-/// without it a chrooted target's `/a/../../b` would walk out into this
-/// process's hierarchy. Returns an owned O_DIRECTORY fd for the parent.
-pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, in_root: bool) -> io::Result<RawFd> {
+/// `openat2(2)` call relative to `base_fd` (Linux 5.6+). Ordinary symlinks in
+/// intermediate components are followed. Absolute paths use RESOLVE_IN_ROOT,
+/// which clamps `..` and absolute symlink restarts at the TARGET'S pinned root.
+/// Relative paths use RESOLVE_BENEATH, which refuses any walk that escapes the
+/// pinned cwd/dirfd; the caller then lets the target kernel execute the syscall
+/// in its own namespace. Magic links are rejected in both modes. Returns an
+/// owned O_DIRECTORY fd for the parent.
+pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, absolute: bool) -> io::Result<RawFd> {
     #[repr(C)]
     struct OpenHow {
         flags: u64,
@@ -158,10 +157,15 @@ pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, in_root: bool) -> io::Resu
     let how = OpenHow {
         flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0,
-        // Default: follow symlinks, permit ".." and mount crossings — what a
-        // plain path walk does. IN_ROOT (absolute/target-root case only)
-        // matches how the TARGET'S OWN root would have clamped the walk.
-        resolve: if in_root { libc::RESOLVE_IN_ROOT } else { 0 },
+        // IN_ROOT matches how the target's own root clamps absolute walks.
+        // BENEATH prevents a relative walk from escaping the pinned cwd/dirfd
+        // into the supervisor's namespace. Mount crossings remain legal.
+        resolve: libc::RESOLVE_NO_MAGICLINKS
+            | if absolute {
+                libc::RESOLVE_IN_ROOT
+            } else {
+                libc::RESOLVE_BENEATH
+            },
     };
     let fd = unsafe {
         libc::syscall(
@@ -246,9 +250,6 @@ pub enum Decision {
     Continue,
     /// Fail the syscall with this errno WITHOUT executing it.
     Errno(i32),
-    /// Pinned handling unavailable (old kernel, unpinnable fd, cross-device
-    /// trash) — the caller falls back to the legacy path-based flow.
-    FallBack,
 }
 
 /// Race-free handling of one trapped delete (#6): pin the target's filesystem
@@ -256,8 +257,9 @@ pub enum Decision {
 /// unlink semantics via fstatat/readdir on pinned fds, then move the entry
 /// with renameat through [`trashd_common::TrashStore::trash_at`].
 ///
-/// Any internal error surfaces as `FallBack`, never as an invented answer:
-/// the legacy flow (or the kernel itself) then decides.
+/// Resolution and storage errors surface as `Continue`: the target's kernel
+/// executes the original syscall in the correct mount namespace. The
+/// supervisor never performs a path-based fallback mutation.
 #[allow(clippy::too_many_arguments)]
 pub fn try_pinned(
     pid: u32,
@@ -328,8 +330,8 @@ pub fn try_pinned(
     // below is therefore rewritten RELATIVE to that root.
     let _dup_base: Option<FdGuard>;
     let base: RawFd = if bytes.first() == Some(&b'/') {
-        if !prefix.is_empty() {
-            prefix = &prefix[1..]; // "/a/" -> "a/"
+        while prefix.first() == Some(&b'/') {
+            prefix = &prefix[1..]; // "///a/" -> "a/"
         }
         tfs.root()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no root fd"))?
@@ -377,9 +379,10 @@ pub fn try_pinned(
                 _owned_parent = Some(g);
                 raw_fd
             }
-            // Component vanished / permission changed mid-flight: the real
-            // syscall will produce the exact errno — defer to it.
-            Err(_) => return Ok(Decision::FallBack),
+            // Component vanished, resolution escaped the pinned base, or the
+            // kernel lacks openat2: execute the original syscall in the
+            // target's namespace rather than re-resolving this path here.
+            Err(_) => return Ok(Decision::Continue),
         }
     };
 
@@ -387,7 +390,7 @@ pub fn try_pinned(
     // final component — matches unlink/rmdir semantics).
     let (mode, _dev, _size) = match stat_nofollow(parent, name) {
         Ok(v) => v,
-        Err(_) => return Ok(Decision::FallBack),
+        Err(_) => return Ok(Decision::Continue),
     };
     let fmt = mode & libc::S_IFMT;
     if remove_dir {
@@ -396,7 +399,7 @@ pub fn try_pinned(
         }
         // rmdir requires POSITIVELY-confirmed emptiness. A sibling repopulating
         // the dir between this check and the move lands the whole tree in the
-        // trash (recoverable) — same residual accepted by the legacy flow.
+        // trash (recoverable), which is still safer than permanent deletion.
         match dir_is_empty(parent, name) {
             Ok(true) => {}
             Ok(false) => return Ok(Decision::Errno(libc::ENOTEMPTY)),
@@ -416,9 +419,10 @@ pub fn try_pinned(
     match store.trash_at(parent, name, display, Some("seccomp")) {
         Ok(_id) => Ok(Decision::Trashed),
         Err(TrashError::Excluded(_)) | Err(TrashError::Refused(_)) => Ok(Decision::Continue),
-        // EXDEV (namespaced/cross-device target), hash/store hiccups, … →
-        // legacy copy-capable flow decides.
-        Err(_) => Ok(Decision::FallBack),
+        // EXDEV (namespaced/cross-device target), hash/store hiccups, and
+        // unsafe stores all defer to the original target syscall. Re-resolving
+        // `display` in the supervisor could mutate an unrelated host path.
+        Err(_) => Ok(Decision::Continue),
     }
 }
 
@@ -489,16 +493,123 @@ mod tests {
             assert_eq!(unsafe { libc::fstat(result.0, &mut stat) }, 0);
             assert_eq!(stat.st_ino, expected, "{path}");
         }
-        // A cwd/dirfd is not a root: the same relative walk must leave it.
-        let outside = FdGuard(resolve_parent(base.0, OsStr::new("../outside"), false).unwrap());
+    }
+
+    #[test]
+    fn relative_resolution_refuses_to_escape_pinned_base() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let base_dir = fixture.path().join("base");
+        let inside = base_dir.join("inside");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink("inside", base_dir.join("inside-link")).unwrap();
+        symlink("../outside", base_dir.join("relative-escape")).unwrap();
+        symlink(&outside, base_dir.join("absolute-escape")).unwrap();
+
+        let base = FdGuard(open_proc_dir(base_dir.to_str().unwrap()).unwrap());
+
+        // An ordinary symlink that remains beneath the pinned base is valid.
+        let resolved = FdGuard(resolve_parent(base.0, OsStr::new("inside-link"), false).unwrap());
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::fstat(outside.0, &mut stat) }, 0);
-        assert_eq!(
-            stat.st_ino,
-            std::fs::metadata(fixture.path().join("outside"))
-                .unwrap()
-                .ino()
-        );
+        assert_eq!(unsafe { libc::fstat(resolved.0, &mut stat) }, 0);
+        assert_eq!(stat.st_ino, std::fs::metadata(&inside).unwrap().ino());
+
+        // Both lexical and symlink escapes must be handed back to the target
+        // kernel; resolving either in the supervisor can select a host inode.
+        for escape in ["../outside", "relative-escape", "absolute-escape"] {
+            let err = resolve_parent(base.0, OsStr::new(escape), false).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{escape}: {err}");
+        }
+    }
+
+    #[test]
+    fn pinned_relative_escape_defers_without_mutating_host_path() {
+        use std::os::unix::fs::symlink;
+
+        let (store, work, _g) = setup("relative-escape");
+        let outside = work.parent().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let dotdot_victim = outside.join("dotdot.txt");
+        let symlink_victim = outside.join("symlink.txt");
+        std::fs::write(&dotdot_victim, b"dotdot").unwrap();
+        std::fs::write(&symlink_victim, b"symlink").unwrap();
+        symlink(&outside, work.join("escape")).unwrap();
+
+        let mut child = spawn_with_cwd(&work);
+        let nr = if cfg!(target_arch = "x86_64") {
+            NR_UNLINKAT_X86_64
+        } else {
+            NR_UNLINKAT_AARCH64
+        };
+        let args: [u64; 6] = [libc::AT_FDCWD as u64, 0, 0, 0, 0, 0];
+
+        for (raw, display) in [
+            ("../outside/dotdot.txt", &dotdot_victim),
+            ("escape/symlink.txt", &symlink_victim),
+        ] {
+            let decision = try_pinned(
+                child.id(),
+                nr,
+                &args,
+                OsStr::new(raw),
+                display,
+                false,
+                -1,
+                0,
+                &store,
+            )
+            .expect("pinned attempt");
+            assert!(
+                matches!(decision, Decision::Continue),
+                "{raw}: {decision:?}"
+            );
+            assert!(display.exists(), "supervisor must not mutate {display:?}");
+        }
+
+        assert!(store.list(None).unwrap().is_empty());
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pinned_store_failure_defers_without_mutating_display_path() {
+        let (store, work, _g) = setup("store-failure");
+        let victim = work.join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+
+        // Make the isolated store unusable after it has opened. The pinned
+        // attempt must return Continue while leaving the source inode alone;
+        // the supervisor must never retry through the display pathname.
+        let files = store.home_dir().join("files");
+        std::fs::remove_dir(&files).unwrap();
+        std::fs::write(&files, b"not a directory").unwrap();
+
+        let mut child = spawn_with_cwd(&work);
+        let nr = if cfg!(target_arch = "x86_64") {
+            NR_UNLINKAT_X86_64
+        } else {
+            NR_UNLINKAT_AARCH64
+        };
+        let decision = try_pinned(
+            child.id(),
+            nr,
+            &[libc::AT_FDCWD as u64, 0, 0, 0, 0, 0],
+            OsStr::new("victim.txt"),
+            &victim,
+            false,
+            -1,
+            0,
+            &store,
+        )
+        .expect("pinned attempt");
+
+        assert!(matches!(decision, Decision::Continue));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        child.kill().unwrap();
+        let _ = child.wait();
     }
 
     #[test]
@@ -823,7 +934,7 @@ mod tests {
             .expect("pinned attempt");
             match d {
                 Decision::Trashed => trashed += 1,
-                Decision::Continue | Decision::FallBack => {}
+                Decision::Continue => {}
                 Decision::Errno(e) => panic!("round {i}: unexpected errno {e}"),
             }
 
