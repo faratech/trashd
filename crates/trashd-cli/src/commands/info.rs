@@ -13,6 +13,9 @@ pub fn run(store: &TrashStore, target: &str) {
             "'{pattern}' matches {count} entries in different trash roots — \
              show a specific one from 'trash ls <pattern>' instead"
         )),
+        // A listing failure must surface as itself, not masquerade as "not
+        // found" (restore/purge share find_entry and do the same).
+        Err(e @ (TrashError::Io(_) | TrashError::Index(_))) => fatal(e),
         Err(_) => fatal(format!("'{target}' not found in trash")),
     };
 
