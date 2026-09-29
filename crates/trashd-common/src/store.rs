@@ -4062,12 +4062,12 @@ mod tests {
                     std::time::Instant::now() < deadline,
                     "compressor neither completed nor held the entry flock"
                 );
-                match fs::OpenOptions::new()
+                if let Ok(file) = fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW)
                     .open(trash.join("files/old.txt"))
                 {
-                    Ok(file) => match file.try_lock() {
+                    match file.try_lock() {
                         Err(_) => saw_held = true,
                         Ok(()) => {
                             if saw_held {
@@ -4077,8 +4077,7 @@ mod tests {
                             }
                             // compressor has not acquired yet — keep waiting
                         }
-                    },
-                    Err(_) => {}
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
