@@ -28,8 +28,24 @@ extern "C" fn forward_term_and_exit(sig: libc::c_int) {
 ///
 /// - `notif_fd`: a dup'd copy of the seccomp notification fd
 pub fn run_watchdog(notif_fd: i32, broker_fd: i32, ready_fd: i32) -> ! {
+    // Same fork→prctl race #93 fixed for the supervisor: PR_SET_PDEATHSIG
+    // only covers orchestrator deaths AFTER it takes effect, so bail out if
+    // the orchestrator vanished in the window — an orphaned watchdog would
+    // otherwise respawn a supervisor that holds the notification fd forever.
+    let parent_at_spawn = unsafe { libc::getppid() };
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+    }
+    if unsafe { libc::getppid() } != parent_at_spawn || parent_at_spawn == 1 {
+        // Already reparented: the orchestrator died before prctl took effect.
+        unsafe {
+            libc::close(notif_fd);
+            libc::close(broker_fd);
+            libc::close(ready_fd);
+        }
+        std::process::exit(1);
+    }
+    unsafe {
         libc::signal(
             libc::SIGINT,
             forward_term_and_exit as *const () as libc::sighandler_t,
