@@ -9,9 +9,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use xxhash_rust::xxh3::Xxh3;
@@ -380,12 +378,16 @@ impl TrashStore {
                     copy_tree(&abs_path, &dest)?;
                 } else if meta.file_type().is_fifo() {
                     // Recreate the FIFO — fs::copy on one blocks forever
-                    // waiting for a writer (#11).
+                    // waiting for a writer (#11). A failed recreation must
+                    // release nothing: copy_done stays false, so the rollback
+                    // below keeps the source instead of unlinking it.
                     use std::os::unix::ffi::OsStrExt;
-                    if let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
-                        unsafe {
-                            libc::mkfifo(c.as_ptr(), (meta.mode() & 0o7777) as libc::mode_t);
-                        }
+                    let c = std::ffi::CString::new(dest.as_os_str().as_bytes())
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                    if unsafe { libc::mkfifo(c.as_ptr(), (meta.mode() & 0o7777) as libc::mode_t) }
+                        != 0
+                    {
+                        return Err(io::Error::last_os_error().into());
                     }
                 } else if meta.file_type().is_char_device()
                     || meta.file_type().is_block_device()
@@ -715,6 +717,10 @@ impl TrashStore {
         // Re-stat by the new id; refresh size and drop the hash if the inode
         // differs (a stale hash would cry wolf on every restore).
         let mut moved_stat: libc::stat = unsafe { std::mem::zeroed() };
+        // Only a RACE-driven correction reaches the sidecar: the is_dir
+        // st_size overwrite stays index-only so `trash ls` keeps showing the
+        // pre-move recursive size for directories.
+        let mut persisted_refresh = false;
         if unsafe {
             libc::fstatat(
                 files_fd,
@@ -727,11 +733,22 @@ impl TrashStore {
             if moved_stat.st_ino != stat.st_ino || moved_stat.st_dev != stat.st_dev {
                 info.size = Some(moved_stat.st_size as u64);
                 info.sha256 = None;
+                persisted_refresh = true;
             } else if is_dir {
                 info.size = Some(moved_stat.st_size as u64);
             }
         } else {
+            // What landed cannot be verified — drop the hash so restore does
+            // not compare new content against the pre-move hash forever.
             info.sha256 = None;
+            persisted_refresh = true;
+        }
+        // Persist the refresh: list()/restore() treat the .trashinfo sidecar
+        // as the source of truth, so a hash/size corrected only in memory
+        // (and mirrored to the write-only index) would cry wolf on every
+        // restore of a raced entry.
+        if persisted_refresh {
+            let _ = write_trashinfo_atomic(&info_file, &info);
         }
         unsafe { libc::close(files_fd) };
 
@@ -773,13 +790,18 @@ impl TrashStore {
         // only: the entries vec is shared across all trash roots, so an
         // orphaned files/<id> in root B would otherwise be hidden by a real
         // entry with the same id in root A.
-        let base = entries.len();
         let info_dir = trash_dir.join("info");
         let files_dir = trash_dir.join("files");
 
         if !info_dir.exists() {
             return Ok(());
         }
+
+        // IDs with a readable sidecar, recorded BEFORE the pattern filter:
+        // orphan detection must know every real entry in this directory, or a
+        // filtered-out entry's own files/<id> would be re-synthesized as a
+        // fake "orphaned" copy of itself (#144).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for entry in fs::read_dir(&info_dir)? {
             let entry = entry?;
@@ -808,6 +830,7 @@ impl TrashStore {
                 Some(i) => i,
                 None => continue,
             };
+            seen_ids.insert(id.clone());
 
             // Spec: topdir trash may store relative paths. Resolve to absolute
             // using the topdir (parent of the trash directory).
@@ -848,10 +871,7 @@ impl TrashStore {
         // this is emergency case and MUST be presented as such."
         // Scan files/ for entries without matching .trashinfo.
         if files_dir.exists() {
-            let known_ids: std::collections::HashSet<String> = entries[base..]
-                .iter()
-                .map(|e| e.id.clone())
-                .collect();
+            let known_ids: std::collections::HashSet<String> = seen_ids;
             let mut orphans = Vec::new();
             if let Ok(file_entries) = fs::read_dir(&files_dir) {
                 for fe in file_entries.flatten() {
@@ -1568,7 +1588,11 @@ impl TrashStore {
         &self.config
     }
 
-    fn find_entry(&self, id_or_pattern: &str) -> Result<TrashEntry, TrashError> {
+    /// Resolve a trash entry by exact ID (or filename fallback), refusing
+    /// ambiguity when the same ID exists in more than one trash root — the
+    /// same resolution rules restore/purge apply, so `trash info` can never
+    /// describe a different copy than the one restore would publish (#148).
+    pub fn find_entry(&self, id_or_pattern: &str) -> Result<TrashEntry, TrashError> {
         let entries = self.list(None)?;
 
         // Exact ID match. IDs are unique WITHIN one trash dir, but two
@@ -2036,7 +2060,9 @@ fn copy_regular_verified(src: &Path, dst: &Path, expect: (u64, u64)) -> io::Resu
         .open(src)?;
     let m = input.metadata()?;
     if !m.is_file() || (m.dev(), m.ino()) != expect {
-        return Err(io::Error::other("target changed while copying to the trash"));
+        return Err(io::Error::other(
+            "target changed while copying to the trash",
+        ));
     }
     let mut output = fs::OpenOptions::new()
         .write(true)
@@ -2206,8 +2232,14 @@ fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
     result?;
     // ENOENT on the final rmdir: something else removed it first — done (std
     // remove_dir_all tolerates the same).
-    if unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), libc::AT_REMOVEDIR) }
-        == 0
+    if unsafe {
+        libc::syscall(
+            libc::SYS_unlinkat,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    } == 0
     {
         Ok(())
     } else {
@@ -2285,8 +2317,14 @@ fn raw_remove_tree_fd(dir_fd: RawFd, depth: u32) -> io::Result<()> {
             let result = raw_remove_tree_fd(child, depth + 1);
             unsafe { libc::close(child) };
             result?;
-            if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) }
-                != 0
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_unlinkat,
+                    dir_fd,
+                    name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } != 0
             {
                 let e = io::Error::last_os_error();
                 if e.raw_os_error() != Some(libc::ENOENT) {
@@ -2336,11 +2374,14 @@ fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
         } else if entry_meta.file_type().is_fifo() {
             // Recreate the named pipe so the directory round-trips on restore.
             // (A FIFO carries no persistent data; fs::copy on one would block.)
+            // A silent failure here would drop the FIFO from the copy while
+            // the caller still removes the original tree.
             use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = std::ffi::CString::new(dest_path.as_os_str().as_bytes()) {
-                unsafe {
-                    libc::mkfifo(c.as_ptr(), (entry_meta.mode() & 0o7777) as libc::mode_t);
-                }
+            let c = std::ffi::CString::new(dest_path.as_os_str().as_bytes())?;
+            if unsafe { libc::mkfifo(c.as_ptr(), (entry_meta.mode() & 0o7777) as libc::mode_t) }
+                != 0
+            {
+                return Err(io::Error::last_os_error());
             }
         } else if entry_meta.file_type().is_char_device()
             || entry_meta.file_type().is_block_device()
@@ -3415,9 +3456,7 @@ fn normalize_path(path: &Path) -> PathBuf {
         path.components().next_back(),
         Some(std::path::Component::Normal(_)) | None
     );
-    if ends_in_dot_component
-        && let Ok(resolved) = fs::canonicalize(path)
-    {
+    if ends_in_dot_component && let Ok(resolved) = fs::canonicalize(path) {
         return resolved;
     }
     if let Some(parent) = path.parent()
@@ -4266,6 +4305,33 @@ mod tests {
         );
     }
 
+    // Regression (#144): a pattern that matches a real entry's files/<id>
+    // name but not its original filename must not cause the entry to be
+    // re-synthesized as a fake "orphaned" copy of itself.
+    #[test]
+    fn pattern_filtered_list_does_not_synthesize_filtered_entries_as_orphans() {
+        let (store, _data, workdir, _lock) = test_store();
+
+        let f = create_file(workdir.path(), "notes.txt", "v1");
+        store.trash(&f, None).unwrap();
+        fs::write(&f, "v2").unwrap();
+        store.trash(&f, None).unwrap(); // collides → timestamp-suffixed id
+
+        let all = store.list(None).unwrap();
+        assert_eq!(all.len(), 2);
+        let suffixed = all
+            .iter()
+            .find(|e| e.id != "notes.txt")
+            .expect("second trash gets a timestamp-suffixed id");
+        assert!(!suffixed.orphaned);
+
+        let filtered = store.list(Some(&suffixed.id)).unwrap();
+        assert!(
+            filtered.iter().all(|e| !e.orphaned),
+            "no fake orphans: {filtered:?}"
+        );
+    }
+
     // Regression (audit #16): an orphaned files/ entry (no .trashinfo) must
     // not hijack `undo` (its synthetic "now" date sorts it newest) nor be
     // restorable to the bogus "(orphaned: …)" pseudo-path.
@@ -4891,12 +4957,8 @@ mod tests {
         fs::write(other_trash.join("files/dup.txt"), b"orphan").unwrap();
 
         let mut entries = Vec::new();
-        store
-            .list_in_dir(&store.home, None, &mut entries)
-            .unwrap();
-        store
-            .list_in_dir(&other_trash, None, &mut entries)
-            .unwrap();
+        store.list_in_dir(&store.home, None, &mut entries).unwrap();
+        store.list_in_dir(&other_trash, None, &mut entries).unwrap();
 
         let orphans: Vec<_> = entries.iter().filter(|e| e.orphaned).collect();
         assert_eq!(orphans.len(), 1, "the other root's orphan must be listed");
