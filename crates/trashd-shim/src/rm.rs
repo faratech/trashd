@@ -79,6 +79,11 @@ struct Rm {
 }
 
 fn main() -> ExitCode {
+    // Die quietly on a closed reader instead of panicking on a broken pipe
+    // (Rust ignores SIGPIPE by default) (#129).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Check bypass env var
     if std::env::var("TRASH_BYPASS").unwrap_or_default() == "1" {
         return passthrough();

@@ -82,6 +82,11 @@ type Fsid = Option<(i32, i32)>;
 type MountFd = (PathBuf, RawFd, Fsid);
 
 fn main() {
+    // Die quietly on a closed stderr/journal pipe instead of panicking on a
+    // broken pipe (Rust ignores SIGPIPE by default) (#129).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("trashd {}", env!("CARGO_PKG_VERSION"));

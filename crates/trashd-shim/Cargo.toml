@@ -16,3 +16,4 @@ path = "src/rm.rs"
 [dependencies]
 trashd-common = { path = "../trashd-common" }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"

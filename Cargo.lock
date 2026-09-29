@@ -1301,6 +1301,7 @@ name = "trashd-shim"
 version = "0.1.5"
 dependencies = [
  "clap",
+ "libc",
  "trashd-common",
 ]
 

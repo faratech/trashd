@@ -19,7 +19,7 @@ for artifact in "$TRASH" "$SHIM" "$EXEC" "$PRELOAD"; do
     [[ -f "$artifact" ]] || { echo "Missing built artifact: $artifact" >&2; exit 1; }
 done
 [[ "$(command -v rm)" == /opt/trashd/bin/rm ]] || { echo 'Built PATH shim missing' >&2; exit 1; }
-if /usr/bin/rm --version | grep -q trashd; then
+if /usr/bin/rm --version | grep >/dev/null trashd; then
     echo 'Runtime /usr/bin/rm is another shim; cannot test explicit permanent bypass' >&2
     exit 1
 fi
@@ -47,7 +47,7 @@ trash empty -y >/dev/null
 # /tmp is in never_trash so use home
 echo "shim_test" > /home/test/trashd_it_shim.txt
 rm /home/test/trashd_it_shim.txt
-if trash ls 2>&1 | grep -q "trashd_it_shim"; then
+if trash ls 2>&1 | grep >/dev/null "trashd_it_shim"; then
     pass "Layer 1: shim trashes file"
 else
     fail "Layer 1: shim trashes file" "not found in trash"
@@ -60,7 +60,7 @@ rm --permanent /home/test/trashd_it_shim.txt 2>/dev/null
 # -----------------------------------------------------------------------
 echo "preload_test" > /home/test/trashd_it_preload.txt
 preload_python -c "import os; os.remove('/home/test/trashd_it_preload.txt')" 2>/dev/null
-if trash ls 2>&1 | grep -q "trashd_it_preload"; then
+if trash ls 2>&1 | grep >/dev/null "trashd_it_preload"; then
     pass "Layer 2: LD_PRELOAD trashes python unlink"
 else
     fail "Layer 2: LD_PRELOAD trashes python unlink" "not found in trash"
@@ -72,7 +72,7 @@ trash empty -y >/dev/null 2>&1
 # -----------------------------------------------------------------------
 echo "perm" > /home/test/trashd_it_perm.txt
 rm --permanent /home/test/trashd_it_perm.txt
-if trash ls 2>&1 | grep -q "trashd_it_perm"; then
+if trash ls 2>&1 | grep >/dev/null "trashd_it_perm"; then
     fail "Bypass: --permanent" "file found in trash (should not be)"
 else
     pass "Bypass: --permanent"
@@ -83,7 +83,7 @@ fi
 # -----------------------------------------------------------------------
 echo "bypass" > /home/test/trashd_it_bypass.txt
 TRASH_BYPASS=1 rm /home/test/trashd_it_bypass.txt
-if trash ls 2>&1 | grep -q "trashd_it_bypass"; then
+if trash ls 2>&1 | grep >/dev/null "trashd_it_bypass"; then
     fail "Bypass: TRASH_BYPASS=1" "file found in trash"
 else
     pass "Bypass: TRASH_BYPASS=1"
@@ -121,7 +121,7 @@ rm --permanent /home/test/trashd_it_rto_alt.txt 2>/dev/null
 echo "purge_me" > /home/test/trashd_it_purge.txt
 rm /home/test/trashd_it_purge.txt
 trash purge trashd_it_purge.txt >/dev/null 2>&1
-if trash ls 2>&1 | grep -q "trashd_it_purge"; then
+if trash ls 2>&1 | grep >/dev/null "trashd_it_purge"; then
     fail "trash purge" "entry still in trash"
 else
     pass "trash purge"
@@ -146,7 +146,7 @@ fi
 mkdir -p /home/test/trashd_it_repo/.git/objects
 echo "obj" > /home/test/trashd_it_repo/.git/objects/test_obj
 preload_python -c "import os; os.remove('/home/test/trashd_it_repo/.git/objects/test_obj')" 2>/dev/null
-if trash ls 2>&1 | grep -q "test_obj"; then
+if trash ls 2>&1 | grep >/dev/null "test_obj"; then
     fail ".git/* skip pattern" "git object was trashed"
 else
     pass ".git/* skip pattern"
@@ -189,7 +189,7 @@ trash empty -y >/dev/null 2>&1
 # trash fsck
 # -----------------------------------------------------------------------
 echo "orphan" > ~/.local/share/Trash/files/trashd_it_orphan
-if trash fsck 2>&1 | grep -q "orphan"; then
+if trash fsck 2>&1 | grep >/dev/null "orphan"; then
     pass "trash fsck detects orphans"
 else
     fail "trash fsck detects orphans" "orphan not detected"
@@ -221,7 +221,7 @@ if [ -x "$EXEC" ] && [ -x /usr/bin/rm ]; then
     else
         timeout 20 "$EXEC" \
             /usr/bin/rm -f /home/test/trashd_it_sec.txt >/dev/null 2>&1
-        if [ ! -f /home/test/trashd_it_sec.txt ] && trash ls 2>&1 | grep -q "trashd_it_sec"; then
+        if [ ! -f /home/test/trashd_it_sec.txt ] && trash ls 2>&1 | grep >/dev/null "trashd_it_sec"; then
             pass "seccomp supervisor trashes rm under trashd-exec"
         else
             fail "seccomp supervisor trashes rm under trashd-exec" "file not trashed"
@@ -253,7 +253,7 @@ echo "batch1" > /home/test/trashd_it_b1.py
 echo "batch2" > /home/test/trashd_it_b2.py
 rm /home/test/trashd_it_b1.py /home/test/trashd_it_b2.py
 OUTPUT=$(trash restore '*.py' --all 2>&1 || true)
-if echo "$OUTPUT" | grep -q "Restored:" && [ -f /home/test/trashd_it_b1.py ] && [ -f /home/test/trashd_it_b2.py ]; then
+if echo "$OUTPUT" | grep >/dev/null "Restored:" && [ -f /home/test/trashd_it_b1.py ] && [ -f /home/test/trashd_it_b2.py ]; then
     pass "trash restore --all batch restore"
 else
     fail "trash restore --all batch restore" "files not restored"
@@ -266,7 +266,7 @@ trash empty -y >/dev/null 2>&1
 # -----------------------------------------------------------------------
 echo "recent" > /home/test/trashd_it_recent.txt
 rm /home/test/trashd_it_recent.txt
-if trash ls --after 1h 2>&1 | grep -q "trashd_it_recent"; then
+if trash ls --after 1h 2>&1 | grep >/dev/null "trashd_it_recent"; then
     pass "trash ls --after shows recent items"
 else
     fail "trash ls --after shows recent items" "recent file not shown"
@@ -278,7 +278,7 @@ trash empty -y >/dev/null 2>&1
 # -----------------------------------------------------------------------
 echo "jsontest" > /home/test/trashd_it_json.txt
 rm /home/test/trashd_it_json.txt
-if trash ls --json 2>&1 | grep -q '"id"'; then
+if trash ls --json 2>&1 | grep >/dev/null '"id"'; then
     pass "trash ls --json outputs JSON"
 else
     fail "trash ls --json outputs JSON" "no JSON output"
@@ -288,7 +288,7 @@ trash empty -y >/dev/null 2>&1
 # -----------------------------------------------------------------------
 # trash config show
 # -----------------------------------------------------------------------
-if trash config show 2>&1 | grep -q "never_trash"; then
+if trash config show 2>&1 | grep >/dev/null "never_trash"; then
     pass "trash config show"
 else
     fail "trash config show" "config not shown"
