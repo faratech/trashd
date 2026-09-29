@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Release from the 2026-09-29 analysis and remediation pass: 38 issues filed,
+Release from the 2026-09-29 analysis and remediation pass: 40 issues filed,
 verified, and closed.
 
 ### Fixed — daemon
@@ -176,6 +176,11 @@ reproducible against 0.1.5 on a live system before fixing.
 - `.trashinfo` decoding is plain percent-decoding: percent-encoded dot
   segments cannot bypass traversal rejection, Path values keep literal
   whitespace, and `file://host` forms cannot invent paths.
+- Restore and the compressors serialize on an entry flock: a compressor can
+  no longer swap zstd bytes into restore's publish window (which published
+  compressed bytes as the restored file), and a purge can no longer strip
+  the sidecar of an in-flight trash — young data-absent sidecars get a
+  grace window and a completed move re-ensures its sidecar.
 - Long-running supervisors no longer leak a descriptor when the trash volume
   fills, and raced FIFO/symlink swaps cannot block a deletion forever.
 - The trash index database is owner-only (0600).
