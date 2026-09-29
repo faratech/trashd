@@ -1227,6 +1227,12 @@ fn cstr_to_path(s: *const libc::c_char) -> Option<PathBuf> {
 fn resolve_at_path(dirfd: libc::c_int, pathname: *const libc::c_char) -> Option<PathBuf> {
     let path = cstr_to_path(pathname)?;
 
+    // An empty pathname is ENOENT in the kernel; joining it below would
+    // resolve to the cwd (or the dirfd) itself and trash it (#84).
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+
     if path.is_absolute() {
         return Some(path);
     }
@@ -1311,6 +1317,10 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
             }
 
             if let Some(path) = cstr_to_path(pathname) {
+                // Empty pathname → ENOENT; joining would trash the cwd (#84).
+                if path.as_os_str().is_empty() {
+                    return None;
+                }
                 let abs = if path.is_absolute() {
                     path.clone()
                 } else {
@@ -1421,6 +1431,10 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
             }
 
             if let Some(path) = cstr_to_path(pathname) {
+                // Empty pathname → ENOENT; joining would trash the cwd (#84).
+                if path.as_os_str().is_empty() {
+                    return None;
+                }
                 let abs = if path.is_absolute() {
                     path.clone()
                 } else {

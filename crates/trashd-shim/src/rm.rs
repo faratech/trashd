@@ -128,11 +128,26 @@ fn main() -> ExitCode {
     // args_os (NOT args): argv may contain non-UTF-8 filenames, and
     // std::env::args() PANICS on them — the file would be neither trashed
     // nor deleted (#14).
+    //
+    // Only occurrences BEFORE the `--` separator can be flags: clap parses
+    // everything after `--` as positional operands, so a file literally named
+    // `--permanent` (given via `rm --permanent -- --permanent`) must survive
+    // the filter intact and reach the real rm.
     if args.permanent {
-        let filtered: Vec<std::ffi::OsString> = std::env::args_os()
-            .skip(1)
-            .filter(|a| a != "--permanent" && a != "--no-trash")
-            .collect();
+        let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let bypass_flag =
+            |a: &std::ffi::OsString| a.as_os_str() != "--permanent" && a.as_os_str() != "--no-trash";
+        let filtered: Vec<std::ffi::OsString> = match raw.iter().position(|a| a == "--") {
+            // Strip the bypass flags only BEFORE `--`; the tail (including the
+            // separator) is operand territory and must pass through verbatim.
+            Some(i) => raw[..i]
+                .iter()
+                .filter(|a| bypass_flag(a))
+                .cloned()
+                .chain(raw[i..].iter().cloned())
+                .collect(),
+            None => raw.iter().filter(|a| bypass_flag(a)).cloned().collect(),
+        };
         return passthrough_with_args(&filtered);
     }
 
@@ -191,6 +206,19 @@ fn main() -> ExitCode {
     let mut exit_code = ExitCode::SUCCESS;
 
     for file in &args.files {
+        // GNU rm refuses operands naming '.' or '..' (including `subdir/..`):
+        // resolving them here would operate on the WRONG directory — a
+        // trailing `..` collapsed to its parent's parent by normalize_path
+        // used to trash the caller's CWD and report success (#83).
+        if is_dot_operand(file) {
+            eprintln!(
+                "rm: refusing to remove '.' or '..': skipping directory '{}'",
+                file.display()
+            );
+            exit_code = ExitCode::FAILURE;
+            continue;
+        }
+
         let meta = match file.symlink_metadata() {
             Ok(m) => m,
             Err(e) if behavior.ignore_missing && e.kind() == std::io::ErrorKind::NotFound => {
@@ -369,6 +397,16 @@ fn is_root_operand(p: &std::path::Path) -> bool {
     matches!(comps.next(), Some(std::path::Component::RootDir)) && comps.next().is_none()
 }
 
+/// True when the operand's final component is `.` or `..` — the shapes GNU rm
+/// refuses outright. Anything else (including `a/../b`, whose last component
+/// is `b`) is handled by the kernel's own resolution.
+fn is_dot_operand(p: &std::path::Path) -> bool {
+    matches!(
+        p.components().next_back(),
+        Some(std::path::Component::CurDir) | Some(std::path::Component::ParentDir)
+    )
+}
+
 /// Prompt user on stderr, return true if they answer 'y' or 'Y'.
 fn prompt_user(msg: &str) -> bool {
     eprint!("{msg}");
@@ -382,18 +420,33 @@ fn prompt_user(msg: &str) -> bool {
 
 /// Find the real rm binary.
 fn real_rm_path() -> PathBuf {
-    let stashed = PathBuf::from("/usr/local/lib/trashd/real/rm");
-    if stashed.exists() {
-        if !stash_is_shim(&stashed) {
-            return stashed;
+    // Prefer the stash NEXT TO THIS SHIM: the installer puts the shim at
+    // ${PREFIX}/lib/trashd/bin/rm and the stash at ${PREFIX}/lib/trashd/real/rm,
+    // so a custom PREFIX install would otherwise never find its stash (#101).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::fs::read_link("/proc/self/exe")
+        && let Some(bin) = exe.parent()
+        && let Some(trashd_dir) = bin.parent()
+    {
+        candidates.push(trashd_dir.join("real/rm"));
+    }
+    // Legacy default-layout stash.
+    candidates.push(PathBuf::from("/usr/local/lib/trashd/real/rm"));
+
+    for stashed in candidates {
+        if stashed.exists() {
+            if !stash_is_shim(&stashed) {
+                return stashed;
+            }
+            // Poisoned stash: executing a copy of THIS SHIM as the "real" rm
+            // recurses without bound (the copy passes through to itself even
+            // with TRASH_BYPASS=1). Fall back to PATH discovery instead.
+            eprintln!(
+                "trashd: warning: {} is a copy of the trashd shim — ignoring it (reinstall to repair)",
+                stashed.display()
+            );
+            break;
         }
-        // Poisoned stash: executing a copy of THIS SHIM as the "real" rm
-        // recurses without bound (the copy passes through to itself even
-        // with TRASH_BYPASS=1). Fall back to PATH discovery instead.
-        eprintln!(
-            "trashd: warning: {} is a copy of the trashd shim — ignoring it (reinstall to repair)",
-            stashed.display()
-        );
     }
 
     if let Ok(path) = std::env::var("PATH") {
@@ -421,15 +474,17 @@ fn real_rm_path() -> PathBuf {
 /// Detect a shim masquerading as the real rm (poisoned stash from an older
 /// installer that resolved `which rm` while the shim was already on PATH).
 /// Probe `--version` ONCE and cache: a genuine rm never mentions "trashd",
-/// while the shim identifies itself. Must NOT be called with TRASH_BYPASS in
-/// the environment — the probe relies on the shim's `--version` short-circuit
-/// (which exits before any passthrough) to avoid recursion.
+/// while the shim identifies itself. The probe MUST strip TRASH_BYPASS from
+/// the child's environment: a shim-copy probe inherits the bypass early-return
+/// and would otherwise spawn its own probe recursively — unbounded forking
+/// (#85) — instead of exiting through the `--version` short-circuit.
 fn stash_is_shim(path: &PathBuf) -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         std::process::Command::new(path)
             .arg("--version")
+            .env_remove("TRASH_BYPASS")
             .output()
             .map(|o| {
                 let out = format!(
@@ -506,6 +561,7 @@ fn real_rm_inner(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     // Standard GNU rm options that previously failed to parse — which made the
     // shim fall through to a PERMANENT delete instead of trashing.
@@ -646,5 +702,50 @@ mod tests {
         assert!(!is_root_operand(&PathBuf::from("/tmp/")));
         assert!(!is_root_operand(&PathBuf::from("relative")));
         assert!(!is_root_operand(&PathBuf::from(".")));
+    }
+
+    // Regression (#83): operands whose final component is `.` or `..` are
+    // refused outright, like GNU rm. `a/../b` (final component `b`) is NOT
+    // one of them — the kernel resolves it correctly.
+    #[test]
+    fn dot_operand_detection() {
+        for operand in [".", "..", "./", "a/..", "a/b/../..", "/tmp/.."] {
+            assert!(is_dot_operand(Path::new(operand)), "{operand}");
+        }
+        for operand in ["", "file", "a/b", "/tmp/x/", "a/../b", "./file"] {
+            assert!(!is_dot_operand(Path::new(operand)), "{operand}");
+        }
+    }
+
+    // Regression (#103): the --permanent passthrough filter must strip the
+    // bypass flags only BEFORE the `--` separator; operands after `--` are
+    // filenames and must reach the real rm verbatim.
+    #[test]
+    fn permanent_filter_keeps_post_separator_operands() {
+        // Reimplemented here against the same rule main() applies, so a
+        // regression in either copy is caught.
+        let filter = |raw: &[&str]| -> Vec<String> {
+            match raw.iter().position(|a| *a == "--") {
+                Some(i) => raw[..i]
+                    .iter()
+                    .filter(|a| !matches!(**a, "--permanent" | "--no-trash"))
+                    .map(|a| a.to_string())
+                    .chain(raw[i..].iter().map(|a| a.to_string()))
+                    .collect(),
+                None => raw
+                    .iter()
+                    .filter(|a| !matches!(**a, "--permanent" | "--no-trash"))
+                    .map(|a| a.to_string())
+                    .collect(),
+            }
+        };
+
+        assert_eq!(
+            filter(&["--permanent", "--", "--permanent"]),
+            vec!["--", "--permanent"]
+        );
+        assert_eq!(filter(&["--permanent", "f"]), vec!["f"]);
+        assert_eq!(filter(&["--no-trash", "-rf", "d"]), vec!["-rf", "d"]);
+        assert_eq!(filter(&["f"]), vec!["f"]);
     }
 }
