@@ -53,10 +53,16 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
         return;
     }
 
-    // Confirmation prompt unless --yes
+    // Confirmation prompt unless --yes. Listing failures must NOT masquerade
+    // as an empty trash here: unwrap_or_default() made a transient listing
+    // error print "Nothing to empty." and exit 0 without deleting anything
+    // (a silent fail-open the dry-run path never had) (#147).
     if !yes {
         let (prompt_size, prompt_count) = if let Some(d) = days {
-            let entries = store.list(None).unwrap_or_default();
+            let entries = match store.list(None) {
+                Ok(e) => e,
+                Err(e) => fatal(e),
+            };
             let now = chrono::Local::now();
             let mut size = 0u64;
             let mut cnt = 0u64;
@@ -69,8 +75,10 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
             }
             (size, cnt)
         } else {
-            let (s, c) = store.status().unwrap_or_default();
-            (s, c as u64)
+            match store.status() {
+                Ok((s, c)) => (s, c as u64),
+                Err(e) => fatal(e),
+            }
         };
         if prompt_count == 0 {
             println!("{}", "Nothing to empty.".dimmed());

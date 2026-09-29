@@ -163,10 +163,19 @@ fn config_get(config: &Config, key: &str) -> Option<String> {
 
 fn load_user_config_table() -> toml::Table {
     let path = Config::user_config_path();
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.parse::<toml::Table>().ok())
-        .unwrap_or_default()
+    // A missing file is the ordinary first-write case. An existing file that
+    // does not parse must STOP the edit: rewriting the table from scratch
+    // here would silently discard every pre-existing setting (#143).
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match content.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(e) => fatal(format!(
+                "refusing to edit {}: the existing config does not parse:\n{e}\nFix or remove the file, then re-run",
+                path.display()
+            )),
+        },
+        Err(_) => toml::Table::new(),
+    }
 }
 
 fn write_user_config_table(table: &toml::Table) {
@@ -184,31 +193,48 @@ fn config_set_scalar(table: &mut toml::Table, key: &str, value: &str) -> bool {
     match key {
         "retention.max_age_days" => {
             let v: u32 = value.parse().unwrap_or_else(|_| fatal("expected integer"));
-            let ret = table
+            // An existing scalar `retention` must error, not panic (#145) —
+            // and never be silently discarded by the rewrite.
+            let ret = match table
                 .entry("retention")
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                 .as_table_mut()
-                .unwrap();
+            {
+                Some(t) => t,
+                None => fatal(
+                    "'retention' in the user config is not a table — fix or remove it, then re-run",
+                ),
+            };
             ret.insert("max_age_days".into(), toml::Value::Integer(v as i64));
         }
         "retention.max_size_gb" => {
             let v: f64 = value.parse().unwrap_or_else(|_| fatal("expected number"));
-            let ret = table
+            let ret = match table
                 .entry("retention")
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                 .as_table_mut()
-                .unwrap();
+            {
+                Some(t) => t,
+                None => fatal(
+                    "'retention' in the user config is not a table — fix or remove it, then re-run",
+                ),
+            };
             ret.insert("max_size_gb".into(), toml::Value::Float(v));
         }
         "retention.disk_pressure_percent" => {
             let v: u8 = value
                 .parse()
                 .unwrap_or_else(|_| fatal("expected integer 0-100"));
-            let ret = table
+            let ret = match table
                 .entry("retention")
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                 .as_table_mut()
-                .unwrap();
+            {
+                Some(t) => t,
+                None => fatal(
+                    "'retention' in the user config is not a table — fix or remove it, then re-run",
+                ),
+            };
             ret.insert(
                 "disk_pressure_percent".into(),
                 toml::Value::Integer(v as i64),

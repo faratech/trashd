@@ -55,8 +55,17 @@ pub fn parse_time_spec(
         return dt;
     }
 
-    // Absolute: "2026-03-20T14:00:00" or "2026-03-20"
+    // Absolute: "2026-03-20T14:00:00", "2026-03-20T14:00", or "2026-03-20"
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        && let Some(local) = dt.and_local_timezone(chrono::Local).single()
+    {
+        return local;
+    }
+    // minutes-precision datetime: the documented "2026-03-20T14:00" form (#146)
+    if s.contains('T')
+        && s.matches('-').count() == 2
+        && let Ok(dt) =
+            chrono::NaiveDateTime::parse_from_str(&format!("{s}:00"), "%Y-%m-%dT%H:%M:%S")
         && let Some(local) = dt.and_local_timezone(chrono::Local).single()
     {
         return local;
