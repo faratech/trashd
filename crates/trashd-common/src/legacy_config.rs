@@ -20,7 +20,17 @@ pub fn normalize(contents: &str) -> Result<toml::Value, toml::de::Error> {
                 .and_then(|retention| retention.remove(key));
             if let Some(legacy) = legacy {
                 // An explicit root setting always takes precedence.
-                root.entry(key.to_owned()).or_insert(legacy);
+                if root.get(key).is_none() {
+                    // A misplaced key SILENTLY applied is the worst failure
+                    // direction for a whitelist like only_trash (real
+                    // deletes); bc1a5f5 originally rejected these outright.
+                    // Keep the legacy compatibility, but stay loud (#150).
+                    eprintln!(
+                        "trashd: note: '{key}' applied from [retention] (legacy layout); \
+                         move it to the top level to silence this"
+                    );
+                    root.insert(key.to_owned(), legacy);
+                }
             }
         }
     }

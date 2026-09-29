@@ -43,7 +43,7 @@ def run():
         count = 0
 
         def case(name, config, size=1, trashed=True, command=None, filename="victim",
-                 local=None, warning=False):
+                 local=None, warning=None):
             nonlocal count
             count += 1
             fixture = root / name
@@ -66,8 +66,8 @@ def run():
             arguments = command(victim) if command else ["/usr/bin/unlink", victim]
             result = subprocess.run(arguments, env=env, capture_output=True)
             assert result.returncode == 0, (name, result.stderr)
-            if warning:
-                assert b"bad config" in result.stderr, (name, result.stderr)
+            if warning is not None:
+                assert warning in result.stderr, (name, result.stderr)
             assert not os.path.lexists(victim), name
             records = list((data / "Trash" / "info").glob("*.trashinfo"))
             assert len(records) == int(trashed), (name, records, result.stderr)
@@ -100,21 +100,30 @@ def run():
              local='only_trash = ["local-relative/*.py*"]\n')
         case("global-veto", 'never_trash = ["file?.c"]\n', filename="file1.c", trashed=False,
              local='only_trash = ["*.[ch]"]\n')
-        case("malformed-retention", '[retention]\nonly_trash = ["*.txt"]\n', warning=True)
+        # A policy key nested under [retention] (legacy layout) is still
+        # applied — but loudly, not silently (#150).
+        case("legacy-retention-promoted", '[retention]\nonly_trash = ["*.txt"]\n',
+             trashed=False, warning=b"applied from [retention]")
+        # A genuinely malformed config keeps the loud "bad config" diagnostic
+        # and falls back to the default (trash everything) policy.
+        case("malformed-config", 'only_trash = ["*.txt"\n', warning=b"bad config")
 
         # glibc implements remove() with the hidden __unlink/__rmdir aliases,
         # which interposing unlink/rmdir cannot see: without a direct hook the
         # deletion below would be permanent with no trashinfo.
         remove_script = (
-            "import ctypes, sys\n"
+            "import ctypes, os, sys\n"
             "libc = ctypes.CDLL(None, use_errno=True)\n"
             "libc.remove.restype = ctypes.c_int\n"
-            "sys.exit(0 if libc.remove(ctypes.c_char_p(sys.argv[1])) == 0 else 1)\n"
+            "rc = libc.remove(ctypes.c_char_p(os.fsencode(sys.argv[1])))\n"
+            "sys.exit(0 if rc == 0 else 1)\n"
         )
         case("libc-remove", "",
              command=lambda victim: ["/usr/bin/python3", "-c", remove_script,
                                      os.fsdecode(victim)])
-        case("libc-remove-excluded", 'bypass_processes = ["python3"]\n', trashed=False,
+        python_name = Path("/usr/bin/python3").resolve().name
+        case("libc-remove-excluded", f'bypass_processes = [{json.dumps(python_name)}]\n',
+             trashed=False,
              command=lambda victim: ["/usr/bin/python3", "-c", remove_script,
                                      os.fsdecode(victim)])
 
