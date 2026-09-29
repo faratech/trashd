@@ -16,9 +16,6 @@ pub const VERSION: &str = match option_env!("TRASHD_VERSION") {
 // of Rust's default SIGPIPE-ignore turning the next println! into a panic
 // with exit 101 (#129).
 fn main() {
-    // Die quietly on a closed reader (SIGPIPE, exit 141) like GNU tools,
-    // instead of Rust's default SIGPIPE-ignore turning the next println!
-    // into a panic with exit 101 (#129).
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
