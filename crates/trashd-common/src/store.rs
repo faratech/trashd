@@ -930,7 +930,7 @@ impl TrashStore {
                 let mut entry = listed.clone();
                 let mut result = self.restore_resolved(&mut entry, target, false);
                 if force && let Err(TrashError::RestoreConflict(ref destination)) = result {
-                    let destination = destination.clone();
+                    let destination = normalize_conflict_base(destination);
                     for i in 1..1000 {
                         let mut candidate = destination.as_os_str().to_os_string();
                         candidate.push(format!(".{i}"));
@@ -1567,7 +1567,7 @@ impl TrashStore {
     }
 
     /// All known trash directories (home + per-mountpoint).
-    fn all_trash_dirs(&self) -> Vec<(PathBuf, String)> {
+    pub fn all_trash_dirs(&self) -> Vec<(PathBuf, String)> {
         if self.isolated {
             vec![(self.home.clone(), "home".into())]
         } else {
@@ -2441,6 +2441,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 /// Atomically (over)write a `.trashinfo` file. Public so the CLI `compress`
 /// command can record the `X-Trashd-Compressed` marker without re-implementing
 /// the temp-file+rename dance.
+/// Strip redundant separators and `.` components from a conflict destination
+/// so the `--force` sibling candidates ("backup.1", "backup.2") are built from
+/// a normalized base: a trailing-slash `--to backup/` must not concatenate to
+/// the hidden "backup/.1" INSIDE the directory (#158).
+pub fn normalize_conflict_base(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<()> {
     atomic_write(info_path, info.to_trashinfo_string().as_bytes())
 }

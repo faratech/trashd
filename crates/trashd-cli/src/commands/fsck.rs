@@ -2,15 +2,61 @@ use colored::Colorize;
 use trashd_common::TrashStore;
 
 pub fn run(store: &TrashStore, fix: bool) {
-    let home_trash = store.home_dir();
-    let info_dir = home_trash.join("info");
-    let files_dir = home_trash.join("files");
+    println!("{}", "Checking trash integrity...".bold());
+
+    let roots = store.all_trash_dirs();
+    // Label each root only when there is more than one: the common single-root
+    // case keeps its historical output.
+    let multi = roots.len() > 1;
 
     let mut orphaned_info = 0usize;
     let mut orphaned_files = 0usize;
     let mut corrupt_info = 0usize;
 
-    println!("{}", "Checking trash integrity...".bold());
+    for (trash_dir, label) in &roots {
+        if multi {
+            println!("\n{} ({})", trash_dir.display(), label);
+        }
+        let (oi, of, ci) = check_trash_dir(trash_dir, fix);
+        orphaned_info += oi;
+        orphaned_files += of;
+        corrupt_info += ci;
+    }
+
+    let total = orphaned_info + orphaned_files + corrupt_info;
+    if total == 0 {
+        println!("{}", "No problems found.".green().bold());
+    } else {
+        println!(
+            "\n{} problems: {} orphaned trashinfo, {} orphaned files, {} corrupt",
+            total, orphaned_info, orphaned_files, corrupt_info,
+        );
+        if !fix {
+            println!("Run {} to fix.", "trash fsck --fix".bold());
+        }
+    }
+
+    // Rebuild the SQLite index for every root, not just home (#157): a
+    // stale per-partition index would keep serving ghost entries.
+    if fix {
+        for (trash_dir, _) in &roots {
+            print!("\nRebuilding index in {}... ", trash_dir.display());
+            match rebuild_index(trash_dir) {
+                Ok(count) => println!("{} ({count} entries)", "done".green()),
+                Err(e) => println!("{} {e}", "failed".red()),
+            }
+        }
+    }
+}
+
+/// Check one trash root; returns (orphaned_info, orphaned_files, corrupt_info).
+fn check_trash_dir(trash_dir: &std::path::Path, fix: bool) -> (usize, usize, usize) {
+    let info_dir = trash_dir.join("info");
+    let files_dir = trash_dir.join("files");
+
+    let mut orphaned_info = 0usize;
+    let mut orphaned_files = 0usize;
+    let mut corrupt_info = 0usize;
 
     // Check for .trashinfo files without matching files
     if let Ok(entries) = std::fs::read_dir(&info_dir) {
@@ -28,8 +74,13 @@ pub fn run(store: &TrashStore, fix: bool) {
                 orphaned_info += 1;
                 println!("  {} orphaned trashinfo (no file): {}", "WARN".yellow(), id);
                 if fix {
-                    let _ = std::fs::remove_file(entry.path());
-                    println!("    {}", "removed".green());
+                    // Report reality: a sidecar that is actually a directory
+                    // or a read-only volume must not print "removed" and
+                    // exit 0 with the file still present (#156).
+                    match std::fs::remove_file(entry.path()) {
+                        Ok(()) => println!("    {}", "removed".green()),
+                        Err(e) => println!("    {} {e}", "failed:".red()),
+                    }
                 }
                 continue; // already reported — don't also count as corrupt
             }
@@ -102,27 +153,7 @@ pub fn run(store: &TrashStore, fix: bool) {
         }
     }
 
-    let total = orphaned_info + orphaned_files + corrupt_info;
-    if total == 0 {
-        println!("{}", "No problems found.".green().bold());
-    } else {
-        println!(
-            "\n{} problems: {} orphaned trashinfo, {} orphaned files, {} corrupt",
-            total, orphaned_info, orphaned_files, corrupt_info,
-        );
-        if !fix {
-            println!("Run {} to fix.", "trash fsck --fix".bold());
-        }
-    }
-
-    // Rebuild SQLite index from .trashinfo files
-    if fix {
-        print!("\nRebuilding index... ");
-        match rebuild_index(home_trash) {
-            Ok(count) => println!("{} ({count} entries)", "done".green()),
-            Err(e) => println!("{} {e}", "failed".red()),
-        }
-    }
+    (orphaned_info, orphaned_files, corrupt_info)
 }
 
 /// Whether `files/<id>` has a usable sidecar, matching the store's own
@@ -215,8 +246,14 @@ mod tests {
         symlink(&regular, &live_link).unwrap();
 
         assert!(sidecar_is_usable(&regular));
-        assert!(!sidecar_is_usable(&dangling), "dangling symlink is not usable");
-        assert!(!sidecar_is_usable(&live_link), "symlinked sidecar is not usable");
+        assert!(
+            !sidecar_is_usable(&dangling),
+            "dangling symlink is not usable"
+        );
+        assert!(
+            !sidecar_is_usable(&live_link),
+            "symlinked sidecar is not usable"
+        );
         assert!(!sidecar_is_usable(&dir.path().join("missing.trashinfo")));
     }
 }

@@ -85,9 +85,12 @@ fn restore_entry(
     match store.restore(target, to) {
         Ok(path) => Ok(path),
         Err(TrashError::RestoreConflict(path)) if force => {
-            // Auto-rename: try .1, .2, .3, ...
+            // Auto-rename: try .1, .2, .3, ... off a NORMALIZED base so a
+            // trailing-slash `--to backup/` yields the sibling "backup.1",
+            // not a hidden "backup/.1" inside the directory (#158).
+            let base = trashd_common::store::normalize_conflict_base(&path);
             for i in 1..1000 {
-                let mut name = path.as_os_str().to_os_string();
+                let mut name = base.as_os_str().to_os_string();
                 name.push(format!(".{i}"));
                 let renamed = PathBuf::from(name);
                 if std::fs::symlink_metadata(&renamed).is_err() {
