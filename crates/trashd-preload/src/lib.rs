@@ -681,6 +681,16 @@ fn sanitize_patterns(list: Vec<String>, what: &str) -> Vec<String> {
 /// (#136), and the preload protects exactly the daemon/cron processes that
 /// have no other layer.
 fn load_local_config(path: &Path) -> Option<LocalConfig> {
+    // The walk runs on EVERY hooked call (the common crate loads config once
+    // at store open; the preload has no such cache), so the warning must be
+    // once-per-process: a broken config in a hot path would otherwise print
+    // a line for every single unlink (#165).
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let warn = |msg: String| {
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("trashd-preload: warning: {msg}");
+        }
+    };
     let mut dir = path.parent()?;
     loop {
         let cfg_path = dir.join(".trashd.toml");
@@ -689,18 +699,12 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
                 Ok(content) => match toml::from_str::<LocalConfig>(&content) {
                     Ok(local) => local,
                     Err(e) => {
-                        eprintln!(
-                            "trashd-preload: warning: ignoring broken {}: {e}",
-                            cfg_path.display()
-                        );
+                        warn(format!("ignoring broken {}: {e}", cfg_path.display()));
                         return None;
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "trashd-preload: warning: ignoring unreadable {}: {e}",
-                        cfg_path.display()
-                    );
+                    warn(format!("ignoring unreadable {}: {e}", cfg_path.display()));
                     return None;
                 }
             };
