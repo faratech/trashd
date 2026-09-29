@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Release from the 2026-09-29 analysis and remediation pass: 40 issues filed,
+Release from the 2026-09-29 analysis and remediation pass: 41 issues filed,
 verified, and closed.
 
 ### Fixed — daemon
