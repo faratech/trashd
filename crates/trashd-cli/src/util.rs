@@ -37,18 +37,22 @@ pub fn parse_time_spec(
 ) -> chrono::DateTime<chrono::Local> {
     let s = s.trim();
 
-    // Relative: "30m", "1h", "2d", "1w"
-    if let Some(mins) = s.strip_suffix('m').and_then(|v| v.parse::<i64>().ok()) {
-        return *now - chrono::Duration::minutes(mins);
-    }
-    if let Some(hours) = s.strip_suffix('h').and_then(|v| v.parse::<i64>().ok()) {
-        return *now - chrono::Duration::hours(hours);
-    }
-    if let Some(days) = s.strip_suffix('d').and_then(|v| v.parse::<i64>().ok()) {
-        return *now - chrono::Duration::days(days);
-    }
-    if let Some(weeks) = s.strip_suffix('w').and_then(|v| v.parse::<i64>().ok()) {
-        return *now - chrono::Duration::weeks(weeks);
+    // Relative: "30m", "1h", "2d", "1w". try_* + checked_sub_signed so an
+    // absurd magnitude (e.g. 99999999999999m) falls through to the clean
+    // error below instead of panicking on a chrono overflow (#96).
+    let relative = if let Some(mins) = s.strip_suffix('m').and_then(|v| v.parse::<i64>().ok()) {
+        chrono::TimeDelta::try_minutes(mins).and_then(|d| now.checked_sub_signed(d))
+    } else if let Some(hours) = s.strip_suffix('h').and_then(|v| v.parse::<i64>().ok()) {
+        chrono::TimeDelta::try_hours(hours).and_then(|d| now.checked_sub_signed(d))
+    } else if let Some(days) = s.strip_suffix('d').and_then(|v| v.parse::<i64>().ok()) {
+        chrono::TimeDelta::try_days(days).and_then(|d| now.checked_sub_signed(d))
+    } else if let Some(weeks) = s.strip_suffix('w').and_then(|v| v.parse::<i64>().ok()) {
+        chrono::TimeDelta::try_weeks(weeks).and_then(|d| now.checked_sub_signed(d))
+    } else {
+        None
+    };
+    if let Some(dt) = relative {
+        return dt;
     }
 
     // Absolute: "2026-03-20T14:00:00" or "2026-03-20"
@@ -57,8 +61,10 @@ pub fn parse_time_spec(
     {
         return local;
     }
-    if let Ok(dt) =
-        chrono::NaiveDateTime::parse_from_str(&format!("{s}T00:00:00"), "%Y-%m-%dT%H:%M:%S")
+    if !s.contains('T')
+        && s.matches('-').count() == 2
+        && let Ok(dt) =
+            chrono::NaiveDateTime::parse_from_str(&format!("{s}T00:00:00"), "%Y-%m-%dT%H:%M:%S")
         && let Some(local) = dt.and_local_timezone(chrono::Local).single()
     {
         return local;

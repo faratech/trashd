@@ -238,11 +238,20 @@ fn config_list_add(table: &mut toml::Table, key: &str, value: &str) {
         "never_trash" | "only_trash" | "bypass_processes" | "bypass_paths" => {}
         _ => fatal(format!("'{key}' is not a list — use 'trash config set'")),
     }
-    let arr = table
+    // The raw table bypasses schema validation, so an existing value can be a
+    // non-array (e.g. `never_trash = "*.tmp"`): surface a readable error
+    // instead of panicking (#94) — and never silently discard the mistyped
+    // value.
+    let arr = match table
         .entry(key)
         .or_insert_with(|| toml::Value::Array(Vec::new()))
         .as_array_mut()
-        .unwrap();
+    {
+        Some(arr) => arr,
+        None => fatal(format!(
+            "'{key}' in the user config is not a list — fix or remove it, then re-run"
+        )),
+    };
     let new_val = toml::Value::String(value.into());
     if !arr.contains(&new_val) {
         arr.push(new_val);

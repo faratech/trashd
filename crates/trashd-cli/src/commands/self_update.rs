@@ -250,7 +250,11 @@ pub fn run(check_only: bool) {
 
     let release = if check_only {
         if let Some(cached) = cached_update_check() {
-            if cached == current {
+            // Apply the same is_newer guard as the fresh-fetch path: a cached
+            // version that is not strictly newer (equal, or older — e.g. this
+            // binary is a dev build newer than the latest release) must be
+            // reported as up to date, never as a pending "update" (#95).
+            if !is_newer(&cached, current) {
                 println!(
                     "{} trashd {} is already the latest version.",
                     "Up to date:".green().bold(),
@@ -449,11 +453,14 @@ pub fn run(check_only: bool) {
         // is inherited by every descendant and can never be cleared. The setuid
         // sudo binary then refuses to escalate ("the 'no new privileges' flag
         // is set"). Running bash directly needs no privilege transition.
-        std::process::Command::new("bash")
-            .arg(&install_script)
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&install_script)
             .env("TRASH_BYPASS", "1")
-            .current_dir(&install_dir)
-            .status()
+            .current_dir(&install_dir);
+        if let Some(prefix) = detect_install_prefix() {
+            cmd.env("PREFIX", prefix);
+        }
+        cmd.status()
     } else if no_new_privs_set() {
         // Non-root and escalation is blocked by no_new_privs (same seccomp cause
         // as above). sudo/su are setuid and cannot work here — fail with a clear
@@ -470,10 +477,12 @@ pub fn run(check_only: bool) {
         )
     } else {
         // Non-root: escalate via sudo as before.
-        std::process::Command::new("sudo")
-            .arg("env")
-            .arg("TRASH_BYPASS=1")
-            .arg("bash")
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("env").arg("TRASH_BYPASS=1");
+        if let Some(prefix) = detect_install_prefix() {
+            cmd.arg(format!("PREFIX={}", prefix.display()));
+        }
+        cmd.arg("bash")
             .arg(&install_script)
             .current_dir(&install_dir)
             .status()
@@ -500,6 +509,20 @@ pub fn run(check_only: bool) {
 fn no_new_privs_set() -> bool {
     // PR_GET_NO_NEW_PRIVS returns 1 when set, 0 otherwise, -1 on error.
     unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1 }
+}
+
+/// The prefix this binary is installed under (…/bin/trash → …), so a
+/// self-update reinstalls to the SAME location instead of silently
+/// reverting a custom PREFIX to /usr/local (#101). None when the layout
+/// doesn't match an installed binary or the prefix is already the default.
+fn detect_install_prefix() -> Option<PathBuf> {
+    let exe = std::fs::read_link("/proc/self/exe").ok()?;
+    let bin = exe.parent()?;
+    let prefix = bin.parent()?;
+    if !bin.ends_with("bin") || prefix == Path::new("/") || prefix == Path::new("/usr/local") {
+        return None;
+    }
+    Some(prefix.to_path_buf())
 }
 
 fn fetch_release() -> GhRelease {
@@ -613,9 +636,13 @@ fn verify_sha256(tarball: &std::path::Path, sha_file: &std::path::Path) -> Resul
 /// Numeric dot-component comparison: true when `candidate` is NEWER than
 /// `current`. Plain string equality alone would offer "downgrades" whenever
 /// the published tag differs at all (e.g. re-releases, v0.1.10 vs 0.1.9).
+/// Pre-release/build suffixes ("-rc1", "+build") are stripped before the
+/// comparison so "0.2.0-rc1" compares as its base release, not as 0.
 fn is_newer(candidate: &str, current: &str) -> bool {
     fn parts(v: &str) -> Vec<u64> {
-        v.split('.')
+        // Strip pre-release/build metadata at the first '-' or '+'.
+        let core = v.split(['-', '+']).next().unwrap_or(v);
+        core.split('.')
             .map(|p| p.trim().parse().unwrap_or(0))
             .collect()
     }
@@ -657,6 +684,35 @@ mod tests {
             ),
             Some(PathBuf::from("/var/cache/alice/trashd/last-update-check"))
         );
+    }
+
+    // Regression (#95): a cached marker that is not strictly newer than the
+    // running binary must read as up to date, and suffixes must not skew the
+    // numeric comparison.
+    #[test]
+    fn cached_and_suffixed_versions_never_offer_downgrades() {
+        // Plain ordering.
+        assert!(is_newer("0.2.0", "0.1.9"));
+        assert!(is_newer("0.1.10", "0.1.9"));
+        assert!(!is_newer("0.1.9", "0.1.9"));
+        assert!(!is_newer("0.1.5", "0.2.0"), "cached downgrade must not read as an update");
+        // Pre-release/build suffixes compare as their base release.
+        assert!(!is_newer("0.2.0-rc1", "0.2.0"));
+        assert!(is_newer("0.2.1-rc1", "0.2.0"));
+        assert!(!is_newer("0.2.0+build.5", "0.2.0"));
+    }
+
+    // Regression (#101): the detected prefix must match an installed layout
+    // (…/bin/trash) and must never fire for the default /usr/local install,
+    // a bare root path, or a non-installed (dev-tree) binary.
+    #[test]
+    fn install_prefix_detection_follows_proc_self_exe() {
+        // Whatever this test binary is, detection must be total (no panic) and
+        // must reject anything whose parent chain is not an installed layout.
+        if let Some(prefix) = detect_install_prefix() {
+            assert!(prefix.is_absolute());
+            assert_ne!(prefix, Path::new("/usr/local"));
+        }
     }
 
     #[test]

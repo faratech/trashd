@@ -62,7 +62,7 @@ pub fn run(store: &TrashStore, fix: bool) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let info_path = info_dir.join(format!("{name}.trashinfo"));
-            if !info_path.exists() {
+            if !sidecar_is_usable(&info_path) {
                 orphaned_files += 1;
                 println!(
                     "  {} orphaned file (no trashinfo): {}",
@@ -125,6 +125,17 @@ pub fn run(store: &TrashStore, fix: bool) {
     }
 }
 
+/// Whether `files/<id>` has a usable sidecar, matching the store's own
+/// classification (`sidecar_version` requires a REGULAR file via
+/// symlink_metadata). `exists()` would follow a dangling symlink and
+/// misclassify intact data as orphaned/deletable (#99).
+fn sidecar_is_usable(info_path: &std::path::Path) -> bool {
+    info_path
+        .symlink_metadata()
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
 /// Scan all .trashinfo files and rebuild the SQLite index from scratch.
 fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::error::Error>> {
     let info_dir = trash_dir.join("info");
@@ -185,5 +196,27 @@ mod tests {
             "data file must be preserved when its metadata is corrupt"
         );
         assert_eq!(fs::read(trash.join("files/keep")).unwrap(), b"precious");
+    }
+
+    // Regression (#99): a DANGLING sidecar symlink must not make fsck classify
+    // intact data as an orphaned file it offers to permanently delete. The
+    // classification matches the store's: only a regular-file sidecar is
+    // usable, and a symlink — dangling or not — never counts.
+    #[test]
+    fn sidecar_classification_matches_store_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular.trashinfo");
+        fs::write(&regular, "[Trash Info]\n").unwrap();
+        let dangling = dir.path().join("dangling.trashinfo");
+        symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        let live_link = dir.path().join("link.trashinfo");
+        symlink(&regular, &live_link).unwrap();
+
+        assert!(sidecar_is_usable(&regular));
+        assert!(!sidecar_is_usable(&dangling), "dangling symlink is not usable");
+        assert!(!sidecar_is_usable(&live_link), "symlinked sidecar is not usable");
+        assert!(!sidecar_is_usable(&dir.path().join("missing.trashinfo")));
     }
 }
