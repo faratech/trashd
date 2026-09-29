@@ -695,7 +695,10 @@ mod tests {
         assert!(is_newer("0.2.0", "0.1.9"));
         assert!(is_newer("0.1.10", "0.1.9"));
         assert!(!is_newer("0.1.9", "0.1.9"));
-        assert!(!is_newer("0.1.5", "0.2.0"), "cached downgrade must not read as an update");
+        assert!(
+            !is_newer("0.1.5", "0.2.0"),
+            "cached downgrade must not read as an update"
+        );
         // Pre-release/build suffixes compare as their base release.
         assert!(!is_newer("0.2.0-rc1", "0.2.0"));
         assert!(is_newer("0.2.1-rc1", "0.2.0"));
