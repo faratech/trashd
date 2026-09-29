@@ -1,26 +1,19 @@
 use crate::util::*;
 use colored::Colorize;
 use trashd_common::TrashStore;
+use trashd_common::store::TrashError;
 
 pub fn run(store: &TrashStore, target: &str) {
-    let entries = match store.list(None) {
+    // Same resolution as restore/purge (find_entry): unique-ID preference,
+    // filename fallback, and refusal on cross-root ambiguous IDs — first-match
+    // here could describe the wrong copy (#148).
+    let entry = match store.find_entry(target) {
         Ok(e) => e,
-        Err(e) => fatal(e),
-    };
-
-    let entry = entries.iter().find(|e| e.id == target).or_else(|| {
-        entries.iter().find(|e| {
-            e.info
-                .original_path
-                .file_name()
-                .map(|n| n.to_string_lossy() == target)
-                .unwrap_or(false)
-        })
-    });
-
-    let entry = match entry {
-        Some(e) => e,
-        None => fatal(format!("'{target}' not found in trash")),
+        Err(TrashError::AmbiguousMatch { pattern, count }) => fatal(format!(
+            "'{pattern}' matches {count} entries in different trash roots — \
+             show a specific one from 'trash ls <pattern>' instead"
+        )),
+        Err(_) => fatal(format!("'{target}' not found in trash")),
     };
 
     println!("{}", "Trash Entry".bold().underline());
