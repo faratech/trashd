@@ -358,10 +358,31 @@ impl Config {
         let mut dir = path.parent()?;
         loop {
             let config_path = dir.join(".trashd.toml");
-            if config_path.is_file()
-                && let Ok(content) = std::fs::read_to_string(&config_path)
-                && let Ok(mut local) = toml::from_str::<LocalConfig>(&content)
-            {
+            if config_path.is_file() {
+                // A PRESENT local policy that cannot be read or parsed must
+                // not fall through to an ancestor's narrower (possibly
+                // whitelist-only) rules — that direction turns "trash it"
+                // into a REAL delete. Treat the broken file as "no local
+                // policy" and stop the walk, with a diagnostic.
+                let mut local = match std::fs::read_to_string(&config_path) {
+                    Ok(content) => match toml::from_str::<LocalConfig>(&content) {
+                        Ok(local) => local,
+                        Err(e) => {
+                            eprintln!(
+                                "trashd: warning: ignoring broken {}: {e}",
+                                config_path.display()
+                            );
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "trashd: warning: ignoring unreadable {}: {e}",
+                            config_path.display()
+                        );
+                        return None;
+                    }
+                };
                 local.never_trash = sanitize_patterns(&local.never_trash, "never_trash");
                 local.only_trash = sanitize_patterns(&local.only_trash, "only_trash");
                 return Some(local);
@@ -646,5 +667,49 @@ mod tests {
         assert!(cfg.should_skip(Path::new("/home/user/script.py")));
         // But local .trashd.toml with only_trash=["*.py"] should override
         // (tested via integration test since it requires filesystem)
+    }
+
+    #[test]
+    fn broken_local_config_stops_the_ancestor_walk_instead_of_inheriting() {
+        // A PRESENT but unparseable .trashd.toml must not fall through to an
+        // ancestor's narrower whitelist — that would turn "trash it" into a
+        // real delete of everything the ancestor's only_trash rejects (#136).
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(dir.path().join(".trashd.toml"), "only_trash = [\"*.py\"]\n").unwrap();
+        std::fs::write(
+            proj.join(".trashd.toml"),
+            "only_trash = [\"*.py\", \"*.rs\"\n",
+        )
+        .unwrap();
+
+        // Clear the built-in policy: its /tmp/* never-trash rule would mask
+        // the local-config behavior under test here.
+        let mut cfg = default_config();
+        cfg.never_trash = Vec::new();
+        let victim = proj.join("main.rs");
+        // No local policy is honored, but the ANCESTOR's whitelist must not
+        // apply either: without local policy the global (empty) rules decide,
+        // so the file is trashed, not skipped.
+        assert!(!cfg.should_skip(&victim));
+    }
+
+    #[test]
+    fn healthy_local_config_still_applies_over_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(dir.path().join(".trashd.toml"), "only_trash = [\"*.py\"]\n").unwrap();
+        std::fs::write(
+            proj.join(".trashd.toml"),
+            "only_trash = [\"*.py\", \"*.rs\"]\n",
+        )
+        .unwrap();
+
+        let mut cfg = default_config();
+        cfg.never_trash = Vec::new();
+        assert!(!cfg.should_skip(&proj.join("main.rs")));
+        assert!(cfg.should_skip(&proj.join("main.c")));
     }
 }
