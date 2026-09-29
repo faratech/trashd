@@ -24,12 +24,12 @@ fn main() {
             json,
         } => commands::ls::run(
             &store,
-            pattern.as_deref(),
+            pattern.as_ref().map(|p| p.to_string_lossy().into_owned()).as_deref(),
             after.as_deref(),
             before.as_deref(),
             json,
         ),
-        Commands::Find { query } => commands::find::run(&store, &query),
+        Commands::Find { query } => commands::find::run(&store, &query.to_string_lossy()),
         Commands::Info { target } => commands::info::run(&store, &target.to_string_lossy()),
         Commands::Restore {
             target,

@@ -358,12 +358,25 @@ fn is_seccomp_active() -> bool {
         let claimed = std::env::var_os("TRASHD_SECCOMP_ACTIVE")
             .map(|v| v == "1")
             .unwrap_or(false);
-        claimed && seccomp_filter_installed()
+        seccomp_deferred(claimed, seccomp_filter_installed())
     })
+}
+
+/// Pure gating logic: a claim must be backed by a real filter.
+fn seccomp_deferred(claimed: bool, filter_installed: bool) -> bool {
+    claimed && filter_installed
 }
 
 /// True when this process runs in seccomp filter mode (value 2 of the
 /// `Seccomp:` field in /proc/self/status). Unreadable status → not verified.
+///
+/// KNOWN RESIDUAL: this accepts ANY seccomp filter, not trashd's — container
+/// runtimes (Docker's default profile), LXC, firejail, or systemd
+/// SystemCallFilter= all set Seccomp: 2 for every process, so on such hosts a
+/// leaked env var still silences the preload. The child closes its
+/// notification fd before exec, so no in-process signal can distinguish
+/// trashd's filter; the residual requires the operator to leak the var
+/// themselves and is accepted rather than complicate the hot path further.
 fn seccomp_filter_installed() -> bool {
     match fs::read_to_string("/proc/self/status") {
         Ok(status) => status.lines().any(|line| {
@@ -1703,21 +1716,17 @@ mod tests {
         assert!(!is_inside_trash(lookalike));
     }
 
+    // The gating logic as a pure function so the test needs no environment
+    // mutation (libtest runs tests in parallel; mutating environ under the
+    // harness races other tests' env reads — round-4 review).
     #[test]
-    fn seccomp_deferral_requires_the_env_var() {
-        // SAFETY: single-threaded test process; the var is removed below.
-        unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
-        // The filter check only GATES the env var, never replaces it: with
-        // the var absent there is nothing to defer to, whatever the host's
-        // own seccomp state is.
-        assert!(!is_seccomp_active());
-        // With the var set, the verdict is host-dependent: container
-        // sandboxes already run Seccomp: 2 (so deferral activates), while on
-        // bare hosts a leaked var alone no longer disables the preload
-        // (#125). No assertion — just proving both paths run without panic.
-        unsafe { std::env::set_var("TRASHD_SECCOMP_ACTIVE", "1") };
-        let _ = is_seccomp_active();
-        unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
+    fn seccomp_deferral_gates_claim_on_filter_presence() {
+        assert!(!seccomp_deferred(false, true), "no claim, nothing to defer to");
+        assert!(!seccomp_deferred(false, false));
+        // The whole point of #125: a claim without a real filter must NOT defer.
+        assert!(!seccomp_deferred(true, false));
+        // Claim + real filter: defer to the seccomp layer.
+        assert!(seccomp_deferred(true, true));
     }
 
     #[test]

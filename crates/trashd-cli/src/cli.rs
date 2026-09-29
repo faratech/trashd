@@ -17,8 +17,9 @@ pub struct Cli {
 pub enum Commands {
     /// List items in the trash
     Ls {
-        /// Filter by glob pattern (e.g. '*.py')
-        pattern: Option<String>,
+        /// Filter by glob pattern (e.g. '*.py'). Raw bytes are matched
+        /// lossily, so non-UTF-8 names work (#127).
+        pattern: Option<OsString>,
         /// Only show items deleted after this time (e.g. '1h', '30m', '2d', '2026-03-20')
         #[arg(long)]
         after: Option<String>,
@@ -31,8 +32,9 @@ pub enum Commands {
     },
     /// Search trash by original path
     Find {
-        /// Path substring or glob pattern to search for
-        query: String,
+        /// Path substring or glob pattern to search for. Raw bytes are
+        /// matched lossily, so non-UTF-8 names work (#127).
+        query: OsString,
     },
     /// Show full metadata for a trash entry
     Info {
