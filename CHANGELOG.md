@@ -1,5 +1,90 @@
 # Changelog
 
+## Unreleased
+
+Release from the 2026-09-29 analysis and remediation pass: 20 issues filed,
+verified, and closed.
+
+### Fixed — daemon
+
+- Directory deletions are audited again: the fanotify marks were missing
+  `FAN_ONDIR`, so the kernel dropped every event carrying FS_ISDIR and
+  `rmdir`/`rm -rf` of directory-only trees logged nothing while the daemon
+  reported healthy monitoring.
+- One mount point with a non-UTF-8 byte no longer empties the entire mount
+  list at startup (fatal crash-loop under systemd); `/proc/mounts` is parsed
+  as raw bytes, matching the kernel's escaping rules.
+
+### Fixed — preload
+
+- glibc `remove()` is interposed directly: it calls the hidden
+  `__unlink`/`__rmdir` aliases, which interposing `unlink`/`rmdir` cannot
+  reach, so deletions through `remove()` bypassed the trash entirely.
+- `/proc/mounts` parsing is byte-safe; a single odd mount point no longer
+  silently loses the trash location for every filesystem.
+
+### Fixed — trash store and restore
+
+- `trash_at` persists the post-move identity refresh (size/hash drop) to the
+  `.trashinfo` sidecar, so a raced entry no longer carries a stale hash that
+  warns on every restore; the recursive directory size keeps its pre-move
+  value in listings.
+- A failed `mkfifo` during a cross-device FIFO trash now aborts the move
+  before the source is removed, instead of reporting success with no data
+  file (also in directory copies).
+- Pattern-filtered listings no longer re-synthesize a filtered-out entry's
+  own data file as a fake "orphaned" copy, and `trash restore <id> --all`
+  no longer fails on healthy entries with the "run fsck" advice.
+- `trash compress` refuses entries larger than restore's decompression bound
+  (min(`max_file_size_mb`, 4 GiB)), so compressed entries can no longer
+  become permanently unrestorable.
+
+### Fixed — config and logging
+
+- A present-but-broken `.trashd.toml` warns and applies no local policy
+  instead of silently inheriting an ancestor's narrower whitelist (which
+  could turn "trash it" into a real delete).
+- Legacy `[retention]` promotion prints a note per applied key: a misplaced
+  policy key is applied compatibly but never silently, restoring the loud
+  rejection an earlier release intended.
+- Operation-log fields are escaped like the daemon log, so filenames
+  containing newlines cannot forge log records.
+
+### Fixed — CLI
+
+- `trash config set/add/remove` refuse to rewrite the user config when the
+  existing file does not parse, instead of silently discarding every
+  pre-existing setting; a scalar `retention` key errors instead of
+  panicking.
+- `trash ls --after/--before` accept the documented minute-precision form
+  (`2026-03-20T14:00`).
+- `trash empty` propagates listing errors instead of printing "Nothing to
+  empty." and exiting 0 when nothing could be listed.
+- `trash info` resolves targets through `find_entry`, refusing ambiguous
+  cross-root IDs exactly like restore/purge.
+
+### Fixed — shim (rm)
+
+- `rm -d` on a non-directory fails with "Not a directory" like GNU rm
+  instead of silently trashing the file, and an excluded empty directory
+  falls back to rmdir semantics.
+
+### Fixed — seccomp layer
+
+- The watchdog closes the same fork→prctl race the supervisor guard covers:
+  an orchestrator killed in the window no longer leaves an orphaned
+  watchdog+supervisor pair holding the notification fd forever.
+
+### Fixed — install and packaging
+
+- The release workflow reuses the build job's version instead of
+  recomputing a date-based one, so a UTC-midnight straddle can no longer
+  publish a release whose quick installer requests nonexistent assets.
+- `make test` and the PKGBUILD `check()` run under `TRASH_BYPASS=1`.
+- The RPM spec passes `PREFIX=%{_prefix}` to `%make_install` (files staged
+  under /usr/local previously failed the %files match) and both packaging
+  specs track the current version.
+
 ## 0.1.6 (2026-09-29)
 
 Release from the 2026-09-28/29 analysis and remediation pass: 47 issues filed,
