@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Release from the 2026-09-29 analysis and remediation pass: 22 issues filed,
+Release from the 2026-09-29 analysis and remediation pass: 35 issues filed,
 verified, and closed.
 
 ### Fixed — daemon
@@ -88,6 +88,37 @@ verified, and closed.
 - The RPM spec passes `PREFIX=%{_prefix}` to `%make_install` (files staged
   under /usr/local previously failed the %files match) and both packaging
   specs track the current version.
+- The RPM spec can build again: `make install` stages the systemd unit to
+  UNITDIR (`/usr/lib/systemd/system`), matching the spec's `%{_unitdir}`
+  `%files` entry.
+- `make install` matches install.sh's daemon layout (LIBDIR + BINDIR
+  symlink), templates the unit's `ExecStart` for the actual prefix (no more
+  `status=203/EXEC` on make/PKGBUILD/custom-prefix installs), and registers
+  the LD_PRELOAD layer on native installs.
+- `make install` no longer resets an existing `/etc/trashd/config.toml`,
+  and the PKGBUILD marks it `backup=()`.
+- `TRASHD_VERSION` is read at build-script runtime and tracked, so rebuilds
+  in an existing target dir pick up version changes; the shim and daemon
+  print the same release version as the CLI.
+- install.sh honors `PREFIX` for fish completions, and `--uninstall`
+  removes completions from the Makefile/system locations too.
+
+### Fixed — CLI (continued)
+
+- `trash config`, `trash log`, and `trash self-update` no longer open the
+  trash store first: read-only commands no longer fail on a broken or
+  foreign-uid trash home, create the trash tree as a side effect, or break
+  the recovery path `trash self-update`.
+- `trash self-update` never silently orders cross-scheme version strings
+  (a semver release after a date-based release read as "up to date"), and
+  the tarball download gets its own 15-minute budget instead of the API
+  call's 30-second global timeout.
+- `trash fsck` checks every trash root (per-partition corruption previously
+  got a false all-clear), reports `--fix` removal failures instead of an
+  unconditional "removed", and rebuilds each root's index.
+- `trash restore --force` builds conflict siblings from a normalized base,
+  so a trailing-slash `--to backup/` yields `backup.1`, not a hidden
+  `backup/.1` inside the directory.
 
 ## 0.1.6 (2026-09-29)
 
