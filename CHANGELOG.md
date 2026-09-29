@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Release from the 2026-09-29 analysis and remediation pass: 35 issues filed,
+Release from the 2026-09-29 analysis and remediation pass: 38 issues filed,
 verified, and closed.
 
 ### Fixed — daemon
@@ -97,6 +97,9 @@ verified, and closed.
   the LD_PRELOAD layer on native installs.
 - `make install` no longer resets an existing `/etc/trashd/config.toml`,
   and the PKGBUILD marks it `backup=()`.
+- `make uninstall` removes the `/etc/ld.so.preload` registration before
+  deleting the `.so`, so a Makefile-only install/uninstall cycle no longer
+  leaves every dynamic process printing an ld.so error.
 - `TRASHD_VERSION` is read at build-script runtime and tracked, so rebuilds
   in an existing target dir pick up version changes; the shim and daemon
   print the same release version as the CLI.
@@ -114,8 +117,9 @@ verified, and closed.
   the tarball download gets its own 15-minute budget instead of the API
   call's 30-second global timeout.
 - `trash fsck` checks every trash root (per-partition corruption previously
-  got a false all-clear), reports `--fix` removal failures instead of an
-  unconditional "removed", and rebuilds each root's index.
+  got a false all-clear) and reports `--fix` removal failures instead of an
+  unconditional "removed"; the index rebuild stays home-only, matching the
+  one index the store actually serves.
 - `trash restore --force` builds conflict siblings from a normalized base,
   so a trailing-slash `--to backup/` yields `backup.1`, not a hidden
   `backup/.1` inside the directory.
