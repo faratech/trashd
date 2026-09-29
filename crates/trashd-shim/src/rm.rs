@@ -142,8 +142,9 @@ fn main() -> ExitCode {
     // the filter intact and reach the real rm.
     if args.permanent {
         let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        let bypass_flag =
-            |a: &std::ffi::OsString| a.as_os_str() != "--permanent" && a.as_os_str() != "--no-trash";
+        let bypass_flag = |a: &std::ffi::OsString| {
+            a.as_os_str() != "--permanent" && a.as_os_str() != "--no-trash"
+        };
         let filtered: Vec<std::ffi::OsString> = match raw.iter().position(|a| a == "--") {
             // Strip the bypass flags only BEFORE `--`; the tail (including the
             // separator) is operand territory and must pass through verbatim.
@@ -255,6 +256,14 @@ fn main() -> ExitCode {
             continue;
         }
 
+        // rm -d has rmdir semantics: a non-directory operand is an error, like
+        // GNU rm's "Not a directory" — not a silent trash of the file (#149).
+        if args.dir && !args.recursive && !is_dir {
+            eprintln!("rm: cannot remove '{}': Not a directory", file.display());
+            exit_code = ExitCode::FAILURE;
+            continue;
+        }
+
         // --preserve-root=all: refuse directory operands that are mount
         // points, like GNU rm's "Device or resource busy" (#119).
         if is_dir && preserve_all && is_mount_point(file) {
@@ -311,7 +320,9 @@ fn main() -> ExitCode {
                 if args.verbose {
                     eprintln!("rm (real): '{}'", file.display());
                 }
-                if let Err(e) = real_rm(file, args.recursive) {
+                // -d excluded empty directories fall back to rmdir semantics
+                // (not real rm's blanket "Is a directory" error) (#149).
+                if let Err(e) = real_rm(file, args.recursive, args.dir) {
                     eprintln!("rm: cannot remove '{}': {e}", file.display());
                     exit_code = ExitCode::FAILURE;
                 }
@@ -432,7 +443,9 @@ fn is_mount_point(p: &std::path::Path) -> bool {
             Err(_) => return false,
         }
     };
-    let parent_dev = absolute.parent().and_then(|parent| std::fs::metadata(parent).ok());
+    let parent_dev = absolute
+        .parent()
+        .and_then(|parent| std::fs::metadata(parent).ok());
     match (std::fs::symlink_metadata(&absolute), parent_dev) {
         (Ok(child), Some(parent)) => child.dev() != parent.dev(),
         _ => false,
@@ -601,31 +614,40 @@ fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
 }
 
 /// Remove a file/dir/symlink correctly using symlink_metadata.
-/// `recursive` must be true for directories to be removed (matches rm -r semantics).
-fn real_rm(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
+/// `recursive` must be true for directories to be removed (matches rm -r semantics);
+/// `dir_only` (rm -d) allows removing an EMPTY directory via rmdir semantics.
+fn real_rm(path: &PathBuf, recursive: bool, dir_only: bool) -> std::io::Result<()> {
     // Set TRASH_BYPASS so the LD_PRELOAD layer doesn't re-intercept
     // our unlink/rmdir calls when we genuinely want a real delete.
     // Safety: the shim is single-threaded (no other threads to race with).
     unsafe {
         std::env::set_var("TRASH_BYPASS", "1");
     }
-    let result = real_rm_inner(path, recursive);
+    let result = real_rm_inner(path, recursive, dir_only);
     unsafe {
         std::env::remove_var("TRASH_BYPASS");
     }
     result
 }
 
-fn real_rm_inner(path: &PathBuf, recursive: bool) -> std::io::Result<()> {
+fn real_rm_inner(path: &PathBuf, recursive: bool, dir_only: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
 
     if meta.file_type().is_symlink() {
+        if dir_only && !recursive {
+            return Err(std::io::Error::other("Not a directory"));
+        }
         std::fs::remove_file(path)
     } else if meta.is_dir() {
-        if !recursive {
-            return Err(std::io::Error::other("Is a directory"));
+        if recursive {
+            std::fs::remove_dir_all(path)
+        } else if dir_only {
+            std::fs::remove_dir(path)
+        } else {
+            Err(std::io::Error::other("Is a directory"))
         }
-        std::fs::remove_dir_all(path)
+    } else if dir_only && !recursive {
+        Err(std::io::Error::other("Not a directory"))
     } else {
         std::fs::remove_file(path)
     }
