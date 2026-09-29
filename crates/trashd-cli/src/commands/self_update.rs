@@ -254,7 +254,8 @@ pub fn run(check_only: bool) {
             // version that is not strictly newer (equal, or older — e.g. this
             // binary is a dev build newer than the latest release) must be
             // reported as up to date, never as a pending "update" (#95).
-            if !is_newer(&cached, current) {
+            let comparable = versions_comparable(&cached, current);
+            if comparable && !is_newer(&cached, current) {
                 println!(
                     "{} trashd {} is already the latest version.",
                     "Up to date:".green().bold(),
@@ -262,12 +263,7 @@ pub fn run(check_only: bool) {
                 );
                 return;
             }
-            println!(
-                "{} {} -> {}",
-                "Update available:".yellow().bold(),
-                current.dimmed(),
-                cached.bold(),
-            );
+            print_update_offer(current, &cached, comparable);
             println!("\nRun {} to install.", "trash self-update".bold());
             return;
         }
@@ -282,8 +278,10 @@ pub fn run(check_only: bool) {
         .unwrap_or(&release.tag_name);
 
     // Numeric comparison — string equality alone would offer "updates" to
-    // older releases (or split 0.1.10 vs 0.1.9 lexicographically).
-    if !is_newer(latest, current) {
+    // older releases (or split 0.1.10 vs 0.1.9 lexicographically). Cross-scheme
+    // versions are never silently ordered (#154).
+    let comparable = versions_comparable(latest, current);
+    if comparable && !is_newer(latest, current) {
         println!(
             "{} trashd {} is up to date (latest release: {}).",
             "Up to date:".green().bold(),
@@ -293,12 +291,7 @@ pub fn run(check_only: bool) {
         return;
     }
 
-    println!(
-        "{} {} -> {}",
-        "Update available:".yellow().bold(),
-        current.dimmed(),
-        latest.bold(),
-    );
+    print_update_offer(current, latest, comparable);
 
     if release.prerelease {
         println!("  {}", "(pre-release)".yellow());
@@ -552,6 +545,17 @@ fn http_agent() -> ureq::Agent {
         .new_agent()
 }
 
+/// The tarball download needs its own budget: ureq 3.x enforces the global
+/// deadline on transport reads while the body streams, so sharing the API
+/// agent's 30 s cap would abort a multi-MB release mid-download on any slow
+/// link (#155). The size bound in download_file still caps total bytes.
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15 * 60)))
+        .build()
+        .new_agent()
+}
+
 fn fetch_latest_release() -> Result<GhRelease, String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let resp = http_agent()
@@ -575,7 +579,7 @@ fn download_file(url: &str, dest: &std::path::Path, max_bytes: u64) -> Result<()
         return Err(format!("refusing non-HTTPS download URL: {url}"));
     }
 
-    let resp = http_agent()
+    let resp = download_agent()
         .get(url)
         .header("User-Agent", "trashd-self-update")
         .call()
@@ -657,6 +661,46 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     false
 }
 
+/// Print the "update available" line, flagging cross-scheme versions where
+/// no ordering could be determined (#154).
+fn print_update_offer(current: &str, latest: &str, comparable: bool) {
+    if comparable {
+        println!(
+            "{} {} -> {}",
+            "Update available:".yellow().bold(),
+            current.dimmed(),
+            latest.bold(),
+        );
+    } else {
+        println!(
+            "{} {} -> {} {}",
+            "Update available:".yellow().bold(),
+            current.dimmed(),
+            latest.bold(),
+            "(cannot compare version schemes — verify the release before installing)".yellow(),
+        );
+    }
+}
+
+/// Date-scheme versions are the release workflow's default YYYY.MM.DD tags.
+/// Numeric comparison ACROSS schemes is meaningless — `is_newer("0.2.0",
+/// "2026.09.29")` hides a real update and the inverse offers an apparent
+/// downgrade (#154) — so callers must never silently order cross-scheme
+/// versions.
+fn is_date_scheme(version: &str) -> bool {
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let comps: Vec<&str> = core.split('.').collect();
+    comps.len() == 3
+        && comps[0].len() == 4
+        && comps
+            .iter()
+            .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn versions_comparable(a: &str, b: &str) -> bool {
+    is_date_scheme(a) == is_date_scheme(b)
+}
+
 fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
     let file = std::fs::File::open(tarball).map_err(|e| format!("open tarball: {e}"))?;
     let gz = flate2::read::GzDecoder::new(file);
@@ -703,6 +747,25 @@ mod tests {
         assert!(!is_newer("0.2.0-rc1", "0.2.0"));
         assert!(is_newer("0.2.1-rc1", "0.2.0"));
         assert!(!is_newer("0.2.0+build.5", "0.2.0"));
+    }
+
+    // Regression (#154): cross-scheme versions must never be silently
+    // ordered — numeric comparison hides semver updates after a date-based
+    // release and offers apparent downgrades in the inverse cache case.
+    #[test]
+    fn cross_scheme_versions_are_flagged_incomparable() {
+        assert!(versions_comparable("0.1.9", "0.2.0"));
+        assert!(versions_comparable("2026.09.29", "2026.10.01"));
+        assert!(!versions_comparable("0.2.0", "2026.09.29"));
+        assert!(!versions_comparable("2026.09.29", "0.2.0"));
+        assert!(is_date_scheme("2026.09.29"));
+        assert!(!is_date_scheme("0.2.0"));
+        // pre-release suffixes are stripped before the scheme check, matching
+        // is_newer's core comparison
+        assert!(is_date_scheme("2026.09.29-rc1"));
+        // a 4-digit-major semver would be misread as a date scheme, but the
+        // failure mode is only "treated as comparable", same as today
+        assert!(is_date_scheme("2026.1.2"));
     }
 
     // Regression (#101): the detected prefix must match an installed layout
