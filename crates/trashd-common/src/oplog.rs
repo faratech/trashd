@@ -7,6 +7,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -30,8 +31,9 @@ pub(crate) fn log_trash_in(
     write_log(
         home,
         &format!(
-            "TRASH id={trash_id} path={} cmd={cmd}",
-            original_path.display(),
+            "TRASH id={trash_id} path={} cmd={}",
+            escape_field(original_path.as_os_str()),
+            escape_field_bytes(cmd.as_bytes()),
         ),
     );
 }
@@ -44,7 +46,10 @@ pub fn log_restore(trash_id: &str, restored_to: &Path) {
 pub(crate) fn log_restore_in(home: &Path, trash_id: &str, restored_to: &Path) {
     write_log(
         home,
-        &format!("RESTORE id={trash_id} to={}", restored_to.display(),),
+        &format!(
+            "RESTORE id={trash_id} to={}",
+            escape_field(restored_to.as_os_str()),
+        ),
     );
 }
 
@@ -64,7 +69,13 @@ pub fn log_empty(count: u64, filter: Option<&str>) {
 
 pub(crate) fn log_empty_in(home: &Path, count: u64, filter: Option<&str>) {
     let filter_str = filter.unwrap_or("all");
-    write_log(home, &format!("EMPTY count={count} filter={filter_str}"));
+    write_log(
+        home,
+        &format!(
+            "EMPTY count={count} filter={}",
+            escape_field_bytes(filter_str.as_bytes()),
+        ),
+    );
 }
 
 /// Read the last N lines of the operation log.
@@ -111,6 +122,30 @@ pub fn notify_desktop(summary: &str, body: &str) {
         .spawn();
 }
 
+/// Encode a log field so one `write_log` call is always exactly one line:
+/// backslash is escaped, and every byte outside printable ASCII (including
+/// newline, which would forge the next record) becomes `\xNN`. Same
+/// discipline as the daemon logger's escape_field (#82); the result can never
+/// contain a physical newline.
+fn escape_field(value: &std::ffi::OsStr) -> String {
+    escape_field_bytes(value.as_bytes())
+}
+
+fn escape_field_bytes(value: &[u8]) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value {
+        match byte {
+            b'\\' => escaped.push_str("\\\\"),
+            0x20..=0x7e => escaped.push(char::from(*byte)),
+            _ => {
+                use std::fmt::Write;
+                write!(&mut escaped, "\\x{byte:02x}").expect("writing to String cannot fail");
+            }
+        }
+    }
+    escaped
+}
+
 fn write_log(home: &Path, message: &str) {
     let path = home.join(".trashd/operations.log");
 
@@ -135,5 +170,26 @@ fn write_log(home: &Path, message: &str) {
 
     if let Err(e) = result {
         eprintln!("trashd: failed to write operation log: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_field_bytes;
+
+    // A field that could contain a physical newline would forge the next
+    // record in the operation log (#137) — the escape must guarantee one
+    // write_log call maps to exactly one line.
+    #[test]
+    fn escape_field_never_emits_newlines_or_raw_control_bytes() {
+        assert_eq!(escape_field_bytes(b"a\nb"), "a\\x0ab");
+        assert_eq!(escape_field_bytes(b"a\rb"), "a\\x0db");
+        assert_eq!(escape_field_bytes(b"back\\slash"), "back\\\\slash");
+        assert_eq!(escape_field_bytes(b"plain text"), "plain text");
+        assert_eq!(escape_field_bytes(&[0xff, b'x']), "\\xffx");
+        for byte in 0u8..0x20 {
+            let escaped = escape_field_bytes(&[byte]);
+            assert!(!escaped.contains('\n') && !escaped.contains('\r'));
+        }
     }
 }
