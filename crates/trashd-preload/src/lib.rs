@@ -1195,6 +1195,9 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
 
     // Move the file
     if fs::rename(path, &dest).is_ok() {
+        // A concurrent purge may have stripped the sidecar while the data was
+        // absent mid-move; a completed move must never land as an orphan (#169).
+        ensure_sidecar_after_move(&info_path, &trashinfo);
         log_preload(&format!(
             "trashed: {} -> {}",
             path.display(),
@@ -1236,6 +1239,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
                 return TrashAttempt::NotTrashed;
             }
             log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
+            ensure_sidecar_after_move(&info_path, &trashinfo);
             return TrashAttempt::Trashed;
         }
     } else if meta.is_dir() {
@@ -1282,12 +1286,27 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
                 return TrashAttempt::NotTrashed;
             }
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
+            ensure_sidecar_after_move(&info_path, &trashinfo);
             return TrashAttempt::Trashed;
         }
     }
 
     let _ = fs::remove_file(&info_path);
     TrashAttempt::NotTrashed
+}
+
+/// Re-create the sidecar if a concurrent purge stripped it during the
+/// write→move window (#169): a completed move must never land as a data
+/// orphan. Bounded retry; a lost race degrades to an fsck-visible orphan,
+/// never to lost data.
+fn ensure_sidecar_after_move(info_path: &Path, trashinfo: &str) {
+    for _ in 0..3 {
+        if fs::symlink_metadata(info_path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = fs::write(info_path, trashinfo);
+    }
 }
 
 /// Atomically claim a unique trashinfo filename using O_CREAT|O_EXCL.
