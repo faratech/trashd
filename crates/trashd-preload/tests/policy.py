@@ -108,6 +108,38 @@ def run():
         # and falls back to the default (trash everything) policy.
         case("malformed-config", 'only_trash = ["*.txt"\n', warning=b"bad config")
 
+        # A PRESENT-but-broken nearest .trashd.toml stops the ancestor walk
+        # (#136): the deletion must follow the DEFAULT policy (trashed), not
+        # inherit the ancestor's narrower whitelist (which would real-delete).
+        walk_root = root / "broken-local-walk"
+        walk_data = walk_root / "data"
+        walk_config = walk_root / "config" / "trashd"
+        walk_config.mkdir(parents=True)
+        (walk_config / "config.toml").write_text("")
+        (walk_root / ".trashd.toml").write_text('only_trash = ["*.py"]\n')
+        sub = walk_root / "sub"
+        sub.mkdir()
+        (sub / ".trashd.toml").write_text("only_trash = [")  # broken TOML
+        walk_victim = os.path.join(os.fsencode(sub), b"main.rs")
+        with open(walk_victim, "wb") as stream:
+            stream.truncate(1)
+        count += 1
+        walk_env = dict(os.environ, LD_PRELOAD=library,
+                        XDG_DATA_HOME=str(walk_data), XDG_CONFIG_HOME=str(walk_config.parent),
+                        HOME=str(walk_root))
+        walk_env.pop("TRASH_BYPASS", None)
+        walk_env.pop("TRASHD_SECCOMP_ACTIVE", None)
+        walk_result = subprocess.run(["/usr/bin/unlink", walk_victim],
+                                     env=walk_env, capture_output=True)
+        assert walk_result.returncode == 0, ("broken-local-walk", walk_result.stderr)
+        assert b"ignoring broken" in walk_result.stderr, ("broken-local-walk",
+                                                          walk_result.stderr)
+        assert not os.path.lexists(walk_victim), "broken-local-walk"
+        walk_records = list((walk_data / "Trash" / "info").glob("*.trashinfo"))
+        assert len(walk_records) == 1, ("broken-local-walk must trash, not inherit "
+                                        "the ancestor whitelist", walk_records)
+        print("PASS broken-local-walk")
+
         # glibc implements remove() with the hidden __unlink/__rmdir aliases,
         # which interposing unlink/rmdir cannot see: without a direct hook the
         # deletion below would be permanent with no trashinfo.

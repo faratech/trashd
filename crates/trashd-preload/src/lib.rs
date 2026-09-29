@@ -675,15 +675,35 @@ fn sanitize_patterns(list: Vec<String>, what: &str) -> Vec<String> {
 
 /// Find the nearest `.trashd.toml` walking up from `path` to the filesystem
 /// root, matching trashd-common's Config::load_local_config (a fixed 5-level
-/// cap silently dropped deep project whitelists, #9).
+/// cap silently dropped deep project whitelists, #9). A PRESENT local policy
+/// that cannot be read or parsed stops the walk with a warning — inheriting
+/// an ancestor's narrower whitelist would turn "trash it" into a REAL delete
+/// (#136), and the preload protects exactly the daemon/cron processes that
+/// have no other layer.
 fn load_local_config(path: &Path) -> Option<LocalConfig> {
     let mut dir = path.parent()?;
     loop {
         let cfg_path = dir.join(".trashd.toml");
-        if cfg_path.is_file()
-            && let Ok(content) = fs::read_to_string(&cfg_path)
-            && let Ok(mut local) = toml::from_str::<LocalConfig>(&content)
-        {
+        if cfg_path.is_file() {
+            let mut local = match fs::read_to_string(&cfg_path) {
+                Ok(content) => match toml::from_str::<LocalConfig>(&content) {
+                    Ok(local) => local,
+                    Err(e) => {
+                        eprintln!(
+                            "trashd-preload: warning: ignoring broken {}: {e}",
+                            cfg_path.display()
+                        );
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "trashd-preload: warning: ignoring unreadable {}: {e}",
+                        cfg_path.display()
+                    );
+                    return None;
+                }
+            };
             local.never_trash = sanitize_patterns(local.never_trash, "never_trash");
             local.only_trash = sanitize_patterns(local.only_trash, "only_trash");
             return Some(local);
