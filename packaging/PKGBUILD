@@ -10,6 +10,8 @@ depends=('gcc-libs')
 makedepends=('rust' 'cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
+# Never silently reset admin policy on upgrade (matches %config(noreplace)).
+backup=('etc/trashd/config.toml')
 
 build() {
     cd "$pkgname-$pkgver"

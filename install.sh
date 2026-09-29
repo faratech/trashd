@@ -101,9 +101,16 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     "$RM" -f "${MAN_DIR}/trash.1" "${MAN_DIR}"/trash-*.1
     echo "    Removed man pages"
 
-    # 6. Remove shell completions (bash, zsh, fish).
+    # 6. Remove shell completions: the PREFIX-relative paths this installer
+    # uses, plus the system/Makefile locations so a mixed install (e.g. a
+    # prior `make install` with the default prefix) is fully cleaned (#164).
     "$RM" -f /etc/bash_completion.d/trash \
+          "${PREFIX}/share/bash-completion/completions/trash" \
+          /usr/local/share/bash-completion/completions/trash \
           "${PREFIX}/share/zsh/site-functions/_trash" \
+          /usr/local/share/zsh/site-functions/_trash \
+          "${PREFIX}/share/fish/vendor_completions.d/trash.fish" \
+          /usr/local/share/fish/vendor_completions.d/trash.fish \
           /usr/share/fish/vendor_completions.d/trash.fish
     echo "    Removed shell completions"
 
@@ -326,11 +333,15 @@ if [ -d "${COMP_DIR}" ]; then
     mkdir -p "${ZSH_COMP_DIR}"
     install -Dm644 "${COMP_DIR}/_trash" "${ZSH_COMP_DIR}/_trash"
     echo "    Installed zsh completions"
-    # Fish
-    if [ -d /usr/share/fish/vendor_completions.d ]; then
-        install -Dm644 "${COMP_DIR}/trash.fish" /usr/share/fish/vendor_completions.d/trash.fish
-        echo "    Installed fish completions"
+    # Fish — honor PREFIX like zsh; fall back to the system vendor dir only
+    # for the default prefix (#164).
+    FISH_COMP_DIR="${PREFIX}/share/fish/vendor_completions.d"
+    if [ "${PREFIX}" = "/usr" ] && [ -d /usr/share/fish/vendor_completions.d ]; then
+        FISH_COMP_DIR="/usr/share/fish/vendor_completions.d"
     fi
+    mkdir -p "${FISH_COMP_DIR}"
+    install -Dm644 "${COMP_DIR}/trash.fish" "${FISH_COMP_DIR}/trash.fish"
+    echo "    Installed fish completions to ${FISH_COMP_DIR}"
 else
     echo "    No completions found (skipping)"
 fi
@@ -358,7 +369,7 @@ if [ -d /etc/profile.d ]; then
     # trashd-exec elsewhere and the layers would silently never activate (#101).
     # Pure index/substr splicing: sed-style metacharacters in the prefix
     # (&, \, |) must reach the generated script byte-exact (#124).
-    awk -v shim="${SHIM_DIR}" -v bin="${BIN_DIR}/trashd-exec" '
+    awk -v shim="${SHIM_DIR}" -v bin="${BIN_DIR}/trashd-exec" -v daemon="${LIB_DIR}/trashd" '
         {
             s = $0; out = ""
             while ((i = index(s, "/usr/local/lib/trashd/bin")) > 0) {
@@ -369,6 +380,11 @@ if [ -d /etc/profile.d ]; then
             while ((i = index(s, "/usr/local/bin/trashd-exec")) > 0) {
                 out = out substr(s, 1, i - 1) bin
                 s = substr(s, i + length("/usr/local/bin/trashd-exec"))
+            }
+            s = out s; out = ""
+            while ((i = index(s, "/usr/local/lib/trashd/trashd")) > 0) {
+                out = out substr(s, 1, i - 1) daemon
+                s = substr(s, i + length("/usr/local/lib/trashd/trashd"))
             }
             print out s
         }' \
@@ -390,8 +406,19 @@ if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     fi
     # Remove old daemon binary name (was in BIN_DIR or LIB_DIR depending on version)
     rm -f "${LIB_DIR}/trashd-daemon" "${BIN_DIR}/trashd-daemon" 2>/dev/null
-    install -Dm644 "$(dirname "$0")/install/systemd/trashd.service" \
-        /etc/systemd/system/trashd.service
+    # Template the daemon path the same way as the profile script: the shipped
+    # unit hardcodes /usr/local/lib/trashd/trashd, which is wrong for any
+    # custom PREFIX and would fail with status=203/EXEC (#160).
+    awk -v daemon="${LIB_DIR}/trashd" '
+        {
+            s = $0; out = ""
+            while ((i = index(s, "/usr/local/lib/trashd/trashd")) > 0) {
+                out = out substr(s, 1, i - 1) daemon
+                s = substr(s, i + length("/usr/local/lib/trashd/trashd"))
+            }
+            print out s
+        }' \
+        "$(dirname "$0")/install/systemd/trashd.service" > /etc/systemd/system/trashd.service
     systemctl daemon-reload
     systemctl enable trashd 2>/dev/null || true
     systemctl restart trashd 2>/dev/null || true
