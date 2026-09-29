@@ -433,6 +433,11 @@ impl TrashStore {
                      source can be removed manually",
                     p = abs_path.display()
                 );
+                // The kept copy is only "complete" with its sidecar: the copy
+                // spanned the same data-absence window as a normal move, so a
+                // concurrent purge may have stripped the sidecar mid-copy
+                // (#171).
+                ensure_sidecar_after_move(&info_file, &info);
                 if let Some(idx) = self.index.as_ref() {
                     let _ = idx.insert(&id, &info, &trash_dir);
                 }
@@ -1395,20 +1400,16 @@ impl TrashStore {
             // compressor: restore flocks the same path across its identity
             // check → rename, so "validated" can never interleave with
             // "renamed" and publish compressed bytes as plaintext (#168).
-            // The lock is on the OPEN inode; our atomic_write swaps a new one
-            // in, and a restorer that then opens the path sees the new
-            // inode/sidecar version and aborts cleanly post-lock.
-            let mut input = match fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-            {
-                Ok(f) => f,
-                Err(_) => continue,
+            // The lock MUST stay held through the marker write and the
+            // atomic_write swap — dropping it after the read re-opens the
+            // publish window (#170). The lock is on the OPEN inode; our
+            // atomic_write swaps a new one in, and a restorer that then opens
+            // the path sees the new inode/sidecar version and aborts cleanly
+            // post-lock.
+            let mut input = match lock_entry_file(path) {
+                Ok(Some(f)) => f,
+                _ => continue,
             };
-            if input.lock().is_err() {
-                continue;
-            }
             // Post-lock identity recheck (#105 discipline, now under the lock).
             if file_identity(&entries[i].trashed_path) != entries[i].identity
                 || sidecar_version(&entries[i].info_path) != entries[i].sidecar_version
@@ -1420,7 +1421,8 @@ impl TrashStore {
             if input.read_to_end(&mut data).is_err() {
                 continue;
             }
-            drop(input);
+            // NOTE: no drop(input) here — the flock stays held through the
+            // revalidation, marker write, and swap below (#170).
             // Defensive: skip if it already looks compressed (marker missing).
             if data.len() >= 4
                 && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == 0xFD2FB528
@@ -2480,9 +2482,6 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Atomically (over)write a `.trashinfo` file. Public so the CLI `compress`
-/// command can record the `X-Trashd-Compressed` marker without re-implementing
-/// the temp-file+rename dance.
 /// True when a data-absent entry is old enough for purge/empty to treat as
 /// fully retired. `trash()` writes the sidecar BEFORE the data lands, so a
 /// freshly-written data-absent sidecar may be an in-flight trash (the
@@ -2522,22 +2521,33 @@ fn ensure_sidecar_after_move(info_file: &Path, info: &TrashInfo) {
 
 /// Take an exclusive flock on an entry's data file. Restore holds it across
 /// its identity check → rename and both compressors hold it across their
-/// validate → swap, so "validated" can never interleave with "renamed" —
-/// the #105 revalidations alone left that window open (#168). Blocking is
-/// fine: the other side holds it for milliseconds. Non-regular entries
-/// (symlinks, dirs) are never swapped by compressors, so there is nothing
-/// to serialize — Ok(None). Any open error means the entry vanished or
-/// changed; callers map that to EntryNotFound.
+/// validate → swap (through the marker write and data swap, #170), so
+/// "validated" can never interleave with "renamed" — the #105 revalidations
+/// alone left that window open (#168). Blocking is fine: the other side
+/// holds it for milliseconds. Non-regular entries (symlinks, dirs) are
+/// never swapped by compressors, so there is nothing to serialize —
+/// Ok(None). Any open error means the entry vanished or changed; callers
+/// map that to EntryNotFound.
 fn lock_entry_file(path: &Path) -> io::Result<Option<fs::File>> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Ok(None);
     }
+    // O_NONBLOCK like every other entry-data open (#111): a FIFO swapped
+    // into the path in the TOCTOU window must not hang the caller.
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    file.lock()?;
-    Ok(Some(file))
+    // File::lock is flock(LOCK_EX) without an EINTR retry (std uses cvt, not
+    // cvt_r), so a handled signal while blocked would surface as an error —
+    // retry instead (#170).
+    loop {
+        match file.lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Strip redundant separators and `.` components from a conflict destination
@@ -2548,6 +2558,9 @@ pub fn normalize_conflict_base(path: &Path) -> PathBuf {
     path.components().collect()
 }
 
+/// Atomically (over)write a `.trashinfo` file. Public so the CLI `compress`
+/// command can record the `X-Trashd-Compressed` marker without re-implementing
+/// the temp-file+rename dance.
 pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<()> {
     atomic_write(info_path, info.to_trashinfo_string().as_bytes())
 }
