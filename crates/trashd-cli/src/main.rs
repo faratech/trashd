@@ -30,15 +30,15 @@ fn main() {
             json,
         ),
         Commands::Find { query } => commands::find::run(&store, &query),
-        Commands::Info { target } => commands::info::run(&store, &target),
+        Commands::Info { target } => commands::info::run(&store, &target.to_string_lossy()),
         Commands::Restore {
             target,
             to,
             force,
             all,
-        } => commands::restore::run(&store, &target, to.as_deref(), force, all),
+        } => commands::restore::run(&store, &target.to_string_lossy(), to.as_deref(), force, all),
         Commands::Undo => commands::undo::run(&store),
-        Commands::Purge { target } => commands::purge::run(&store, &target),
+        Commands::Purge { target } => commands::purge::run(&store, &target.to_string_lossy()),
         Commands::Empty {
             older,
             dry_run,

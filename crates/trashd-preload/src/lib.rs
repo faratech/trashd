@@ -345,13 +345,33 @@ fn is_bypass_active() -> bool {
 
 /// When Layer 4 (seccomp) is active, it handles interception at the kernel
 /// level. The preload layer defers to avoid double-trashing.
+///
+/// The env var alone once sufficed — but ANY process inheriting or exporting
+/// `TRASHD_SECCOMP_ACTIVE=1` (a leaked export, a copied Environment= line)
+/// then silently lost ALL preload protection: every intercepted delete
+/// became permanent (#125). Defer only when BOTH hold: the wrapper claims
+/// the handshake AND this process really runs under a seccomp filter
+/// (`Seccomp: 2` in /proc/self/status).
 fn is_seccomp_active() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var_os("TRASHD_SECCOMP_ACTIVE")
+        let claimed = std::env::var_os("TRASHD_SECCOMP_ACTIVE")
             .map(|v| v == "1")
-            .unwrap_or(false)
+            .unwrap_or(false);
+        claimed && seccomp_filter_installed()
     })
+}
+
+/// True when this process runs in seccomp filter mode (value 2 of the
+/// `Seccomp:` field in /proc/self/status). Unreadable status → not verified.
+fn seccomp_filter_installed() -> bool {
+    match fs::read_to_string("/proc/self/status") {
+        Ok(status) => status.lines().any(|line| {
+            line.strip_prefix("Seccomp:")
+                .is_some_and(|value| value.trim() == "2")
+        }),
+        Err(_) => false,
+    }
 }
 
 /// Cache by PID, so children of a fork re-evaluate their own process tree.
@@ -1681,6 +1701,23 @@ mod tests {
 
         let lookalike = Path::new("/home/u/proj/.Trash-backup/x");
         assert!(!is_inside_trash(lookalike));
+    }
+
+    #[test]
+    fn seccomp_deferral_requires_the_env_var() {
+        // SAFETY: single-threaded test process; the var is removed below.
+        unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
+        // The filter check only GATES the env var, never replaces it: with
+        // the var absent there is nothing to defer to, whatever the host's
+        // own seccomp state is.
+        assert!(!is_seccomp_active());
+        // With the var set, the verdict is host-dependent: container
+        // sandboxes already run Seccomp: 2 (so deferral activates), while on
+        // bare hosts a leaked var alone no longer disables the preload
+        // (#125). No assertion — just proving both paths run without panic.
+        unsafe { std::env::set_var("TRASHD_SECCOMP_ACTIVE", "1") };
+        let _ = is_seccomp_active();
+        unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
     }
 
     #[test]

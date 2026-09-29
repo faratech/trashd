@@ -157,7 +157,11 @@ def run(args, command):
             (root / "dev" / name).symlink_to(f"/proc/self/fd/{fd}")
         (root / "tmp").chmod(0o1777)
         (root / "work").chmod(0o1777)
-        os.chown(root / "home/test", 65534, 65534)
+        # The suite runs as uid 0 with HOME=/home/test: keep the home
+        # root-owned. A foreign-owned ancestor is correctly refused by the
+        # store ("can be replaced by another user") and used to abort the
+        # whole suite on its first call (#126).
+        os.chown(root / "home/test", 0, 0)
         (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/home/test:/bin/sh\n")
         (root / "etc/group").write_text("root:x:0:\nnogroup:x:65534:\n")
         for name in ("resolv.conf", "localtime"):

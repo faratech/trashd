@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -35,13 +36,15 @@ pub enum Commands {
     },
     /// Show full metadata for a trash entry
     Info {
-        /// Trash ID or file name
-        target: String,
+        /// Trash ID or file name. Raw bytes are matched lossily, so
+        /// non-UTF-8 names work (#127).
+        target: OsString,
     },
     /// Restore a trashed file by name or ID
     Restore {
-        /// File name, trash ID, or glob pattern
-        target: String,
+        /// File name, trash ID, or glob pattern. Raw bytes are matched
+        /// lossily, so non-UTF-8 names work (#127).
+        target: OsString,
         /// Restore to this path instead of original location
         #[arg(long = "to")]
         to: Option<PathBuf>,
@@ -56,8 +59,9 @@ pub enum Commands {
     Undo,
     /// Permanently delete a specific trash entry
     Purge {
-        /// Trash ID or file name to permanently delete
-        target: String,
+        /// Trash ID or file name to permanently delete. Raw bytes are
+        /// matched lossily, so non-UTF-8 names work (#127).
+        target: OsString,
     },
     /// Permanently empty the trash
     Empty {
