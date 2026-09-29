@@ -30,6 +30,10 @@ const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
 
 const FAN_DELETE: u64 = 0x0000_0200;
 const FAN_DELETE_SELF: u64 = 0x0000_0400;
+// Without FAN_ONDIR in the mark mask the kernel drops every event carrying
+// FS_ISDIR — including on FAN_MARK_FILESYSTEM marks — so directory deletions
+// (rmdir, rm -rf of a dir-only tree) would never reach the audit log.
+const FAN_ONDIR: u64 = 0x4000_0000;
 // Delete events carry fd = FAN_NOFD (-1) with FAN_REPORT_FID groups — there
 // is no fd to close for them.
 // FAN_MOVED_FROM deliberately NOT watched: without pairing logic every
@@ -146,7 +150,7 @@ fn run() -> io::Result<()> {
         match fanotify_mark(
             fan_fd,
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-            FAN_DELETE | FAN_DELETE_SELF,
+            FAN_DELETE | FAN_DELETE_SELF | FAN_ONDIR,
             &mount.path,
         ) {
             Ok(()) => {
@@ -338,10 +342,7 @@ fn event_fsid(event_buf: &[u8], fh_offset: usize) -> Fsid {
 ///   directly via open_by_handle_at. Type-1 records were never parsed before,
 ///   and with FAN_REPORT_FID groups delete events carry fd=FAN_NOFD, so the
 ///   old /proc/self/fd fallback could never fire either (#29).
-fn extract_dfid_name_path(
-    event_buf: &[u8],
-    mount_fds: &[MountFd],
-) -> Option<PathBuf> {
+fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[MountFd]) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
@@ -473,11 +474,7 @@ fn resolve_handle_to_path(
 /// handle-resolution fds for anything new (#37), and RE-mark anything whose
 /// filesystem identity changed: a remount at the same path is a new
 /// superblock whose old mark and old cached fd died with the unmount (#98).
-fn refresh_mounts(
-    fan_fd: RawFd,
-    marked: &mut Vec<(PathBuf, Fsid)>,
-    fds: &mut Vec<MountFd>,
-) {
+fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<(PathBuf, Fsid)>, fds: &mut Vec<MountFd>) {
     let fresh = mounts::list_mounts();
     let live_paths: Vec<PathBuf> = fresh.iter().map(|m| m.path.clone()).collect();
 
@@ -511,31 +508,29 @@ fn refresh_mounts(
         match fanotify_mark(
             fan_fd,
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-            FAN_DELETE | FAN_DELETE_SELF,
+            FAN_DELETE | FAN_DELETE_SELF | FAN_ONDIR,
             &mount.path,
         ) {
-            Ok(()) => {
-                match marked.iter_mut().find(|(p, _)| p == &mount.path) {
-                    Some(entry) => {
-                        if entry.1 != fsid && fsid.is_some() {
-                            eprintln!(
-                                "trashd: re-marking \"{}\" ({}) [filesystem changed]",
-                                escape_path(&mount.path),
-                                mount.fstype
-                            );
-                            entry.1 = fsid;
-                        }
-                    }
-                    None => {
+            Ok(()) => match marked.iter_mut().find(|(p, _)| p == &mount.path) {
+                Some(entry) => {
+                    if entry.1 != fsid && fsid.is_some() {
                         eprintln!(
-                            "trashd: watching \"{}\" ({}) [new mount]",
+                            "trashd: re-marking \"{}\" ({}) [filesystem changed]",
                             escape_path(&mount.path),
                             mount.fstype
                         );
-                        marked.push((mount.path.clone(), fsid));
+                        entry.1 = fsid;
                     }
                 }
-            }
+                None => {
+                    eprintln!(
+                        "trashd: watching \"{}\" ({}) [new mount]",
+                        escape_path(&mount.path),
+                        mount.fstype
+                    );
+                    marked.push((mount.path.clone(), fsid));
+                }
+            },
             Err(_) => continue,
         }
 
