@@ -101,6 +101,23 @@ def run():
         case("global-veto", 'never_trash = ["file?.c"]\n', filename="file1.c", trashed=False,
              local='only_trash = ["*.[ch]"]\n')
         case("malformed-retention", '[retention]\nonly_trash = ["*.txt"]\n', warning=True)
+
+        # glibc implements remove() with the hidden __unlink/__rmdir aliases,
+        # which interposing unlink/rmdir cannot see: without a direct hook the
+        # deletion below would be permanent with no trashinfo.
+        remove_script = (
+            "import ctypes, sys\n"
+            "libc = ctypes.CDLL(None, use_errno=True)\n"
+            "libc.remove.restype = ctypes.c_int\n"
+            "sys.exit(0 if libc.remove(ctypes.c_char_p(sys.argv[1])) == 0 else 1)\n"
+        )
+        case("libc-remove", "",
+             command=lambda victim: ["/usr/bin/python3", "-c", remove_script,
+                                     os.fsdecode(victim)])
+        case("libc-remove-excluded", 'bypass_processes = ["python3"]\n', trashed=False,
+             command=lambda victim: ["/usr/bin/python3", "-c", remove_script,
+                                     os.fsdecode(victim)])
+
         records, victim, env = case("raw-name", "", filename=b"name-\xff \n%?#")
         restore_env = dict(env, TRASH_BYPASS="1")
         restore_env.pop("LD_PRELOAD", None)

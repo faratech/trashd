@@ -1,7 +1,9 @@
 //! trashd LD_PRELOAD library
 //!
-//! Intercepts unlink(), unlinkat(), and rmdir() syscalls to move files to trash
-//! instead of permanently deleting them.
+//! Intercepts unlink(), unlinkat(), rmdir(), and remove() (glibc's remove()
+//! calls hidden __unlink/__rmdir aliases that PLT interposition cannot reach,
+//! so it must be hooked directly) to move files to trash instead of
+//! permanently deleting them.
 //!
 //! Usage:
 //!   LD_PRELOAD=/usr/local/lib/trashd/libtrashd_preload.so <command>
@@ -17,10 +19,10 @@ mod legacy_config;
 
 use serde::Deserialize;
 use std::cell::Cell;
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -329,6 +331,20 @@ unsafe fn real_rmdir() -> RmdirFn {
     *F.get_or_init(|| {
         let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, c"rmdir".as_ptr() as *const _) };
         assert!(!sym.is_null(), "trashd: dlsym(rmdir) failed");
+        unsafe { std::mem::transmute(sym) }
+    })
+}
+
+// Same C signature as unlink: int remove(const char *).
+unsafe fn real_remove() -> UnlinkFn {
+    static F: OnceLock<UnlinkFn> = OnceLock::new();
+    *F.get_or_init(|| {
+        // remove() must be interposed DIRECTLY: glibc implements it with the
+        // hidden internal aliases __unlink/__rmdir, which PLT interposition of
+        // unlink/rmdir cannot see — a program deleting via remove() would
+        // otherwise bypass the trash entirely.
+        let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, c"remove".as_ptr() as *const _) };
+        assert!(!sym.is_null(), "trashd: dlsym(remove) failed");
         unsafe { std::mem::transmute(sym) }
     })
 }
@@ -914,25 +930,29 @@ fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
 
 /// Unescape /proc/mounts octal sequences (the kernel escapes only whitespace
 /// and backslash, e.g. "\040" for space) so mount paths with spaces resolve.
-fn unescape_octal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            let oct: String = chars.by_ref().take(3).collect();
-            if oct.len() == 3
-                && let Ok(val) = u8::from_str_radix(&oct, 8)
-            {
-                out.push(val as char);
-                continue;
-            }
-            out.push('\\');
-            out.push_str(&oct);
+///
+/// Operates on raw bytes and preserves every unescaped byte verbatim: mount
+/// points may contain arbitrary non-UTF-8 bytes.
+fn unescape_octal(field: &[u8]) -> OsString {
+    let mut out: Vec<u8> = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        // the kernel emits exactly %03o (three octal digits 0-7)
+        if field[i] == b'\\'
+            && i + 4 <= field.len()
+            && field[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let o = &field[i + 1..i + 4];
+            out.push(((o[0] - b'0') << 6) | ((o[1] - b'0') << 3) | (o[2] - b'0'));
+            i += 4;
         } else {
-            out.push(c);
+            out.push(field[i]);
+            i += 1;
         }
     }
-    out
+    OsString::from_vec(out)
 }
 
 fn home_trash_dir() -> PathBuf {
@@ -958,12 +978,18 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
         std::env::current_dir().ok()?.join(path)
     };
 
-    let content = fs::read_to_string("/proc/mounts").ok()?;
+    // Parsed as raw bytes: the kernel octal-escapes only space/tab/newline/
+    // backslash in mount paths, so any other raw byte ≥ 0x80 survives
+    // verbatim and a UTF-8 read would fail on a single such mount point —
+    // silently losing the trash location for EVERY filesystem.
+    let content = fs::read("/proc/mounts").ok()?;
     let mut best: Option<PathBuf> = None;
     let mut best_len = 0;
 
-    for line in content.lines() {
-        let mut parts = line.split_whitespace();
+    for line in content.split(|&b| b == b'\n') {
+        let mut parts = line
+            .split(|&b| b == b' ' || b == b'\t')
+            .filter(|f| !f.is_empty());
         let _dev = match parts.next() {
             Some(d) => d,
             None => continue,
@@ -989,7 +1015,12 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 
 /// Copy a regular file with a race-hardened source open (see try_trash's
 /// cross-device branch). The destination is created exclusively.
-fn copy_regular_verified(src: &Path, dst: &Path, expect_dev: u64, expect_ino: u64) -> io::Result<()> {
+fn copy_regular_verified(
+    src: &Path,
+    dst: &Path,
+    expect_dev: u64,
+    expect_ino: u64,
+) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut input = fs::OpenOptions::new()
         .read(true)
@@ -1579,6 +1610,69 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
     }
 }
 
+/// # Safety
+/// Called by the dynamic linker as a libc hook. `pathname` must be a valid C string pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
+    unsafe {
+        // Capture the caller's errno first (see unlink()).
+        let saved_errno = *libc::__errno_location();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = match ReentrancyGuard::enter() {
+                Some(g) => g,
+                None => return None,
+            };
+
+            if !should_intercept() {
+                return None;
+            }
+
+            if let Some(path) = cstr_to_path(pathname) {
+                // Empty pathname → ENOENT; joining would trash the cwd (#84).
+                if path.as_os_str().is_empty() {
+                    return None;
+                }
+                let abs = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    match std::env::current_dir() {
+                        Ok(cwd) => cwd.join(&path),
+                        Err(_) => return None,
+                    }
+                };
+
+                // remove() == unlink() for non-directories and rmdir() for
+                // (empty) directories; symlink_metadata never follows links.
+                if let Ok(meta) = fs::symlink_metadata(&abs)
+                    && !should_skip_path(&abs)
+                {
+                    let is_real_dir = meta.is_dir() && !meta.file_type().is_symlink();
+                    let eligible = if is_real_dir {
+                        fs::read_dir(&abs)
+                            .map(|mut rd| rd.next().is_none())
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    };
+                    if eligible
+                        && let Some(result) =
+                            finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                    {
+                        return Some(result);
+                    }
+                }
+            }
+            None
+        }));
+
+        match res {
+            Ok(Some(ret)) => ret,
+            _ => (real_remove())(pathname),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1721,7 +1815,10 @@ mod tests {
     // harness races other tests' env reads — round-4 review).
     #[test]
     fn seccomp_deferral_gates_claim_on_filter_presence() {
-        assert!(!seccomp_deferred(false, true), "no claim, nothing to defer to");
+        assert!(
+            !seccomp_deferred(false, true),
+            "no claim, nothing to defer to"
+        );
         assert!(!seccomp_deferred(false, false));
         // The whole point of #125: a claim without a real filter must NOT defer.
         assert!(!seccomp_deferred(true, false));
