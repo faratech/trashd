@@ -2133,7 +2133,9 @@ fn raw_unlink_at(path: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    if unsafe { libc::unlinkat(libc::AT_FDCWD, c.as_ptr(), 0) } == 0 {
+    // libc::syscall — NOT the libc::unlinkat wrapper, which is an
+    // interposable symbol the preload hooks (that was the whole point).
+    if unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), 0) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -2155,7 +2157,13 @@ fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe {
-        libc::fstatat(libc::AT_FDCWD, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+        libc::syscall(
+            libc::SYS_newfstatat,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            &mut st as *mut libc::stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
     } != 0
     {
         return Err(io::Error::last_os_error());
@@ -2165,7 +2173,8 @@ fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
         return raw_unlink_at(path);
     }
     let fd = unsafe {
-        libc::openat(
+        libc::syscall(
+            libc::SYS_openat,
             libc::AT_FDCWD,
             c.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
@@ -2174,10 +2183,13 @@ fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    let fd = fd as RawFd;
     let result = raw_remove_tree_fd(fd, depth);
     unsafe { libc::close(fd) };
     result?;
-    if unsafe { libc::unlinkat(libc::AT_FDCWD, c.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+    if unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), libc::AT_REMOVEDIR) }
+        == 0
+    {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -2193,13 +2205,22 @@ fn raw_remove_tree_fd(dir_fd: RawFd, depth: u32) -> io::Result<()> {
     }
     for name in read_directory_names(dir_fd)? {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatat(dir_fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        if unsafe {
+            libc::syscall(
+                libc::SYS_newfstatat,
+                dir_fd,
+                name.as_ptr(),
+                &mut st as *mut libc::stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
         {
             return Err(io::Error::last_os_error());
         }
         if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
             let child = unsafe {
-                libc::openat(
+                libc::syscall(
+                    libc::SYS_openat,
                     dir_fd,
                     name.as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
@@ -2208,13 +2229,16 @@ fn raw_remove_tree_fd(dir_fd: RawFd, depth: u32) -> io::Result<()> {
             if child < 0 {
                 return Err(io::Error::last_os_error());
             }
+            let child = child as RawFd;
             let result = raw_remove_tree_fd(child, depth + 1);
             unsafe { libc::close(child) };
             result?;
-            if unsafe { libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) }
+                != 0
+            {
                 return Err(io::Error::last_os_error());
             }
-        } else if unsafe { libc::unlinkat(dir_fd, name.as_ptr(), 0) } != 0 {
+        } else if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
     }
