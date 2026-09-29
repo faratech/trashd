@@ -52,7 +52,7 @@ install: build
 	# embeds the un-prefixed runtime paths. index/substr splicing keeps
 	# metacharacters in the prefix byte-exact.
 	mkdir -p $(DESTDIR)/etc/profile.d
-	awk -v shim="$(LIBDIR)/bin" -v bin="$(BINDIR)/trashd-exec" -v daemon="$(LIBDIR)/trashd" '{ s = $$0; out = ""; while ((i = index(s, "/usr/local/lib/trashd/bin")) > 0) { out = out substr(s, 1, i-1) shim; s = substr(s, i + length("/usr/local/lib/trashd/bin")) } s = out s; out = ""; while ((i = index(s, "/usr/local/bin/trashd-exec")) > 0) { out = out substr(s, 1, i-1) bin; s = substr(s, i + length("/usr/local/bin/trashd-exec")) } s = out s; out = ""; while ((i = index(s, "/usr/local/lib/trashd/trashd")) > 0) { out = out substr(s, 1, i-1) daemon; s = substr(s, i + length("/usr/local/lib/trashd/trashd")) } print out s }' \
+	awk -v shim="$(LIBDIR)/bin" -v bin="$(BINDIR)/trashd-exec" '{ s = $$0; out = ""; while ((i = index(s, "/usr/local/lib/trashd/bin")) > 0) { out = out substr(s, 1, i-1) shim; s = substr(s, i + length("/usr/local/lib/trashd/bin")) } s = out s; out = ""; while ((i = index(s, "/usr/local/bin/trashd-exec")) > 0) { out = out substr(s, 1, i-1) bin; s = substr(s, i + length("/usr/local/bin/trashd-exec")) } print out s }' \
 		install/profile.d/trashd.sh > $(DESTDIR)/etc/profile.d/trashd.sh
 	chmod 0644 $(DESTDIR)/etc/profile.d/trashd.sh
 	# Same templating for the unit's ExecStart, staged to UNITDIR so the RPM
@@ -85,6 +85,14 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/trash
 	rm -f $(DESTDIR)$(BINDIR)/trashd-exec
 	rm -f $(DESTDIR)$(BINDIR)/trashd
+	# Remove the LD_PRELOAD registration BEFORE deleting the .so (mirror of
+	# the install step and install.sh's uninstall step 1): a dangling entry
+	# makes every dynamic process print an ld.so error forever (#166).
+	if [ -z "$(DESTDIR)" ] && grep -qs "$(LIBDIR)/libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then \
+		sed -i '\|$(LIBDIR)/libtrashd_preload.so|d' /etc/ld.so.preload; \
+		[ -s /etc/ld.so.preload ] || rm -f /etc/ld.so.preload; \
+		echo "==> Removed LD_PRELOAD layer from /etc/ld.so.preload"; \
+	fi
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -f $(DESTDIR)/etc/profile.d/trashd.sh
 	rm -f $(DESTDIR)$(UNITDIR)/trashd.service

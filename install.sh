@@ -369,7 +369,7 @@ if [ -d /etc/profile.d ]; then
     # trashd-exec elsewhere and the layers would silently never activate (#101).
     # Pure index/substr splicing: sed-style metacharacters in the prefix
     # (&, \, |) must reach the generated script byte-exact (#124).
-    awk -v shim="${SHIM_DIR}" -v bin="${BIN_DIR}/trashd-exec" -v daemon="${LIB_DIR}/trashd" '
+    awk -v shim="${SHIM_DIR}" -v bin="${BIN_DIR}/trashd-exec" '
         {
             s = $0; out = ""
             while ((i = index(s, "/usr/local/lib/trashd/bin")) > 0) {
@@ -380,11 +380,6 @@ if [ -d /etc/profile.d ]; then
             while ((i = index(s, "/usr/local/bin/trashd-exec")) > 0) {
                 out = out substr(s, 1, i - 1) bin
                 s = substr(s, i + length("/usr/local/bin/trashd-exec"))
-            }
-            s = out s; out = ""
-            while ((i = index(s, "/usr/local/lib/trashd/trashd")) > 0) {
-                out = out substr(s, 1, i - 1) daemon
-                s = substr(s, i + length("/usr/local/lib/trashd/trashd"))
             }
             print out s
         }' \
