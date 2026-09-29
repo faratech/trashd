@@ -1,5 +1,6 @@
 use crate::trashinfo::TrashInfo;
 use rusqlite::{Connection, params};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Index location relative to a trash directory. Shared so every caller
@@ -11,8 +12,36 @@ pub struct TrashIndex {
     conn: Connection,
 }
 
+/// Surface a privacy-setup failure as the same kind of open error SQLite
+/// itself would produce, so callers' existing "degrade to no-index" handling
+/// keeps working.
+fn cantopen(error: &std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!("cannot open trash index privately: {error}")),
+    )
+}
+
 impl TrashIndex {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
+        // SQLite creates new database files with the process umask (typically
+        // 0644), but the index records original paths and commands — private
+        // metadata. Create/repair the file owner-only BEFORE SQLite touches
+        // it, matching the .trashinfo sidecars and the operation log (#79).
+        // The -wal/-shm side files stay protected by the 0700 trash directory
+        // enforced around them.
+        let db = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| cantopen(&e))?;
+        if let Err(e) = db.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            return Err(cantopen(&e));
+        }
+        drop(db);
+
         let conn = Connection::open(path)?;
         // A transient lock must never demote a protection layer to real `rm`:
         // wait for the lock instead of returning SQLITE_BUSY immediately.
@@ -135,6 +164,51 @@ mod tests {
     use super::*;
     use crate::trashinfo::TrashInfo;
     use std::path::PathBuf;
+
+    // The database file must be owner-only no matter the ambient umask:
+    // SQLite alone would create it 0644 (issue #79).
+    #[test]
+    fn index_file_is_private_regardless_of_umask() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("idx-mode-test")
+            .join(format!("{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.sqlite");
+
+        {
+            let idx = TrashIndex::open(&db_path).unwrap();
+            idx.rebuild(&[(String::from("id"), TrashInfo::new(PathBuf::from("/x")), dir.clone())])
+                .unwrap();
+        }
+        let mode = std::fs::symlink_metadata(&db_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "index must be 0600 (umask {:#o})", get_umask());
+
+        // Reopening repairs an existing too-open file as well.
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(TrashIndex::open(&db_path).unwrap());
+        let mode = std::fs::symlink_metadata(&db_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn get_umask() -> u32 {
+        // Read-only peek: set a new umask and restore the old one it returns.
+        unsafe {
+            let old = libc::umask(0o022);
+            libc::umask(old);
+            old as u32
+        }
+    }
 
     // rebuild() must commit every row in one transaction and be idempotent.
     #[test]
