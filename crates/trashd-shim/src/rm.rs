@@ -417,8 +417,18 @@ fn is_root_operand(p: &std::path::Path) -> bool {
 /// True when `p` is a mount point: its device differs from its parent's.
 fn is_mount_point(p: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let parent_dev = p.parent().and_then(|parent| std::fs::metadata(parent).ok());
-    match (std::fs::symlink_metadata(p), parent_dev) {
+    // Resolve relative operands first: a bare name's lexical parent is ""
+    // and would stat-fail, silently disabling the check (round-3 review).
+    let absolute = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => return false,
+        }
+    };
+    let parent_dev = absolute.parent().and_then(|parent| std::fs::metadata(parent).ok());
+    match (std::fs::symlink_metadata(&absolute), parent_dev) {
         (Ok(child), Some(parent)) => child.dev() != parent.dev(),
         _ => false,
     }
@@ -514,23 +524,36 @@ fn real_rm_path() -> PathBuf {
 /// and would otherwise spawn its own probe recursively — unbounded forking
 /// (#85) — instead of exiting through the `--version` short-circuit.
 fn stash_is_shim(path: &PathBuf) -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::process::Command::new(path)
-            .arg("--version")
-            .env_remove("TRASH_BYPASS")
-            .output()
-            .map(|o| {
-                let out = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                out.contains("trashd")
-            })
-            .unwrap_or(true) // unreadable/unrunnable — don't trust it
-    })
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Cache PER PATH: a single process-global boolean made the first result
+    // poison every other candidate — with a shim-copy stash, genuine
+    // /usr/bin/rm was "rejected" without ever being probed and --permanent
+    // became unusable (round-3 regression review of #116).
+    static CACHED: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock()
+        && let Some(verdict) = map.get(path)
+    {
+        return *verdict;
+    }
+    let verdict = std::process::Command::new(path)
+        .arg("--version")
+        .env_remove("TRASH_BYPASS")
+        .output()
+        .map(|o| {
+            let out = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            out.contains("trashd")
+        })
+        .unwrap_or(true); // unreadable/unrunnable — don't trust it
+    if let Ok(mut map) = cache.lock() {
+        map.insert(path.clone(), verdict);
+    }
+    verdict
 }
 
 fn passthrough() -> ExitCode {

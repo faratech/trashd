@@ -2172,27 +2172,51 @@ fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return raw_unlink_at(path);
     }
+    // Open NOFOLLOW: a symlink swapped in between the fstatat above and this
+    // open must never be traversed — recursing into its target would gut an
+    // unrelated directory (round-3 regression review). ELOOP/ENOTDIR mean the
+    // name now names a symlink or non-directory: unlink THAT.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat,
             libc::AT_FDCWD,
             c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+            return raw_unlink_at(path);
+        }
+        return Err(e);
     }
     let fd = fd as RawFd;
+    // Identity re-check: the fd must be the inode we just statted.
+    let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::syscall(libc::SYS_fstat, fd, &mut opened as *mut libc::stat) } != 0
+        || opened.st_dev != st.st_dev
+        || opened.st_ino != st.st_ino
+    {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::other("target changed while removing"));
+    }
     let result = raw_remove_tree_fd(fd, depth);
     unsafe { libc::close(fd) };
     result?;
+    // ENOENT on the final rmdir: something else removed it first — done (std
+    // remove_dir_all tolerates the same).
     if unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), libc::AT_REMOVEDIR) }
         == 0
     {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(e)
+        }
     }
 }
 
@@ -2215,31 +2239,65 @@ fn raw_remove_tree_fd(dir_fd: RawFd, depth: u32) -> io::Result<()> {
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            // A concurrent remover got here first — std tolerates ENOENT too.
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                continue;
+            }
+            return Err(e);
         }
         if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            // NOFOLLOW: never traverse a child swapped to a symlink (round-3
+            // regression review); ELOOP/ENOTDIR → unlink the entry itself.
             let child = unsafe {
                 libc::syscall(
                     libc::SYS_openat,
                     dir_fd,
                     name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )
             };
             if child < 0 {
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+                    if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), 0) } != 0 {
+                        let e = io::Error::last_os_error();
+                        if e.raw_os_error() != Some(libc::ENOENT) {
+                            return Err(e);
+                        }
+                    }
+                    continue;
+                }
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    continue;
+                }
+                return Err(e);
             }
             let child = child as RawFd;
+            let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::syscall(libc::SYS_fstat, child, &mut opened as *mut libc::stat) } != 0
+                || opened.st_dev != st.st_dev
+                || opened.st_ino != st.st_ino
+            {
+                unsafe { libc::close(child) };
+                return Err(io::Error::other("child changed while removing"));
+            }
             let result = raw_remove_tree_fd(child, depth + 1);
             unsafe { libc::close(child) };
             result?;
             if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) }
                 != 0
             {
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(e);
+                }
             }
         } else if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), 0) } != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ENOENT) {
+                return Err(e);
+            }
         }
     }
     Ok(())
