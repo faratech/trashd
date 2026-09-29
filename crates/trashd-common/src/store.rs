@@ -454,6 +454,10 @@ impl TrashStore {
             return Err(e);
         }
 
+        // The move completed: make sure a concurrent purge did not strip the
+        // sidecar while the data was absent mid-move (#169).
+        ensure_sidecar_after_move(&info_file, &info);
+
         // Update index (best-effort; it's only a cache). The database lives in
         // the HOME trash only — cross-partition entries written there were
         // never read by anything and silently diverged from the authoritative
@@ -709,6 +713,10 @@ impl TrashStore {
             let _ = fs::remove_file(&info_file);
             return Err(TrashError::Io(e));
         }
+
+        // The move completed: make sure a concurrent purge did not strip the
+        // sidecar while the data was absent mid-move (#169).
+        ensure_sidecar_after_move(&info_file, &info);
 
         // POST-MOVE IDENTITY CHECK (audit review): the final component could
         // have been replaced between our metadata/hash reads and the rename —
@@ -1077,11 +1085,21 @@ impl TrashStore {
             return Err(TrashError::RestoreConflict(restore_to));
         }
 
+        // Serialize against compressors (auto-purge and CLI both flock the
+        // same path before validating): without this lock a compressor could
+        // swap zstd bytes into the stat→rename window below and the rename
+        // would publish compressed bytes as the restored file (#168). Held
+        // through the publish; compressors hold it for milliseconds.
+        let _compress_lock = lock_entry_file(&entry.trashed_path)
+            .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
+
         if file_identity(&entry.trashed_path) != entry.identity
             || sidecar_version(&entry.info_path) != entry.sidecar_version
         {
             // A replaced ID belongs to another operation; leave its data and
             // sidecar alone instead of retiring somebody else's new entry.
+            // Post-lock, this also catches a compressor swap that completed
+            // while we waited: the inode is no longer ours.
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
 
@@ -1258,7 +1276,7 @@ impl TrashStore {
                     fs::remove_dir_all(&entry.trashed_path).is_ok()
                 }
                 Ok(_) => fs::remove_file(&entry.trashed_path).is_ok(),
-                Err(_) => true, // already gone
+                Err(_) => data_absence_is_retired(&entry.info_path),
             };
             if !data_gone {
                 eprintln!(
@@ -1373,10 +1391,36 @@ impl TrashStore {
             if meta.len() < 1024 || meta.len() > COMPRESS_MAX_BYTES {
                 continue;
             }
-            let data = match fs::read(path) {
-                Ok(d) => d,
+            // Hold the entry flock across validate → swap, mirroring the CLI
+            // compressor: restore flocks the same path across its identity
+            // check → rename, so "validated" can never interleave with
+            // "renamed" and publish compressed bytes as plaintext (#168).
+            // The lock is on the OPEN inode; our atomic_write swaps a new one
+            // in, and a restorer that then opens the path sees the new
+            // inode/sidecar version and aborts cleanly post-lock.
+            let mut input = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+            {
+                Ok(f) => f,
                 Err(_) => continue,
             };
+            if input.lock().is_err() {
+                continue;
+            }
+            // Post-lock identity recheck (#105 discipline, now under the lock).
+            if file_identity(&entries[i].trashed_path) != entries[i].identity
+                || sidecar_version(&entries[i].info_path) != entries[i].sidecar_version
+            {
+                continue;
+            }
+            use std::io::Read;
+            let mut data = Vec::with_capacity(meta.len() as usize);
+            if input.read_to_end(&mut data).is_err() {
+                continue;
+            }
+            drop(input);
             // Defensive: skip if it already looks compressed (marker missing).
             if data.len() >= 4
                 && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == 0xFD2FB528
@@ -1388,9 +1432,7 @@ impl TrashStore {
             {
                 // Re-validate the entry before mutating ANYTHING: a concurrent
                 // restore/purge that retired this entry while we encoded must
-                // not be resurrected by our marker write or data swap, and a
-                // restorer racing the swap must not publish compressed bytes
-                // as plaintext (#105) — same discipline as restore/decompress.
+                // not be resurrected by our marker write or data swap (#105).
                 if file_identity(&entries[i].trashed_path) != entries[i].identity
                     || sidecar_version(&entries[i].info_path) != entries[i].sidecar_version
                 {
@@ -1505,7 +1547,7 @@ impl TrashStore {
                 fs::remove_dir_all(&entry.trashed_path).is_ok()
             }
             Ok(_) => fs::remove_file(&entry.trashed_path).is_ok(),
-            Err(_) => true, // already gone
+            Err(_) => data_absence_is_retired(&entry.info_path),
         };
         if !data_gone {
             // Keep the .trashinfo so the entry stays listed/restorable;
@@ -2441,6 +2483,63 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 /// Atomically (over)write a `.trashinfo` file. Public so the CLI `compress`
 /// command can record the `X-Trashd-Compressed` marker without re-implementing
 /// the temp-file+rename dance.
+/// True when a data-absent entry is old enough for purge/empty to treat as
+/// fully retired. `trash()` writes the sidecar BEFORE the data lands, so a
+/// freshly-written data-absent sidecar may be an in-flight trash (the
+/// cross-device copy_tree window spans seconds) — stripping its sidecar
+/// would strand the completed move as an unrestorable orphan (#169).
+fn data_absence_is_retired(info_path: &Path) -> bool {
+    const GRACE_SECS: u64 = 5;
+    let sidecar_age = fs::symlink_metadata(info_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs());
+    match sidecar_age {
+        Some(age) => age >= GRACE_SECS,
+        // Unreadable sidecar: nothing in flight to protect; purge semantics
+        // for a genuinely missing sidecar still apply.
+        None => true,
+    }
+}
+
+/// Re-create the sidecar if a concurrent purge stripped it during the
+/// write→move window (#169). A completed move must never land as a data
+/// orphan just because a purge decided "data absent = retired" while the
+/// rename was in flight. Bounded retry: purge decides before the data
+/// exists and does not re-fire, so one rewrite after a short wait is
+/// enough in practice; a lost race degrades to an fsck-visible orphan,
+/// never to lost data.
+fn ensure_sidecar_after_move(info_file: &Path, info: &TrashInfo) {
+    for _ in 0..3 {
+        if fs::symlink_metadata(info_file).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = fs::write(info_file, info.to_trashinfo_string());
+    }
+}
+
+/// Take an exclusive flock on an entry's data file. Restore holds it across
+/// its identity check → rename and both compressors hold it across their
+/// validate → swap, so "validated" can never interleave with "renamed" —
+/// the #105 revalidations alone left that window open (#168). Blocking is
+/// fine: the other side holds it for milliseconds. Non-regular entries
+/// (symlinks, dirs) are never swapped by compressors, so there is nothing
+/// to serialize — Ok(None). Any open error means the entry vanished or
+/// changed; callers map that to EntryNotFound.
+fn lock_entry_file(path: &Path) -> io::Result<Option<fs::File>> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Ok(None);
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.lock()?;
+    Ok(Some(file))
+}
+
 /// Strip redundant separators and `.` components from a conflict destination
 /// so the `--force` sibling candidates ("backup.1", "backup.2") are built from
 /// a normalized base: a trailing-slash `--to backup/` must not concatenate to
@@ -3805,6 +3904,102 @@ mod tests {
         assert!(!link.exists());
         assert!(target.exists());
         assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+    }
+
+    // Regression (#168): restore must hold the entry flock across its
+    // identity check → rename, so a compressor holding the same lock during
+    // its validate → swap can never have the swap land in restore's publish
+    // window (which would publish compressed bytes as the restored file).
+    // Discriminates: without restore's lock acquisition, the restore below
+    // completes immediately instead of blocking.
+    #[test]
+    fn restore_blocks_while_entry_flock_is_held() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
+        fs::create_dir_all(&base).unwrap();
+        let data_dir = TempDir::with_prefix_in("data-race-", &base).unwrap();
+        let workdir = TempDir::with_prefix_in("work-race-", &base).unwrap();
+        let trash = data_dir.path().join("Trash");
+        let mut config = Config::default();
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        let store = TrashStore::open_isolated(&trash, config).unwrap();
+
+        let f = create_file(workdir.path(), "race.txt", "plaintext-content");
+        let id = store.trash(&f, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+
+        // Hold the flock like a compressor mid validate→swap.
+        let guard = lock_entry_file(&entry.trashed_path).unwrap().unwrap();
+
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let mut config2 = Config::default();
+                config2.retention.max_age_days = 0;
+                config2.retention.max_size_gb = 0.0;
+                config2.retention.disk_pressure_percent = 0;
+                let store2 = TrashStore::open_isolated(&trash, config2).unwrap();
+                store2.restore(&id, None)
+            });
+            // A blocked restore has not finished; a pre-#168 restore would
+            // have completed and published by now.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !handle.is_finished(),
+                "restore must block while the entry flock is held"
+            );
+            drop(guard);
+            let restored = handle.join().unwrap().unwrap();
+            assert_eq!(fs::read(&restored).unwrap(), b"plaintext-content");
+        });
+    }
+
+    // Regression (#169): a FRESH data-absent sidecar is an in-flight trash —
+    // purge/empty must not treat it as retired — while an old one purges.
+    #[test]
+    fn fresh_data_absent_sidecars_are_not_purgeable() {
+        let dir = TempDir::new().unwrap();
+        let sidecar = dir.path().join("fresh.trashinfo");
+        fs::write(&sidecar, "[Trash Info]\n").unwrap();
+        assert!(
+            !data_absence_is_retired(&sidecar),
+            "a just-written sidecar with no data may be mid-move"
+        );
+
+        // Backdate the sidecar past the grace window.
+        let old = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let times = [old, old];
+        let c = std::ffi::CString::new(sidecar.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+        assert!(data_absence_is_retired(&sidecar));
+    }
+
+    // Regression (#169): a completed move whose sidecar a concurrent purge
+    // stripped mid-flight is re-ensured instead of landing as an orphan.
+    #[test]
+    fn ensure_sidecar_after_move_recreates_stripped_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let sidecar = dir.path().join("x.trashinfo");
+        let info = TrashInfo::new(PathBuf::from("/tmp/orig"));
+        fs::write(&sidecar, info.to_trashinfo_string()).unwrap();
+
+        // Simulate the purge winning the race, then the move completing.
+        fs::remove_file(&sidecar).unwrap();
+        ensure_sidecar_after_move(&sidecar, &info);
+        assert_eq!(
+            fs::read_to_string(&sidecar).unwrap(),
+            info.to_trashinfo_string()
+        );
+
+        // Idempotent when the sidecar is intact.
+        ensure_sidecar_after_move(&sidecar, &info);
+        assert!(sidecar.exists());
     }
 
     #[test]
