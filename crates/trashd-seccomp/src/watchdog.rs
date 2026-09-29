@@ -101,6 +101,12 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
         set_nonblocking(notif_fd, true);
         drain_with_continue(notif_fd);
 
+        // Bounded backoff (#121): a persistent startup error (e.g. socketpair
+        // failure under fd pressure) would otherwise produce a tight
+        // fork/respawn loop with stderr spam. 250 ms keeps failover snappy
+        // while bounding the loop rate.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
         // Phase 2: Fork a new supervisor.
         let pid = unsafe { libc::fork() };
         match pid {

@@ -356,8 +356,22 @@ if [ -d /etc/profile.d ]; then
     # Template the actual install prefix into the profile script: the shipped
     # file hardcodes /usr/local, but a PREFIX=... install puts the shim and
     # trashd-exec elsewhere and the layers would silently never activate (#101).
-    sed -e "s|/usr/local/lib/trashd/bin|${SHIM_DIR}|g" \
-        -e "s|/usr/local/bin/trashd-exec|${BIN_DIR}/trashd-exec|g" \
+    # Pure index/substr splicing: sed-style metacharacters in the prefix
+    # (&, \, |) must reach the generated script byte-exact (#124).
+    awk -v shim="${SHIM_DIR}" -v bin="${BIN_DIR}/trashd-exec" '
+        {
+            s = $0; out = ""
+            while ((i = index(s, "/usr/local/lib/trashd/bin")) > 0) {
+                out = out substr(s, 1, i - 1) shim
+                s = substr(s, i + length("/usr/local/lib/trashd/bin"))
+            }
+            s = out s; out = ""
+            while ((i = index(s, "/usr/local/bin/trashd-exec")) > 0) {
+                out = out substr(s, 1, i - 1) bin
+                s = substr(s, i + length("/usr/local/bin/trashd-exec"))
+            }
+            print out s
+        }' \
         "$(dirname "$0")/install/profile.d/trashd.sh" > /etc/profile.d/trashd.sh
     chmod 0644 /etc/profile.d/trashd.sh
     echo "    Installed /etc/profile.d/trashd.sh (prefix ${PREFIX})"

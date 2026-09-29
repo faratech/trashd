@@ -122,7 +122,9 @@ fn main() -> ExitCode {
 
     // Accepted for GNU rm compatibility — parsed so these invocations trash
     // rather than fall through to a permanent delete.
-    let _ = (&args.one_file_system, &args.preserve_root);
+    let _ = args.one_file_system;
+    // GNU --preserve-root=all additionally refuses mount-point operands.
+    let preserve_all = args.preserve_root.as_deref() == Some("all");
 
     // If --permanent, pass through to real rm (stripping our custom flags).
     // args_os (NOT args): argv may contain non-UTF-8 filenames, and
@@ -248,6 +250,17 @@ fn main() -> ExitCode {
             continue;
         }
 
+        // --preserve-root=all: refuse directory operands that are mount
+        // points, like GNU rm's "Device or resource busy" (#119).
+        if is_dir && preserve_all && is_mount_point(file) {
+            eprintln!(
+                "rm: cannot remove '{}': Device or resource busy",
+                file.display()
+            );
+            exit_code = ExitCode::FAILURE;
+            continue;
+        }
+
         // Non-empty dir without -r
         if is_dir
             && args.dir
@@ -335,6 +348,8 @@ struct RemovalBehavior {
 
 impl RemovalBehavior {
     fn from_matches(matches: &clap::ArgMatches) -> Self {
+        // GNU semantics (#117): interaction follows flag order, but
+        // ignore_missing is monotonic — set by -f, never cleared by -i/-I.
         // Clap indices preserve ordering within short groups (-fi vs -if)
         // and across long options. Keep every --interactive occurrence:
         // `-f --interactive=always --interactive=never` must still report a
@@ -369,7 +384,9 @@ impl RemovalBehavior {
                     behavior.interaction = Interaction::Never;
                 }
                 "always" | "once" => {
-                    behavior.ignore_missing = false;
+                    // GNU never clears ignore_missing_files outside -f: an
+                    // interaction flag only changes PROMPTING, so
+                    // `rm -f -i missing` still exits 0 silently (#117).
                     behavior.interaction = if option == "always" {
                         Interaction::Always
                     } else {
@@ -395,6 +412,16 @@ impl RemovalBehavior {
 fn is_root_operand(p: &std::path::Path) -> bool {
     let mut comps = p.components();
     matches!(comps.next(), Some(std::path::Component::RootDir)) && comps.next().is_none()
+}
+
+/// True when `p` is a mount point: its device differs from its parent's.
+fn is_mount_point(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent_dev = p.parent().and_then(|parent| std::fs::metadata(parent).ok());
+    match (std::fs::symlink_metadata(p), parent_dev) {
+        (Ok(child), Some(parent)) => child.dev() != parent.dev(),
+        _ => false,
+    }
 }
 
 /// True when the operand's final component is `.` or `..` — the shapes GNU rm
@@ -464,7 +491,15 @@ fn real_rm_path() -> PathBuf {
     for path in &["/usr/bin/rm", "/bin/rm"] {
         let p = PathBuf::from(path);
         if p.exists() {
-            return p;
+            // Same poisoning guard as the stash and PATH candidates: a shim
+            // copy installed over the real rm must not be exec'd (#116).
+            if !stash_is_shim(&p) {
+                return p;
+            }
+            eprintln!(
+                "trashd: warning: {} is a copy of the trashd shim — ignoring it (reinstall to repair)",
+                p.display()
+            );
         }
     }
 
@@ -506,6 +541,16 @@ fn passthrough() -> ExitCode {
 
 fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
     let rm = real_rm_path();
+    // Terminal guard (#116): if EVERY candidate turned out to be a shim copy,
+    // exec'ing it would recurse without bound (each copy bypasses to its own
+    // passthrough). Fail loudly instead of forking forever.
+    if stash_is_shim(&rm) {
+        eprintln!(
+            "trashd: error: no genuine rm binary found ({} is a shim copy); refusing to recurse",
+            rm.display()
+        );
+        return ExitCode::FAILURE;
+    }
     // Set TRASH_BYPASS=1 so the LD_PRELOAD layer doesn't re-intercept
     // the real rm's unlink() calls when we're passing through.
     match Command::new(&rm)
@@ -620,20 +665,20 @@ mod tests {
     #[test]
     fn force_and_interactive_follow_argument_order() {
         for (flags, interaction, ignore_missing) in [
-            (vec!["-fi"], Interaction::Always, false),
+            (vec!["-fi"], Interaction::Always, true),
             (vec!["-if"], Interaction::Never, true),
-            (vec!["-f", "-i"], Interaction::Always, false),
+            (vec!["-f", "-i"], Interaction::Always, true),
             (vec!["-i", "-f"], Interaction::Never, true),
-            (vec!["-fI"], Interaction::Once, false),
+            (vec!["-fI"], Interaction::Once, true),
             (vec!["-If"], Interaction::Never, true),
             (vec!["-iI"], Interaction::Once, false),
             (vec!["-Ii"], Interaction::Always, false),
-            (vec!["--force", "--interactive"], Interaction::Always, false),
+            (vec!["--force", "--interactive"], Interaction::Always, true),
             (vec!["--interactive", "--force"], Interaction::Never, true),
             (
                 vec!["--force", "--interactive=once"],
                 Interaction::Once,
-                false,
+                true,
             ),
             (
                 vec!["--interactive=once", "--force"],
@@ -645,7 +690,7 @@ mod tests {
             (
                 vec!["-f", "--interactive=always", "--interactive=never"],
                 Interaction::Never,
-                false,
+                true,
             ),
             (
                 vec!["--interactive=always", "-f", "--interactive=never"],
@@ -653,7 +698,7 @@ mod tests {
                 true,
             ),
             (vec!["-fif"], Interaction::Never, true),
-            (vec!["-ifi"], Interaction::Always, false),
+            (vec!["-ifi"], Interaction::Always, true),
         ] {
             let argv: Vec<_> = ["rm"].into_iter().chain(flags).chain(["file"]).collect();
             assert_eq!(

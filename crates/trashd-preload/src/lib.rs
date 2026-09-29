@@ -45,6 +45,8 @@ struct PreloadConfig {
     bypass_paths: Vec<String>,
     /// Maximum regular-file size in MiB. Zero disables the limit.
     max_file_size_mb: u64,
+    /// Maximum directory-tree size in MiB. Zero disables the limit (#118).
+    max_dir_size_mb: u64,
 }
 
 /// Partial config for layered merge — all fields optional.
@@ -55,6 +57,7 @@ struct PartialPreloadConfig {
     bypass_processes: Option<Vec<String>>,
     bypass_paths: Option<Vec<String>>,
     max_file_size_mb: Option<u64>,
+    max_dir_size_mb: Option<u64>,
     // Validate this table even though the preload does not run retention.
     // A misplaced root policy key must not be silently ignored (#63).
     #[serde(rename = "retention")]
@@ -133,6 +136,7 @@ impl Default for PreloadConfig {
             ],
             bypass_paths: Vec::new(),
             max_file_size_mb: 1024,
+            max_dir_size_mb: 0,
         }
     }
 }
@@ -168,6 +172,9 @@ impl PreloadConfig {
         }
         if let Some(limit) = partial.max_file_size_mb {
             self.max_file_size_mb = limit;
+        }
+        if let Some(limit) = partial.max_dir_size_mb {
+            self.max_dir_size_mb = limit;
         }
     }
 }
@@ -429,17 +436,52 @@ fn is_inside_trash(path: &Path) -> bool {
     }
 
     // Inside a per-mount trash: some ancestor component is exactly ".Trash"
-    // (the shared spec dir) or ".Trash-<uid>" (numeric uid).
+    // (the shared spec dir) or ".Trash-<uid>". The uid must be THIS caller's
+    // effective uid: a lookalike directory like ~/proj/.Trash-1001 (another
+    // user's uid, or any name with digits) is ordinary user data, and
+    // skipping interception here would PERMANENTLY DELETE it while the
+    // shim/seccomp layers trash it (#108).
     path.components().any(|comp| {
         if let Component::Normal(name) = comp {
             let n = name.to_string_lossy();
-            n == ".Trash"
-                || n.strip_prefix(".Trash-")
-                    .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+            n == ".Trash" || n == format!(".Trash-{}", unsafe { libc::geteuid() })
         } else {
             false
         }
     })
+}
+
+/// Bounded directory-tree size walk mirroring trashd-common's dir_size_capped.
+fn dir_size_capped(path: &Path) -> (u64, bool) {
+    const MAX_FILES: u64 = 10_000;
+    let mut total = 0u64;
+    let mut count = 0u64;
+    fn walk(path: &Path, total: &mut u64, count: &mut u64, max: u64) {
+        if *count >= max {
+            return;
+        }
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if *count >= max {
+                    return;
+                }
+                *count += 1;
+                let Ok(meta) = entry.path().symlink_metadata() else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    walk(&entry.path(), total, count, max);
+                } else {
+                    *total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    walk(path, &mut total, &mut count, MAX_FILES);
+    (total, count >= MAX_FILES)
 }
 
 /// Match a single never_trash/only_trash pattern against a path string.
@@ -912,6 +954,28 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 // Core trash logic
 // ---------------------------------------------------------------------------
 
+/// Copy a regular file with a race-hardened source open (see try_trash's
+/// cross-device branch). The destination is created exclusively.
+fn copy_regular_verified(src: &Path, dst: &Path, expect_dev: u64, expect_ino: u64) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(src)?;
+    let m = input.metadata()?;
+    if !m.is_file() || m.dev() != expect_dev || m.ino() != expect_ino {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "source changed"));
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(dst)?;
+    io::copy(&mut input, &mut output)?;
+    Ok(())
+}
+
 fn exceeds_file_size_limit(cfg: &PreloadConfig, meta: &fs::Metadata) -> bool {
     meta.is_file()
         && cfg.max_file_size_mb != 0
@@ -942,6 +1006,18 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         || exceeds_file_size_limit(config(), &meta)
     {
         return TrashAttempt::NotTrashed;
+    }
+    // Directory size cap (#118): the other layers refuse oversized trees, so
+    // trashing one here file-by-file would gut it where the user asked for a
+    // refusal. Bounded walk, same 10k-entry cap as trashd-common.
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        let cfg = config();
+        if cfg.max_dir_size_mb > 0 {
+            let (bytes, capped) = dir_size_capped(path);
+            if capped || bytes / (1024 * 1024) > cfg.max_dir_size_mb {
+                return TrashAttempt::NotTrashed;
+            }
+        }
     }
     let trash_dir = match trash_dir_for(path) {
         Ok(path) => path,
@@ -1088,8 +1164,11 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         let _ = fs::remove_file(&info_path);
         return TrashAttempt::NotTrashed;
     } else {
-        // Regular file: copy + delete original
-        if fs::copy(path, &dest).is_err() {
+        // Regular file: copy + delete original. The copy opens the source
+        // with O_NOFOLLOW|O_NONBLOCK and re-verifies dev/ino first: a racer
+        // swapping the file for a FIFO must not block the copy forever, and
+        // a symlink swap must not be read through (#111).
+        if copy_regular_verified(path, &dest, meta.dev(), meta.ino()).is_err() {
             // A partial/failed copy must not strand an orphaned data file
             // in the trash (#33).
             let _ = fs::remove_file(&dest);
@@ -1577,6 +1656,31 @@ mod tests {
                 .into_owned(),
         );
         assert!(process_is_bypassed(&cfg, pid));
+    }
+
+    #[test]
+    fn dir_size_cap_merges_from_config() {
+        let mut cfg = PreloadConfig::default();
+        assert_eq!(cfg.max_dir_size_mb, 0, "default is disabled");
+        cfg.merge(toml::from_str::<PartialPreloadConfig>("max_dir_size_mb = 5").unwrap());
+        assert_eq!(cfg.max_dir_size_mb, 5);
+    }
+
+    // Regression (#108): lookalike .Trash-<other-uid> directories are user
+    // data, not trash — the hook must intercept them (not skip, which would
+    // permanently delete).
+    #[test]
+    fn is_inside_trash_matches_only_own_uid_suffix() {
+        let own_dir = format!("/mnt/usb/.Trash-{}", unsafe { libc::geteuid() });
+        let own = Path::new(&own_dir).join("files/x");
+        assert!(is_inside_trash(&own));
+
+        let other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        let foreign_dir = format!("/home/u/proj/.Trash-{other_uid}/out.bin");
+        assert!(!is_inside_trash(Path::new(&foreign_dir)));
+
+        let lookalike = Path::new("/home/u/proj/.Trash-backup/x");
+        assert!(!is_inside_trash(lookalike));
     }
 
     #[test]

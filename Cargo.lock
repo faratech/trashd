@@ -1271,7 +1271,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "url",
  "xxhash-rust",
  "zstd",
 ]

@@ -1,6 +1,5 @@
 use chrono::{DateTime, Local, NaiveDateTime};
 use std::path::{Path, PathBuf};
-use url::Url;
 
 /// Represents a .trashinfo metadata file per FreeDesktop.org Trash spec.
 #[derive(Debug, Clone)]
@@ -88,12 +87,15 @@ impl TrashInfo {
         let mut compressed = None;
 
         for line in content.lines() {
-            let line = line.trim();
-            if line == "[Trash Info]" || line.is_empty() {
+            let trimmed = line.trim();
+            if trimmed == "[Trash Info]" || trimmed.is_empty() {
                 continue;
             }
             // split_once on '=' — the value is everything after the first '='
-            // (handles '=' in filenames since Path values are percent-encoded)
+            // (handles '=' in filenames since Path values are percent-encoded).
+            // Split the RAW line: the Path value must keep leading/trailing
+            // literal whitespace byte-exact per this module's contract (only
+            // the key is trimmed) (#112).
             if let Some((key, value)) = line.split_once('=') {
                 match key.trim() {
                     // Spec: first occurrence wins for Path and DeletionDate
@@ -221,20 +223,16 @@ fn decode_percent(s: &str) -> Vec<u8> {
 }
 
 /// Decode a percent-encoded path from .trashinfo.
+///
+/// Plain byte-level decoding — deliberately NOT the WHATWG URL parser, which
+/// silently strips leading/trailing spaces from the whole URL (#112),
+/// normalizes percent-encoded dot segments (#87), and invents paths out of
+/// `file://host/...` forms (#25). Raw decoding does none of that; traversal
+/// is rejected segment-wise at parse time (#27/#87) and restore re-checks the
+/// decoded components on its side.
 fn decode_path(s: &str) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
-    let raw = decode_percent(s);
-    // Only consult the URL parser for ABSOLUTE values. For a relative topdir
-    // path like "localhost/foo", `file://localhost/foo` parses with host
-    // "localhost" and to_file_path() happily returns "/foo" — inventing an
-    // absolute path out of a relative one (#25).
-    if raw.first() == Some(&b'/')
-        && let Ok(url) = Url::parse(&format!("file://{s}"))
-        && let Ok(path) = url.to_file_path()
-    {
-        return path;
-    }
-    PathBuf::from(std::ffi::OsString::from_vec(raw))
+    PathBuf::from(std::ffi::OsString::from_vec(decode_percent(s)))
 }
 
 #[cfg(test)]
@@ -338,8 +336,7 @@ X-Trashd-SHA256=deadbeef
     // Regression (#87): percent-encoded dot segments normalize away inside the
     // URL parser, so the encoded value must be checked segment by segment.
     #[test]
-    fn parse_rejects_encoded_dot_segments() {
-        for path in [
+    fn parse_rejects_encoded_dot_segments() {        for path in [
             "/%2e%2e/%2e%2e/etc/evil",
             "/home/user/%2E%2e/etc/evil",
             "/x/%2e/%2e%2e/etc/evil",
@@ -351,6 +348,20 @@ X-Trashd-SHA256=deadbeef
                 "traversal path must be rejected: {path}"
             );
         }
+    }
+
+    // Regression (#112): the Path value must keep leading/trailing literal
+    // whitespace byte-exact — only the KEY is trimmed. (trashd's own writer
+    // percent-encodes spaces, so this only matters for foreign sidecars.)
+    #[test]
+    fn path_value_is_not_trimmed() {
+        let content = "[Trash Info]\nPath=/home/user/trailing \nDeletionDate=2026-03-20T00:00:00\n";
+        let info = TrashInfo::from_trashinfo(content).unwrap();
+        assert_eq!(
+            info.original_path,
+            PathBuf::from("/home/user/trailing "),
+            "trailing space must survive"
+        );
     }
 
     #[test]

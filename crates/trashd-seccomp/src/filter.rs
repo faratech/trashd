@@ -11,8 +11,19 @@ const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+// Only the x86_64 program emits a JGE (the x32 guard); the interpreter in
+// tests still needs the constant on every arch.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const BPF_JGE: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
+
+// x32 processes report arch == AUDIT_ARCH_X86_64 but OR 0x40000000 into every
+// syscall number, so the arch check alone cannot catch them (#123). Numbers
+// with that bit set are rejected outright — same loud-fail policy as a
+// non-native architecture.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 // seccomp_data offsets
 const OFFSET_NR: u32 = 0; // offsetof(seccomp_data, nr)
@@ -91,34 +102,42 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 /// Build the BPF filter program that traps delete-related syscalls.
 #[cfg(target_arch = "x86_64")]
 pub fn build_filter() -> Vec<SockFilter> {
-    //  [0] LD arch                [6] JEQ io_uring_setup     -> ERRNO
-    //  [1] JEQ native -> [2], else ERRNO[11]
-    //  [2] LD nr                  [7] JEQ io_uring_enter     -> ERRNO
-    //  [3] JEQ unlink  -> NOTIF   [8] JEQ io_uring_register  -> ERRNO
-    //  [4] JEQ unlinkat-> NOTIF   [9]  RET ALLOW
-    //  [5] JEQ rmdir   -> NOTIF   [10] RET USER_NOTIF
-    //                             [11] RET ERRNO|ENOSYS
+    //  [0] LD arch
+    //  [1] JEQ native -> [2], else ERRNO[12]
+    //  [2] LD nr
+    //  [3] JGE x32-bit           -> ERRNO[12]
+    //  [4] JEQ unlink        -> NOTIF[11]
+    //  [5] JEQ unlinkat      -> NOTIF[11]
+    //  [6] JEQ rmdir         -> NOTIF[11]
+    //  [7] JEQ io_uring_setup    -> ERRNO[12]
+    //  [8] JEQ io_uring_enter    -> ERRNO[12]
+    //  [9] JEQ io_uring_register -> ERRNO[12]
+    // [10] RET ALLOW   [11] RET USER_NOTIF   [12] RET ERRNO|ENOSYS
     vec![
         // [0] Load architecture
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
         // [1] Native arch → continue; anything else → ERRNO|ENOSYS (a 32-bit
         // process under the 64-bit supervisor used to get silent ALLOWs)
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 9),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 10),
         // [2] Load syscall number
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
-        // [3..5] unlink/unlinkat/rmdir → USER_NOTIF [10]
+        // [3] x32 syscalls carry this bit and reuse the native arch token, so
+        // the arch check cannot catch them; without this they would silently
+        // ALLOW every delete (#123). Reject them like a foreign architecture.
+        bpf_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 8, 0),
+        // [4..6] unlink/unlinkat/rmdir → USER_NOTIF [11]
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINK, 6, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 5, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_RMDIR, 4, 0),
-        // [6..8] io_uring → ERRNO|ENOSYS [11]
+        // [7..9] io_uring → ERRNO|ENOSYS [12]
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_SETUP, 4, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_ENTER, 3, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_REGISTER, 2, 0),
-        // [9] No match → ALLOW
+        // [10] No match → ALLOW
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        // [10] delete syscalls trap to the supervisor
+        // [11] delete syscalls trap to the supervisor
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-        // [11] io_uring and wrong-arch syscalls fail loudly
+        // [12] io_uring, wrong-arch, and x32 syscalls fail loudly
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO_ENOSYS),
     ]
 }
@@ -194,6 +213,12 @@ mod tests {
                 } else {
                     ins.jf as usize
                 };
+            } else if ins.code == BPF_JMP | BPF_JGE | BPF_K {
+                pc += 1 + if acc >= ins.k {
+                    ins.jt as usize
+                } else {
+                    ins.jf as usize
+                };
             } else if ins.code == BPF_RET | BPF_K {
                 return ins.k;
             } else {
@@ -235,6 +260,21 @@ mod tests {
         // Wrong arch is never ALLOW: e.g. an i386 token (AUDIT_ARCH_I386)
         // under the 64-bit supervisor gets ENOSYS instead of silent passage.
         assert_eq!(run_filter(&prog, 0x4000_0003, 87), SECCOMP_RET_ERRNO_ENOSYS);
+        // Regression (#123): x32 syscalls reuse the native arch token with
+        // 0x40000000 ORed into the number — they must fail loudly, not fall
+        // through to ALLOW.
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                run_filter(&prog, NATIVE_ARCH, 87 | 0x4000_0000),
+                SECCOMP_RET_ERRNO_ENOSYS
+            );
+            assert_eq!(
+                run_filter(&prog, NATIVE_ARCH, 263 | 0x4000_0000),
+                SECCOMP_RET_ERRNO_ENOSYS
+            );
+            // Ordinary 64-bit numbers (no x32 bit) are unaffected.
+            assert_eq!(run_filter(&prog, NATIVE_ARCH, 0x3FFF_FFFF), SECCOMP_RET_ALLOW);
+        }
         // Ordinary syscalls keep working.
         assert_eq!(run_filter(&prog, NATIVE_ARCH, 1), SECCOMP_RET_ALLOW); // write
         assert_eq!(run_filter(&prog, NATIVE_ARCH, 257), SECCOMP_RET_ALLOW); // openat

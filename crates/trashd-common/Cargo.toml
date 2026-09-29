@@ -20,6 +20,5 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.14"
 toml = "1"
 thiserror = "2"
-url = "2"
 
 tempfile = "3"

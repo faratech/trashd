@@ -76,6 +76,16 @@ pub fn duplicate_fd(pid: u32, fd: i32) -> io::Result<RawFd> {
 /// replacement has a different socket and never consumes the old response.
 pub fn serve(fd: RawFd) -> io::Result<()> {
     let (data, reply) = recv_packet(fd)?;
+    // A zero-length datagram means the peer (the watchdog's broker half) is
+    // GONE: further polls would spin forever on our socketpair half. Report
+    // it distinctly so the orchestrator can stop polling instead of failing
+    // the whole wait loop (#120).
+    if data.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "broker peer closed",
+        ));
+    }
     let reply = reply.ok_or_else(|| io::Error::other("missing broker reply socket"))?;
     if data.len() != 16 {
         return Err(io::Error::other("invalid broker request"));

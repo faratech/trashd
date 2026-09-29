@@ -360,8 +360,13 @@ impl TrashStore {
 
         let dest = trash_dir.join("files").join(&id);
 
-        // Write .trashinfo content to the already-created file
-        fs::write(&info_file, info.to_trashinfo_string())?;
+        // Write .trashinfo content to the already-created file. On failure,
+        // release the claim so an ENOSPC cannot strand an invisible 0-byte
+        // sidecar that also reserves the id stem (#109).
+        if let Err(e) = fs::write(&info_file, info.to_trashinfo_string()) {
+            let _ = fs::remove_file(&info_file);
+            return Err(TrashError::Io(e));
+        }
 
         // Try rename (fast, same filesystem — should always work with topdir trash)
         let mut copy_done = false;
@@ -396,11 +401,14 @@ impl TrashStore {
                     fs::set_permissions(&dest, meta.permissions())?;
                 }
                 copy_done = true;
-                // Remove the original
+                // Remove the original with RAW SYSCALLS: under a system-wide
+                // LD_PRELOAD install the calling process is itself hooked, and
+                // ordinary unlinkat/rmdir wrappers here would be re-intercepted —
+                // trashing the source a SECOND time on top of the copy (#104).
                 if meta.file_type().is_symlink() || meta.is_file() {
-                    fs::remove_file(&abs_path)?;
+                    raw_unlink_at(&abs_path)?;
                 } else {
-                    fs::remove_dir_all(&abs_path)?;
+                    raw_remove_tree_at(&abs_path, 0)?;
                 }
             }
             Ok(())
@@ -1173,7 +1181,11 @@ impl TrashStore {
             .iter()
             .find(|e| !e.orphaned)
             .ok_or_else(|| TrashError::EntryNotFound("(trash is empty)".into()))?;
-        self.restore(&newest.id, None)
+        // Restore the RESOLVED entry directly: re-resolving by ID string would
+        // fail permanently with AmbiguousMatch when the same filename is
+        // trashed in two partitions' trash roots (#107).
+        let mut entry = newest.clone();
+        self.restore_resolved(&mut entry, None, true)
     }
 
     /// Permanently delete a trash entry.
@@ -1307,9 +1319,11 @@ impl TrashStore {
                 if age.num_days() < max_age as i64 {
                     continue; // don't break — multi-partition entries may not be perfectly sorted
                 }
-                let _ = self.purge_entry(&entries[i]);
-                purged[i] = true;
-                purge_count += 1;
+                // A failed purge keeps its entry listed and counted (#106).
+                if self.purge_entry(&entries[i]).is_ok() {
+                    purged[i] = true;
+                    purge_count += 1;
+                }
             }
         }
 
@@ -1352,6 +1366,16 @@ impl TrashStore {
             if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3)
                 && compressed.len() < data.len()
             {
+                // Re-validate the entry before mutating ANYTHING: a concurrent
+                // restore/purge that retired this entry while we encoded must
+                // not be resurrected by our marker write or data swap, and a
+                // restorer racing the swap must not publish compressed bytes
+                // as plaintext (#105) — same discipline as restore/decompress.
+                if file_identity(&entries[i].trashed_path) != entries[i].identity
+                    || sidecar_version(&entries[i].info_path) != entries[i].sidecar_version
+                {
+                    continue;
+                }
                 // Record the compression marker BEFORE swapping the data
                 // (#28): a crash in the window then leaves plain data with a
                 // stale marker — which restore recognizes by the missing zstd
@@ -1391,15 +1415,22 @@ impl TrashStore {
                 if freed >= excess {
                     break;
                 }
-                // Use actual disk size (may differ from info.size after compression)
-                freed += entry_disk_size(&entries[i]);
-                let _ = self.purge_entry(&entries[i]);
-                purged[i] = true;
-                purge_count += 1;
+                // Only count a purge that actually happened: a failed removal
+                // must stay in the accounting (and out of the freed total), or
+                // the trash silently exceeds max_size_gb (#106).
+                let size = entry_disk_size(&entries[i]);
+                if self.purge_entry(&entries[i]).is_ok() {
+                    freed += size;
+                    purged[i] = true;
+                    purge_count += 1;
+                }
             }
         }
 
-        // Phase 3: disk pressure — purge oldest 10% of surviving items
+        // Phase 3: disk pressure — purge oldest 10% of surviving items.
+        // Pressure is measured on the HOME filesystem, so only entries on that
+        // same filesystem can relieve it; purging other partitions' entries
+        // would delete data without fixing the pressure (#113).
         if pressure_pct > 0 {
             let home = self.home.clone();
             if let Some(usage_pct) = disk_usage_percent(&home)
@@ -1412,13 +1443,14 @@ impl TrashStore {
                     if purged_count >= to_purge {
                         break;
                     }
-                    if purged[i] {
+                    if purged[i] || !mounts::same_filesystem(&home, &entries[i].trash_root) {
                         continue;
                     }
-                    let _ = self.purge_entry(&entries[i]);
-                    purged[i] = true;
-                    purge_count += 1;
-                    purged_count += 1;
+                    if self.purge_entry(&entries[i]).is_ok() {
+                        purged[i] = true;
+                        purge_count += 1;
+                        purged_count += 1;
+                    }
                 }
             }
         }
@@ -2093,6 +2125,102 @@ fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
     }
 }
 
+/// Unlink one filesystem entry with a raw `unlinkat` syscall. Hookable libc
+/// wrappers are deliberately avoided here: under a system-wide LD_PRELOAD the
+/// calling process is itself interposed, and an ordinary remove would trash
+/// the source a second time during cross-device cleanup (#104).
+fn raw_unlink_at(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    if unsafe { libc::unlinkat(libc::AT_FDCWD, c.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Recursively remove a directory tree with raw *at syscalls relative to
+/// pinned descriptors (see [`raw_unlink_at`] for why libc wrappers are
+/// avoided). Depth-limited like copy_tree.
+fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    const MAX_DEPTH: u32 = COPY_TREE_MAX_DEPTH;
+    if depth > MAX_DEPTH {
+        return Err(io::Error::other(format!(
+            "directory tree too deep (>{MAX_DEPTH} levels) — possible cycle"
+        )));
+    }
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(libc::AT_FDCWD, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // A swapped symlink is unlinked as a file, never traversed.
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return raw_unlink_at(path);
+    }
+    let fd = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = raw_remove_tree_fd(fd, depth);
+    unsafe { libc::close(fd) };
+    result?;
+    if unsafe { libc::unlinkat(libc::AT_FDCWD, c.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn raw_remove_tree_fd(dir_fd: RawFd, depth: u32) -> io::Result<()> {
+    if depth > COPY_TREE_MAX_DEPTH {
+        return Err(io::Error::other(format!(
+            "directory tree too deep (>{} levels) — possible cycle",
+            COPY_TREE_MAX_DEPTH
+        )));
+    }
+    for name in read_directory_names(dir_fd)? {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir_fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = unsafe {
+                libc::openat(
+                    dir_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if child < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let result = raw_remove_tree_fd(child, depth + 1);
+            unsafe { libc::close(child) };
+            result?;
+            if unsafe { libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        } else if unsafe { libc::unlinkat(dir_fd, name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Copy a directory tree preserving symlinks and permissions.
 /// Depth-limited to prevent infinite recursion from symlink loops or
 /// bind mounts creating cycles.
@@ -2139,7 +2267,14 @@ fn copy_tree_inner(src: &Path, dst: &Path, depth: u32) -> io::Result<()> {
             // Device nodes need CAP_MKNOD to recreate and sockets are kernel
             // rendezvous objects with no persistent data — skip them.
         } else {
-            fs::copy(entry.path(), &dest_path)?;
+            // Verified open (no-follow, non-blocking, identity re-check): a
+            // racer swapping a child for a FIFO must not block the copy and a
+            // symlink swap must not be read through (#111).
+            copy_regular_verified(
+                entry.path().as_path(),
+                &dest_path,
+                (entry_meta.dev(), entry_meta.ino()),
+            )?;
             fs::set_permissions(&dest_path, entry_meta.permissions())?;
         }
     }
@@ -3327,7 +3462,16 @@ fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
 /// itself, not its target.
 fn entry_disk_size(entry: &TrashEntry) -> u64 {
     match fs::symlink_metadata(&entry.trashed_path) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => entry.info.size.unwrap_or(m.len()),
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+            // Foreign (spec-compliant) entries carry no X-Trashd-Size; falling
+            // back to the directory INODE size under-counted each foreign tree
+            // at ~4 KiB, so retention never trimmed directory-heavy trashes
+            // (#115). Use the same capped walk trash-time sizing uses.
+            entry
+                .info
+                .size
+                .unwrap_or_else(|| dir_size(&entry.trashed_path))
+        }
         Ok(m) => m.len(),
         Err(_) => entry.info.size.unwrap_or(0),
     }
@@ -3346,8 +3490,11 @@ fn disk_usage_percent(path: &Path) -> Option<f64> {
         }
         // Total usable by non-root = used_by_users + f_bavail
         // where used_by_users = f_blocks - f_bfree
-        // So effective total = (f_blocks - f_bfree) + f_bavail
-        let used = stat.f_blocks - stat.f_bfree;
+        // So effective total = (f_blocks - f_bfree) + f_bavail.
+        // saturating_sub: some FUSE filesystems report f_bfree > f_blocks;
+        // unsigned wrap would fabricate a huge "used" and trigger retention
+        // purges (#114).
+        let used = stat.f_blocks.saturating_sub(stat.f_bfree);
         let effective_total = used + stat.f_bavail;
         if effective_total == 0 {
             return None;
@@ -4673,5 +4820,70 @@ mod tests {
         assert_eq!(orphans.len(), 1, "the other root's orphan must be listed");
         assert_eq!(orphans[0].trash_root, other_trash);
         assert_eq!(entries.len(), 2);
+    }
+
+    // Regression (#107): undo must restore the RESOLVED entry. Two roots can
+    // hold the same id; re-resolving by ID string would fail with
+    // AmbiguousMatch forever. restore_resolved on the picked entry is the
+    // path undo now takes, so drive it the same way.
+    #[test]
+    fn resolved_entry_restores_even_with_cross_root_id_collision() {
+        let (store, _data, work, _lock) = test_store();
+        let f1 = create_file(work.path(), "report.pdf", "newest");
+        let id = store.trash(&f1, None).unwrap();
+
+        // A second root holding an entry with the SAME id (as happens when the
+        // same filename is trashed on two partitions).
+        let other_root = tempfile::tempdir().unwrap();
+        let other_trash = other_root.path().join("Trash");
+        fs::create_dir_all(other_trash.join("files")).unwrap();
+        fs::create_dir_all(other_trash.join("info")).unwrap();
+        fs::write(other_trash.join("files").join(&id), b"older copy").unwrap();
+        let other_info = TrashInfo::new(work.path().join("report.pdf"));
+        fs::write(
+            other_trash.join("info").join(format!("{id}.trashinfo")),
+            other_info.to_trashinfo_string(),
+        )
+        .unwrap();
+
+        let mut entries = Vec::new();
+        store.list_in_dir(&store.home, None, &mut entries).unwrap();
+        store.list_in_dir(&other_trash, None, &mut entries).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // undo picks the newest — restoring it must NOT depend on ID lookup.
+        entries.sort_by_key(|b| std::cmp::Reverse(b.info.deletion_date));
+        let mut chosen = entries[0].clone();
+        let restored = store.restore_resolved(&mut chosen, None, true).unwrap();
+        assert_eq!(restored, f1);
+        assert_eq!(fs::read_to_string(&f1).unwrap(), "newest");
+    }
+
+    // Regression (#115): a foreign directory entry without X-Trashd-Size must
+    // count its real (capped) tree size, not the ~4 KiB inode size.
+    #[test]
+    fn foreign_directory_entry_uses_tree_size_for_accounting() {
+        let (store, _data, work, _lock) = test_store();
+        let tree = work.path().join("foreign-tree");
+        fs::create_dir_all(&tree).unwrap();
+        let payload = "x".repeat(50_000);
+        fs::write(tree.join("big"), &payload).unwrap();
+
+        // Seed a sidecar WITHOUT the trashd size extension, as another
+        // spec-compliant tool would.
+        let id = "foreign-tree";
+        fs::rename(&tree, store.home.join("files").join(id)).unwrap();
+        let info = TrashInfo::new(work.path().join("foreign-tree"));
+        fs::write(
+            store.home.join("info").join(format!("{id}.trashinfo")),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+
+        let (size, _count) = store.status().unwrap();
+        assert!(
+            size >= 50_000,
+            "foreign directory tree must be accounted at its real size, got {size}"
+        );
     }
 }

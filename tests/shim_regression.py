@@ -74,10 +74,14 @@ def main():
             assert result.returncode == 0 and "trashd rm shim" in result.stdout, (flags, result.stdout, result.stderr)
         print("PASS: 10 repeated-option cases execute the shim")
 
+        # GNU semantics (#117): ignore_missing_files is set by -f and never
+        # cleared by interaction flags, so EVERY -f-led form exits 0 silently
+        # for a missing operand; interaction only governs prompting of files
+        # that exist.
         for flags, status in [
-            (["-f", "-i"], 1), (["-i", "-f"], 0),
+            (["-f", "-i"], 0), (["-i", "-f"], 0),
             (["-f", "--interactive=never"], 0),
-            (["-f", "--interactive=always", "--interactive=never"], 1),
+            (["-f", "--interactive=always", "--interactive=never"], 0),
         ]:
             result = run([*flags, root / "not-present"])
             assert result.returncode == status, (flags, result.returncode, result.stderr)

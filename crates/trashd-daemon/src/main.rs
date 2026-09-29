@@ -497,29 +497,31 @@ fn refresh_mounts(
         }
         let fsid = fsid_of_path(&mount.path);
 
-        let known = marked.iter().find(|(p, _)| p == &mount.path);
-        let identity_changed = match (known, &fsid) {
-            (Some((_, Some(old))), Some(new)) => old != new,
-            _ => false,
-        };
-        if known.is_none() || identity_changed {
-            match fanotify_mark(
-                fan_fd,
-                FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-                FAN_DELETE | FAN_DELETE_SELF,
-                &mount.path,
-            ) {
-                Ok(()) => {
-                    if identity_changed {
-                        eprintln!(
-                            "trashd: re-marking \"{}\" ({}) [remounted]",
-                            escape_path(&mount.path),
-                            mount.fstype
-                        );
-                        if let Some(entry) = marked.iter_mut().find(|(p, _)| p == &mount.path) {
+        // Re-mark EVERY live mount on every refresh tick: f_fsid is stable
+        // across unmount/remount of the SAME filesystem, so an identity
+        // comparison cannot see a same-fs umount+mount cycle at one path —
+        // yet the old fanotify mark died with the old superblock (#122).
+        // FAN_MARK_ADD is idempotent for an already-marked superblock, so the
+        // unconditional re-mark is cheap and re-arms the current one.
+        match fanotify_mark(
+            fan_fd,
+            FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+            FAN_DELETE | FAN_DELETE_SELF,
+            &mount.path,
+        ) {
+            Ok(()) => {
+                match marked.iter_mut().find(|(p, _)| p == &mount.path) {
+                    Some(entry) => {
+                        if entry.1 != fsid && fsid.is_some() {
+                            eprintln!(
+                                "trashd: re-marking \"{}\" ({}) [filesystem changed]",
+                                escape_path(&mount.path),
+                                mount.fstype
+                            );
                             entry.1 = fsid;
                         }
-                    } else {
+                    }
+                    None => {
                         eprintln!(
                             "trashd: watching \"{}\" ({}) [new mount]",
                             escape_path(&mount.path),
@@ -528,18 +530,14 @@ fn refresh_mounts(
                         marked.push((mount.path.clone(), fsid));
                     }
                 }
-                Err(_) => continue,
             }
+            Err(_) => continue,
         }
 
-        let fd_known = fds.iter().find(|(p, _, _)| p == &mount.path).is_some();
-        let fd_stale = match (fds.iter().find(|(p, _, _)| p == &mount.path), &fsid) {
-            (Some((_, _, Some(old))), Some(new)) => old != new,
-            _ => false,
-        };
-        if (!fd_known || fd_stale)
-            && let Ok(c) = std::ffi::CString::new(mount.path.to_string_lossy().as_bytes())
-        {
+        // Same reasoning for the handle-resolution fd: an O_PATH fd from
+        // before a remount points at the detached superblock and would fail
+        // (or misresolve) open_by_handle_at. Refresh it unconditionally.
+        if let Ok(c) = std::ffi::CString::new(mount.path.to_string_lossy().as_bytes()) {
             let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
             if fd >= 0 {
                 match fds.iter_mut().find(|(p, _, _)| p == &mount.path) {

@@ -37,7 +37,15 @@ install: build
 	install -Dm755 target/release/trashd $(DESTDIR)$(BINDIR)/trashd
 	install -Dm755 target/release/libtrashd_preload.so $(DESTDIR)$(LIBDIR)/libtrashd_preload.so
 	install -Dm644 config/trashd.toml $(DESTDIR)/etc/trashd/config.toml
-	install -Dm644 install/profile.d/trashd.sh $(DESTDIR)/etc/profile.d/trashd.sh
+	# Template the runtime prefix into the profile script — the shipped file
+	# hardcodes /usr/local, which would leave Layers 1/4 inactive for custom
+	# PREFIX installs (#101, #124). DESTDIR is staging-only, so the script
+	# embeds the un-prefixed runtime paths. index/substr splicing keeps
+	# metacharacters in the prefix byte-exact.
+	mkdir -p $(DESTDIR)/etc/profile.d
+	awk -v shim="$(LIBDIR)/bin" -v bin="$(BINDIR)/trashd-exec" '{ s = $$0; out = ""; while ((i = index(s, "/usr/local/lib/trashd/bin")) > 0) { out = out substr(s, 1, i-1) shim; s = substr(s, i + length("/usr/local/lib/trashd/bin")) } s = out s; out = ""; while ((i = index(s, "/usr/local/bin/trashd-exec")) > 0) { out = out substr(s, 1, i-1) bin; s = substr(s, i + length("/usr/local/bin/trashd-exec")) } print out s }' \
+		install/profile.d/trashd.sh > $(DESTDIR)/etc/profile.d/trashd.sh
+	chmod 0644 $(DESTDIR)/etc/profile.d/trashd.sh
 	install -Dm644 install/systemd/trashd.service $(DESTDIR)/etc/systemd/system/trashd.service
 	# Man page
 	install -Dm644 target/man/trash.1 $(DESTDIR)$(MANDIR)/trash.1

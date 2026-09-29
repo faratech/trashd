@@ -443,6 +443,9 @@ fn wait_for_children(
     let mut targets = std::collections::BTreeMap::<i32, OwnedFd>::new();
     let mut refresh = true;
     let mut pending_signals = Vec::new();
+    // A dead broker peer must not abort the wait loop: the wrapped command is
+    // still running and its real exit status has to survive (#120).
+    let mut broker_fd = broker_fd;
     loop {
         if refresh {
             let mut reaped = false;
@@ -528,7 +531,20 @@ fn wait_for_children(
         }
         refresh |= fds.iter().skip(2).any(|fd| fd.revents != 0);
         if fds[1].revents & libc::POLLIN != 0 {
-            broker::serve(fds[1].fd)?;
+            match broker::serve(fds[1].fd) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Peer closed: drop it from the poll set instead of
+                    // spinning on EOF or tearing down live children (#120).
+                    eprintln!("trashd-exec: broker peer closed; continuing without it");
+                    broker_fd = None;
+                }
+                Err(e) => {
+                    // One malformed/failed request must not kill the wrapped
+                    // command; log and keep serving.
+                    eprintln!("trashd-exec: broker request failed: {e}");
+                }
+            }
         }
     }
 }
