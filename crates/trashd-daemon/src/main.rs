@@ -75,6 +75,12 @@ struct FanotifyEventInfoFid {
 const FANOTIFY_METADATA_VERSION: u8 = 3;
 const META_SIZE: usize = std::mem::size_of::<FanotifyEventMetadata>();
 
+/// statfs/fanotify filesystem identity: statfs's f_fsid as a comparable pair.
+type Fsid = Option<(i32, i32)>;
+
+/// Cached handle-resolution mount: path, O_PATH fd, and that fd's fsid (#97).
+type MountFd = (PathBuf, RawFd, Fsid);
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -120,7 +126,10 @@ fn run() -> io::Result<()> {
     // Mark all real mount points
     let mount_list = mounts::list_mounts();
     let mut marked = 0;
-    let mut marked_paths: Vec<PathBuf> = Vec::new();
+    // Each entry carries the filesystem identity (statfs f_fsid) it was
+    // marked for: a remount at the same path is a NEW superblock whose old
+    // fanotify mark died with the unmount (#98).
+    let mut marked_paths: Vec<(PathBuf, Fsid)> = Vec::new();
     for mount in &mount_list {
         if matches!(
             mount.fstype.as_str(),
@@ -142,7 +151,7 @@ fn run() -> io::Result<()> {
                     mount.fstype,
                 );
                 marked += 1;
-                marked_paths.push(mount.path.clone());
+                marked_paths.push((mount.path.clone(), fsid_of_path(&mount.path)));
             }
             Err(e) => {
                 eprintln!(
@@ -160,8 +169,10 @@ fn run() -> io::Result<()> {
     }
 
     // Open O_PATH fds to each watched mount point for open_by_handle_at.
-    // open_by_handle_at requires a mount fd on the same filesystem as the handle.
-    let mut mount_fds: Vec<(PathBuf, RawFd)> = Vec::new();
+    // open_by_handle_at requires a mount fd on the same filesystem as the
+    // handle; the fsid recorded beside each fd is what events are matched
+    // against so a handle is never decoded against the WRONG filesystem (#97).
+    let mut mount_fds: Vec<MountFd> = Vec::new();
     for mount in &mount_list {
         if matches!(
             mount.fstype.as_str(),
@@ -175,7 +186,7 @@ fn run() -> io::Result<()> {
         };
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
         if fd >= 0 {
-            mount_fds.push((mount.path.clone(), fd));
+            mount_fds.push((mount.path.clone(), fd, fsid_of_path(&mount.path)));
         }
     }
 
@@ -277,12 +288,42 @@ fn run() -> io::Result<()> {
 fn resolve_event_path(
     event_buf: &[u8],
     _event: &FanotifyEventMetadata,
-    mount_fds: &[(PathBuf, RawFd)],
+    mount_fds: &[MountFd],
 ) -> Option<PathBuf> {
     // Try to extract path from extended FID info (DFID_NAME for FAN_DELETE,
     // DFID for FAN_DELETE_SELF). No fd-based fallback: with FAN_REPORT_FID
     // groups delete events always carry fd=FAN_NOFD, so it was dead code (#29).
     extract_dfid_name_path(event_buf, mount_fds)
+}
+
+/// statfs f_fsid of the filesystem at `path` — the identity fanotify events
+/// carry, used to decode file handles against the RIGHT mount (#97).
+fn fsid_of_path(path: &std::path::Path) -> Fsid {
+    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // libc keeps fsid_t.__val private; the type is repr(C) [c_int; 2].
+    const _: () = assert!(std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<[i32; 2]>());
+    let fsid: [i32; 2] = unsafe { std::mem::transmute(st.f_fsid) };
+    Some((fsid[0], fsid[1]))
+}
+
+/// Read the event's fsid (two native-endian i32 words that sit between the
+/// info header and the file_handle).
+fn event_fsid(event_buf: &[u8], fh_offset: usize) -> Fsid {
+    if fh_offset < 8 {
+        return None;
+    }
+    let b = event_buf.get(fh_offset - 8..fh_offset)?;
+    if b.len() != 8 {
+        return None;
+    }
+    Some((
+        i32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+        i32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+    ))
 }
 
 /// Parse extended FID info to get a path.
@@ -292,7 +333,10 @@ fn resolve_event_path(
 ///   directly via open_by_handle_at. Type-1 records were never parsed before,
 ///   and with FAN_REPORT_FID groups delete events carry fd=FAN_NOFD, so the
 ///   old /proc/self/fd fallback could never fire either (#29).
-fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[(PathBuf, RawFd)]) -> Option<PathBuf> {
+fn extract_dfid_name_path(
+    event_buf: &[u8],
+    mount_fds: &[MountFd],
+) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
@@ -313,14 +357,11 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[(PathBuf, RawFd)]) -> O
             if fh_offset + 8 > event_buf.len() {
                 break;
             }
-            let handle_bytes = u32::from_ne_bytes([
-                event_buf[fh_offset],
-                event_buf[fh_offset + 1],
-                event_buf[fh_offset + 2],
-                event_buf[fh_offset + 3],
-            ]) as usize;
+            // handle_bytes is not needed here: the kernel-returned handle is
+            // passed to open_by_handle_at by pointer, length-validated above.
+            let fsid = event_fsid(event_buf, fh_offset);
             let file_handle_ptr = event_buf[fh_offset..].as_ptr();
-            return resolve_handle_to_path(file_handle_ptr, handle_bytes, mount_fds);
+            return resolve_handle_to_path(file_handle_ptr, fsid, mount_fds);
         }
 
         if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
@@ -343,6 +384,7 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[(PathBuf, RawFd)]) -> O
                 event_buf[fh_offset + 2],
                 event_buf[fh_offset + 3],
             ]) as usize;
+            let fsid = event_fsid(event_buf, fh_offset);
 
             // The name follows the file_handle
             let name_offset = fh_offset + 8 + handle_bytes;
@@ -363,7 +405,7 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[(PathBuf, RawFd)]) -> O
 
             // Try to resolve the parent directory via open_by_handle_at
             let file_handle_ptr = event_buf[fh_offset..].as_ptr();
-            let parent_dir = resolve_handle_to_path(file_handle_ptr, handle_bytes, mount_fds);
+            let parent_dir = resolve_handle_to_path(file_handle_ptr, fsid, mount_fds);
 
             if let Some(dir) = parent_dir {
                 return Some(dir.join(filename));
@@ -381,17 +423,28 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[(PathBuf, RawFd)]) -> O
 
 /// Try to resolve a file_handle to a path via open_by_handle_at + /proc/self/fd.
 ///
-/// `mount_fd_hint` is an O_PATH fd to a file on the same filesystem as the handle,
-/// or -1 to try all known mount points.
+/// `expected_fsid` is the filesystem identity the event was emitted for. When
+/// known, ONLY a cached mount fd with a matching statfs f_fsid is used: the
+/// kernel does not verify that a handle originated on the given mount, so
+/// trial-decoding against every mount could resolve identical
+/// inode/generation pairs on the wrong filesystem (#97). When unknown, fall
+/// back to the historical trial order.
 fn resolve_handle_to_path(
     file_handle_ptr: *const u8,
-    _handle_bytes: usize,
-    mount_fds: &[(PathBuf, RawFd)],
+    expected_fsid: Fsid,
+    mount_fds: &[MountFd],
 ) -> Option<PathBuf> {
+    let candidates: Vec<RawFd> = match expected_fsid {
+        Some(fsid) => mount_fds
+            .iter()
+            .filter(|(_, _, f)| *f == Some(fsid))
+            .map(|(_, fd, _)| *fd)
+            .collect(),
+        None => mount_fds.iter().map(|(_, fd, _)| *fd).collect(),
+    };
+
     // open_by_handle_at requires a mount fd on the same filesystem as the handle.
-    // Try each cached mount fd until one succeeds.
-    for (_, mount_fd) in mount_fds {
-        let mount_fd = *mount_fd;
+    for mount_fd in candidates {
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_open_by_handle_at,
@@ -412,16 +465,44 @@ fn resolve_handle_to_path(
 }
 
 /// Diff a fresh /proc/mounts scan against the marked set; mark and open
-/// handle-resolution fds for anything new (#37).
-fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<PathBuf>, fds: &mut Vec<(PathBuf, RawFd)>) {
-    for mount in mounts::list_mounts() {
+/// handle-resolution fds for anything new (#37), and RE-mark anything whose
+/// filesystem identity changed: a remount at the same path is a new
+/// superblock whose old mark and old cached fd died with the unmount (#98).
+fn refresh_mounts(
+    fan_fd: RawFd,
+    marked: &mut Vec<(PathBuf, Fsid)>,
+    fds: &mut Vec<MountFd>,
+) {
+    let fresh = mounts::list_mounts();
+    let live_paths: Vec<PathBuf> = fresh.iter().map(|m| m.path.clone()).collect();
+
+    // Drop state for mounts that vanished entirely (fd close; the fanotify
+    // mark died with the superblock).
+    marked.retain(|(p, _)| live_paths.contains(p));
+    fds.retain(|(p, fd, _)| {
+        if live_paths.contains(p) {
+            true
+        } else {
+            unsafe { libc::close(*fd) };
+            false
+        }
+    });
+
+    for mount in &fresh {
         if matches!(
             mount.fstype.as_str(),
             "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
         ) {
             continue;
         }
-        if !marked.iter().any(|p| p == &mount.path) {
+        let fsid = fsid_of_path(&mount.path);
+
+        let known = marked.iter().find(|(p, _)| p == &mount.path);
+        let identity_changed = match (known, &fsid) {
+            (Some((_, Some(old))), Some(new)) => old != new,
+            _ => false,
+        };
+        if known.is_none() || identity_changed {
             match fanotify_mark(
                 fan_fd,
                 FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
@@ -429,22 +510,46 @@ fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<PathBuf>, fds: &mut Vec<(PathB
                 &mount.path,
             ) {
                 Ok(()) => {
-                    eprintln!(
-                        "trashd: watching \"{}\" ({}) [new mount]",
-                        escape_path(&mount.path),
-                        mount.fstype
-                    );
-                    marked.push(mount.path.clone());
+                    if identity_changed {
+                        eprintln!(
+                            "trashd: re-marking \"{}\" ({}) [remounted]",
+                            escape_path(&mount.path),
+                            mount.fstype
+                        );
+                        if let Some(entry) = marked.iter_mut().find(|(p, _)| p == &mount.path) {
+                            entry.1 = fsid;
+                        }
+                    } else {
+                        eprintln!(
+                            "trashd: watching \"{}\" ({}) [new mount]",
+                            escape_path(&mount.path),
+                            mount.fstype
+                        );
+                        marked.push((mount.path.clone(), fsid));
+                    }
                 }
                 Err(_) => continue,
             }
         }
-        if !fds.iter().any(|(p, _)| p == &mount.path)
+
+        let fd_known = fds.iter().find(|(p, _, _)| p == &mount.path).is_some();
+        let fd_stale = match (fds.iter().find(|(p, _, _)| p == &mount.path), &fsid) {
+            (Some((_, _, Some(old))), Some(new)) => old != new,
+            _ => false,
+        };
+        if (!fd_known || fd_stale)
             && let Ok(c) = std::ffi::CString::new(mount.path.to_string_lossy().as_bytes())
         {
             let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
             if fd >= 0 {
-                fds.push((mount.path.clone(), fd));
+                match fds.iter_mut().find(|(p, _, _)| p == &mount.path) {
+                    Some(entry) => {
+                        unsafe { libc::close(entry.1) };
+                        entry.1 = fd;
+                        entry.2 = fsid;
+                    }
+                    None => fds.push((mount.path.clone(), fd, fsid)),
+                }
             }
         }
     }
@@ -483,5 +588,30 @@ fn fanotify_mark(
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression (#97): the fsid recorded in a fanotify FID record must be
+    // extracted from the bytes between the info header and the file_handle,
+    // so handle decoding can be pinned to the originating filesystem.
+    #[test]
+    fn event_fsid_is_read_from_the_record() {
+        // header (4 bytes) + fsid (8 bytes) + file_handle prefix (8 bytes)
+        let mut buf = Vec::new();
+        buf.push(2u8); // FAN_EVENT_INFO_TYPE_DFID_NAME
+        buf.push(0); // pad
+        buf.extend_from_slice(&32u16.to_ne_bytes()); // len
+        buf.extend_from_slice(&0x1111_2222i32.to_ne_bytes());
+        buf.extend_from_slice(&0x3333_4444i32.to_ne_bytes());
+        buf.extend_from_slice(&8u32.to_ne_bytes()); // handle_bytes
+        buf.extend_from_slice(&1i32.to_ne_bytes()); // handle_type
+
+        assert_eq!(event_fsid(&buf, 12), Some((0x1111_2222, 0x3333_4444)));
+        assert_eq!(event_fsid(&buf[..8], 12), None, "truncated record");
+        assert_eq!(event_fsid(&buf, 4), None, "offset before the fsid");
     }
 }
