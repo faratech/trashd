@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.7 (2026-09-29)
 
 Release from the 2026-09-29 analysis and remediation pass: 41 issues filed,
 verified, and closed.
