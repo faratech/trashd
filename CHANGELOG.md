@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Release from the 2026-09-29 analysis and remediation pass: 20 issues filed,
+Release from the 2026-09-29 analysis and remediation pass: 22 issues filed,
 verified, and closed.
 
 ### Fixed — daemon
@@ -22,6 +22,9 @@ verified, and closed.
   reach, so deletions through `remove()` bypassed the trash entirely.
 - `/proc/mounts` parsing is byte-safe; a single odd mount point no longer
   silently loses the trash location for every filesystem.
+- The preload's duplicated local-config walk stops at a present-but-broken
+  `.trashd.toml` like the common crate, instead of inheriting an ancestor's
+  narrower whitelist and permanently deleting.
 
 ### Fixed — trash store and restore
 
@@ -61,7 +64,8 @@ verified, and closed.
 - `trash empty` propagates listing errors instead of printing "Nothing to
   empty." and exiting 0 when nothing could be listed.
 - `trash info` resolves targets through `find_entry`, refusing ambiguous
-  cross-root IDs exactly like restore/purge.
+  cross-root IDs exactly like restore/purge, and surfaces listing errors
+  instead of reporting "not found".
 
 ### Fixed — shim (rm)
 
