@@ -25,7 +25,7 @@ build:
 	cargo build --release
 
 test:
-	cargo test --workspace
+	TRASH_BYPASS=1 cargo test --workspace
 
 clean:
 	cargo clean

@@ -172,25 +172,17 @@ jobs:
       - name: Determine version
         id: version
         env:
-          VERSION_INPUT: ${{ github.event.inputs.version }}
+          BUILD_VERSION: ${{ needs.build.outputs.version }}
         run: |
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            # Tag-push trigger: trust the pushed tag verbatim (never suffix-bump it,
-            # or the loop would see its own tag and turn v0.1.3 into v0.1.3.1)
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [ -n "${VERSION_INPUT}" ]; then
-            VERSION="${VERSION_INPUT}"
-            # Check if tag exists, append .N if so
-            BASE_VERSION="${VERSION}"
-            SUFFIX=0
-            while git tag -l "v${VERSION}" | grep -q .; do
-              SUFFIX=$((SUFFIX + 1))
-              VERSION="${BASE_VERSION}.${SUFFIX}"
-            done
-          else
-            VERSION=$(date -u +%Y.%m.%d)
+          # Reuse the build job's version verbatim: recomputing a date-based
+          # version here could straddle UTC midnight and mint a tag that does
+          # not match the built tarball names (breaking the quick installer,
+          # which derives the asset name from the tag).
+          if [ -z "${BUILD_VERSION}" ]; then
+            echo "error: build job did not export a version" >&2
+            exit 1
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${BUILD_VERSION}" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8

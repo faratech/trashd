@@ -1,5 +1,5 @@
 Name:           trashd
-Version:        0.1.2
+Version:        0.1.6
 Release:        1%{?dist}
 Summary:        A Linux recycle bin that works in scripts, cron, and at the desktop
 License:        MIT
@@ -24,6 +24,9 @@ monitoring.
 cargo build --release
 
 %install
+# %make_install alone does not pass PREFIX, so the Makefile's /usr/local
+# default would stage everything under /usr/local while %files claims
+# %{_prefix} (/usr) — failing the build.
 %make_install PREFIX=%{_prefix}
 
 %files
