@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.1.6 (2026-09-29)
+
+Release from the 2026-09-28/29 analysis and remediation pass: 47 issues filed,
+verified, and closed across six review rounds. Fixes below; all were confirmed
+reproducible against 0.1.5 on a live system before fixing.
+
+### Fixed — shim (rm)
+
+- Operands whose final component is `.` or `..` are refused like GNU rm;
+  `rm -rf ..` no longer trashes the caller's working directory while
+  reporting success, and paths ending in `..` resolve to the parent instead
+  of silently collapsing to the directory itself.
+- `--permanent`/`--no-trash` are only stripped before `--`, so files literally
+  named like the bypass flags can be permanently deleted.
+- `rm -f -i missing` exits 0 silently: ignore-missing follows GNU semantics
+  (set by `-f`, never cleared by interaction flags).
+- `--preserve-root=all` refuses mount-point operands.
+- Real-rm discovery probes every candidate (stash, PATH, /usr/bin/rm) for
+  shim copies and refuses to recurse if only shim copies exist; a shim-copy
+  probe no longer forks without bound under TRASH_BYPASS=1.
+- The real-rm stash is located relative to the shim itself, so custom-prefix
+  installs work.
+
+### Fixed — preload
+
+- An empty pathname falls through to the real syscall (ENOENT) instead of
+  trashing the caller's working directory or dirfd.
+- Only the caller's own `.Trash-<uid>` matches the trash-internal skip, so
+  lookalike directories are trashed, not permanently deleted.
+- `max_dir_size_mb` is parsed and enforced (bounded walk), matching the other
+  layers.
+- Cross-device copies open sources with O_NOFOLLOW|O_NONBLOCK and re-verify
+  identity, so a swapped FIFO cannot hang the host process and a swapped
+  symlink is not read through.
+- `TRASHD_SECCOMP_ACTIVE=1` only defers interception when the process really
+  runs under a seccomp filter; a leaked export no longer disables protection
+  on unfiltered hosts.
+
+### Fixed — trash store and restore
+
+- Cross-device removal uses raw syscalls: under a system-wide LD_PRELOAD the
+  source is no longer re-intercepted and captured twice.
+- Auto-purge re-validates entries before compression, counts only successful
+  purges, relieves disk pressure only on the pressured filesystem, and sizes
+  foreign directory entries by their real (capped) tree size.
+- Undo restores the resolved newest entry, working across trash roots that
+  hold the same ID.
+- Orphaned entries are detected per trash root, so recoverable data is listed
+  even when another root holds the same ID.
+- `.trashinfo` decoding is plain percent-decoding: percent-encoded dot
+  segments cannot bypass traversal rejection, Path values keep literal
+  whitespace, and `file://host` forms cannot invent paths.
+- Long-running supervisors no longer leak a descriptor when the trash volume
+  fills, and raced FIFO/symlink swaps cannot block a deletion forever.
+- The trash index database is owner-only (0600).
+
+### Fixed — seccomp layer
+
+- io_uring, non-native architectures, and x32-numbered syscalls are refused
+  with ENOSYS instead of silently allowing permanent deletes.
+- Notifications are validated before target memory is read (PID-reuse hardening).
+- A supervisor can no longer outlive the watchdog holding the notification fd.
+- A dead broker no longer SIGKILLs the wrapped command — its real exit status
+  is returned — and supervisor respawns are rate-limited.
+
+### Fixed — daemon, CLI, packaging
+
+- Deletion events resolve file handles only against the filesystem the event
+  came from, and remounts at the same path are re-marked.
+- `trash config add` reports a readable error instead of panicking on a
+  non-array list value; `trash ls --after` bounds-checks magnitudes instead
+  of overflowing.
+- `trash self-update --check` no longer offers downgrades from the cache,
+  compares versions suffix-aware, and reinstalls under the original PREFIX.
+- `trash fsck` no longer misclassifies data with a dangling sidecar symlink
+  as orphaned and offered for deletion.
+- Non-UTF-8 names are accepted by `ls`, `find`, `info`, `restore`, and
+  `purge` on the command line.
+- The CLI, shim, and daemon die quietly on SIGPIPE like GNU tools instead of
+  panicking with exit 101.
+- install.sh and `make install` template the real prefix into the profile
+  script (custom-prefix installs activate all layers; metacharacter prefixes
+  survive), `make build` no longer runs `cargo update`, and the release
+  workflow hardens interpolation and fails on missing attestations.
+
+
 ## 0.1.5 (2026-09-27)
 
 - Accept legacy configuration files that placed global settings under
