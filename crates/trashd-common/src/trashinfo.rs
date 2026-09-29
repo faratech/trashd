@@ -99,10 +99,17 @@ impl TrashInfo {
                     // Spec: first occurrence wins for Path and DeletionDate
                     "Path" if path.is_none() => {
                         // Reject traversal lexically BEFORE decoding: the URL
-                        // parser normalizes ".." silently, which would defeat
+                        // parser normalizes ".." silently — and even percent-
+                        // encoded dot segments ("%2e%2e") — which would defeat
                         // restore's ParentDir guard and let a crafted
-                        // .trashinfo restore to an arbitrary location (#27).
-                        if value.split('/').any(|seg| seg == "..") {
+                        // .trashinfo restore to an arbitrary location (#27,
+                        // encoded-form bypass). A segment is rejected when its
+                        // percent-DECODED bytes are "." or "..", which covers
+                        // "..", "%2e", ".%2E", "%2e.", and friends.
+                        if value
+                            .split('/')
+                            .any(|seg| matches!(&decode_percent(seg)[..], b"." | b".."))
+                        {
                             return None;
                         }
                         // Spec: Path value is percent-encoded bytes — don't trim
@@ -326,6 +333,24 @@ X-Trashd-SHA256=deadbeef
     fn parse_missing_path_returns_none() {
         let content = "[Trash Info]\nDeletionDate=2026-03-20T14:30:00\n";
         assert!(TrashInfo::from_trashinfo(content).is_none());
+    }
+
+    // Regression (#87): percent-encoded dot segments normalize away inside the
+    // URL parser, so the encoded value must be checked segment by segment.
+    #[test]
+    fn parse_rejects_encoded_dot_segments() {
+        for path in [
+            "/%2e%2e/%2e%2e/etc/evil",
+            "/home/user/%2E%2e/etc/evil",
+            "/x/%2e/%2e%2e/etc/evil",
+            "../../etc/evil",
+        ] {
+            let content = format!("[Trash Info]\nPath={path}\nDeletionDate=2026-03-20T00:00:00\n");
+            assert!(
+                TrashInfo::from_trashinfo(&content).is_none(),
+                "traversal path must be rejected: {path}"
+            );
+        }
     }
 
     #[test]

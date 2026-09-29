@@ -9,7 +9,9 @@ use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use xxhash_rust::xxh3::Xxh3;
@@ -339,11 +341,19 @@ impl TrashStore {
 
         // Compute file hash for small files only (configurable, default 1 MB).
         // Hashing reads the entire file — too expensive for large files on every rm.
+        // The open is race-hardened: O_NOFOLLOW|O_NONBLOCK plus a dev/ino
+        // re-check, so a racer swapping the victim for a FIFO (which would
+        // block a plain open forever) or a symlink fails the hash instead of
+        // hanging or reading through a link.
         let hash_limit = self.config.sha256_max_size_mb.saturating_mul(1024 * 1024);
         if meta.is_file()
             && hash_limit > 0
             && meta.size() <= hash_limit
-            && let Ok(hash) = hash_file(&abs_path, &self.config.hash_algorithm)
+            && let Ok(hash) = hash_file_verified(
+                &abs_path,
+                &self.config.hash_algorithm,
+                (meta.dev(), meta.ino()),
+            )
         {
             info.sha256 = Some(hash);
         }
@@ -382,7 +392,7 @@ impl TrashStore {
                         io::Error::other("cannot trash device node across filesystems").into(),
                     );
                 } else {
-                    fs::copy(&abs_path, &dest)?;
+                    copy_regular_verified(&abs_path, &dest, (meta.dev(), meta.ino()))?;
                     fs::set_permissions(&dest, meta.permissions())?;
                 }
                 copy_done = true;
@@ -598,7 +608,13 @@ impl TrashStore {
         // data fidelity comes from the move itself and the raw-bytes
         // percent-encoding in the .trashinfo).
         let base_name = name.to_string_lossy();
-        let (id, info_file) = unique_id_atomic(&trash_dir, &base_name)?;
+        let (id, info_file) = match unique_id_atomic(&trash_dir, &base_name) {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { libc::close(files_fd) };
+                return Err(e);
+            }
+        };
 
         let trashinfo_path = Self::compute_trashinfo_path(&trash_dir, &display_path, &home_trash);
         let mut info = TrashInfo::new(trashinfo_path);
@@ -656,14 +672,20 @@ impl TrashStore {
             }
         }
 
-        let cid = std::ffi::CString::new(id.as_bytes())
-            .map_err(|_| TrashError::NotFound(display_path.clone()))?;
+        let cid = match std::ffi::CString::new(id.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                unsafe { libc::close(files_fd) };
+                return Err(TrashError::NotFound(display_path.clone()));
+            }
+        };
 
         // Write .trashinfo BEFORE opening files_fd / moving — same ordering
         // as trash(). On write failure release the claimed sidecar so we do
         // not strand an empty orphan in info/ (review finding).
         if let Err(e) = fs::write(&info_file, info.to_trashinfo_string()) {
             let _ = fs::remove_file(&info_file);
+            unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(e));
         }
 
@@ -739,6 +761,11 @@ impl TrashStore {
         pattern: Option<&str>,
         entries: &mut Vec<TrashEntry>,
     ) -> Result<(), TrashError> {
+        // Orphan detection below must compare against ids from THIS directory
+        // only: the entries vec is shared across all trash roots, so an
+        // orphaned files/<id> in root B would otherwise be hidden by a real
+        // entry with the same id in root A.
+        let base = entries.len();
         let info_dir = trash_dir.join("info");
         let files_dir = trash_dir.join("files");
 
@@ -813,8 +840,10 @@ impl TrashStore {
         // this is emergency case and MUST be presented as such."
         // Scan files/ for entries without matching .trashinfo.
         if files_dir.exists() {
-            let known_ids: std::collections::HashSet<String> =
-                entries.iter().map(|e| e.id.clone()).collect();
+            let known_ids: std::collections::HashSet<String> = entries[base..]
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
             let mut orphans = Vec::new();
             if let Ok(file_entries) = fs::read_dir(&files_dir) {
                 for fe in file_entries.flatten() {
@@ -1940,6 +1969,51 @@ fn sidecar_version(path: &Path) -> Option<SidecarVersion> {
 /// entire file in RAM.
 fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
     hash_reader(fs::File::open(path)?, algorithm)
+}
+
+/// Open `path` without following a replacement symlink and without blocking
+/// on a replacement FIFO, verify it is still the same regular file that the
+/// caller statted, then hash it. A swapped or vanished target fails the hash
+/// (hashing is best-effort metadata) instead of hanging or reading through a
+/// link.
+fn hash_file_verified(path: &Path, algorithm: &str, expect: (u64, u64)) -> io::Result<String> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let m = file.metadata()?;
+    if !m.is_file() || (m.dev(), m.ino()) != expect {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target changed while hashing",
+        ));
+    }
+    hash_reader(file, algorithm)
+}
+
+/// Cross-device trash copy for a regular file, with the same race hardening
+/// as [`hash_file_verified`]: the source is opened no-follow/non-blocking and
+/// its identity re-checked, so a swapped FIFO cannot block the copy and a
+/// swapped symlink cannot be read through. The destination is claimed
+/// exclusively; a failed copy leaves the partial dest for the caller's
+/// rollback to remove.
+fn copy_regular_verified(src: &Path, dst: &Path, expect: (u64, u64)) -> io::Result<()> {
+    let mut input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(src)?;
+    let m = input.metadata()?;
+    if !m.is_file() || (m.dev(), m.ino()) != expect {
+        return Err(io::Error::other("target changed while copying to the trash"));
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(dst)?;
+    io::copy(&mut input, &mut output)?;
+    Ok(())
 }
 
 fn hash_reader(mut file: impl Read, algorithm: &str) -> io::Result<String> {
@@ -3112,7 +3186,23 @@ fn hash_file_at(parent: RawFd, name: &CStr, algorithm: &str) -> io::Result<Strin
 /// Normalize a path: canonicalize the parent (resolving symlinks in directory
 /// components) but preserve the final component as-is (so symlinks are not
 /// followed for the target file itself).
+///
+/// A path whose final component is `.` or `..` has no file component to
+/// preserve — it must be resolved FULLY. The parent-only canonicalization
+/// would silently DROP a trailing `..` ("/a/b/.." → "/a/b"), pointing the
+/// caller at the wrong directory (#83); for those shapes canonicalize the
+/// whole path, falling back to lexical normalization when the target does not
+/// exist.
 fn normalize_path(path: &Path) -> PathBuf {
+    let ends_in_dot_component = !matches!(
+        path.components().next_back(),
+        Some(std::path::Component::Normal(_)) | None
+    );
+    if ends_in_dot_component
+        && let Ok(resolved) = fs::canonicalize(path)
+    {
+        return resolved;
+    }
     if let Some(parent) = path.parent()
         && let Ok(canonical_parent) = fs::canonicalize(parent)
     {
@@ -4538,5 +4628,50 @@ mod tests {
         ));
         store.config.max_file_size_mb = 0;
         assert!(store.trash(&path, None).is_ok());
+    }
+
+    // Regression (#83): a path ending in ".." must resolve to the PARENT, not
+    // silently collapse to the directory itself.
+    #[test]
+    fn normalize_path_resolves_trailing_dotdot_to_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("a");
+        let b = a.join("b");
+        fs::create_dir_all(&b).unwrap();
+        assert_eq!(normalize_path(&b.join("..")), a);
+        assert_eq!(normalize_path(&b.join(".")), b);
+        // Ordinary paths still preserve the final component verbatim.
+        let link = a.join("link");
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert_eq!(normalize_path(&link), link);
+    }
+
+    // Regression (#88): an orphaned files/<id> in one trash root must stay
+    // visible even when another root holds a real entry with the same id.
+    #[test]
+    fn orphan_detection_is_per_root_not_cross_root() {
+        let (store, _data, work, _lock) = test_store();
+        let real = create_file(work.path(), "dup.txt", "real");
+        store.trash(&real, None).unwrap();
+
+        // A second, unrelated trash root containing an orphan with the SAME id.
+        let other_root = tempfile::tempdir().unwrap();
+        let other_trash = other_root.path().join("Trash");
+        fs::create_dir_all(other_trash.join("files")).unwrap();
+        fs::create_dir_all(other_trash.join("info")).unwrap();
+        fs::write(other_trash.join("files/dup.txt"), b"orphan").unwrap();
+
+        let mut entries = Vec::new();
+        store
+            .list_in_dir(&store.home, None, &mut entries)
+            .unwrap();
+        store
+            .list_in_dir(&other_trash, None, &mut entries)
+            .unwrap();
+
+        let orphans: Vec<_> = entries.iter().filter(|e| e.orphaned).collect();
+        assert_eq!(orphans.len(), 1, "the other root's orphan must be listed");
+        assert_eq!(orphans[0].trash_root, other_trash);
+        assert_eq!(entries.len(), 2);
     }
 }
