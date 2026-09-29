@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -31,21 +33,46 @@ pub fn device_id_or_parent(path: &Path) -> Option<u64> {
 }
 
 /// Parse /proc/mounts to get all mount points.
+///
+/// Parsed as raw bytes: the kernel octal-escapes only space/tab/newline/
+/// backslash (all ASCII) in mount paths, so any other raw byte ≥ 0x80
+/// survives verbatim — a UTF-8 read of the whole file would fail on a single
+/// such mount point and silently empty the entire mount list.
 pub fn list_mounts() -> Vec<MountPoint> {
-    let content = match fs::read_to_string("/proc/mounts") {
+    let content = match fs::read("/proc/mounts") {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    parse_mounts(&content)
+}
 
+/// Parse mounted-filesystems content (`/proc/mounts` format).
+fn parse_mounts(content: &[u8]) -> Vec<MountPoint> {
     let mut mounts = Vec::new();
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let device = parts[0].to_string();
-        let path = PathBuf::from(unescape_octal(parts[1]));
-        let fstype = parts[2].to_string();
+    for line in content.split(|&b| b == b'\n') {
+        // fields are separated by space/tab (both kernel-escaped in paths),
+        // so ASCII splitting is exact
+        let mut parts = line
+            .split(|&b| b == b' ' || b == b'\t')
+            .filter(|f| !f.is_empty());
+        // strip a trailing \r defensively (getmntent format has none, but a
+        // trailing CR would otherwise corrupt every field)
+        let device = parts
+            .next()
+            .map(|f| {
+                String::from_utf8_lossy(f)
+                    .trim_end_matches('\r')
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let path = match parts.next() {
+            Some(p) => PathBuf::from(OsString::from_vec(unescape_octal(p))),
+            None => continue,
+        };
+        let fstype = match parts.next() {
+            Some(f) => String::from_utf8_lossy(f).to_string(),
+            None => continue,
+        };
 
         // Skip virtual filesystems
         if matches!(
@@ -348,22 +375,27 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
 }
 
 /// Unescape octal sequences in mount paths (e.g. \040 for space).
-fn unescape_octal(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            let oct: String = chars.by_ref().take(3).collect();
-            if oct.len() == 3
-                && let Ok(val) = u8::from_str_radix(&oct, 8)
-            {
-                result.push(val as char);
-                continue;
-            }
-            result.push('\\');
-            result.push_str(&oct);
+///
+/// Operates on raw bytes and preserves every unescaped byte verbatim: mount
+/// points may contain arbitrary non-UTF-8 bytes (the kernel only escapes
+/// space/tab/newline/backslash).
+fn unescape_octal(field: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        // the kernel emits exactly %03o (three octal digits 0-7)
+        if field[i] == b'\\'
+            && i + 4 <= field.len()
+            && field[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let o = &field[i + 1..i + 4];
+            result.push(((o[0] - b'0') << 6) | ((o[1] - b'0') << 3) | (o[2] - b'0'));
+            i += 4;
         } else {
-            result.push(c);
+            result.push(field[i]);
+            i += 1;
         }
     }
     result
@@ -403,5 +435,48 @@ mod tests {
         std::os::unix::fs::symlink(target.path(), topdir.path().join(format!(".Trash-{uid}")))
             .unwrap();
         assert!(check_private_topdir_trash(topdir.path(), uid, true).is_none());
+    }
+
+    #[test]
+    fn parse_mounts_survives_non_utf8_mount_point() {
+        // The kernel octal-escapes only space/tab/newline/backslash; a raw
+        // byte ≥ 0x80 in a mount point must not zero out the whole list.
+        let content = b"/dev/sda1 /mnt/\xffdata ext4 rw 0 0\n/proc /proc proc rw 0 0\n";
+        let mounts = parse_mounts(content);
+        assert_eq!(mounts.len(), 1);
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            mounts[0].path.as_os_str().as_bytes(),
+            b"/mnt/\xffdata".as_slice()
+        );
+    }
+
+    #[test]
+    fn parse_mounts_unescapes_whitespace_and_keeps_sort_order() {
+        let content = b"/dev/sdb1 /mnt/with\\040space ext4 rw 0 0\n\
+                        /dev/sdc1 /mnt/nested/deep vfat rw 0 0\n";
+        let mounts = parse_mounts(content);
+        assert_eq!(mounts.len(), 2);
+        // longest (most specific) first
+        assert_eq!(mounts[0].path, PathBuf::from("/mnt/nested/deep"));
+        assert_eq!(mounts[1].path, PathBuf::from("/mnt/with space"));
+        assert_eq!(mounts[1].device, "/dev/sdb1");
+        assert_eq!(mounts[1].fstype, "ext4");
+    }
+
+    #[test]
+    fn unescape_octal_round_trips_kernel_escapes() {
+        // the kernel escapes exactly space, tab, newline, backslash
+        for (raw, expected) in [
+            (b"\\040".as_slice(), b" ".as_slice()),
+            (b"\\011".as_slice(), b"\t".as_slice()),
+            (b"\\012".as_slice(), b"\n".as_slice()),
+            (b"\\134".as_slice(), b"\\".as_slice()),
+            (b"a\\040b".as_slice(), b"a b".as_slice()),
+            // non-UTF-8 payload bytes pass through verbatim
+            (b"/m\xff/x".as_slice(), b"/m\xff/x".as_slice()),
+        ] {
+            assert_eq!(unescape_octal(raw), expected, "input {raw:?}");
+        }
     }
 }
