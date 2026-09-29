@@ -67,13 +67,15 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
             # Tag-push trigger: trust the pushed tag verbatim (never suffix-bump it,
             # or the loop would see its own tag and turn v0.1.3 into v0.1.3.1)
             VERSION="${GITHUB_REF_NAME#v}"
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          elif [ -n "${VERSION_INPUT}" ]; then
+            VERSION="${VERSION_INPUT}"
             # Check if tag exists, append .N if so
             BASE_VERSION="${VERSION}"
             SUFFIX=0
@@ -96,8 +98,10 @@ jobs:
         run: TRASH_BYPASS=1 cargo test --workspace -- --test-threads=1
 
       - name: Package release tarball
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           STAGING="trashd-${VERSION}-linux-${{ matrix.arch }}"
           mkdir -p "${STAGING}/bin" "${STAGING}/lib" "${STAGING}/share/man/man1" "${STAGING}/share/completions" "${STAGING}/config" "${STAGING}/install"
 
@@ -139,7 +143,9 @@ jobs:
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
-        continue-on-error: true
+        # Deliberately NO continue-on-error: the release notes tell users to
+        # verify assets with `gh attestation verify`, so a silently missing
+        # attestation would break verification of the published release (#102).
         with:
           subject-path: |
             trashd-*.tar.gz
@@ -165,13 +171,15 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
             # Tag-push trigger: trust the pushed tag verbatim (never suffix-bump it,
             # or the loop would see its own tag and turn v0.1.3 into v0.1.3.1)
             VERSION="${GITHUB_REF_NAME#v}"
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          elif [ -n "${VERSION_INPUT}" ]; then
+            VERSION="${VERSION_INPUT}"
             # Check if tag exists, append .N if so
             BASE_VERSION="${VERSION}"
             SUFFIX=0
@@ -233,10 +241,12 @@ jobs:
       - name: Create GitHub Release (also creates the tag)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE_INPUT: ${{ github.event.inputs.prerelease }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           PRERELEASE=""
-          if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+          if [ "${PRERELEASE_INPUT}" = "true" ]; then
             PRERELEASE="--prerelease"
           fi
 
@@ -290,7 +300,9 @@ jobs:
             ${ASSETS}
 
       - name: Release summary
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           echo "Release v${VERSION} created successfully!"
           echo "https://github.com/faratech/trashd/releases/tag/v${VERSION}"

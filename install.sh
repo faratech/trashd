@@ -353,8 +353,14 @@ fi
 
 echo "==> Installing PATH + seccomp hook (Layers 1 & 4)..."
 if [ -d /etc/profile.d ]; then
-    install -Dm644 "$(dirname "$0")/install/profile.d/trashd.sh" /etc/profile.d/trashd.sh
-    echo "    Installed /etc/profile.d/trashd.sh"
+    # Template the actual install prefix into the profile script: the shipped
+    # file hardcodes /usr/local, but a PREFIX=... install puts the shim and
+    # trashd-exec elsewhere and the layers would silently never activate (#101).
+    sed -e "s|/usr/local/lib/trashd/bin|${SHIM_DIR}|g" \
+        -e "s|/usr/local/bin/trashd-exec|${BIN_DIR}/trashd-exec|g" \
+        "$(dirname "$0")/install/profile.d/trashd.sh" > /etc/profile.d/trashd.sh
+    chmod 0644 /etc/profile.d/trashd.sh
+    echo "    Installed /etc/profile.d/trashd.sh (prefix ${PREFIX})"
     echo "    Layer 1: PATH shim shadows rm"
     echo "    Layer 4: Interactive shells run under seccomp protection"
 fi

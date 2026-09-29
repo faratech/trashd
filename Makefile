@@ -12,13 +12,16 @@ COMPLETIONS_FISH ?= $(PREFIX)/share/fish/vendor_completions.d
 
 all: build
 
+# Opt-in dependency refresh — NOT part of build/install: releases and installs
+# must build against the committed Cargo.lock (same discipline as install.sh
+# --locked and the CI workflows).
 update:
 	@echo "==> Updating Rust toolchain..."
 	rustup update stable 2>/dev/null || true
 	@echo "==> Updating dependencies..."
 	cargo update
 
-build: update
+build:
 	cargo build --release
 
 test:
