@@ -17,9 +17,20 @@ fn target_dir() -> PathBuf {
         .join("target")
 }
 
+// Read at script RUNTIME and re-run when it changes: option_env! bakes the
+// value into the build-script binary at ITS compile time, so a rebuild with a
+// different TRASHD_VERSION in an existing target dir silently kept the old
+// version in --version and the man pages (#162).
+fn build_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        env::var("TRASHD_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+    })
+}
+
 fn build_cli() -> Command {
     Command::new("trash")
-        .version(option_env!("TRASHD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))
+        .version(build_version())
         .about("trashd — Linux recycle bin for the CLI")
         .subcommand(
             Command::new("ls")
@@ -227,6 +238,9 @@ fn build_cli() -> Command {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    println!("cargo:rerun-if-env-changed=TRASHD_VERSION");
+    // Emit for the bin crate too, so src/main.rs can env!("TRASHD_VERSION").
+    println!("cargo:rustc-env=TRASHD_VERSION={}", build_version());
 
     let target_dir = target_dir();
     let out_dir = target_dir.join("completions");

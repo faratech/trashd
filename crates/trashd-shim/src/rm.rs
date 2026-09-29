@@ -110,7 +110,7 @@ fn main() -> ExitCode {
     }
 
     if args.version {
-        println!("trashd rm shim {}", env!("CARGO_PKG_VERSION"));
+        println!("trashd rm shim {}", env!("TRASHD_VERSION"));
         return ExitCode::SUCCESS;
     }
 

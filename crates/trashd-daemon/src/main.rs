@@ -93,7 +93,7 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("trashd {}", env!("CARGO_PKG_VERSION"));
+        println!("trashd {}", env!("TRASHD_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
