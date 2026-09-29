@@ -123,7 +123,16 @@ fn respond_errno(fd: i32, id: u64, errno: i32) -> io::Result<()> {
 /// or an unrecoverable error occurs.
 pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> {
     // The watchdog's death must also retire its supervisor on startup errors.
+    // PR_SET_PDEATHSIG only covers deaths AFTER it takes effect, so capture
+    // the parent BEFORE it and bail out if the parent vanished in the
+    // fork→prctl window — otherwise this process would outlive the watchdog
+    // holding the last copy of the notification fd (#93).
+    let parent_at_spawn = unsafe { libc::getppid() };
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    if unsafe { libc::getppid() } != parent_at_spawn || parent_at_spawn == 1 {
+        // Reparented already: the watchdog died before prctl took effect.
+        std::process::exit(1);
+    }
     if let Err(e) = crate::broker::connect(broker_fd) {
         signal_ready(ready_fd, false);
         return Err(e);
@@ -179,6 +188,18 @@ pub(crate) fn signal_ready(fd: i32, ready: bool) {
 
 /// Handle a single notification.
 fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config: &Config) {
+    // Check if the notification is still valid BEFORE touching the target's
+    // /proc state: if the target died and its PID was recycled, the reads
+    // below must not inspect an unrelated process's memory or fds (#92).
+    // try_pinned re-checks after each pidfd acquisition as well.
+    if !notif_id_valid(fd, notif.id) {
+        // Target likely gone. Send CONTINUE defensively — if the target is truly
+        // dead, the response harmlessly fails with ENOENT. If the ioctl failed
+        // spuriously, this prevents hanging the supervised process.
+        respond_continue(fd, notif.id);
+        return;
+    }
+
     // Raw pathname argument from the target's memory. The target is frozen in
     // its syscall, so this memory is stable against the TARGET; a sibling
     // sharing its memory could mutate it (documented residual micro-race —
@@ -200,17 +221,6 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
             return;
         }
     };
-
-    // Check if the notification is still valid (TOCTOU mitigation).
-    // If invalid, the target already died or was handled by the watchdog —
-    // any response we send will just get ENOENT, which is harmless.
-    if !notif_id_valid(fd, notif.id) {
-        // Target likely gone. Send CONTINUE defensively — if the target is truly
-        // dead, the response harmlessly fails with ENOENT. If the ioctl failed
-        // spuriously, this prevents hanging the supervised process.
-        respond_continue(fd, notif.id);
-        return;
-    }
 
     // From this point, ALL code paths MUST send a response.
     // Failure to respond will hang the supervised process.
