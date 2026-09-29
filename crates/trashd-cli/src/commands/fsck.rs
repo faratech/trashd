@@ -36,12 +36,15 @@ pub fn run(store: &TrashStore, fix: bool) {
         }
     }
 
-    // Rebuild the SQLite index for every root, not just home (#157): a
-    // stale per-partition index would keep serving ghost entries.
+    // Rebuild only the HOME index when fixing: the store serves exactly one
+    // SQLite index (at the home root); per-mount roots have none, so writing
+    // there would just drop unused files (and fail on read-only media).
+    // The per-root CHECKS above are what makes fsck multi-partition (#157).
     if fix {
-        for (trash_dir, _) in &roots {
-            print!("\nRebuilding index in {}... ", trash_dir.display());
-            match rebuild_index(trash_dir) {
+        let home = store.home_dir();
+        if roots.iter().any(|(p, _)| p == home) {
+            print!("\nRebuilding index in {}... ", home.display());
+            match rebuild_index(home) {
                 Ok(count) => println!("{} ({count} entries)", "done".green()),
                 Err(e) => println!("{} {e}", "failed".red()),
             }
