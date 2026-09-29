@@ -4015,6 +4015,89 @@ mod tests {
         assert!(sidecar.exists());
     }
 
+    // Regression (#170): the auto-purge compressor must hold the entry flock
+    // through the marker write AND the data swap — dropping it after the
+    // read re-opens #168's publish window. Discriminated via the first
+    // moment the flock is acquirable again: with the fix it is necessarily
+    // after the compressed data is in place; with the early drop it is
+    // necessarily before the marker exists.
+    #[test]
+    fn autopurge_compressor_releases_flock_only_after_swap() {
+        let (store, _data, _workdir, _lock) = test_store();
+        let trash = store.home.clone();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::create_dir_all(trash.join("files")).unwrap();
+
+        // An aged, compressible entry (phase 2a only touches entries older
+        // than 7 days; test_store disables the age/size/pressure purges).
+        // 8 MiB so the encode phase is long enough to dominate the poll
+        // interval: with the early-drop bug the flock is freed BEFORE the
+        // encode, so a fast poll reliably observes a marker-free release.
+        let data = vec![b'x'; 8 * 1024 * 1024];
+        fs::write(trash.join("files/old.txt"), &data).unwrap();
+        let mut info = TrashInfo::new(PathBuf::from("/work/old.txt"));
+        info.deletion_date = chrono::Local::now() - chrono::Duration::days(10);
+        let sidecar = trash.join("info/old.txt.trashinfo");
+        fs::write(&sidecar, info.to_trashinfo_string()).unwrap();
+
+        std::thread::scope(|scope| {
+            // TrashStore is !Sync (SQLite connection): the compressor runs on
+            // its own store instance over the same isolated trash root.
+            let handle = scope.spawn(|| {
+                let store2 = TrashStore::open_isolated(&trash, Config::default()).unwrap();
+                store2.maybe_auto_purge()
+            });
+
+            // Anchor on the compressor: first observe the flock HELD (it
+            // acquired), then find the FIRST moment it is acquirable again
+            // and check the marker. Hold-through-swap ⇒ the marker is
+            // already present at that moment; an early drop ⇒ necessarily
+            // absent (encode + marker + swap are still pending).
+            use std::os::unix::fs::OpenOptionsExt;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut saw_held = false;
+            let marker_at_first_release;
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "compressor neither completed nor held the entry flock"
+                );
+                match fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(trash.join("files/old.txt"))
+                {
+                    Ok(file) => match file.try_lock() {
+                        Err(_) => saw_held = true,
+                        Ok(()) => {
+                            if saw_held {
+                                let content = fs::read_to_string(&sidecar).unwrap_or_default();
+                                marker_at_first_release = content.contains("X-Trashd-Compressed");
+                                break;
+                            }
+                            // compressor has not acquired yet — keep waiting
+                        }
+                    },
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                marker_at_first_release,
+                "entry flock was released before the compressed data was in place"
+            );
+            handle.join().unwrap().unwrap();
+        });
+
+        // The entry is actually compressed once the compressor finishes.
+        let mut magic = [0u8; 4];
+        fs::File::open(trash.join("files/old.txt"))
+            .unwrap()
+            .read_exact(&mut magic)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(magic), 0xFD2FB528);
+    }
+
     #[test]
     fn restore_symlink_recreates_link() {
         let (store, _data, workdir, _lock) = test_store();
