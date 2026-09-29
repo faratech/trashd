@@ -40,6 +40,19 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
         if size_before < 1024 {
             continue;
         }
+        // Keep the invariant "anything compress accepts is restorable":
+        // restore refuses to decompress beyond min(max_file_size_mb, 4 GiB),
+        // so a larger entry would be permanently stuck if swapped here.
+        let configured = store.config().max_file_size_mb.saturating_mul(1024 * 1024);
+        const HARD_DECOMPRESS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+        let restore_limit = if configured == 0 {
+            HARD_DECOMPRESS_LIMIT
+        } else {
+            configured.min(HARD_DECOMPRESS_LIMIT)
+        };
+        if size_before > restore_limit {
+            continue;
+        }
         // Check zstd magic — skip already compressed
         if is_zstd(&entry.trashed_path) {
             continue;
