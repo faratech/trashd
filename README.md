@@ -60,7 +60,7 @@ In GUI sessions (when `$DISPLAY` or `$WAYLAND_DISPLAY` is set), sends a desktop 
 
 ### Layer 2 — LD_PRELOAD (`libtrashd_preload.so`)
 
-A shared library that hooks `unlink()`, `unlinkat()`, and `rmdir()` at the libc level using `dlsym(RTLD_NEXT, ...)`. Catches deletions from any dynamically-linked program — Python's `os.remove()`, Perl's `unlink`, Go's `os.Remove()`, compiled C programs, anything that calls libc.
+A shared library that hooks `unlink()`, `unlinkat()`, `rmdir()`, and `remove()` at the libc level using `dlsym(RTLD_NEXT, ...)`. (glibc's `remove()` calls hidden internal aliases that hooking `unlink`/`rmdir` cannot reach, so it is interposed directly.) Catches deletions from any dynamically-linked program — Python's `os.remove()`, Perl's `unlink`, Go's `os.Remove()`, compiled C programs, anything that calls libc.
 
 Enabled system-wide via `/etc/ld.so.preload` (installed automatically). The library is intentionally standalone — no dependency on `trashd-common` or SQLite — to keep the `.so` small (~870 KB) and avoid pulling heavy dependencies into every process on the system.
 
@@ -72,7 +72,7 @@ Key safety mechanisms:
 
 ### Layer 3 — fanotify daemon (`trashd`)
 
-A system service that monitors all real filesystems for `FAN_DELETE`, `FAN_DELETE_SELF`, and `FAN_MOVED_FROM` events using fanotify with `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (requires Linux 5.9+). Detection and audit only — it cannot intercept or prevent deletions.
+A system service that monitors all real filesystems for `FAN_DELETE` and `FAN_DELETE_SELF` events — files and directories (`FAN_ONDIR`) — using fanotify with `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (requires Linux 5.9+). Detection and audit only — it cannot intercept or prevent deletions.
 
 Resolves deleted file paths by parsing extended `fanotify_event_info_fid` structs to extract the parent directory's file handle and the deleted filename. The parent is resolved via `open_by_handle_at()` against cached per-mount `O_PATH` file descriptors. Logs every deletion with PID, process name, and path.
 
@@ -495,7 +495,7 @@ Per the FreeDesktop spec: "If info file corresponding to file in $trash/files is
 - Orphaned files (no matching `.trashinfo` in `info/`)
 - Corrupt `.trashinfo` (unparseable)
 
-`trash fsck --fix` removes all detected problems.
+`trash fsck --fix` removes orphaned `.trashinfo` files and — after per-item confirmation — orphaned data files. Corrupt `.trashinfo` metadata is never auto-removed: the data file is intact, so it is preserved in place for manual recovery.
 
 ## FreeDesktop.org Trash spec v1.0 compliance
 
