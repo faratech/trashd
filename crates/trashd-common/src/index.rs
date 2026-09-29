@@ -180,8 +180,12 @@ mod tests {
 
         {
             let idx = TrashIndex::open(&db_path).unwrap();
-            idx.rebuild(&[(String::from("id"), TrashInfo::new(PathBuf::from("/x")), dir.clone())])
-                .unwrap();
+            idx.rebuild(&[(
+                String::from("id"),
+                TrashInfo::new(PathBuf::from("/x")),
+                dir.clone(),
+            )])
+            .unwrap();
         }
         let mode = std::fs::symlink_metadata(&db_path)
             .unwrap()

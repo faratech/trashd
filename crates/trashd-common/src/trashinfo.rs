@@ -336,7 +336,8 @@ X-Trashd-SHA256=deadbeef
     // Regression (#87): percent-encoded dot segments normalize away inside the
     // URL parser, so the encoded value must be checked segment by segment.
     #[test]
-    fn parse_rejects_encoded_dot_segments() {        for path in [
+    fn parse_rejects_encoded_dot_segments() {
+        for path in [
             "/%2e%2e/%2e%2e/etc/evil",
             "/home/user/%2E%2e/etc/evil",
             "/x/%2e/%2e%2e/etc/evil",

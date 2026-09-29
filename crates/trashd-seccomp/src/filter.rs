@@ -240,7 +240,11 @@ mod tests {
     fn filter_decisions_match_policy() {
         let prog = build_filter();
 
-        let unlinkat_nr: u32 = if cfg!(target_arch = "x86_64") { 263 } else { 35 };
+        let unlinkat_nr: u32 = if cfg!(target_arch = "x86_64") {
+            263
+        } else {
+            35
+        };
 
         assert_eq!(
             run_filter(&prog, NATIVE_ARCH, unlinkat_nr),
@@ -273,7 +277,10 @@ mod tests {
                 SECCOMP_RET_ERRNO_ENOSYS
             );
             // Ordinary 64-bit numbers (no x32 bit) are unaffected.
-            assert_eq!(run_filter(&prog, NATIVE_ARCH, 0x3FFF_FFFF), SECCOMP_RET_ALLOW);
+            assert_eq!(
+                run_filter(&prog, NATIVE_ARCH, 0x3FFF_FFFF),
+                SECCOMP_RET_ALLOW
+            );
         }
         // Ordinary syscalls keep working.
         assert_eq!(run_filter(&prog, NATIVE_ARCH, 1), SECCOMP_RET_ALLOW); // write
