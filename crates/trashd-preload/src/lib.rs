@@ -16,6 +16,14 @@
 
 #[path = "../../trashd-common/src/legacy_config.rs"]
 mod legacy_config;
+#[allow(dead_code)]
+#[path = "../../trashd-common/src/mounts.rs"]
+mod mounts;
+#[path = "../../trashd-common/src/seccomp_identity.rs"]
+mod seccomp_identity;
+#[allow(dead_code)]
+#[path = "../../trashd-common/src/store_lock.rs"]
+mod store_lock;
 
 use serde::Deserialize;
 use std::cell::Cell;
@@ -359,48 +367,21 @@ fn is_bypass_active() -> bool {
         .unwrap_or(false)
 }
 
-/// When Layer 4 (seccomp) is active, it handles interception at the kernel
-/// level. The preload layer defers to avoid double-trashing.
-///
-/// The env var alone once sufficed — but ANY process inheriting or exporting
-/// `TRASHD_SECCOMP_ACTIVE=1` (a leaked export, a copied Environment= line)
-/// then silently lost ALL preload protection: every intercepted delete
-/// became permanent (#125). Defer only when BOTH hold: the wrapper claims
-/// the handshake AND this process really runs under a seccomp filter
-/// (`Seccomp: 2` in /proc/self/status).
+/// Defer only to a cookie-identified trashd filter after completed startup.
 fn is_seccomp_active() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        let claimed = std::env::var_os("TRASHD_SECCOMP_ACTIVE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        seccomp_deferred(claimed, seccomp_filter_installed())
+        let claimed = std::env::var_os("TRASHD_SECCOMP_ACTIVE").is_some_and(|v| v == "1");
+        let verified = std::env::var(seccomp_identity::COOKIE_ENV)
+            .ok()
+            .and_then(|s| seccomp_identity::parse(&s))
+            .is_some_and(seccomp_identity::verified);
+        seccomp_deferred(claimed, verified)
     })
 }
 
-/// Pure gating logic: a claim must be backed by a real filter.
-fn seccomp_deferred(claimed: bool, filter_installed: bool) -> bool {
-    claimed && filter_installed
-}
-
-/// True when this process runs in seccomp filter mode (value 2 of the
-/// `Seccomp:` field in /proc/self/status). Unreadable status → not verified.
-///
-/// KNOWN RESIDUAL: this accepts ANY seccomp filter, not trashd's — container
-/// runtimes (Docker's default profile), LXC, firejail, or systemd
-/// SystemCallFilter= all set Seccomp: 2 for every process, so on such hosts a
-/// leaked env var still silences the preload. The child closes its
-/// notification fd before exec, so no in-process signal can distinguish
-/// trashd's filter; the residual requires the operator to leak the var
-/// themselves and is accepted rather than complicate the hot path further.
-fn seccomp_filter_installed() -> bool {
-    match fs::read_to_string("/proc/self/status") {
-        Ok(status) => status.lines().any(|line| {
-            line.strip_prefix("Seccomp:")
-                .is_some_and(|value| value.trim() == "2")
-        }),
-        Err(_) => false,
-    }
+fn seccomp_deferred(claimed: bool, verified: bool) -> bool {
+    claimed && verified
 }
 
 /// Cache by PID, so children of a fork re-evaluate their own process tree.
@@ -477,27 +458,10 @@ fn process_name(pid: u32) -> Option<String> {
 /// misclassified as trash-internal (which would make the hook permanently
 /// `rm` it instead of trashing it).
 fn is_inside_trash(path: &Path) -> bool {
-    use std::path::Component;
-
-    // Inside the home trash directory tree?
-    if path.starts_with(home_trash_dir()) {
-        return true;
-    }
-
-    // Inside a per-mount trash: some ancestor component is exactly ".Trash"
-    // (the shared spec dir) or ".Trash-<uid>". The uid must be THIS caller's
-    // effective uid: a lookalike directory like ~/proj/.Trash-1001 (another
-    // user's uid, or any name with digits) is ordinary user data, and
-    // skipping interception here would PERMANENTLY DELETE it while the
-    // shim/seccomp layers trash it (#108).
-    path.components().any(|comp| {
-        if let Component::Normal(name) = comp {
-            let n = name.to_string_lossy();
-            n == ".Trash" || n == format!(".Trash-{}", unsafe { libc::geteuid() })
-        } else {
-            false
-        }
-    })
+    let home = home_trash_dir();
+    let uid = unsafe { libc::geteuid() };
+    let trusted_home = ensure_trusted_parent(&home, uid).is_ok();
+    mounts::is_trash_internal(path, &home, trusted_home)
 }
 
 /// Bounded directory-tree size walk mirroring trashd-common's dir_size_capped.
@@ -1044,6 +1008,7 @@ fn copy_regular_verified(
     dst: &Path,
     expect_dev: u64,
     expect_ino: u64,
+    created: &mut Option<(u64, u64)>,
 ) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut input = fs::OpenOptions::new()
@@ -1060,6 +1025,8 @@ fn copy_regular_verified(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(dst)?;
+    let metadata = output.metadata()?;
+    *created = Some((metadata.dev(), metadata.ino()));
     io::copy(&mut input, &mut output)?;
     Ok(())
 }
@@ -1078,6 +1045,7 @@ enum TrashAttempt {
     /// through to libc here would turn an attack on the store into permanent
     /// deletion, so hooks return EACCES instead.
     UnsafeStore,
+    Error(i32),
 }
 
 /// Move `path` into the appropriate trash. `expect_dev`/`expect_ino` are the
@@ -1121,6 +1089,18 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         return TrashAttempt::UnsafeStore;
     }
 
+    let guard = match store_lock::RootMutationGuard::acquire(&trash_dir) {
+        Ok(g) => g,
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EACCES | libc::ELOOP | libc::ENOTDIR)
+            ) =>
+        {
+            return TrashAttempt::UnsafeStore;
+        }
+        Err(e) => return TrashAttempt::Error(e.raw_os_error().unwrap_or(libc::EIO)),
+    };
     // Atomic unique ID via O_CREAT|O_EXCL
     let base_name = path
         .file_name()
@@ -1194,10 +1174,27 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
     }
 
     // Move the file
-    if fs::rename(path, &dest).is_ok() {
+    let source = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return TrashAttempt::Error(libc::EINVAL),
+    };
+    let target = match CString::new(dest.as_os_str().as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return TrashAttempt::Error(libc::EINVAL),
+    };
+    if unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
         // A concurrent purge may have stripped the sidecar while the data was
         // absent mid-move; a completed move must never land as an orphan (#169).
-        ensure_sidecar_after_move(&info_path, &trashinfo);
         log_preload(&format!(
             "trashed: {} -> {}",
             path.display(),
@@ -1206,6 +1203,10 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         return TrashAttempt::Trashed;
     }
 
+    if dest.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(&info_path);
+        return TrashAttempt::Error(libc::EEXIST);
+    }
     // Cross-device: copy preserving symlinks, then remove original
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -1228,18 +1229,16 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
                     return TrashAttempt::NotTrashed;
                 }
             };
+            drop(guard);
             let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
             if ret != 0 {
-                // Couldn't remove the original symlink — don't report a
-                // false success (which would leave the original on disk and
-                // a duplicate in the trash). Roll back and fall through to
-                // the real unlink. Matches the regular-file branch below.
-                let _ = fs::remove_file(&info_path);
-                let _ = fs::remove_file(&dest);
-                return TrashAttempt::NotTrashed;
+                return TrashAttempt::Error(
+                    io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                );
             }
             log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
-            ensure_sidecar_after_move(&info_path, &trashinfo);
             return TrashAttempt::Trashed;
         }
     } else if meta.is_dir() {
@@ -1260,11 +1259,17 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         // with O_NOFOLLOW|O_NONBLOCK and re-verifies dev/ino first: a racer
         // swapping the file for a FIFO must not block the copy forever, and
         // a symlink swap must not be read through (#111).
-        if copy_regular_verified(path, &dest, meta.dev(), meta.ino()).is_err() {
-            // A partial/failed copy must not strand an orphaned data file
-            // in the trash (#33).
-            let _ = fs::remove_file(&dest);
+        let mut created = None;
+        if let Err(e) = copy_regular_verified(path, &dest, meta.dev(), meta.ino(), &mut created) {
+            if created.is_some()
+                && fs::symlink_metadata(&dest).ok().map(|m| (m.dev(), m.ino())) == created
+            {
+                let _ = fs::remove_file(&dest);
+            }
             let _ = fs::remove_file(&info_path);
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                return TrashAttempt::Error(libc::EEXIST);
+            }
             return TrashAttempt::NotTrashed;
         }
         {
@@ -1278,35 +1283,22 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
                     return TrashAttempt::NotTrashed;
                 }
             };
+            drop(guard);
             let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
             if ret != 0 {
-                // Unlink of original failed — clean up the copy to avoid orphan
-                let _ = fs::remove_file(&info_path);
-                let _ = fs::remove_file(&dest);
-                return TrashAttempt::NotTrashed;
+                return TrashAttempt::Error(
+                    io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                );
             }
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
-            ensure_sidecar_after_move(&info_path, &trashinfo);
             return TrashAttempt::Trashed;
         }
     }
 
     let _ = fs::remove_file(&info_path);
     TrashAttempt::NotTrashed
-}
-
-/// Re-create the sidecar if a concurrent purge stripped it during the
-/// write→move window (#169): a completed move must never land as a data
-/// orphan. Bounded retry; a lost race degrades to an fsck-visible orphan,
-/// never to lost data.
-fn ensure_sidecar_after_move(info_path: &Path, trashinfo: &str) {
-    for _ in 0..3 {
-        if fs::symlink_metadata(info_path).is_ok() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let _ = fs::write(info_path, trashinfo);
-    }
 }
 
 /// Atomically claim a unique trashinfo filename using O_CREAT|O_EXCL.
@@ -1411,36 +1403,34 @@ fn cstr_to_path(s: *const libc::c_char) -> Option<PathBuf> {
 }
 
 fn resolve_at_path(dirfd: libc::c_int, pathname: *const libc::c_char) -> Option<PathBuf> {
-    let path = cstr_to_path(pathname)?;
-
-    // An empty pathname is ENOENT in the kernel; joining it below would
-    // resolve to the cwd (or the dirfd) itself and trash it (#84).
-    if path.as_os_str().is_empty() {
+    let raw = cstr_to_path(pathname)?;
+    let bytes = raw.as_os_str().as_bytes();
+    let end = bytes.iter().rposition(|b| *b != b'/')? + 1;
+    let path = Path::new(OsStr::from_bytes(&bytes[..end]));
+    let final_bytes = bytes[..end].rsplit(|b| *b == b'/').next()?;
+    if final_bytes.is_empty() || final_bytes == b"." || final_bytes == b".." {
         return None;
     }
-
-    if path.is_absolute() {
-        return Some(path);
-    }
-
-    if dirfd == libc::AT_FDCWD {
-        return std::env::current_dir().ok().map(|cwd| cwd.join(&path));
-    }
-
-    let fd_link = format!("/proc/self/fd/{dirfd}");
-    match fs::read_link(&fd_link) {
-        Ok(dir_path) => Some(dir_path.join(&path)),
-        Err(_) => {
-            // Can't resolve the dirfd (e.g. /proc not mounted). We fall through
-            // to the real syscall — a permanent delete with no trashing. Log it
-            // so operators know interception was silently bypassed here.
-            log_preload(&format!(
-                "could not resolve dirfd {dirfd} via /proc; not intercepting {}",
-                path.display()
-            ));
-            None
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if dirfd == libc::AT_FDCWD {
+        std::env::current_dir().ok()?.join(path)
+    } else {
+        // Resolve through the actual descriptor, never a readlink pathname.
+        let base = PathBuf::from(format!("/proc/self/fd/{dirfd}"));
+        if !fs::metadata(&base).ok()?.is_dir() {
+            return None;
+        }
+        base.join(path)
+    };
+    if end != bytes.len() {
+        let meta = fs::symlink_metadata(&absolute).ok()?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return None;
         }
     }
+    let parent = fs::canonicalize(absolute.parent()?).ok()?;
+    Some(parent.join(absolute.file_name()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,6 +1449,10 @@ fn finish_attempt(attempt: TrashAttempt, saved_errno: libc::c_int) -> Option<lib
     match attempt {
         TrashAttempt::Trashed => Some(success_with_errno(saved_errno)),
         TrashAttempt::NotTrashed => None,
+        TrashAttempt::Error(e) => {
+            unsafe { *libc::__errno_location() = e };
+            Some(-1)
+        }
         TrashAttempt::UnsafeStore => {
             unsafe { *libc::__errno_location() = libc::EACCES };
             Some(-1)
@@ -1502,20 +1496,7 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
                 return None;
             }
 
-            if let Some(path) = cstr_to_path(pathname) {
-                // Empty pathname → ENOENT; joining would trash the cwd (#84).
-                if path.as_os_str().is_empty() {
-                    return None;
-                }
-                let abs = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    match std::env::current_dir() {
-                        Ok(cwd) => cwd.join(&path),
-                        Err(_) => return None,
-                    }
-                };
-
+            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname) {
                 // Use symlink_metadata to not follow symlinks — dangling symlinks
                 // should be trashed, not permanently deleted via the fallthrough.
                 if let Ok(meta) = fs::symlink_metadata(&abs)
@@ -1559,6 +1540,9 @@ pub unsafe extern "C" fn unlinkat(
                 return None;
             }
 
+            if flags & !libc::AT_REMOVEDIR != 0 {
+                return None;
+            }
             let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
             if let Some(abs) = resolve_at_path(dirfd, pathname) {
@@ -1616,20 +1600,7 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                 return None;
             }
 
-            if let Some(path) = cstr_to_path(pathname) {
-                // Empty pathname → ENOENT; joining would trash the cwd (#84).
-                if path.as_os_str().is_empty() {
-                    return None;
-                }
-                let abs = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    match std::env::current_dir() {
-                        Ok(cwd) => cwd.join(&path),
-                        Err(_) => return None,
-                    }
-                };
-
+            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname) {
                 // Use symlink_metadata — rmdir only applies to real directories, not symlinks
                 if let Ok(meta) = fs::symlink_metadata(&abs)
                     && meta.is_dir()
@@ -1671,20 +1642,7 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
                 return None;
             }
 
-            if let Some(path) = cstr_to_path(pathname) {
-                // Empty pathname → ENOENT; joining would trash the cwd (#84).
-                if path.as_os_str().is_empty() {
-                    return None;
-                }
-                let abs = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    match std::env::current_dir() {
-                        Ok(cwd) => cwd.join(&path),
-                        Err(_) => return None,
-                    }
-                };
-
+            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname) {
                 // remove() == unlink() for non-directories and rmdir() for
                 // (empty) directories; symlink_metadata never follows links.
                 if let Ok(meta) = fs::symlink_metadata(&abs)
@@ -1843,7 +1801,7 @@ mod tests {
     fn is_inside_trash_matches_only_own_uid_suffix() {
         let own_dir = format!("/mnt/usb/.Trash-{}", unsafe { libc::geteuid() });
         let own = Path::new(&own_dir).join("files/x");
-        assert!(is_inside_trash(&own));
+        assert!(!is_inside_trash(&own));
 
         let other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
         let foreign_dir = format!("/home/u/proj/.Trash-{other_uid}/out.bin");

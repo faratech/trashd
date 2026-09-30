@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.8 (2026-09-30)
+
+### Fixed
+
+- Seccomp setup failures, including inherited-listener `EBUSY`, launch a fresh
+  fallback process without carrying newly applied `NoNewPrivs`. Startup now
+  checks memory and filesystem capabilities before releasing the command.
+- Seccomp notifications from worker threads pin the correct task and directory
+  descriptors; canceled notifications are rechecked before trash publication.
+- Preload verifies a cookie-specific filter proof before deferring to seccomp,
+  normalizes physical parent paths, authenticates actual trash roots, and lets
+  the kernel reject invalid `unlinkat` flags without mutating files.
+- A shared persistent store lock coordinates writers, fsck, restore, purge,
+  retention, and compression. Operations revalidate entry identity and metadata
+  before committing, protecting active reservations and reused IDs.
+- Cross-device copies preserve complete recovery data when source cleanup fails,
+  avoid nested interception deadlocks, and never merge into an existing entry.
+- The rm shim implements GNU `--one-file-system` partial-removal behavior and
+  rejects terminal-dot directory operands before path normalization.
+- The disposable seccomp test sandbox uses an owned home for its unprivileged
+  user and covers fallback privileges, threaded descriptors, and copy cleanup.
+
+### Changed
+
+- Automatic nonroot login shells use preload/shim to preserve sudo and setuid
+  behavior. Root shell wrapping uses `--preserve-privileges`; explicit wrapping
+  documents its normal `NoNewPrivs` restriction.
+- All components must be upgraded together to share the store mutation lock.
+  Existing trash metadata remains compatible; no migration is required.
+
+Issues: #108, #128, #173–#183.
+
 ## 0.1.7 (2026-09-29)
 
 Release from the 2026-09-29 analysis and remediation pass: 41 issues filed,

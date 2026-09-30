@@ -67,7 +67,7 @@ Enabled system-wide via `/etc/ld.so.preload` (installed automatically). The libr
 Key safety mechanisms:
 - **Re-entrancy guard** — A thread-local `Cell<bool>` prevents internal `rename()`/`mkdir()` calls during trash operations from re-entering the hooked `unlink()`.
 - **Trash directory skip** — Paths inside `~/.local/share/Trash/`, `.Trash-$UID/`, and `.Trash/` are never intercepted. This prevents the preload from trashing SQLite journal files and `.trashinfo` cleanup operations.
-- **Seccomp deference** — When `TRASHD_SECCOMP_ACTIVE=1` is set (by Layer 4), the preload skips interception entirely to avoid double-trashing.
+- **Seccomp deference** — Preload defers after checking ACTIVE and a cookie-specific filter proof. Unrelated filters or stale markers retain preload protection.
 - **Config change detection** — Checks config file mtime every 60 seconds and logs when changes are detected. Full reload requires process restart (intentional — mutating global state in a preload `.so` is unsafe).
 
 ### Layer 3 — fanotify daemon (`trashd`)
@@ -78,13 +78,15 @@ Resolves deleted file paths by parsing extended `fanotify_event_info_fid` struct
 
 Runs as a systemd service with `AmbientCapabilities=CAP_SYS_ADMIN`. Skips virtual filesystems (tmpfs, ramfs, devtmpfs, overlay, squashfs). Uses non-blocking I/O with a 1-second poll timeout.
 
+Trash publication, compression and retirement share a persistent private `.trashd/store.lock` in each trash root. Cleanup revalidates the listed data identity and metadata version before mutation, so reused IDs cannot inherit old purge or compression selections. Install all rebuilt components together: older writers do not participate in this lock. Existing IDs and trashinfo remain compatible without migration.
+
 ### Layer 4 — seccomp supervisor (`trashd-exec`)
 
 The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the kernel syscall boundary using a BPF seccomp filter with `SECCOMP_RET_USER_NOTIF`. Catches everything — statically-linked binaries, setuid programs, programs that clear `LD_PRELOAD`, and raw syscalls.
 
 **Process architecture:**
 
-1. **Child** — Installs the BPF seccomp filter via `syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ...)`, passes the notification file descriptor to the parent via `SCM_RIGHTS` over a Unix socketpair, then `execvp()`'s the target command. Requires `prctl(PR_SET_NO_NEW_PRIVS, 1)` before installing the filter.
+1. **Child** — Installs the BPF seccomp filter via `syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ...)`, passes the notification file descriptor to the parent via `SCM_RIGHTS` over a Unix socketpair, then `execvp()`'s the target command. Explicit wrapping sets `PR_SET_NO_NEW_PRIVS`; `--preserve-privileges` installs using CAP_SYS_ADMIN instead and falls back when unavailable.
 
 2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Absolute paths are confined to the target's pinned root. Relative walks that escape a pinned cwd/dirfd are handed back to the target kernel; the supervisor never retries them through a host-namespace display path. Validates notification IDs to mitigate TOCTOU races.
 
@@ -94,11 +96,15 @@ The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the k
 
 The BPF filter is architecture-specific: x86_64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84). aarch64 traps only `SYS_unlinkat` (35) since the other two syscalls don't exist on that architecture.
 
-Interactive shells are automatically wrapped via `/etc/profile.d/trashd.sh`, which detects interactive mode (`case "$-" in *i*`) and sets `TRASHD_SECCOMP_ATTEMPTED=1` to prevent repeated wrapping. `trashd-exec` sets `TRASHD_SECCOMP_ACTIVE=1` only after listener installation, memory-access verification, and supervisor startup succeed. If listener installation or memory access is unavailable, the command runs with the marker cleared so preload fallback remains available. Failure to start the supervisor aborts the command.
+Automatic nonroot login shells use preload and the PATH shim, preserving normal `sudo` behavior. Interactive root shells try `trashd-exec --preserve-privileges` without changing privilege state. Set `TRASHD_SECCOMP_AUTO=0` to disable automatic wrapping. `TRASHD_SECCOMP_ATTEMPTED` prevents profile recursion.
+
+Explicit `trashd-exec <command>` provides kernel interception but sets irreversible, inherited `NoNewPrivs`, preventing setuid/file-capability elevation. ACTIVE and a random cookie are published only after memory access, root/cwd and directory-descriptor pinning, `openat2`, and supervisor readiness succeed. Setup failure launches a fresh fallback child from the original parent with both markers cleared. Supervisor startup failure aborts.
+
+`Device or resource busy (os error 16)` means an earlier inherited notification filter already owns a listener. Another listener cannot be installed, and namespaces cannot remove the inherited filter. The wrapper reports the downgrade and retains preload/shim fallback where available; it cannot undo privilege restrictions imposed upstream.
 
 ### How the layers interact
 
-Layer 4 (seccomp) is the primary layer for interactive shells — it's the most robust. Layer 2 (LD_PRELOAD) provides system-wide fallback coverage for daemons, cron jobs, and non-interactive processes that don't go through `profile.d`. The preload checks `TRASHD_SECCOMP_ACTIVE` and defers when seccomp is active, preventing double interception.
+Layer 4 provides kernel interception for explicitly wrapped commands and capable root shells. Layer 2 (LD_PRELOAD) provides system-wide fallback coverage for daemons, cron jobs, and non-interactive processes that don't go through `profile.d`. Preload checks ACTIVE plus the cookie-specific filter proof before deferring.
 
 Layer 1 (shim) catches `rm` specifically and provides the user-facing flags (`--permanent`, `-i`, `-v`). When it passes through to real `rm`, it sets `TRASH_BYPASS=1` so Layer 2 doesn't re-intercept.
 
@@ -623,7 +629,7 @@ Covers: Layer 1 shim, Layer 2 LD_PRELOAD, `--permanent` bypass, `TRASH_BYPASS=1`
 ## Requirements
 
 - **Rust 1.97+** (for building from source)
-- **Linux 5.5+** (for seccomp user notification — Layer 4)
+- **Linux 5.6+** (for seccomp notification and pinned `openat2` resolution — Layer 4)
 - **Linux 5.9+** (for fanotify FID reporting — Layer 3)
 - **CAP_SYS_ADMIN** or root (for fanotify daemon)
 - Layers 1 and 2 work on any Linux kernel

@@ -27,10 +27,10 @@ Four interception layers feed into a shared trash store, all active by default a
 Layer 1: PATH shim (trashd-shim)       — shadows rm via PATH ordering
 Layer 2: LD_PRELOAD (trashd-preload)   — hooks unlink/unlinkat/rmdir (system-wide via /etc/ld.so.preload)
 Layer 3: fanotify daemon (trashd) — detection/audit only (systemd service, Linux 5.9+)
-Layer 4: seccomp supervisor (trashd-seccomp) — traps syscalls at kernel boundary (interactive shells, Linux 5.5+)
+Layer 4: seccomp supervisor (trashd-seccomp) — traps syscalls at kernel boundary (explicit commands/capable root shells, Linux 5.6+)
 ```
 
-Layer 4 (seccomp) is the primary layer for interactive shells. Layer 2 (LD_PRELOAD) is the fallback for daemons/cron/non-interactive processes. The preload checks `TRASHD_SECCOMP_ACTIVE` and defers only after the wrapper successfully installs the listener and completes its startup handshake.
+Automatic nonroot login shells use preload/shim to preserve privilege elevation; root wrapping uses `--preserve-privileges`. Layer 2 (LD_PRELOAD) is the fallback for daemons/cron/non-interactive processes. Preload requires ACTIVE and a cookie-specific filter proof after complete startup readiness.
 
 ### Crate dependency graph
 

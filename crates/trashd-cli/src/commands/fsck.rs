@@ -17,7 +17,7 @@ pub fn run(store: &TrashStore, fix: bool) {
         if multi {
             println!("\n{} ({})", trash_dir.display(), label);
         }
-        let (oi, of, ci) = check_trash_dir(trash_dir, fix);
+        let (oi, of, ci) = check_trash_dir(store, trash_dir, fix);
         orphaned_info += oi;
         orphaned_files += of;
         corrupt_info += ci;
@@ -44,7 +44,11 @@ pub fn run(store: &TrashStore, fix: bool) {
         let home = store.home_dir();
         if roots.iter().any(|(p, _)| p == home) {
             print!("\nRebuilding index in {}... ", home.display());
-            match rebuild_index(home) {
+            match store
+                .lock_trash_root(home)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                .and_then(|_guard| rebuild_index(home))
+            {
                 Ok(count) => println!("{} ({count} entries)", "done".green()),
                 Err(e) => println!("{} {e}", "failed".red()),
             }
@@ -53,7 +57,22 @@ pub fn run(store: &TrashStore, fix: bool) {
 }
 
 /// Check one trash root; returns (orphaned_info, orphaned_files, corrupt_info).
-fn check_trash_dir(trash_dir: &std::path::Path, fix: bool) -> (usize, usize, usize) {
+fn check_trash_dir(
+    store: &TrashStore,
+    trash_dir: &std::path::Path,
+    fix: bool,
+) -> (usize, usize, usize) {
+    let guard = if fix {
+        match store.lock_trash_root(trash_dir) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("Could not lock {}: {e}", trash_dir.display());
+                return (0, 0, 1);
+            }
+        }
+    } else {
+        None
+    };
     let info_dir = trash_dir.join("info");
     let files_dir = trash_dir.join("files");
 
@@ -73,7 +92,9 @@ fn check_trash_dir(trash_dir: &std::path::Path, fix: bool) -> (usize, usize, usi
             // symlink_metadata (not exists()): a DANGLING symlink in files/
             // is still an entry we must not silently discard by declaring its
             // trashinfo orphaned.
-            if std::fs::symlink_metadata(&file_path).is_err() {
+            if std::fs::symlink_metadata(&file_path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
                 orphaned_info += 1;
                 println!("  {} orphaned trashinfo (no file): {}", "WARN".yellow(), id);
                 if fix {
@@ -111,6 +132,10 @@ fn check_trash_dir(trash_dir: &std::path::Path, fix: bool) -> (usize, usize, usi
         }
     }
 
+    // Capture candidates while publication is excluded, then release the
+    // guard before asking the user. purge_resolved revalidates after consent.
+    let snapshots = store.list(None).unwrap_or_default();
+    drop(guard);
     // Check for files without matching .trashinfo
     if let Ok(entries) = std::fs::read_dir(&files_dir) {
         for entry in entries.flatten() {
@@ -130,16 +155,17 @@ fn check_trash_dir(trash_dir: &std::path::Path, fix: bool) -> (usize, usize, usi
                     // preserve-data philosophy — require explicit per-item
                     // confirmation. symlink_metadata so dangling symlinks are
                     // classified correctly, not followed.
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let Some(snapshot) = snapshots
+                        .iter()
+                        .find(|e| e.trash_root == *trash_dir && e.id == name && e.orphaned)
+                    else {
+                        continue;
+                    };
                     if crate::util::confirm(&format!(
                         "    permanently delete orphaned '{}'? This cannot be undone [y/N] ",
                         entry.path().display()
                     )) {
-                        let res = if is_dir {
-                            std::fs::remove_dir_all(entry.path())
-                        } else {
-                            std::fs::remove_file(entry.path())
-                        };
+                        let res = store.purge_resolved(snapshot);
                         match res {
                             Ok(()) => println!("    {}", "removed".green()),
                             Err(e) => println!("    {} {e}", "failed:".red()),
@@ -208,6 +234,45 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn fix_waits_for_writer_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        let guard = store.lock_trash_root(&root).unwrap();
+        let sidecar = root.join("info/active.trashinfo");
+        let info = trashd_common::trashinfo::TrashInfo::new(dir.path().join("source"));
+        fs::write(&sidecar, info.to_trashinfo_string()).unwrap();
+        let worker_root = root.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let store =
+                TrashStore::open_isolated(&worker_root, trashd_common::Config::default()).unwrap();
+            started_tx.send(()).unwrap();
+            let result = check_trash_dir(&store, &worker_root, true);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(sidecar.is_file());
+        fs::write(root.join("files/active"), b"complete").unwrap();
+        drop(guard);
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            (0, 0, 0)
+        );
+        worker.join().unwrap();
+        assert_eq!(fs::read(root.join("files/active")).unwrap(), b"complete");
+        assert!(sidecar.is_file());
+    }
 
     // C1: `fsck --fix` must NEVER delete the data file just because its
     // .trashinfo is unparseable — the file in files/<id> is intact and is

@@ -101,7 +101,7 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 
 /// Build the BPF filter program that traps delete-related syscalls.
 #[cfg(target_arch = "x86_64")]
-pub fn build_filter() -> Vec<SockFilter> {
+fn build_base_filter() -> Vec<SockFilter> {
     //  [0] LD arch
     //  [1] JEQ native -> [2], else ERRNO[12]
     //  [2] LD nr
@@ -144,7 +144,7 @@ pub fn build_filter() -> Vec<SockFilter> {
 
 /// Build the BPF filter for aarch64 (only unlinkat exists).
 #[cfg(target_arch = "aarch64")]
-pub fn build_filter() -> Vec<SockFilter> {
+fn build_base_filter() -> Vec<SockFilter> {
     //  [0] LD arch    [3] JEQ unlinkat -> NOTIF[8]
     //  [1] JEQ native -> [2], else ERRNO[9]
     //  [2] LD nr      [4..6] JEQ io_uring_* -> ERRNO[9]
@@ -163,11 +163,47 @@ pub fn build_filter() -> Vec<SockFilter> {
     ]
 }
 
+/// Identify this filter with a cookie in otherwise unused getpid arguments.
+pub fn build_filter(cookie: [u32; 4]) -> Vec<SockFilter> {
+    let mut proof = vec![
+        bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, native_arch(), 0, 11),
+        bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_getpid as u32, 0, 9),
+    ];
+    for (i, word) in cookie.into_iter().enumerate() {
+        proof.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 16 + i as u32 * 8));
+        proof.push(bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            word,
+            0,
+            (7 - i * 2) as u8,
+        ));
+    }
+    proof.push(bpf_stmt(
+        BPF_RET | BPF_K,
+        SECCOMP_RET_ERRNO | crate::seccomp_identity::PROOF_ERRNO as u32,
+    ));
+    proof.extend(build_base_filter());
+    proof
+}
+
+fn native_arch() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        AUDIT_ARCH_X86_64
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        AUDIT_ARCH_AARCH64
+    }
+}
+
 /// Install the seccomp filter and return the notification fd.
 ///
-/// Must be called after `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
-pub fn install_filter() -> io::Result<i32> {
-    let filter = build_filter();
+/// Requires NoNewPrivs or CAP_SYS_ADMIN in the current user namespace.
+pub fn install_filter(cookie: [u32; 4]) -> io::Result<i32> {
+    let filter = build_filter(cookie);
     let prog = SockFprog {
         len: filter.len() as u16,
         filter: filter.as_ptr(),
@@ -196,6 +232,10 @@ mod tests {
     /// Minimal cBPF interpreter: runs the program against (arch, nr) the same
     /// way the kernel would, so the hand-computed jt/jf offsets stay pinned.
     fn run_filter(prog: &[SockFilter], arch: u32, nr: u32) -> u32 {
+        run_filter_args(prog, arch, nr, [0; 4])
+    }
+
+    fn run_filter_args(prog: &[SockFilter], arch: u32, nr: u32, args: [u32; 4]) -> u32 {
         let mut pc = 0usize;
         let mut acc: u32 = 0;
         loop {
@@ -204,6 +244,9 @@ mod tests {
                 acc = match ins.k {
                     OFFSET_NR => nr,
                     OFFSET_ARCH => arch,
+                    offset if (16..48).contains(&offset) && (offset - 16) % 8 == 0 => {
+                        args[((offset - 16) / 8) as usize]
+                    }
                     _ => panic!("unexpected absolute load offset {}", ins.k),
                 };
                 pc += 1;
@@ -233,12 +276,81 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     const NATIVE_ARCH: u32 = AUDIT_ARCH_AARCH64;
 
+    #[test]
+    fn kernel_cookie_proof_is_nonblocking_and_preserves_errno() {
+        if std::env::var_os("TRASHD_TEST_COOKIE_PROOF").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "filter::tests::kernel_cookie_proof_is_nonblocking_and_preserves_errno",
+                    "--nocapture",
+                ])
+                .env("TRASHD_TEST_COOKIE_PROOF", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Identity-only filter in a disposable process: no notification
+        // listener and no deletion interception or filesystem mutation.
+        let cookie = [0x12345678, 0xabcdef01, 0x78901234, 0x56789abc];
+        let mut instructions = build_filter(cookie);
+        instructions.truncate(13);
+        instructions.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+        let program = SockFprog {
+            len: instructions.len() as u16,
+            filter: instructions.as_ptr(),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) },
+            0
+        );
+        unsafe {
+            *libc::__errno_location() = libc::ENOENT;
+        }
+        assert!(crate::seccomp_identity::verified(cookie));
+        assert_eq!(unsafe { *libc::__errno_location() }, libc::ENOENT);
+        assert!(!crate::seccomp_identity::verified([0; 4]));
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_getpid, 0, 0, 0, 0) },
+            std::process::id() as libc::c_long
+        );
+    }
+
+    #[test]
+    fn only_native_cookie_probe_proves_filter_identity() {
+        let cookie = [1, 2, 3, 4];
+        let filter = build_filter(cookie);
+        let getpid = libc::SYS_getpid as u32;
+        assert_eq!(
+            run_filter_args(&filter, NATIVE_ARCH, getpid, cookie),
+            SECCOMP_RET_ERRNO | crate::seccomp_identity::PROOF_ERRNO as u32
+        );
+        assert_eq!(run_filter(&filter, NATIVE_ARCH, getpid), SECCOMP_RET_ALLOW);
+        for i in 0..4 {
+            let mut wrong = cookie;
+            wrong[i] ^= 1;
+            assert_eq!(
+                run_filter_args(&filter, NATIVE_ARCH, getpid, wrong),
+                SECCOMP_RET_ALLOW
+            );
+        }
+        assert_eq!(
+            run_filter_args(&filter, 0, getpid, cookie),
+            SECCOMP_RET_ERRNO_ENOSYS
+        );
+    }
+
     // Regression (#90, #91): the delete syscalls trap, io_uring is refused
     // with ENOSYS, wrong-arch tokens are refused with ENOSYS, and everything
     // else is allowed.
     #[test]
     fn filter_decisions_match_policy() {
-        let prog = build_filter();
+        let prog = build_filter([1, 2, 3, 4]);
 
         let unlinkat_nr: u32 = if cfg!(target_arch = "x86_64") {
             263

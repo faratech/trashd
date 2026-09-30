@@ -107,6 +107,42 @@ def main():
             assert stored.read_bytes() == b"recoverable"
         print("PASS: repeated force/recursive flags retain actual recoverable trash data")
 
+        # Raw terminal dots must be refused before normalization, even -f.
+        for spelling in ["dot/.", "dot/./", "dot/..//"]:
+            folder = root / "dot"
+            folder.mkdir(exist_ok=True); (folder / "keep").write_bytes(b"precious")
+            result = run(["-rf", spelling])
+            assert result.returncode != 0 and (folder / "keep").read_bytes() == b"precious", (spelling, result.stderr)
+        print("PASS: raw terminal-dot operands are refused")
+
+        # Compare protected and excluded branches with genuine GNU partial
+        # removal, on distinct tmpfs descendants of disposable operand trees.
+        for excluded in [False, True]:
+            base = Path("/tmp") if excluded else root
+            operands = [base / ("boundary-" + ("gnu" if i else "shim")) for i in range(2)]
+            try:
+                for operand in operands:
+                    operand.mkdir()
+                    (operand / "foreign").mkdir()
+                    (operand / "same").write_bytes(b"recoverable")
+                    subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "none", str(operand / "foreign")], check=True)
+                    (operand / "foreign/keep").write_bytes(b"foreign survives")
+                ours = run(["-rf", "--one-file-system", operands[0]])
+                gnu_env = dict(env, TRASH_BYPASS="1")
+                oracle = subprocess.run(["/usr/bin/rm", "-rf", "--one-file-system", str(operands[1])], env=gnu_env, capture_output=True)
+                assert ours.returncode == oracle.returncode != 0, (ours.stderr, oracle.stderr)
+                for operand in operands:
+                    assert not (operand / "same").exists()
+                    assert (operand / "foreign/keep").read_bytes() == b"foreign survives"
+                if not excluded:
+                    records = list((root / "data/Trash/info").glob("*.trashinfo"))
+                    assert any(str(operands[0] / "same") in record.read_text() for record in records)
+            finally:
+                for operand in operands:
+                    if (operand / "foreign").is_mount():
+                        subprocess.run(["/usr/bin/umount", str(operand / "foreign")], check=True)
+            print("PASS: GNU filesystem boundary behavior", "excluded" if excluded else "protected")
+
 
 if __name__ == "__main__":
     main()

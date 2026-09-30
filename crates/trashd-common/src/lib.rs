@@ -4,6 +4,7 @@ pub mod index;
 pub mod mounts;
 pub mod oplog;
 pub mod store;
+pub mod store_lock;
 pub mod trashinfo;
 
 pub use config::Config;

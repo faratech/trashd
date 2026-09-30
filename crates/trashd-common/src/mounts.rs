@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -204,6 +204,27 @@ pub fn trash_dir_for_path(path: &Path, home_trash: &Path) -> PathBuf {
     home_trash.to_path_buf()
 }
 
+/// Read-only selection used by preflight; it never prepares a store.
+pub(crate) fn existing_trash_dir_for_path(path: &Path, home: &Path) -> PathBuf {
+    if same_filesystem(path, home) {
+        return home.to_path_buf();
+    }
+    let uid = unsafe { libc::geteuid() };
+    if let Some(mount) = find_mount_point(path) {
+        if let Some(root) = check_shared_trash(&mount.path, uid, false)
+            .or_else(|| check_private_topdir_trash(&mount.path, uid, false))
+        {
+            return root;
+        }
+        // A future same-device private store would be inside a mount-root
+        // operand. Preserve the existing trash-self refusal before traversal.
+        if trusted_topdir(&mount.path, uid) && !mount.path.join(format!(".Trash-{uid}")).exists() {
+            return mount.path.join(format!(".Trash-{uid}"));
+        }
+    }
+    home.to_path_buf()
+}
+
 /// Check if $topdir/.Trash/ exists, is a real directory (not symlink),
 /// has the sticky bit, and is usable. If so, return $topdir/.Trash/$UID/.
 ///
@@ -334,6 +355,79 @@ pub(crate) fn is_safe_trash_root(path: &Path, uid: u32) -> bool {
         && validate_private_dir(&path.join("info"), uid, false)
 }
 
+/// Classify authenticated stores without creating or repairing directories.
+/// Keep a descriptor so removing files/info during cleanup does not invalidate
+/// a previously authenticated root, and inode reuse cannot impersonate it.
+#[allow(dead_code)]
+pub(crate) fn is_trash_internal(path: &Path, home: &Path, trusted_home: bool) -> bool {
+    use std::os::fd::FromRawFd;
+    use std::sync::{Mutex, OnceLock};
+    static ROOTS: OnceLock<Mutex<HashMap<PathBuf, fs::File>>> = OnceLock::new();
+    let uid = unsafe { libc::geteuid() };
+    let mut candidates = Vec::new();
+    if trusted_home && path.starts_with(home) {
+        candidates.push(home.to_path_buf());
+    }
+    for mount in list_mounts() {
+        if !path.starts_with(&mount.path) {
+            continue;
+        }
+        for root in [
+            check_shared_trash(&mount.path, uid, false),
+            check_private_topdir_trash(&mount.path, uid, false),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.starts_with(&root) {
+                candidates.push(root);
+            }
+        }
+    }
+    let Ok(mut roots) = ROOTS.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+        return false;
+    };
+    for root in candidates {
+        if !validate_private_dir(&root, uid, false) {
+            roots.remove(&root);
+            continue;
+        }
+        if let Some(pinned) = roots.get(&root) {
+            if let (Ok(old), Ok(current)) = (pinned.metadata(), root.symlink_metadata())
+                && old.dev() == current.dev()
+                && old.ino() == current.ino()
+            {
+                return true;
+            }
+            roots.remove(&root);
+        }
+        if !is_safe_trash_root(&root, uid) {
+            continue;
+        }
+        let Ok(name) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+            continue;
+        };
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue;
+        }
+        let pinned = unsafe { fs::File::from_raw_fd(fd) };
+        if let (Ok(old), Ok(current)) = (pinned.metadata(), root.symlink_metadata())
+            && old.dev() == current.dev()
+            && old.ino() == current.ino()
+        {
+            roots.insert(root, pinned);
+            return true;
+        }
+    }
+    false
+}
+
 /// Discover all trash directories across all mount points.
 /// Returns (trash_dir, mount_description) pairs.
 pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
@@ -404,6 +498,28 @@ fn unescape_octal(field: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_cleanup_cache_is_readonly_and_inode_bound() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("Trash");
+        for path in [&home, &home.join("files"), &home.join("info")] {
+            fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        assert!(is_trash_internal(&home.join("files/item"), &home, true));
+        fs::remove_dir(home.join("files")).unwrap();
+        assert!(is_trash_internal(&home.join("info"), &home, true));
+        fs::remove_dir(home.join("info")).unwrap();
+        assert!(is_trash_internal(&home, &home, true));
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!is_trash_internal(&home, &home, true));
+        assert_eq!(home.symlink_metadata().unwrap().mode() & 0o777, 0o755);
+        assert!(!home.join("files").exists());
+        assert!(!home.join("info").exists());
+        let lookalike = fixture.path().join("project/.Trash");
+        assert!(!is_trash_internal(&lookalike.join("item"), &home, true));
+        assert!(!lookalike.exists());
+    }
 
     #[test]
     fn private_topdir_trash_is_created_private_and_probe_rejects_open_mode() {

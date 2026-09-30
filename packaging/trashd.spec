@@ -1,5 +1,5 @@
 Name:           trashd
-Version:        0.1.7
+Version:        0.1.8
 Release:        1%{?dist}
 Summary:        A Linux recycle bin that works in scripts, cron, and at the desktop
 License:        MIT

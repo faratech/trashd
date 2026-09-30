@@ -119,17 +119,39 @@ pub fn serve(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn duplicate_locally(pid: u32, fd: i32) -> io::Result<OwnedFd> {
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if pidfd < 0 {
+pub(crate) fn duplicate_locally(pid: u32, fd: i32) -> io::Result<OwnedFd> {
+    // PIDFD_THREAD (O_EXCL) addresses the task's own descriptor table.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, libc::O_EXCL) };
+    if pidfd >= 0 {
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+        let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+        if result >= 0 {
+            return Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) });
+        }
+    }
+    let task = std::ffi::CString::new(format!("/proc/{pid}"))?;
+    let procfd = unsafe {
+        libc::open(
+            task.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if procfd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
-    let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    let procfd = unsafe { OwnedFd::from_raw_fd(procfd) };
+    let name = std::ffi::CString::new(format!("fd/{fd}"))?;
+    let result = unsafe {
+        libc::openat(
+            procfd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) })
+        Ok(unsafe { OwnedFd::from_raw_fd(result) })
     }
 }
 

@@ -134,7 +134,7 @@ def run(args, command):
                 os.chown(entry, uid, uid)
             sentinels.append(sentinel)
 
-        for name in ("usr", "etc", "dev", "proc", "tmp", "work", "home/test", "opt/trashd/bin", "opt/trashd/lib"):
+        for name in ("usr", "etc", "dev", "proc", "tmp", "work", "home/test", "home/nobody", "opt/trashd/bin", "opt/trashd/lib"):
             (root / name).mkdir(parents=True, exist_ok=True)
         # Non-recursive read-only binds expose runtimes, never writable
         # host data. Separate host submounts are not imported.
@@ -162,7 +162,9 @@ def run(args, command):
         # store ("can be replaced by another user") and used to abort the
         # whole suite on its first call (#126).
         os.chown(root / "home/test", 0, 0)
-        (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/home/test:/bin/sh\n")
+        os.chown(root / "home/nobody", 65534, 65534)
+        (root / "home/nobody").chmod(0o700)
+        (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/home/nobody:/bin/sh\n")
         (root / "etc/group").write_text("root:x:0:\nnogroup:x:65534:\n")
         for name in ("resolv.conf", "localtime"):
             if (Path("/etc") / name).is_file():

@@ -225,6 +225,13 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     // From this point, ALL code paths MUST send a response.
     // Failure to respond will hang the supervised process.
 
+    if notif.data.nr == libc::SYS_unlinkat as i32
+        && (notif.data.args[2] as i32 & !libc::AT_REMOVEDIR) != 0
+    {
+        respond_continue(fd, notif.id);
+        return;
+    }
+
     // Honor bypass_processes: if the deleting process (or an ancestor) is in
     // the bypass list (git, cargo, apt, …), let the real delete happen — same
     // as the shim/preload layers do.

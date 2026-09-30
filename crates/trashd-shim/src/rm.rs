@@ -127,7 +127,6 @@ fn main() -> ExitCode {
 
     // Accepted for GNU rm compatibility — parsed so these invocations trash
     // rather than fall through to a permanent delete.
-    let _ = args.one_file_system;
     // GNU --preserve-root=all additionally refuses mount-point operands.
     let preserve_all = args.preserve_root.as_deref() == Some("all");
 
@@ -288,6 +287,17 @@ fn main() -> ExitCode {
                 file.display()
             );
             exit_code = ExitCode::FAILURE;
+            continue;
+        }
+
+        if args.one_file_system && args.recursive && is_dir {
+            use std::os::unix::fs::MetadataExt;
+            if let Err(e) =
+                remove_one_filesystem(&store, file, meta.dev(), &behavior, &args, &cmd_str)
+            {
+                eprintln!("rm: cannot remove '{}': {e}", file.display());
+                exit_code = ExitCode::FAILURE;
+            }
             continue;
         }
 
@@ -456,10 +466,153 @@ fn is_mount_point(p: &std::path::Path) -> bool {
 /// refuses outright. Anything else (including `a/../b`, whose last component
 /// is `b`) is handled by the kernel's own resolution.
 fn is_dot_operand(p: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = p.as_os_str().as_bytes();
+    let end = bytes.iter().rposition(|b| *b != b'/').map_or(0, |i| i + 1);
     matches!(
-        p.components().next_back(),
-        Some(std::path::Component::CurDir) | Some(std::path::Component::ParentDir)
+        bytes[..end].rsplit(|b| *b == b'/').next(),
+        Some(b"." | b"..")
     )
+}
+
+/// Traverse through retained directory descriptors, never following a leaf
+/// symlink. Each operand supplies its own device, matching GNU rm.
+fn open_walk_dir(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn homogeneous_tree(path: &std::path::Path, device: u64) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let meta = path.symlink_metadata()?;
+    if meta.dev() != device {
+        return Ok(false);
+    }
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Ok(true);
+    }
+    let dir = open_walk_dir(path)?;
+    if dir.metadata()?.dev() != device {
+        return Ok(false);
+    }
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    for entry in std::fs::read_dir(pinned)? {
+        if !homogeneous_tree(&entry?.path(), device)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn remove_one_filesystem(
+    store: &TrashStore,
+    path: &std::path::Path,
+    device: u64,
+    behavior: &RemovalBehavior,
+    args: &Rm,
+    command: &str,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use trashd_common::store::TrashError;
+    let meta = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) if behavior.ignore_missing && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+    };
+    if meta.dev() != device {
+        return Err(std::io::Error::other("skipping a different filesystem"));
+    }
+    // Preserve size and trash-self refusals before any descendant changes.
+    match store.check_trash_eligibility(path) {
+        Ok(()) | Err(TrashError::Excluded(_)) => {}
+        Err(e) => return Err(std::io::Error::other(e)),
+    }
+    let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
+    if is_dir && (behavior.interaction == Interaction::Always || !homogeneous_tree(path, device)?) {
+        if behavior.interaction == Interaction::Always
+            && !prompt_user(&format!(
+                "rm: descend into directory '{}'? [y/N] ",
+                path.display()
+            ))
+        {
+            return Ok(false);
+        }
+        let dir = open_walk_dir(path)?;
+        if dir.metadata()?.dev() != device {
+            return Err(std::io::Error::other("skipping a different filesystem"));
+        }
+        let pinned = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        let mut kept = false;
+        let mut failure = None;
+        for entry in std::fs::read_dir(pinned)? {
+            match entry.and_then(|e| {
+                remove_one_filesystem(store, &e.path(), device, behavior, args, command)
+            }) {
+                Ok(true) => {}
+                Ok(false) => kept = true,
+                Err(e) => {
+                    eprintln!("rm: {e}");
+                    failure = Some(e);
+                    kept = true;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        if kept {
+            return Ok(false);
+        }
+        // Do not move an ancestor if anything appeared or was retained.
+        if std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
+            .next()
+            .is_some()
+        {
+            return Err(std::io::Error::other("Directory not empty"));
+        }
+    }
+    if behavior.interaction == Interaction::Always
+        && !prompt_user(&format!("rm: remove '{}'? [y/N] ", path.display()))
+    {
+        return Ok(false);
+    }
+    let parent = std::fs::File::open(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    )?;
+    if !parent.metadata()?.is_dir() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let moved = match store.trash_at(parent.as_raw_fd(), name, path, Some(command)) {
+        Err(TrashError::Io(e)) if e.raw_os_error() == Some(libc::EXDEV) => {
+            store.trash(path, Some(command))
+        }
+        other => other,
+    };
+    match moved {
+        Ok(id) => {
+            if args.verbose {
+                eprintln!("trashed '{}' [{}]", path.display(), id);
+            }
+        }
+        Err(TrashError::Excluded(_)) => {
+            let path = path.to_path_buf();
+            real_rm(&path, is_dir, false)?;
+        }
+        Err(e) => return Err(std::io::Error::other(e)),
+    }
+    Ok(true)
 }
 
 /// Prompt user on stderr, return true if they answer 'y' or 'Y'.

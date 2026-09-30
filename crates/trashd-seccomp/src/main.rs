@@ -1,6 +1,6 @@
 //! trashd-exec — launch a command under seccomp trash protection.
 //!
-//! Usage: trashd-exec <command> [args...]
+//! Usage: trashd-exec [--preserve-privileges] [--] <command> [args...]
 //!
 //! All child processes (and their descendants) have unlink/unlinkat/rmdir
 //! trapped by a seccomp filter. A supervisor process moves files to trash
@@ -17,6 +17,8 @@ mod broker;
 mod filter;
 mod mem;
 mod pin;
+#[path = "../../trashd-common/src/seccomp_identity.rs"]
+mod seccomp_identity;
 mod supervisor;
 mod watchdog;
 
@@ -32,25 +34,37 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
-        eprintln!("Usage: trashd-exec <command> [args...]");
+        eprintln!("Usage: trashd-exec [--preserve-privileges] [--] <command> [args...]");
         eprintln!();
         eprintln!("Launch a command with seccomp-based trash protection.");
         eprintln!("All unlink/rmdir syscalls are intercepted and files are");
         eprintln!("moved to trash instead of deleted.");
         eprintln!();
         eprintln!("Set TRASH_BYPASS=1 to disable (checked by shim/preload layers).");
-        eprintln!("Requires Linux 5.5+ kernel.");
+        eprintln!("Requires Linux 5.6+ kernel.");
+        eprintln!(
+            "Explicit wrapping sets NoNewPrivs (setuid and file capabilities cannot elevate)."
+        );
+        eprintln!("--preserve-privileges requires CAP_SYS_ADMIN; otherwise it uses fallback.");
         return ExitCode::from(1);
     }
 
+    let preserve_privileges = args[1] == "--preserve-privileges";
+    let mut start = if preserve_privileges { 2 } else { 1 };
+    if args.get(start).is_some_and(|a| a == "--") {
+        start += 1;
+    }
+    if start == args.len() {
+        return ExitCode::from(1);
+    }
     if std::env::var("TRASH_BYPASS")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        exec_command(&args[1..]);
+        exec_command(&args[start..]);
     }
 
-    match run(&args[1..]) {
+    match run(&args[start..], preserve_privileges) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("trashd-exec: {e}");
@@ -59,13 +73,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(command_args: &[String]) -> io::Result<ExitCode> {
+fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCode> {
     // Keep orphaned target descendants in our ancestry: Yama authorizes the
     // stable ancestor broker even when a target forks and its parent exits.
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
     let signals = SignalWait::new()?;
+    let cookie = seccomp_identity::random()?;
+    // This descriptor exists in the waiting child and exercises dirfd pinning.
+    let directory = std::fs::File::open(".")?;
     // Create a socketpair for passing the notification fd from child to parent.
     let mut sv = [0i32; 2];
     if unsafe {
@@ -90,17 +107,25 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
             unsafe { libc::close(sv[0]) }; // Close parent's end
 
             // Required before seccomp
-            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+            if !preserve_privileges
+                && unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0
+            {
                 let e = io::Error::last_os_error();
                 eprintln!("trashd-exec: prctl(NO_NEW_PRIVS) failed: {e}");
+                send_fd(sv[1], -1);
                 unsafe { libc::_exit(126) };
             }
 
             // Install seccomp filter — returns notification fd
-            let notif_fd = match filter::install_filter() {
+            let notif_fd = match filter::install_filter(cookie) {
                 Ok(fd) => fd,
                 Err(e) => {
                     eprintln!("trashd-exec: seccomp filter install failed: {e}");
+                    if e.raw_os_error() == Some(libc::EBUSY) {
+                        eprintln!(
+                            "trashd-exec: an inherited notification listener prevents another listener"
+                        );
+                    }
                     eprintln!("trashd-exec: continuing with preload/shim fallback, if available");
                     // Only an established listener may disable preload. A
                     // stale inherited marker must never survive fallback.
@@ -108,7 +133,7 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
                     // Send -1 to signal failure, then exec without protection
                     send_fd(sv[1], -1);
                     unsafe { libc::close(sv[1]) };
-                    exec_command(command_args);
+                    unsafe { libc::_exit(126) };
                 }
             };
 
@@ -133,6 +158,10 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
             unsafe {
                 libc::close(sv[1]);
                 std::env::set_var("TRASHD_SECCOMP_ACTIVE", "1");
+                std::env::set_var(
+                    seccomp_identity::COOKIE_ENV,
+                    seccomp_identity::encode(cookie),
+                );
             }
 
             // Exec the command
@@ -154,13 +183,19 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     // hang every delete, so kill + reap it before bailing (#13).
     let notif_fd = recv_fd(startup.as_raw_fd())?;
     if notif_fd < 0 {
-        // Child couldn't install seccomp — just wait for it
-        return child.wait(None, &signals);
+        child.wait(None, &signals)?;
+        return fallback(command_args, &signals);
     }
     let listener = unsafe { OwnedFd::from_raw_fd(notif_fd) };
 
     // Verify actual ptrace permission before releasing the filtered child.
-    if let Err(e) = mem::read_path_locally(child_pid as u32, STARTUP_PROBE.as_ptr() as u64) {
+    if let Err(e) = mem::read_path_locally(child_pid as u32, STARTUP_PROBE.as_ptr() as u64)
+        .map_err(|e| io::Error::other(format!("memory access: {e}")))
+        .and_then(|_| {
+            pin::startup_probe(child_pid as u32, directory.as_raw_fd())
+                .map_err(|e| io::Error::other(format!("filesystem access: {e}")))
+        })
+    {
         child.terminate(libc::SIGKILL);
         drop(listener);
         drop(startup);
@@ -168,16 +203,7 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
         eprintln!("trashd-exec: continuing with preload/shim fallback, if available");
         // A filter cannot be removed. Replace the waiting filtered child
         // with one forked from this unfiltered parent before fallback exec.
-        let fallback = unsafe { libc::fork() };
-        if fallback < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if fallback == 0 {
-            signals.restore_mask();
-            unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
-            exec_command(command_args);
-        }
-        return ChildProcess(fallback).wait(None, &signals);
+        return fallback(command_args, &signals);
     }
     let (broker_server, broker_client) = UnixDatagram::pair()?;
     let (ready_server, ready_client) = UnixDatagram::pair()?;
@@ -250,6 +276,22 @@ fn run(command_args: &[String]) -> io::Result<ExitCode> {
     watchdog.terminate(libc::SIGTERM);
 
     result
+}
+
+fn fallback(command_args: &[String], signals: &SignalWait) -> io::Result<ExitCode> {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        signals.restore_mask();
+        unsafe {
+            std::env::remove_var("TRASHD_SECCOMP_ACTIVE");
+            std::env::remove_var(seccomp_identity::COOKIE_ENV);
+        }
+        exec_command(command_args);
+    }
+    ChildProcess(pid).wait(None, signals)
 }
 
 /// Own a child until it is reaped. Startup failures must never strand a

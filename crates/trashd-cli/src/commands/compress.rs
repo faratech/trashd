@@ -69,12 +69,7 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
             continue;
         }
 
-        match compress_file_zstd(
-            &entry.trashed_path,
-            &entry.info_path,
-            &entry.info,
-            size_before,
-        ) {
+        match compress_file_zstd(store, entry, size_before) {
             Ok(Some(size_after)) => {
                 saved += size_before.saturating_sub(size_after);
                 compressed += 1;
@@ -138,9 +133,8 @@ fn is_zstd(path: &std::path::Path) -> bool {
 /// which restore would silently serve as "original content". If the final
 /// swap fails, the marker is reverted so the entry stays consistent.
 fn compress_file_zstd(
-    path: &std::path::Path,
-    info_path: &std::path::Path,
-    info: &trashd_common::trashinfo::TrashInfo,
+    store: &TrashStore,
+    entry: &trashd_common::store::TrashEntry,
     size_before: u64,
 ) -> std::io::Result<Option<u64>> {
     use trashd_common::store::write_trashinfo_atomic;
@@ -149,6 +143,9 @@ fn compress_file_zstd(
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+    let path = &entry.trashed_path;
+    let info_path = &entry.info_path;
+    let info = &entry.info;
     // Open without following a replacement symlink, and don't block if the
     // entry was replaced with a FIFO after the caller inspected it.
     let mut input = std::fs::OpenOptions::new()
@@ -203,6 +200,12 @@ fn compress_file_zstd(
     tmp.as_file().set_permissions(metadata.permissions())?;
     tmp.as_file().sync_all()?;
 
+    let guard = store
+        .lock_trash_root(&entry.trash_root)
+        .map_err(std::io::Error::other)?;
+    store
+        .validate_entry_locked(entry, &guard)
+        .map_err(std::io::Error::other)?;
     // 1) Marker first.
     let mut marked = info.clone();
     marked.compressed = Some("zstd".into());
@@ -225,17 +228,33 @@ mod tests {
     use std::path::Path;
     use trashd_common::trashinfo::TrashInfo;
 
+    fn fixture(dir: &Path, name: &str) -> (TrashStore, trashd_common::store::TrashEntry) {
+        let store = TrashStore::open_isolated(&dir.join("Trash"), trashd_common::Config::default())
+            .unwrap();
+        let path = store.home_dir().join("files").join(name);
+        fs::write(&path, vec![b'x'; 8192]).unwrap();
+        let info = TrashInfo::new(dir.join(name));
+        fs::write(
+            store
+                .home_dir()
+                .join("info")
+                .join(format!("{name}.trashinfo")),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+        let entry = store.find_entry(name).unwrap();
+        (store, entry)
+    }
+
     fn compress_fixture(dir: &Path, name: &str, mode: u32) {
-        let path = dir.join(name);
-        let info_path = dir.join(format!("{name}.trashinfo"));
+        let (store, entry) = fixture(dir, name);
+        let path = entry.trashed_path.clone();
+        let info_path = entry.info_path.clone();
         let content = vec![b'x'; 8192];
-        fs::write(&path, &content).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-        let info = TrashInfo::new(path.clone());
-        fs::write(&info_path, info.to_trashinfo_string()).unwrap();
 
         assert!(
-            compress_file_zstd(&path, &info_path, &info, content.len() as u64)
+            compress_file_zstd(&store, &entry, content.len() as u64)
                 .unwrap()
                 .is_some()
         );
@@ -286,18 +305,12 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data");
-        fs::write(&path, vec![b'x'; 8192]).unwrap();
+        let (store, entry) = fixture(dir.path(), "data");
+        let path = entry.trashed_path.clone();
         let input = fs::File::open(&path).unwrap();
         assert_eq!(unsafe { libc::fchown(input.as_raw_fd(), 65534, 65534) }, 0);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o4700)).unwrap();
-        let info = TrashInfo::new(path.clone());
-        fs::write(dir.path().join("info"), info.to_trashinfo_string()).unwrap();
-        assert!(
-            compress_file_zstd(&path, &dir.path().join("info"), &info, 8192)
-                .unwrap()
-                .is_some()
-        );
+        assert!(compress_file_zstd(&store, &entry, 8192).unwrap().is_some());
         let metadata = fs::metadata(path).unwrap();
         assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o4700);
@@ -312,24 +325,29 @@ mod tests {
                 scope.spawn(move || compress_fixture(path, name, 0o600));
             }
         });
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 8);
+        assert_eq!(
+            fs::read_dir(dir.path().join("Trash/files"))
+                .unwrap()
+                .count(),
+            4
+        );
     }
 
     #[test]
     fn concurrent_compression_of_same_entry_does_not_compress_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data");
-        let info_path = dir.path().join("data.trashinfo");
+        let (store, entry) = fixture(dir.path(), "data");
+        let path = entry.trashed_path.clone();
         let content = vec![b'x'; 8192];
-        fs::write(&path, &content).unwrap();
-        let info = TrashInfo::new(path.clone());
-        fs::write(&info_path, info.to_trashinfo_string()).unwrap();
+        let root = store.home_dir().to_path_buf();
         let barrier = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
                     barrier.wait();
-                    compress_file_zstd(&path, &info_path, &info, 8192).unwrap();
+                    let store =
+                        TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+                    let _ = compress_file_zstd(&store, &entry, 8192);
                 });
             }
         });
@@ -337,33 +355,54 @@ mod tests {
             zstd::decode_all(fs::File::open(path).unwrap()).unwrap(),
             content
         );
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(root.join("files")).unwrap().count(), 1);
     }
 
     #[test]
     fn failed_marker_write_preserves_original_and_removes_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data");
+        let (store, mut entry) = fixture(dir.path(), "data");
+        let path = entry.trashed_path.clone();
         let content = vec![b'x'; 8192];
-        fs::write(&path, &content).unwrap();
-        let info = TrashInfo::new(path.clone());
-        let result = compress_file_zstd(&path, &dir.path().join("missing/info"), &info, 8192);
+        entry.info_path = dir.path().join("missing/info");
+        let result = compress_file_zstd(&store, &entry, 8192);
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), content);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(store.home_dir().join("files"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn compression_refuses_symlink_as_source() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
-        let path = dir.path().join("link");
+        let (store, entry) = fixture(dir.path(), "link");
+        let path = entry.trashed_path.clone();
         let content = vec![b'x'; 8192];
         fs::write(&target, &content).unwrap();
+        fs::remove_file(&path).unwrap();
         symlink(&target, &path).unwrap();
-        let info = TrashInfo::new(path.clone());
-        assert!(compress_file_zstd(&path, &dir.path().join("info"), &info, 8192).is_err());
+        assert!(compress_file_zstd(&store, &entry, 8192).is_err());
         assert_eq!(fs::read(target).unwrap(), content);
         assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
+    #[test]
+    fn stale_snapshot_cannot_compress_reused_id_or_changed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, entry) = fixture(dir.path(), "data");
+        fs::remove_file(&entry.trashed_path).unwrap();
+        fs::write(&entry.trashed_path, vec![b'y'; 8192]).unwrap();
+        let replacement = fs::read(&entry.info_path).unwrap();
+        assert!(compress_file_zstd(&store, &entry, 8192).is_err());
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), vec![b'y'; 8192]);
+        assert_eq!(fs::read(&entry.info_path).unwrap(), replacement);
+        let fresh = store.find_entry("data").unwrap();
+        fs::write(&fresh.info_path, b"changed metadata").unwrap();
+        assert!(compress_file_zstd(&store, &fresh, 8192).is_err());
+        assert_eq!(fs::read(&fresh.info_path).unwrap(), b"changed metadata");
     }
 }

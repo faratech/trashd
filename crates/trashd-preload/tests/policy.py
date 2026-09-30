@@ -182,6 +182,106 @@ def run():
             assert stream.read() == b"\x00"
         assert not records[0].exists()
         print(f"PASS raw-name CLI restore and --force; {count} isolated deletion cases passed")
+
+        def focused_fixture(name):
+            fixture = root / name
+            fixture.mkdir()
+            data = fixture / "data"; data.mkdir()
+            environment = dict(os.environ, LD_PRELOAD=library, HOME=str(fixture),
+                XDG_DATA_HOME=str(data), XDG_CONFIG_HOME=str(fixture / "config"), TRASH_BYPASS="0")
+            environment.pop("TRASHD_SECCOMP_ACTIVE", None)
+            environment.pop("TRASHD_SECCOMP_COOKIE", None)
+            return fixture, data, environment
+
+        for name, spelling in [("dot-parent", "./victim"), ("dotdot-parent", "child/../victim"),
+                               ("excluded-spelling", "/tmp/../work/{relative}/victim")]:
+            fixture, data, environment = focused_fixture(name)
+            (fixture / "child").mkdir()
+            victim = fixture / "victim"; victim.write_bytes(b"roundtrip")
+            operand = spelling.format(relative=str(fixture.relative_to("/work")))
+            result = subprocess.run(["/usr/bin/unlink", operand], cwd=fixture, env=environment, capture_output=True)
+            assert result.returncode == 0, result.stderr
+            records = list((data / "Trash/info").glob("*.trashinfo"))
+            assert len(records) == 1 and not victim.exists(), (name, result.stderr)
+            restored = subprocess.run([cli, "restore", records[0].stem], env=dict(environment, TRASH_BYPASS="1"), capture_output=True)
+            assert restored.returncode == 0 and victim.read_bytes() == b"roundtrip", (name, restored.stderr)
+        print("PASS: normalized parents use consistent policy and restorable metadata")
+
+        fixture, data, environment = focused_fixture("physical-parent")
+        (fixture / "target/sub").mkdir(parents=True)
+        (fixture / "alias").symlink_to("target/sub", target_is_directory=True)
+        victim = fixture / "target/victim"; victim.write_bytes(b"physical")
+        result = subprocess.run(["/usr/bin/unlink", "alias/../victim"], cwd=fixture, env=environment, capture_output=True)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        records = list((data / "Trash/info").glob("*.trashinfo"))
+        assert len(records) == 1 and ("Path=" + str(victim)) in records[0].read_text()
+        print("PASS: symlinked parents follow kernel resolution")
+
+        fixture, data, environment = focused_fixture("raw-final-symlink")
+        target = fixture / "target"; target.write_bytes(b"target survives")
+        link = os.fsencode(fixture) + b"/link-\xff"
+        os.symlink(os.fsencode(target), link)
+        result = subprocess.run(["/usr/bin/unlink", link], env=environment, capture_output=True)
+        assert result.returncode == 0 and target.read_bytes() == b"target survives", result.stderr
+        records = list((data / "Trash/info").glob("*.trashinfo"))
+        assert len(records) == 1
+        restored = subprocess.run([cli, "restore", records[0].stem], env=dict(environment, TRASH_BYPASS="1"), capture_output=True)
+        assert restored.returncode == 0 and os.path.islink(link), restored.stderr
+        assert os.readlink(link) == os.fsencode(target)
+        print("PASS: raw-byte final symlink survives trash/restore")
+
+        for marker in [None, "invalid", "0123456789abcdef0123456789abcdef"]:
+            fixture, data, environment = focused_fixture("marker-" + str(marker))
+            environment["TRASHD_SECCOMP_ACTIVE"] = "1"
+            if marker is not None: environment["TRASHD_SECCOMP_COOKIE"] = marker
+            victim = fixture / "victim"; victim.write_bytes(b"recoverable")
+            result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+            assert result.returncode == 0 and len(list((data / "Trash/info").glob("*.trashinfo"))) == 1, result.stderr
+        print("PASS: unrelated inherited filters and stale markers retain preload")
+
+        fixture, data, environment = focused_fixture("invalid-flags")
+        victim = fixture / "victim"; victim.write_bytes(b"untouched")
+        code = "import ctypes,errno,os,sys; c=ctypes.CDLL(None,use_errno=True); r=c.unlinkat(-100,ctypes.c_char_p(os.fsencode(sys.argv[1])),1024); assert r==-1 and ctypes.get_errno()==errno.EINVAL"
+        result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment, capture_output=True)
+        assert result.returncode == 0 and victim.read_bytes() == b"untouched", result.stderr
+        assert not list((data / "Trash/info").glob("*.trashinfo"))
+        print("PASS: unsupported unlinkat flags leave data and metadata untouched")
+
+        # Exercise published-copy cleanup failure even without a usable
+        # listener. Both filters affect only a sandbox child; errno denial
+        # takes precedence over any inherited notification filter.
+        import errno
+        from seccomp_regression import force_install_error
+        renameat2 = {"x86_64": 316, "aarch64": 276}[os.uname().machine]
+        unlink_nr = {"x86_64": 87, "aarch64": 35}[os.uname().machine]
+        def deny_move_and_cleanup():
+            force_install_error(errno.EPERM, renameat2)()
+            force_install_error(errno.EACCES, unlink_nr)()
+        for is_link in [False, True]:
+            fixture, data, environment = focused_fixture("cleanup-failure-" + str(is_link))
+            victim = fixture / "victim"
+            if is_link:
+                target = fixture / "target"; target.write_bytes(b"complete recovery")
+                victim.symlink_to(target)
+            else: victim.write_bytes(b"complete recovery")
+            code = "import errno,os,sys\ntry: os.unlink(sys.argv[1])\nexcept OSError as e: assert e.errno==errno.EACCES\nelse: raise AssertionError('cleanup should fail')"
+            result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
+                capture_output=True, preexec_fn=deny_move_and_cleanup, timeout=10)
+            assert result.returncode == 0 and victim.read_bytes() == b"complete recovery", result.stderr
+            records = list((data / "Trash/info").glob("*.trashinfo"))
+            assert len(records) == 1
+            stored = data / "Trash/files" / records[0].stem
+            assert stored.read_bytes() == b"complete recovery"
+            assert stored.is_symlink() == is_link
+        print("PASS: failed source cleanup returns errno and retains complete recovery copies")
+
+        for dirname in [".Trash", f".Trash-{os.geteuid()}"]:
+            fixture, data, environment = focused_fixture("lookalike-" + dirname)
+            folder = fixture / dirname; folder.mkdir()
+            victim = folder / "victim"; victim.write_bytes(b"recoverable")
+            result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+            assert result.returncode == 0 and len(list((data / "Trash/info").glob("*.trashinfo"))) == 1, result.stderr
+        print("PASS: nested trash lookalikes remain ordinary protected data")
     return 0
 
 

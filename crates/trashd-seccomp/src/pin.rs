@@ -61,7 +61,7 @@ impl std::os::unix::io::AsRawFd for FdGuard {
 /// context. Owns its fds; `Drop` closes them.
 pub struct TargetFs {
     pid: u32,
-    pidfd: RawFd,
+    procfd: RawFd,
     root_fd: Option<RawFd>,
     cwd_fd: Option<RawFd>,
 }
@@ -69,7 +69,7 @@ pub struct TargetFs {
 impl Drop for TargetFs {
     fn drop(&mut self) {
         unsafe {
-            libc::close(self.pidfd);
+            libc::close(self.procfd);
             if let Some(fd) = self.root_fd.take() {
                 libc::close(fd);
             }
@@ -81,18 +81,14 @@ impl Drop for TargetFs {
 }
 
 impl TargetFs {
-    /// Pin the target's root and cwd. `pidfd_open` must succeed (Linux 5.3+);
-    /// root/cwd opens are best-effort — callers check the one they need.
+    /// Pin the exact triggering task, including non-leader threads.
     pub fn open(pid: u32) -> io::Result<Self> {
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i64, 0i64) };
-        if pidfd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let root_fd = open_proc_dir(&format!("/proc/{pid}/root"));
-        let cwd_fd = open_proc_dir(&format!("/proc/{pid}/cwd"));
+        let procfd = open_proc_dir(&format!("/proc/{pid}")).ok_or_else(io::Error::last_os_error)?;
+        let root_fd = open_task_directory(procfd, c"root");
+        let cwd_fd = open_task_directory(procfd, c"cwd");
         Ok(Self {
             pid,
-            pidfd: pidfd as RawFd,
+            procfd,
             root_fd,
             cwd_fd,
         })
@@ -109,19 +105,54 @@ impl TargetFs {
     }
 
     /// Duplicate the target's `dirfd` into this process via pidfd_getfd(2)
-    /// (Linux 5.14+). The duplicate shares the open file description, so it
+    /// (Linux 5.6+), with an exact task proc-descriptor fallback. The duplicate shares the open file description, so it
     /// references the same directory inode even if the target (or a sibling)
     /// closes or renames things afterwards.
     pub fn dup_dirfd(&self, dirfd: i32) -> io::Result<RawFd> {
         if crate::broker::is_connected() {
             return crate::broker::duplicate_fd(self.pid, dirfd);
         }
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, self.pidfd, dirfd as i64, 0i64) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(fd as RawFd)
+        let name = CString::new(format!("fd/{dirfd}"))?;
+        open_task_directory(self.procfd, &name).ok_or_else(io::Error::last_os_error)
     }
+}
+
+fn open_task_directory(procfd: RawFd, name: &CStr) -> Option<RawFd> {
+    let fd = unsafe {
+        libc::openat(
+            procfd,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 { None } else { Some(fd) }
+}
+
+/// All mandatory filesystem backends must work before preload defers.
+pub fn startup_probe(pid: u32, inherited_dirfd: i32) -> io::Result<()> {
+    let fs = TargetFs::open(pid)?;
+    let root = fs.root().ok_or_else(io::Error::last_os_error)?;
+    let cwd = fs.cwd().ok_or_else(io::Error::last_os_error)?;
+    let _root = FdGuard(resolve_parent(root, OsStr::new("."), true)?);
+    let _cwd = FdGuard(resolve_parent(cwd, OsStr::new("."), false)?);
+    let _dir = FdGuard(fs.dup_dirfd(inherited_dirfd)?);
+    // Invalid descriptors/empty names cannot mutate anything; ENOENT/EBADF
+    // proves renameat2 reaches the kernel rather than an inherited denial.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            -1,
+            c"".as_ptr(),
+            -1,
+            c"".as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    let error = io::Error::last_os_error();
+    if result != -1 || !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EBADF)) {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn open_proc_dir(path: &str) -> Option<RawFd> {
@@ -277,6 +308,9 @@ pub fn try_pinned(
     #[cfg(target_arch = "aarch64")]
     const NR_UNLINKAT: i32 = 35;
 
+    if syscall_nr == NR_UNLINKAT && (args[2] as i32 & !libc::AT_REMOVEDIR) != 0 {
+        return Ok(Decision::Continue);
+    }
     // Only unlinkat carries a dirfd argument; unlink/rmdir are CWD-relative.
     let dirfd: Option<i32> = if syscall_nr == NR_UNLINKAT {
         Some(args[0] as i32)
@@ -291,9 +325,8 @@ pub fn try_pinned(
 
     let tfs = TargetFs::open(pid)?;
 
-    // PID-reuse guard: notif.pid was valid at recv time, but by the time we
-    // pidfd_open it the target may have died and the kernel recycled the PID.
-    // Re-check notification validity NOW that the pidfd exists — a still-valid
+    // Task-reuse guard: the target may have died after receiving the event.
+    // Re-check validity after pinning its proc directory — a still-valid
     // id proves this pid is still the blocked target.
     // notify_fd < 0 skips this check — unit tests have no seccomp fd.
     if notify_fd >= 0 && !crate::supervisor::notif_id_valid(notify_fd, notify_id) {
@@ -416,7 +449,9 @@ pub fn try_pinned(
     // inside TrashStore::trash_at. Config eligibility runs on the display
     // path — name-based policy, exactly like the kernel's own name-based
     // unlink semantics; trash_at re-checks for parity with other layers.
-    match store.trash_at(parent, name, display, Some("seccomp")) {
+    match store.trash_at_checked(parent, name, display, Some("seccomp"), || {
+        notify_fd < 0 || crate::supervisor::notif_id_valid(notify_fd, notify_id)
+    }) {
         Ok(_id) => Ok(Decision::Trashed),
         Err(TrashError::Excluded(_)) | Err(TrashError::Refused(_)) => Ok(Decision::Continue),
         // EXDEV (namespaced/cross-device target), hash/store hiccups, and
@@ -474,6 +509,55 @@ mod tests {
 
     const NR_UNLINKAT_X86_64: i32 = 263;
     const NR_UNLINKAT_AARCH64: i32 = 35;
+
+    #[test]
+    fn unsupported_flags_defer_before_filesystem_access() {
+        let (store, _path, _fixture) = setup("invalid-unlinkat");
+        let nr = libc::SYS_unlinkat as i32;
+        let args = [libc::AT_FDCWD as u64, 0, 1024, 0, 0, 0];
+        assert!(matches!(
+            try_pinned(
+                0,
+                nr,
+                &args,
+                OsStr::new("victim"),
+                std::path::Path::new("victim"),
+                false,
+                -1,
+                0,
+                &store
+            )
+            .unwrap(),
+            Decision::Continue
+        ));
+        assert!(store.list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn filesystem_pinning_accepts_worker_tid() {
+        std::thread::spawn(|| {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            let fs = TargetFs::open(tid).unwrap();
+            assert!(fs.root().is_some());
+            assert!(fs.cwd().is_some());
+            let directory = std::fs::File::open(".").unwrap();
+            use std::os::fd::AsRawFd;
+            let pinned = FdGuard(fs.dup_dirfd(directory.as_raw_fd()).unwrap());
+            let broker_pinned =
+                crate::broker::duplicate_locally(tid, directory.as_raw_fd()).unwrap();
+            let broker_file = std::fs::File::from(broker_pinned);
+            use std::os::unix::fs::MetadataExt;
+            assert!(broker_file.metadata().unwrap().is_dir());
+            assert_eq!(
+                broker_file.metadata().unwrap().ino(),
+                directory.metadata().unwrap().ino()
+            );
+            let stat = unsafe { libc::fcntl(pinned.0, libc::F_GETFL) };
+            assert!(stat >= 0);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn root_resolution_clamps_dotdot_and_follows_symlinks() {

@@ -27,6 +27,8 @@ BIN = Path("/opt/trashd/bin/trashd-exec")
 PRELOAD = Path("/opt/trashd/lib/libtrashd_preload.so")
 LIBC = ctypes.CDLL(None, use_errno=True)
 SYSCALL_SECCOMP = {"x86_64": 317, "aarch64": 277}[os.uname().machine]
+SYSCALL_PIDFD_GETFD = 438
+SYSCALL_OPENAT2 = {"x86_64": 437, "aarch64": 437}[os.uname().machine]
 SYSCALL_READV = {"x86_64": 310, "aarch64": 270}[os.uname().machine]
 
 
@@ -91,7 +93,7 @@ def recovery_records(data, original):
 
 
 TARGET = r'''
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys, time, threading, ctypes
 print(json.dumps([os.getpid(), os.environ.get("TRASHD_SECCOMP_ACTIVE")]), flush=True)
 for row in sys.stdin:
     mode, path = json.loads(row)
@@ -101,6 +103,40 @@ for row in sys.stdin:
         fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
         try: os.unlink(os.path.basename(path), dir_fd=fd)
         finally: os.close(fd)
+    elif mode == "invalid-flags":
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.unlinkat(-100, ctypes.c_char_p(os.fsencode(path)), 1024)
+        assert result == -1 and ctypes.get_errno() == 22
+    elif mode in ["common-copy", "preload-copy"]:
+        sys.path.insert(0, "/tests")
+        from seccomp_regression import force_install_error
+        renameat2 = {"x86_64": 316, "aarch64": 276}[os.uname().machine]
+        child_env = dict(os.environ)
+        if mode == "common-copy":
+            command = ["/opt/trashd/bin/trashd-rm", path]
+        else:
+            child_env.pop("TRASHD_SECCOMP_ACTIVE", None)
+            child_env.pop("TRASHD_SECCOMP_COOKIE", None)
+            child_env["LD_PRELOAD"] = "/opt/trashd/lib/libtrashd_preload.so"
+            command = [sys.executable, "-c", "import os,sys; os.unlink(sys.argv[1])", path]
+        # Deny rename only in the deleting descendant after wrapper readiness.
+        # Supervisor rename remains available, exposing nested lock cycles.
+        subprocess.run(command, env=child_env, preexec_fn=force_install_error(1, renameat2), check=True, timeout=8)
+    elif mode.startswith("thread"):
+        errors = []
+        def worker():
+            try:
+                if mode == "thread-private":
+                    assert ctypes.CDLL(None, use_errno=True).unshare(0x400) == 0
+                if mode in ["thread-dirfd", "thread-private"]:
+                    fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+                    try: os.unlink(os.path.basename(path), dir_fd=fd)
+                    finally: os.close(fd)
+                else: os.unlink(path)
+            except BaseException as e: errors.append(e)
+        thread = threading.Thread(target=worker)
+        thread.start(); thread.join()
+        if errors: raise errors[0]
     elif mode == "exit":
         break
     elif mode == "orphan":
@@ -137,23 +173,61 @@ def stop(process):
         process.wait(timeout=5)
 
 
-def delete(process, work, data, mode, name, fifo=False):
+def delete(process, work, data, mode, name, fifo=False, symlink=False):
     path = work / name
     if fifo:
         os.mkfifo(path)
+    elif symlink:
+        target = work / (name + "-target")
+        target.write_bytes(b"target survives")
+        path.symlink_to(target)
     else:
         path.write_bytes(b"recoverable\n")
     process.stdin.write(json.dumps([mode, str(path)]) + "\n")
     process.stdin.flush()
     assert line(process) == "ok"
-    assert not path.exists(), path
+    assert not os.path.lexists(path), path
+    if symlink: assert target.read_bytes() == b"target survives"
     assert recovery_records(data, path), f"permanent deletion: {path}"
+
+
+def privilege_fallback():
+    # A privileged filter can be installed without first setting NoNewPrivs.
+    # Keep this fixture wholly inside the disposable root, including setuid id.
+    if LIBC.prctl(39, 0, 0, 0, 0) != 0:
+        print("SKIP: NoNewPrivs=0 fallback/setuid gate (already inherited)", flush=True)
+        return
+    with tempfile.TemporaryDirectory(prefix="privilege-", dir="/work") as temporary:
+        import shutil
+        fixture = Path(temporary)
+        fixture.chmod(0o755)
+        probe = fixture / "uid-probe"
+        shutil.copyfile("/usr/bin/id", probe)
+        probe.chmod(0o4755)
+        def inject_and_drop():
+            instructions = (Instruction * 4)(Instruction(0x20, 0, 0, 0),
+                Instruction(0x15, 0, 1, SYSCALL_SECCOMP),
+                Instruction(0x06, 0, 0, 0x00050000 | errno.EBUSY),
+                Instruction(0x06, 0, 0, 0x7FFF0000))
+            program = Program(len(instructions), instructions)
+            if LIBC.syscall(SYSCALL_SECCOMP, 1, 0, ctypes.byref(program)):
+                raise RuntimeError("privileged injection requires CAP_SYS_ADMIN")
+            os.setgroups([]); os.setgid(65534); os.setuid(65534)
+        code = "import ctypes,subprocess,sys; print(ctypes.CDLL(None).prctl(39,0,0,0,0)); print(subprocess.check_output([sys.argv[1],'-u'],text=True).strip())"
+        env = dict(os.environ, TRASH_BYPASS="0")
+        env.pop("LD_PRELOAD", None)
+        result = subprocess.run([str(BIN), sys.executable, "-c", code, str(probe)],
+            env=env, capture_output=True, text=True, timeout=10, preexec_fn=inject_and_drop)
+        assert result.returncode == 0 and result.stdout.splitlines() == ["0", "0"], (result.stdout, result.stderr)
+        print("PASS: failed installation preserves NoNewPrivs=0 and setuid behavior", flush=True)
 
 
 def run():
     require_sandbox()
     assert BIN.is_file() and PRELOAD.is_file(), "build seccomp + preload before creating sandbox"
     if os.geteuid() == 0:
+        privilege_fallback()
+        os.environ.update(HOME="/home/nobody", XDG_DATA_HOME="/home/nobody/.local/share", XDG_CONFIG_HOME="/home/nobody/.config")
         os.setgroups([])
         os.setgid(65534)
         os.setuid(65534)
@@ -208,6 +282,19 @@ def run():
         if os.environ.get("REQUIRE_SECCOMP") == "1":
             assert "cannot inspect protected child" in (fixture / "access-failure.log").read_text()
 
+        with (fixture / "filesystem-failure.log").open("w") as log:
+            process = launch(env, log, errno.ENOSYS, SYSCALL_OPENAT2)
+            try:
+                _, active = line(process)
+                assert active is None
+                delete(process, work, data, "unlink", "filesystem-fallback.txt")
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally: stop(process)
+        if os.environ.get("REQUIRE_SECCOMP") == "1":
+            assert "filesystem access:" in (fixture / "filesystem-failure.log").read_text()
+        print("PASS: filesystem capability failure retains preload recovery", flush=True)
+
         # Direct-to-wrapper signals must work on the guaranteed fallback path.
         for sig in [signal.SIGHUP, signal.SIGINT, signal.SIGTERM]:
             with (fixture / f"signal-{sig}.log").open("w") as log:
@@ -236,14 +323,22 @@ def run():
                         raise AssertionError("listener unavailable:\n" + log_path.read_text())
                     print("SKIP: protected integration (listener unavailable); set REQUIRE_SECCOMP=1 in CI")
                     return
-                for mode in ["unlink", "child", "dirfd"]:
+                invalid = work / "invalid-flags.txt"
+                invalid.write_bytes(b"untouched")
+                process.stdin.write(json.dumps(["invalid-flags", str(invalid)]) + "\n"); process.stdin.flush()
+                assert line(process) == "ok"
+                assert invalid.read_bytes() == b"untouched" and not recovery_records(data, invalid)
+                for mode in ["unlink", "child", "dirfd", "thread", "thread-dirfd", "thread-private"]:
                     delete(process, work, data, mode, f"before-{mode}.txt")
                 delete(process, work, data, "unlink", "pipe", fifo=True)
+                for mode in ["common-copy", "preload-copy"]:
+                    delete(process, work, data, mode, f"nested-{mode}.txt")
+                    delete(process, work, data, mode, f"nested-{mode}.link", symlink=True)
                 watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
                 supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
                 os.kill(supervisor, signal.SIGKILL)
                 wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
-                for mode in ["unlink", "child", "dirfd"]:
+                for mode in ["unlink", "child", "dirfd", "thread", "thread-dirfd", "thread-private"]:
                     delete(process, work, data, mode, f"after-{mode}.txt")
                 os.kill(process.pid, signal.SIGTERM)
                 assert process.wait(timeout=5) == 128 + signal.SIGTERM
@@ -251,6 +346,17 @@ def run():
             finally:
                 stop(process)
         print("PASS: protected deletes, forked children, dirfds, FIFO, restart, signals", flush=True)
+
+        with (fixture / "descriptor-backend.log").open("w") as log:
+            process = launch(protected_env, log, errno.ENOSYS, SYSCALL_PIDFD_GETFD)
+            try:
+                _, active = line(process)
+                assert active == "1", "proc descriptor fallback must satisfy startup"
+                delete(process, work, data, "thread-private", "proc-backend-thread.txt")
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally: stop(process)
+        print("PASS: denied pidfd_getfd retains exact-task proc interception", flush=True)
 
         for sig in [signal.SIGHUP, signal.SIGINT]:
             with (fixture / f"protected-signal-{sig}.log").open("w") as log:
