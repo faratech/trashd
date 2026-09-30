@@ -394,6 +394,9 @@ mod tests {
     fn stale_snapshot_cannot_compress_reused_id_or_changed_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let (store, entry) = fixture(dir.path(), "data");
+        // Keep the original inode alive so immediate recreation cannot reuse
+        // it: this case tests a different data identity with an unchanged sidecar.
+        let _original = fs::File::open(&entry.trashed_path).unwrap();
         fs::remove_file(&entry.trashed_path).unwrap();
         fs::write(&entry.trashed_path, vec![b'y'; 8192]).unwrap();
         let replacement = fs::read(&entry.info_path).unwrap();
