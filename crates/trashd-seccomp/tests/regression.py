@@ -124,9 +124,11 @@ for row in sys.stdin:
             child_env.pop("TRASHD_SECCOMP_COOKIE", None)
             child_env["LD_PRELOAD"] = "/opt/trashd/lib/libtrashd_preload.so"
             command = [sys.executable, "-c", "import os,sys; os.unlink(sys.argv[1])", path]
-        # Deny rename only in the deleting descendant after wrapper readiness.
-        # Supervisor rename remains available, exposing nested lock cycles.
-        subprocess.run(command, env=child_env, preexec_fn=force_install_error(1, renameat2), check=True, timeout=8)
+        # Fail rename with EXDEV only in the deleting descendant after wrapper
+        # readiness: the cross-device case is the one that takes the copy path
+        # (other errors fail the delete since #204/#205). Supervisor rename
+        # remains available, exposing nested lock cycles.
+        subprocess.run(command, env=child_env, preexec_fn=force_install_error(18, renameat2), check=True, timeout=8)
     elif mode.startswith("thread"):
         errors = []
         def worker():
