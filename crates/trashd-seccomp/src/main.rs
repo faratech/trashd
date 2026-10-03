@@ -103,7 +103,7 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
         -1 => return Err(io::Error::last_os_error()),
         0 => {
             // --- CHILD PROCESS ---
-            signals.restore_mask();
+            signals.restore_for_exec();
             unsafe { libc::close(sv[0]) }; // Close parent's end
 
             // Required before seccomp
@@ -183,8 +183,10 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
     // hang every delete, so kill + reap it before bailing (#13).
     let notif_fd = recv_fd(startup.as_raw_fd())?;
     if notif_fd < 0 {
-        child.wait(None, &signals)?;
-        return fallback(command_args, &signals);
+        // The failed child is exiting on its own; reap it before replacing
+        // this process so it never lingers as the command's zombie.
+        child.terminate(libc::SIGKILL);
+        fallback(command_args, &signals);
     }
     let listener = unsafe { OwnedFd::from_raw_fd(notif_fd) };
 
@@ -202,8 +204,8 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
         eprintln!("trashd-exec: cannot inspect protected child: {e}");
         eprintln!("trashd-exec: continuing with preload/shim fallback, if available");
         // A filter cannot be removed. Replace the waiting filtered child
-        // with one forked from this unfiltered parent before fallback exec.
-        return fallback(command_args, &signals);
+        // with this unfiltered process.
+        fallback(command_args, &signals);
     }
     let (broker_server, broker_client) = UnixDatagram::pair()?;
     let (ready_server, ready_client) = UnixDatagram::pair()?;
@@ -222,7 +224,7 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
         -1 => return Err(io::Error::last_os_error()),
         0 => {
             // --- WATCHDOG PROCESS ---
-            signals.restore_mask();
+            signals.reset_for_worker();
             drop(startup);
             drop(broker_server);
             drop(ready_server);
@@ -278,20 +280,20 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
     result
 }
 
-fn fallback(command_args: &[String], signals: &SignalWait) -> io::Result<ExitCode> {
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
+/// Become the unprotected command. With no supervisor there is nothing for a
+/// resident wrapper to do: exec in place leaves no wait loop to spin, keeps
+/// signals and exit status native, and lets `exit` close a terminal while
+/// daemons the shell started keep running. The failed child must already be
+/// reaped.
+fn fallback(command_args: &[String], signals: &SignalWait) -> ! {
+    unsafe {
+        // Survives execve; the command must not start adopting orphans.
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
+        std::env::remove_var("TRASHD_SECCOMP_ACTIVE");
+        std::env::remove_var(seccomp_identity::COOKIE_ENV);
     }
-    if pid == 0 {
-        signals.restore_mask();
-        unsafe {
-            std::env::remove_var("TRASHD_SECCOMP_ACTIVE");
-            std::env::remove_var(seccomp_identity::COOKIE_ENV);
-        }
-        exec_command(command_args);
-    }
-    ChildProcess(pid).wait(None, signals)
+    signals.restore_for_exec();
+    exec_command(command_args)
 }
 
 /// Own a child until it is reaped. Startup failures must never strand a
@@ -299,6 +301,7 @@ fn fallback(command_args: &[String], signals: &SignalWait) -> io::Result<ExitCod
 struct ChildProcess(libc::pid_t);
 
 impl ChildProcess {
+    #[cfg(test)]
     fn wait(&mut self, broker: Option<i32>, signals: &SignalWait) -> io::Result<ExitCode> {
         wait_for_children(self, broker, signals, None)
     }
@@ -325,14 +328,27 @@ impl Drop for ChildProcess {
 
 /// Consume termination signals synchronously while servicing broker requests.
 /// Signals target a pidfd, never a potentially recycled numeric PID.
+///
+/// An inherited SIGCHLD=SIG_IGN (WSL's login passes one to every shell) or
+/// SA_NOCLDWAIT makes the kernel reap our children itself: no zombie, no
+/// status, and a pidfd that stays readable forever, a 100% CPU spin. Waiting
+/// therefore runs with the default disposition; the wrapped command gets the
+/// inherited one back.
 struct SignalWait {
     fd: OwnedFd,
     old: libc::sigset_t,
+    old_sigchld: libc::sigaction,
 }
 
 impl SignalWait {
     fn new() -> io::Result<Self> {
         unsafe {
+            let mut default_sigchld: libc::sigaction = std::mem::zeroed();
+            default_sigchld.sa_sigaction = libc::SIG_DFL;
+            let mut old_sigchld = std::mem::zeroed();
+            if libc::sigaction(libc::SIGCHLD, &default_sigchld, &mut old_sigchld) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             let mut mask: libc::sigset_t = std::mem::zeroed();
             let mut old = std::mem::zeroed();
             libc::sigemptyset(&mut mask);
@@ -341,23 +357,42 @@ impl SignalWait {
             }
             let result = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old);
             if result != 0 {
+                libc::sigaction(libc::SIGCHLD, &old_sigchld, std::ptr::null_mut());
                 return Err(io::Error::from_raw_os_error(result));
             }
             let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
             if fd < 0 {
                 let e = io::Error::last_os_error();
                 libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+                libc::sigaction(libc::SIGCHLD, &old_sigchld, std::ptr::null_mut());
                 return Err(e);
             }
             Ok(Self {
                 fd: OwnedFd::from_raw_fd(fd),
                 old,
+                old_sigchld,
             })
         }
     }
 
-    fn restore_mask(&self) {
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    /// Hand the wrapped command the signal state it would have had without
+    /// the wrapper. Call last before exec: pending signals are delivered here.
+    fn restore_for_exec(&self) {
+        unsafe {
+            libc::sigaction(libc::SIGCHLD, &self.old_sigchld, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut());
+        }
+    }
+
+    /// Internal workers (watchdog, supervisor) never inherit the wrapper's
+    /// mask: teardown relies on SIGTERM reaching them, and SIGCHLD stays at
+    /// the default so their waitpid() observes real exits.
+    fn reset_for_worker(&self) {
+        unsafe {
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        }
     }
 
     fn next(&self) -> Option<u32> {
@@ -376,7 +411,7 @@ impl SignalWait {
 impl Drop for SignalWait {
     fn drop(&mut self) {
         while self.next().is_some() {}
-        self.restore_mask();
+        self.restore_for_exec();
     }
 }
 
@@ -453,8 +488,15 @@ fn wait_for_startup(
         }
         if fds[2].revents != 0 {
             let mut status = 0;
-            if unsafe { libc::waitpid(child.0, &mut status, 0) } < 0 {
-                return Err(io::Error::last_os_error());
+            while unsafe { libc::waitpid(child.0, &mut status, 0) } < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    // Already reaped: never let Drop SIGKILL a reused PID.
+                    if e.raw_os_error() == Some(libc::ECHILD) {
+                        child.0 = 0;
+                    }
+                    return Err(e);
+                }
             }
             child.0 = 0;
             return Ok(Some(exit_status(status)));
@@ -474,6 +516,11 @@ fn wait_for_startup(
 /// A pidfd stays bound to the original process after exit and reap (#42).
 /// Polling signalfd keeps HUP/INT/TERM responsive for both protected and
 /// fallback execution, instead of blocking them throughout waitpid (#64).
+///
+/// Every polled descriptor that reports an event is drained or dropped in the
+/// same iteration: a pidfd whose process can no longer be reaped here (the
+/// kernel reaped it under an ignored SIGCHLD) is readable forever and used to
+/// spin this loop at 100% CPU.
 fn wait_for_children(
     child: &mut ChildProcess,
     broker_fd: Option<i32>,
@@ -483,6 +530,10 @@ fn wait_for_children(
     let original = child.0;
     let mut original_status = None;
     let mut targets = std::collections::BTreeMap::<i32, OwnedFd>::new();
+    // Exited but not yet waitable (a tracer holds the zombie): poll again
+    // only after the SIGCHLD that announces its release.
+    let mut parked = std::collections::BTreeSet::<i32>::new();
+    let mut fired = Vec::new();
     let mut refresh = true;
     let mut pending_signals = Vec::new();
     // A dead broker peer must not abort the wait loop: the wrapped command is
@@ -495,28 +546,61 @@ fn wait_for_children(
                 std::fs::read_to_string(format!("/proc/self/task/{}/children", unsafe {
                     libc::getpid()
                 }))?;
-            for pid in children
+            let mut candidates: std::collections::BTreeSet<i32> = children
                 .split_whitespace()
                 .filter_map(|p| p.parse::<i32>().ok())
-            {
-                if Some(pid) == watchdog_pid {
-                    continue;
-                }
+                .filter(|&pid| Some(pid) != watchdog_pid)
+                .collect();
+            // A process the kernel already reaped is never listed, and a
+            // snapshot can miss a live child: check known pids directly.
+            candidates.extend(targets.keys().copied());
+            if original_status.is_none() {
+                candidates.insert(original);
+            }
+            for pid in candidates {
                 let mut status = 0;
-                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                let waited = loop {
+                    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if waited >= 0
+                        || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                    {
+                        break waited;
+                    }
+                };
                 if waited == pid {
                     reaped = true;
                     targets.remove(&pid);
-                    if pid == original {
+                    if pid == original && original_status.is_none() {
                         child.0 = 0; // disarm cleanup immediately after reap
                         original_status = Some(exit_status(status));
                     }
                 } else if waited == 0 && !targets.contains_key(&pid) {
-                    targets.insert(pid, open_pidfd(pid)?);
+                    match open_pidfd(pid) {
+                        Ok(fd) => {
+                            targets.insert(pid, fd);
+                        }
+                        // Reaped by the kernel since waitpid: rescan.
+                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => reaped = true,
+                        Err(e) => return Err(e),
+                    }
                 } else if waited < 0 {
-                    return Err(io::Error::last_os_error());
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::ECHILD) {
+                        return Err(e);
+                    }
+                    // No longer ours to reap: stop watching it.
+                    targets.remove(&pid);
+                    parked.remove(&pid);
+                    if pid == original && original_status.is_none() {
+                        child.0 = 0;
+                        eprintln!(
+                            "trashd-exec: exit status of pid {pid} was lost (SIGCHLD ignored?)"
+                        );
+                        original_status = Some(ExitCode::from(1));
+                    }
                 }
             }
+            parked.extend(fired.drain(..).filter(|pid| targets.contains_key(pid)));
             // Reparenting may have happened after this /proc snapshot but
             // before waitpid. Rescan after every reap before declaring the
             // protected tree empty, including newly adopted descendants.
@@ -551,8 +635,13 @@ fn wait_for_children(
                 revents: 0,
             },
         ];
-        fds.extend(targets.values().map(|fd| libc::pollfd {
-            fd: fd.as_raw_fd(),
+        let polled: Vec<i32> = targets
+            .keys()
+            .copied()
+            .filter(|pid| !parked.contains(pid))
+            .collect();
+        fds.extend(polled.iter().map(|pid| libc::pollfd {
+            fd: targets[pid].as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         }));
@@ -565,14 +654,24 @@ fn wait_for_children(
         }
         while let Some(sig) = signals.next() {
             refresh = true;
-            if sig != libc::SIGCHLD as u32 {
+            if sig == libc::SIGCHLD as u32 {
+                parked.clear();
+            } else {
                 // Refresh before forwarding: the original may have just
                 // exited, in which case its adopted roots receive the signal.
                 pending_signals.push(sig);
             }
         }
-        refresh |= fds.iter().skip(2).any(|fd| fd.revents != 0);
-        if fds[1].revents & libc::POLLIN != 0 {
+        fired.extend(
+            polled
+                .iter()
+                .zip(fds.iter().skip(2))
+                .filter(|(_, fd)| fd.revents != 0)
+                .map(|(&pid, _)| pid),
+        );
+        refresh |= !fired.is_empty();
+        let broker_events = fds[1].revents;
+        if broker_events & libc::POLLIN != 0 {
             match broker::serve(fds[1].fd) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -587,6 +686,10 @@ fn wait_for_children(
                     eprintln!("trashd-exec: broker request failed: {e}");
                 }
             }
+        } else if broker_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            // Nothing to read will ever clear this state: stop polling it.
+            eprintln!("trashd-exec: broker socket failed; continuing without it");
+            broker_fd = None;
         }
     }
 }
@@ -777,6 +880,135 @@ mod tests {
     }
 
     #[test]
+    fn inherited_sigchld_ignore_still_returns_status() {
+        isolated_case(|| {
+            // WSL's login hands shells SIGCHLD=SIG_IGN. The kernel then reaps
+            // children itself, so a wrapper that keeps the inherited
+            // disposition never observes the exit and spins on its pidfd.
+            unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+            let signals = SignalWait::new().unwrap();
+            let original = unsafe { libc::fork() };
+            assert!(original >= 0);
+            if original == 0 {
+                unsafe {
+                    libc::usleep(50_000);
+                    libc::_exit(37)
+                };
+            }
+            let mut child = ChildProcess(original);
+            assert_eq!(child.wait(None, &signals).unwrap(), ExitCode::from(37));
+            assert_eq!(child.0, 0);
+        });
+    }
+
+    #[test]
+    fn target_reaped_elsewhere_is_dropped_instead_of_polled_forever() {
+        isolated_case(|| {
+            let signals = SignalWait::new().unwrap();
+            // Defeat SignalWait's normalization: the kernel reaps this child,
+            // so its status is lost, but its pidfd must not keep the wait
+            // loop awake (or asleep) forever.
+            unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+            let original = unsafe { libc::fork() };
+            assert!(original >= 0);
+            if original == 0 {
+                unsafe {
+                    libc::usleep(50_000);
+                    libc::_exit(37)
+                };
+            }
+            let start = std::time::Instant::now();
+            let mut child = ChildProcess(original);
+            assert_eq!(child.wait(None, &signals).unwrap(), ExitCode::from(1));
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(child.0, 0);
+        });
+    }
+
+    #[test]
+    fn fallback_replaces_the_wrapper_with_the_command() {
+        const PROBE: &str = "TRASHD_TEST_FALLBACK_PROBE";
+        if let Ok(wrapper) = std::env::var(PROBE) {
+            // Running as the fallback command. Nothing protects it, so no
+            // wrapper may stay resident: it IS the wrapper process, with the
+            // wrapper's subreaper, signal and marker state undone.
+            assert_eq!(unsafe { libc::getpid() }.to_string(), wrapper);
+            let mut subreaper: libc::c_int = -1;
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut subreaper) },
+                0
+            );
+            assert_eq!(subreaper, 0);
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) };
+            assert_eq!(action.sa_sigaction, libc::SIG_IGN, "inherited disposition");
+            let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) };
+            for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGCHLD] {
+                assert_eq!(unsafe { libc::sigismember(&mask, sig) }, 0, "signal {sig}");
+            }
+            assert!(std::env::var_os("TRASHD_SECCOMP_ACTIVE").is_none());
+            assert!(std::env::var_os(seccomp_identity::COOKIE_ENV).is_none());
+            let children =
+                std::fs::read_to_string(format!("/proc/self/task/{wrapper}/children")).unwrap();
+            assert_eq!(
+                children.trim(),
+                "",
+                "a forked fallback child is left behind"
+            );
+            return;
+        }
+        isolated_case(|| {
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                assert_eq!(libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0), 0);
+                std::env::set_var("TRASHD_SECCOMP_ACTIVE", "1");
+                std::env::set_var(seccomp_identity::COOKIE_ENV, "stale");
+                std::env::set_var(PROBE, libc::getpid().to_string());
+            }
+            let signals = SignalWait::new().unwrap();
+            let args = [
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".into(),
+                "tests::fallback_replaces_the_wrapper_with_the_command".into(),
+                "--test-threads=1".into(),
+                "--nocapture".into(),
+            ];
+            fallback(&args, &signals);
+        });
+    }
+
+    #[test]
+    fn internal_workers_start_with_default_signal_state() {
+        isolated_case(|| {
+            // A blocked SIGTERM inherited by trashd-exec would make the
+            // watchdog immune to teardown, and an ignored SIGCHLD would hide
+            // its supervisor's exit status.
+            unsafe {
+                let mut term: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut term);
+                libc::sigaddset(&mut term, libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &term, std::ptr::null_mut());
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            }
+            let signals = SignalWait::new().unwrap();
+            signals.reset_for_worker();
+            let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) };
+            for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGCHLD] {
+                assert_eq!(unsafe { libc::sigismember(&mask, sig) }, 0, "signal {sig}");
+            }
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) };
+            assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+            std::mem::forget(signals); // a worker never restores the wrapper's state
+        });
+    }
+
+    #[test]
     fn startup_cancellation_reaps_even_a_stopped_child() {
         isolated_case(|| {
             let signals = SignalWait::new().unwrap();
@@ -836,7 +1068,7 @@ mod tests {
                 for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
                     unsafe { libc::signal(sig, libc::SIG_DFL) };
                 }
-                signals.restore_mask();
+                signals.restore_for_exec();
                 loop {
                     unsafe { libc::pause() };
                 }

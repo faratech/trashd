@@ -14,10 +14,12 @@ pub const VERSION: &str = match option_env!("TRASHD_VERSION") {
 
 // Die quietly on a closed reader (SIGPIPE, exit 141) like GNU tools, instead
 // of Rust's default SIGPIPE-ignore turning the next println! into a panic
-// with exit 101 (#129).
+// with exit 101 (#129). An inherited SIGCHLD=SIG_IGN (WSL's login) makes the
+// kernel reap the installer/editor we spawn, so waiting for it fails ECHILD.
 fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
     let cli = Cli::parse();
 

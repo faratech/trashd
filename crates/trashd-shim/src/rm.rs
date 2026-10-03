@@ -80,9 +80,12 @@ struct Rm {
 
 fn main() -> ExitCode {
     // Die quietly on a closed reader instead of panicking on a broken pipe
-    // (Rust ignores SIGPIPE by default) (#129).
+    // (Rust ignores SIGPIPE by default) (#129). An inherited SIGCHLD=SIG_IGN
+    // (WSL's login) lets the kernel reap the real rm before we can wait for
+    // it: the genuine binary then looked like a shim copy and was refused.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
     // Check bypass env var
     if std::env::var("TRASH_BYPASS").unwrap_or_default() == "1" {

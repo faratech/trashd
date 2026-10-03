@@ -108,6 +108,12 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
         // recycled PID.
         SUPERVISOR_PID.store(0, Ordering::Relaxed);
 
+        // Every filtered task has exited: there is nothing left to
+        // supervise, and a replacement would only exit again every 250 ms.
+        if supervisor::listener_done(notif_fd, 0) {
+            unsafe { libc::_exit(0) };
+        }
+
         eprintln!(
             "trashd-exec: watchdog: supervisor died ({}), failing over",
             exit_info
@@ -207,20 +213,9 @@ fn passthrough_loop(fd: i32) -> ! {
                 // fd closed — we're done
                 unsafe { libc::_exit(0) };
             }
-            Err(e)
-                if e.raw_os_error() == Some(libc::EAGAIN)
-                    || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
-            {
-                // fd is non-blocking and no notifications pending — poll until ready
-                unsafe {
-                    let mut pfd = libc::pollfd {
-                        fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    libc::poll(&mut pfd, 1, 1000);
-                }
-            }
+            // RECV ignores O_NONBLOCK and fails at once after every filtered
+            // task exits: block in poll, never retry blindly.
+            Err(_) if supervisor::listener_done(fd, -1) => unsafe { libc::_exit(0) },
             Err(_) => continue,
         }
     }
@@ -237,5 +232,16 @@ fn set_nonblocking(fd: i32, nonblock: bool) {
             };
             libc::fcntl(fd, libc::F_SETFL, new_flags);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supervisor::tests::{exits_cleanly, finished_listener};
+
+    #[test]
+    fn emergency_passthrough_ends_when_the_listener_is_finished() {
+        exits_cleanly(|| passthrough_loop(finished_listener()));
     }
 }

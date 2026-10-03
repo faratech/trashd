@@ -87,6 +87,22 @@ def main():
             assert result.returncode == status, (flags, result.returncode, result.stderr)
         print("PASS: 4 missing-file force/interaction order cases")
 
+        # A caller that ignores SIGCHLD (WSL's login hands one to every shell)
+        # lets the kernel reap the real rm before the shim can wait for it.
+        # The shim must still accept the genuine rm and report its status.
+        def ignore_sigchld():
+            import signal
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        def run_ignoring_sigchld(args):
+            return subprocess.run([str(binary), *map(str, args)], text=True, capture_output=True, env=env, cwd=root, timeout=10, preexec_fn=ignore_sigchld)
+        operand = root / "permanent-ignored-sigchld"
+        operand.write_bytes(b"permanently removed")
+        result = run_ignoring_sigchld(["--permanent", operand])
+        assert result.returncode == 0 and not operand.exists(), result.stderr
+        result = run_ignoring_sigchld(["--permanent", root / "not-present"])
+        assert result.returncode == 1 and "trashd" not in result.stderr, result.stderr
+        print("PASS: --permanent with ignored SIGCHLD reports the real rm's status")
+
         for name, flags, directory in [
             ("repeated-force", ["-ff"], False),
             ("repeated-recursive", ["-r", "--recursive"], True),

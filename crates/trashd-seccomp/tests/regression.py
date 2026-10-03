@@ -74,6 +74,11 @@ def line(process):
     return json.loads(result)
 
 
+def cpu_seconds(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 def children(pid):
     try:
         return [int(p) for p in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
@@ -139,6 +144,11 @@ for row in sys.stdin:
         if errors: raise errors[0]
     elif mode == "exit":
         break
+    elif mode == "sigchld":
+        import signal
+        ignored = signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN
+        print(json.dumps("ignored" if ignored else "handled"), flush=True)
+        continue
     elif mode == "orphan":
         parent = os.getpid()
         child = os.fork()
@@ -158,12 +168,19 @@ for row in sys.stdin:
 '''
 
 
-def launch(env, log, error=None, syscall=SYSCALL_SECCOMP):
+def launch(env, log, error=None, syscall=SYSCALL_SECCOMP, sigchld=None):
+    install = force_install_error(error, syscall) if error is not None else None
+    def prepare():
+        # e.g. WSL's login, which hands every shell SIGCHLD=SIG_IGN
+        if sigchld is not None:
+            signal.signal(signal.SIGCHLD, sigchld)
+        if install:
+            install()
     return subprocess.Popen(
         [str(BIN), sys.executable, "-u", "-c", TARGET],
         env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=log, text=True, start_new_session=True,
-        preexec_fn=force_install_error(error, syscall) if error is not None else None,
+        preexec_fn=prepare if install or sigchld is not None else None,
     )
 
 
@@ -201,7 +218,8 @@ def privilege_fallback():
         import shutil
         fixture = Path(temporary)
         fixture.chmod(0o755)
-        probe = fixture / "uid-probe"
+        # Keep the basename: multi-call coreutils (uutils) dispatch on argv[0].
+        probe = fixture / "id"
         shutil.copyfile("/usr/bin/id", probe)
         probe.chmod(0o4755)
         def inject_and_drop():
@@ -295,18 +313,38 @@ def run():
             assert "filesystem access:" in (fixture / "filesystem-failure.log").read_text()
         print("PASS: filesystem capability failure retains preload recovery", flush=True)
 
-        # Direct-to-wrapper signals must work on the guaranteed fallback path.
+        # Fallback replaces the wrapper with the command, so signals sent to
+        # the wrapper's pid reach the command itself.
         for sig in [signal.SIGHUP, signal.SIGINT, signal.SIGTERM]:
             with (fixture / f"signal-{sig}.log").open("w") as log:
                 process = launch(env, log, errno.EBUSY)
                 try:
                     target, _ = line(process)
+                    assert target == process.pid, "fallback left a resident wrapper"
                     os.kill(process.pid, sig)
-                    assert process.wait(timeout=5) == 128 + sig
-                    assert not Path(f"/proc/{target}").exists()
+                    assert process.wait(timeout=5) == -sig
                 finally:
                     stop(process)
-        print("PASS: HUP/INT/TERM forwarded on startup fallback", flush=True)
+        print("PASS: HUP/INT/TERM reach the command on startup fallback", flush=True)
+
+        # WSL's login hands root shells SIGCHLD=SIG_IGN, and WSL's own
+        # listener forces fallback. A resident wrapper then spun at 100% CPU
+        # on its child's pidfd; the command must replace it instead and keep
+        # the disposition it would have had without the wrapper.
+        with (fixture / "ignored-sigchld.log").open("w") as log:
+            process = launch(env, log, errno.EBUSY, sigchld=signal.SIG_IGN)
+            try:
+                target, active = line(process)
+                assert active is None
+                assert target == process.pid, "fallback left a resident wrapper"
+                process.stdin.write(json.dumps(["sigchld", ""]) + "\n"); process.stdin.flush()
+                assert line(process) == "ignored"
+                delete(process, work, data, "unlink", "ignored-sigchld.txt")
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: fallback with ignored SIGCHLD execs in place and keeps the disposition", flush=True)
 
         # With preload disabled, only a working notification supervisor can
         # recover these deletes; descendants exercise the Yama fork boundary.
@@ -417,6 +455,33 @@ def run():
                 finally:
                     stop(process)
         print("PASS: orphan descendants retain protection and signal forwarding until reaped", flush=True)
+
+        # The same inherited SIGCHLD=SIG_IGN on a protected wrapper: the kernel
+        # would reap its children itself, losing the status and leaving a
+        # pidfd that is readable forever.
+        with (fixture / "protected-ignored-sigchld.log").open("w") as log:
+            process = launch(protected_env, log, sigchld=signal.SIG_IGN)
+            try:
+                original, active = line(process)
+                assert active == "1"
+                process.stdin.write(json.dumps(["sigchld", ""]) + "\n"); process.stdin.flush()
+                assert line(process) == "ignored"
+                path = work / "ignored-sigchld-orphan.txt"
+                path.write_bytes(b"orphan must remain recoverable\n")
+                process.stdin.write(json.dumps(["orphan", str(path)]) + "\n"); process.stdin.flush()
+                event, orphan = line(process)
+                assert event == "adopted"
+                wait_until(lambda: not Path(f"/proc/{original}").exists(), "original command reaped")
+                before = cpu_seconds(process.pid)
+                time.sleep(0.5)
+                assert cpu_seconds(process.pid) - before < 0.2, "wrapper spins while waiting"
+                Path(str(path) + ".go").touch()
+                assert line(process) == "ok"
+                assert recovery_records(data, path), "orphan deletion was not recovered"
+                assert process.wait(timeout=5) == 37, "original exit status must be preserved"
+            finally:
+                stop(process)
+        print("PASS: protected wrapper with ignored SIGCHLD keeps status and does not spin", flush=True)
 
 
 if __name__ == "__main__":

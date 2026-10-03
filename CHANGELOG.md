@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `trashd-exec` no longer spins at 100% CPU (or hangs) when it inherits
+  `SIGCHLD=SIG_IGN`, as root login shells do under WSL's `login`. The kernel
+  reaped its children itself, leaving a permanently readable pidfd in the wait
+  loop and the original exit status unobservable. The wrapper now waits with
+  the default disposition, restores the inherited one for the command, and
+  drops any target it can no longer reap (#184).
+- Seccomp fallback (for example `EBUSY` from WSL's own notification listener)
+  execs the command in place instead of keeping a resident wrapper. A terminal
+  now closes on `exit` even while daemons the shell started keep running, and
+  signals and exit status are native (#185).
+- The seccomp supervisor, its passthrough mode and the watchdog's emergency
+  passthrough exit once every filtered task has exited, instead of spinning on
+  immediate `ENOENT` from the orphaned listener. The watchdog no longer
+  respawns supervisors for a finished listener, and starts with an unblocked
+  signal mask so teardown `SIGTERM` always reaches it (#186).
+- The rm shim and `trash` CLI reset `SIGCHLD` to the default: an inherited
+  `SIG_IGN` made the shim reject the genuine `rm` as a shim copy and made
+  `trash config edit`/`self-update` report failure for successful children (#187).
+- The fanotify daemon re-scans mounts at most once per second instead of after
+  every drained batch of events (#188).
+- The seccomp regression's setuid probe keeps the `id` basename so multi-call
+  coreutils (uutils) can run it (#189).
+
 ## 0.1.8 (2026-09-30)
 
 ### Fixed

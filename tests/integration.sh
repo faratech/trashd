@@ -295,6 +295,17 @@ else
 fi
 
 # -----------------------------------------------------------------------
+# trash config edit under an inherited SIGCHLD=SIG_IGN (WSL's login): the
+# kernel must not reap the editor before the CLI can read its status.
+# -----------------------------------------------------------------------
+if EDITOR=true python3 -c 'import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); os.execv(sys.argv[1], sys.argv[1:])' \
+        "$TRASH" config edit >/dev/null 2>&1; then
+    pass "trash config edit with ignored SIGCHLD"
+else
+    fail "trash config edit with ignored SIGCHLD" "editor status lost"
+fi
+
+# -----------------------------------------------------------------------
 # trash config get/set
 # -----------------------------------------------------------------------
 ORIGINAL=$(trash config get retention.max_age_days 2>&1)

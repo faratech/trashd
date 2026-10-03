@@ -66,7 +66,7 @@ Key safety mechanisms:
 
 `trashd-exec <command>` runs an orchestrator, target child, supervisor, and watchdog:
 1. **Child**: installs the BPF seccomp filter, passes the notification fd via SCM_RIGHTS, waits for startup acknowledgement, then sets `TRASHD_SECCOMP_ACTIVE=1` and execs the command. Failed setup clears the flag so preload can protect the fallback.
-2. **Orchestrator**: remains the target's ancestor/subreaper and brokers process-memory reads for the supervisor, preserving Yama `ptrace_scope=1` restrictions. It forwards SIGHUP/SIGINT/SIGTERM through pidfds while serving broker requests, and waits for surviving descendants before returning the original command's status.
+2. **Orchestrator**: remains the target's ancestor/subreaper and brokers process-memory reads for the supervisor, preserving Yama `ptrace_scope=1` restrictions. It forwards SIGHUP/SIGINT/SIGTERM through pidfds while serving broker requests, and waits for surviving descendants before returning the original command's status. `SignalWait` forces the default SIGCHLD disposition while waiting (an inherited `SIG_IGN`, e.g. from WSL's `login`, makes the kernel reap children and once spun this loop at 100% CPU) and restores the inherited one for the command. On setup failure it reaps the filtered child and execs the command in place — no resident wrapper in fallback mode.
 3. **Supervisor**: reads notifications, obtains pathname bytes through the ancestor broker, moves files to trash, and responds to the kernel.
 4. **Watchdog**: holds a duplicate notification fd, drains notifications on supervisor failure, and respawns the supervisor with the broker connection.
 

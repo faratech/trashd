@@ -203,6 +203,7 @@ fn run() -> io::Result<()> {
 
     // Event loop
     let mut buf = vec![0u8; 8192];
+    let mut last_refresh = std::time::Instant::now();
 
     loop {
         let n = unsafe { libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -216,10 +217,15 @@ fn run() -> io::Result<()> {
                     revents: 0,
                 };
                 unsafe { libc::poll(&mut pfd, 1, 1000) };
-                // Idle tick: pick up mounts that appeared after startup
-                // (USB sticks, network shares) — the startup snapshot never
-                // watched them (#37).
-                refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
+                // Pick up mounts that appeared after startup (USB sticks,
+                // network shares) — the startup snapshot never watched them
+                // (#37). The queue also drains after every busy batch, so
+                // throttle the full re-scan instead of running it per batch.
+                let now = std::time::Instant::now();
+                if mount_refresh_due(last_refresh, now) {
+                    refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
+                    last_refresh = now;
+                }
                 continue;
             }
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -294,6 +300,13 @@ fn run() -> io::Result<()> {
 /// We resolve the parent via open_by_handle_at and join with the filename.
 ///
 /// Falls back to reading /proc/self/fd/{event.fd} for FAN_DELETE_SELF.
+/// Mounts that appear after startup are picked up at most this often.
+const MOUNT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn mount_refresh_due(last: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last) >= MOUNT_REFRESH_INTERVAL
+}
+
 fn resolve_event_path(
     event_buf: &[u8],
     _event: &FanotifyEventMetadata,
@@ -592,6 +605,22 @@ fn fanotify_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The queue drains after every batch of events, not only when idle: a
+    // full mount re-scan per batch multiplied CPU under steady deletes.
+    #[test]
+    fn mount_refresh_runs_at_most_once_per_interval() {
+        let last = std::time::Instant::now();
+        assert!(!mount_refresh_due(last, last));
+        assert!(!mount_refresh_due(
+            last,
+            last + std::time::Duration::from_millis(999)
+        ));
+        assert!(mount_refresh_due(
+            last,
+            last + std::time::Duration::from_secs(1)
+        ));
+    }
 
     // Regression (#97): the fsid recorded in a fanotify FID record must be
     // extracted from the bytes between the info header and the file_handle,

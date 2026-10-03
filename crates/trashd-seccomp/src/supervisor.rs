@@ -68,6 +68,26 @@ pub fn notif_recv(fd: i32) -> io::Result<SeccompNotif> {
     }
 }
 
+/// RECV failed: wait up to `timeout_ms` for listener news and report whether
+/// none can ever come. Once every filtered task has exited, RECV fails at
+/// once (ENOENT on current kernels) and poll reports POLLHUP, so retrying
+/// RECV without this check spins at 100% CPU.
+pub(crate) fn listener_done(fd: i32, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } >= 0 {
+            return pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return true;
+        }
+    }
+}
+
 /// Send a response to a notification.
 fn notif_send(fd: i32, resp: &SeccompNotifResp) -> io::Result<()> {
     let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, resp as *const _) };
@@ -157,16 +177,19 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         // Block until a notification arrives
         let notif = match notif_recv(fd) {
             Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                // Target process died before we read the notification
-                continue;
-            }
             Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
                 // fd closed — supervisor is shutting down
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("trashd-exec: supervisor: recv error: {e}");
+                // ENOENT: a target died before we read its notification, or
+                // every filtered task has exited.
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    eprintln!("trashd-exec: supervisor: recv error: {e}");
+                }
+                if listener_done(fd, -1) {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -374,7 +397,89 @@ fn run_passthrough(fd: i32) -> io::Result<()> {
         match notif_recv(fd) {
             Ok(notif) => respond_continue(fd, notif.id),
             Err(e) if e.raw_os_error() == Some(libc::EBADF) => return Ok(()),
+            Err(_) if listener_done(fd, -1) => return Ok(()),
             Err(_) => continue,
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// Once every filtered task has exited, RECV fails at once (ENOENT on
+    /// current kernels) and poll reports POLLHUP. A pipe without a writer
+    /// reproduces both (RECV fails with ENOTTY) without a seccomp filter.
+    pub(crate) fn finished_listener() -> i32 {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { libc::close(fds[1]) };
+        fds[0]
+    }
+
+    /// Run `case` in a child that a spin cannot outlive.
+    pub(crate) fn exits_cleanly(case: impl FnOnce()) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::alarm(5) };
+            case();
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0, "loop kept running on a finished listener");
+    }
+
+    #[test]
+    fn only_a_finished_listener_is_done() {
+        let mut idle = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(idle.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // Live tasks with nothing pending: keep supervising.
+        assert!(!listener_done(idle[0], 0));
+        let finished = finished_listener();
+        assert!(listener_done(finished, 0));
+        unsafe {
+            libc::close(idle[0]);
+            libc::close(idle[1]);
+            libc::close(finished);
+        }
+    }
+
+    /// The kernel contract the loops rely on, against a real listener.
+    #[test]
+    fn real_listener_reports_hangup_after_filtered_tasks_exit() {
+        let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+            let fd = crate::seccomp_identity::random()
+                .and_then(crate::filter::install_filter)
+                .unwrap_or(-1);
+            crate::send_fd(std::os::fd::AsRawFd::as_raw_fd(&child), fd);
+            unsafe { libc::_exit(0) };
+        }
+        let fd = crate::recv_fd(std::os::fd::AsRawFd::as_raw_fd(&parent)).unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        if fd < 0 {
+            // e.g. WSL: an inherited listener makes installation fail EBUSY.
+            eprintln!("SKIP: seccomp listener unavailable");
+            return;
+        }
+        let start = std::time::Instant::now();
+        assert!(notif_recv(fd).is_err());
+        assert!(listener_done(fd, 1000));
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn passthrough_ends_when_the_listener_is_finished() {
+        exits_cleanly(|| run_passthrough(finished_listener()).unwrap());
     }
 }
