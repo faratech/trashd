@@ -355,37 +355,40 @@ impl Config {
     /// content; its `only_trash` whitelist can cause REAL DELETES of anything
     /// not listed. Only place one in trees you control.
     fn load_local_config(path: &Path) -> Option<LocalConfig> {
+        use crate::local_trust::{LocalConfigFile, read_local_config};
         let mut dir = path.parent()?;
         loop {
+            // A PRESENT local policy that cannot be trusted, read or parsed
+            // must not fall through to an ancestor's narrower (possibly
+            // whitelist-only) rules — that direction turns "trash it" into a
+            // REAL delete. Treat it as "no local policy" and stop the walk,
+            // with a diagnostic that never echoes file content (#198).
             let config_path = dir.join(".trashd.toml");
-            if config_path.is_file() {
-                // A PRESENT local policy that cannot be read or parsed must
-                // not fall through to an ancestor's narrower (possibly
-                // whitelist-only) rules — that direction turns "trash it"
-                // into a REAL delete. Treat the broken file as "no local
-                // policy" and stop the walk, with a diagnostic.
-                let mut local = match std::fs::read_to_string(&config_path) {
-                    Ok(content) => match toml::from_str::<LocalConfig>(&content) {
+            match read_local_config(dir) {
+                LocalConfigFile::Absent => {}
+                LocalConfigFile::Ignored(reason) => {
+                    eprintln!(
+                        "trashd: warning: ignoring {}: it {reason}",
+                        config_path.display()
+                    );
+                    return None;
+                }
+                LocalConfigFile::Content(content) => {
+                    let mut local = match toml::from_str::<LocalConfig>(&content) {
                         Ok(local) => local,
                         Err(e) => {
                             eprintln!(
-                                "trashd: warning: ignoring broken {}: {e}",
-                                config_path.display()
+                                "trashd: warning: ignoring broken {}: {}",
+                                config_path.display(),
+                                e.message()
                             );
                             return None;
                         }
-                    },
-                    Err(e) => {
-                        eprintln!(
-                            "trashd: warning: ignoring unreadable {}: {e}",
-                            config_path.display()
-                        );
-                        return None;
-                    }
-                };
-                local.never_trash = sanitize_patterns(&local.never_trash, "never_trash");
-                local.only_trash = sanitize_patterns(&local.only_trash, "only_trash");
-                return Some(local);
+                    };
+                    local.never_trash = sanitize_patterns(&local.never_trash, "never_trash");
+                    local.only_trash = sanitize_patterns(&local.only_trash, "only_trash");
+                    return Some(local);
+                }
             }
             dir = dir.parent()?; // None at the filesystem root
         }
@@ -693,6 +696,52 @@ mod tests {
         // apply either: without local policy the global (empty) rules decide,
         // so the file is trashed, not skipped.
         assert!(!cfg.should_skip(&victim));
+    }
+
+    /// A project whose local policy would skip (real-delete) everything.
+    fn project_with_local_veto() -> (tempfile::TempDir, PathBuf, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(dir.path().join("veto.toml"), "never_trash = [\"*\"]\n").unwrap();
+        let mut cfg = default_config();
+        cfg.never_trash = Vec::new();
+        (dir, proj, cfg)
+    }
+
+    // Regression (#198, #207): .trashd.toml decides whether deletes are
+    // permanent, so only a regular file the deleting user (or root) owns and
+    // nobody else can write counts. A symlink could also point root's reader
+    // at /etc/shadow (echoed by parse errors) or /proc/kmsg (blocks forever).
+    #[test]
+    fn symlinked_local_config_is_ignored() {
+        let (dir, proj, cfg) = project_with_local_veto();
+        std::os::unix::fs::symlink(dir.path().join("veto.toml"), proj.join(".trashd.toml"))
+            .unwrap();
+        assert!(!cfg.should_skip(&proj.join("file")));
+    }
+
+    #[test]
+    fn writable_local_config_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, proj, cfg) = project_with_local_veto();
+        let local = proj.join(".trashd.toml");
+        std::fs::copy(dir.path().join("veto.toml"), &local).unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!cfg.should_skip(&proj.join("file")));
+    }
+
+    #[test]
+    fn foreign_owned_local_config_is_ignored() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: changing a file's owner requires root");
+            return;
+        }
+        let (dir, proj, cfg) = project_with_local_veto();
+        let local = proj.join(".trashd.toml");
+        std::fs::copy(dir.path().join("veto.toml"), &local).unwrap();
+        std::os::unix::fs::chown(&local, Some(65534), Some(65534)).unwrap();
+        assert!(!cfg.should_skip(&proj.join("file")));
     }
 
     #[test]

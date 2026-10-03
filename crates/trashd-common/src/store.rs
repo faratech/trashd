@@ -10,7 +10,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use xxhash_rust::xxh3::Xxh3;
@@ -446,44 +446,56 @@ impl TrashStore {
                 if is_conflict_error(&rename_error) {
                     return Err(rename_error.into());
                 }
-                // Cross-filesystem fallback — order matters: check symlink first
-                if meta.file_type().is_symlink() {
-                    let link_target = fs::read_link(&abs_path)?;
-                    std::os::unix::fs::symlink(&link_target, &dest)?;
-                    created_identity = file_identity(&dest);
-                } else if meta.is_dir() {
-                    copy_tree(&abs_path, &dest, &mut created_identity)?;
-                } else if meta.file_type().is_fifo() {
-                    // Recreate the FIFO — fs::copy on one blocks forever
-                    // waiting for a writer (#11). A failed recreation must
-                    // release nothing: copy_done stays false, so the rollback
-                    // below keeps the source instead of unlinking it.
-                    use std::os::unix::ffi::OsStrExt;
-                    let c = std::ffi::CString::new(dest.as_os_str().as_bytes())
-                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-                    if unsafe { libc::mkfifo(c.as_ptr(), (meta.mode() & 0o7777) as libc::mode_t) }
-                        != 0
-                    {
-                        return Err(io::Error::last_os_error().into());
-                    }
-                } else if meta.file_type().is_char_device()
-                    || meta.file_type().is_block_device()
-                    || meta.file_type().is_socket()
-                {
-                    // No CAP_MKNOD / no persistent data — refuse rather than
-                    // fall through to fs::copy on a device node.
-                    return Err(
-                        io::Error::other("cannot trash device node across filesystems").into(),
-                    );
-                } else {
-                    copy_regular_verified(
-                        &abs_path,
-                        &dest,
-                        (meta.dev(), meta.ino()),
-                        &mut created_identity,
-                    )?;
-                    fs::set_permissions(&dest, meta.permissions())?;
+                // Only a cross-device move or an unsupported RENAME_NOREPLACE
+                // calls for copying. EACCES/EPERM/EROFS would make the source
+                // removal fail as well and only strand a copy (#204).
+                if !is_copy_fallback_error(&rename_error) {
+                    return Err(rename_error.into());
                 }
+                // Copy through pinned descriptors, then retire ONLY what was
+                // copied. Re-walking the path afterwards permanently deleted
+                // files created during the copy, a tree or file replaced
+                // meanwhile, and nodes the copy had skipped (#192).
+                let parent = abs_path.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "source has no parent")
+                })?;
+                let name = CString::new(
+                    abs_path
+                        .file_name()
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
+                        .as_bytes(),
+                )
+                .map_err(io::Error::from)?;
+                let parent =
+                    CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::from)?;
+                let source_parent = open_directory_at(libc::AT_FDCWD, &parent, false, false)?;
+                let files_dir = CString::new(trash_dir.join("files").as_os_str().as_bytes())
+                    .map_err(io::Error::from)?;
+                let files = open_directory_at(libc::AT_FDCWD, &files_dir, true, false)?;
+                let id_name = CString::new(id.as_bytes()).map_err(io::Error::from)?;
+                let source = stat_at(source_parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)?;
+                if stat_identity(&source) != (meta.dev(), meta.ino()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "source changed before the cross-device copy",
+                    )
+                    .into());
+                }
+                let snapshot = if source.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    Some(snapshot_directory_at(source_parent.as_raw_fd(), &name)?)
+                } else {
+                    None
+                };
+                created_identity = Some(copy_source_at(
+                    source_parent.as_raw_fd(),
+                    &name,
+                    files.as_raw_fd(),
+                    &id_name,
+                    &source,
+                )?);
+                // The copy's data is synced; make its directory entry durable
+                // before the source can disappear.
+                files.sync_all()?;
                 copy_done = true;
                 if trash_dir == home_trash
                     && let Some(idx) = self.index.as_ref()
@@ -493,14 +505,23 @@ impl TrashStore {
                 // Source retirement can trap into a seccomp supervisor that
                 // needs this same root lock. The recovery pair is committed.
                 drop(guard.take());
-                // Remove the original with RAW SYSCALLS: under a system-wide
-                // LD_PRELOAD install the calling process is itself hooked, and
-                // ordinary unlinkat/rmdir wrappers here would be re-intercepted —
-                // trashing the source a SECOND time on top of the copy (#104).
-                if meta.file_type().is_symlink() || meta.is_file() {
-                    raw_unlink_at(&abs_path)?;
-                } else {
-                    raw_remove_tree_at(&abs_path, 0)?;
+                // Raw syscalls throughout: the system-wide preload would
+                // otherwise trash the source a second time (#104).
+                let complete = match &snapshot {
+                    Some(before) => retire_directory_snapshot_at(
+                        source_parent.as_raw_fd(),
+                        &name,
+                        stat_identity(&source),
+                        before,
+                        false,
+                    )?,
+                    None => retire_copied_node_at(source_parent.as_raw_fd(), &name, &source)?,
+                };
+                if !complete {
+                    return Err(io::Error::other(
+                        "files that changed while being moved were left in place",
+                    )
+                    .into());
                 }
             }
             Ok(())
@@ -699,9 +720,9 @@ impl TrashStore {
 
         self.ensure_trash_dir(&trash_dir)?;
 
-        // The trash files/ dir must be on the SAME filesystem as the pinned
-        // inode or renameat would cross devices; surface that distinctly so
-        // the supervisor can continue the target's original syscall.
+        // A trash on another filesystem cannot take a rename; the copy
+        // fallback below handles it instead of continuing the target's
+        // syscall, which made such deletes permanent (#195).
         let files_dir = trash_dir.join("files");
         let c_files_dir = match std::ffi::CString::new(files_dir.as_os_str().as_bytes()) {
             Ok(c) => c,
@@ -721,10 +742,7 @@ impl TrashStore {
             unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(io::Error::last_os_error()));
         }
-        if fstat_files.st_dev as u64 != file_dev {
-            unsafe { libc::close(files_fd) };
-            return Err(TrashError::Io(io::Error::from_raw_os_error(libc::EXDEV)));
-        }
+        let cross_device = fstat_files.st_dev as u64 != file_dev;
 
         let trashinfo_path = Self::compute_trashinfo_path(&trash_dir, &display_path, &home_trash);
         let mut info = TrashInfo::new(trashinfo_path);
@@ -832,7 +850,9 @@ impl TrashStore {
             )));
         }
         // THE MOVE (#6): kernel-resolved against pinned inodes on both sides.
-        let rc = unsafe {
+        let moved = if cross_device {
+            Err(io::Error::from_raw_os_error(libc::EXDEV))
+        } else if unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
                 parent_fd,
@@ -841,14 +861,71 @@ impl TrashStore {
                 cid.as_ptr(),
                 libc::RENAME_NOREPLACE,
             )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         };
-        if rc != 0 {
-            unsafe { libc::close(files_fd) };
-            let e = io::Error::last_os_error();
-            // Nothing partial was created at dest (rename is atomic); just
-            // release the claimed .trashinfo.
-            let _ = fs::remove_file(&info_file);
-            return Err(TrashError::Io(e));
+        let mut copied = false;
+        if let Err(e) = moved {
+            // Nothing partial was created at dest (rename is atomic).
+            if !is_copy_fallback_error(&e) {
+                unsafe { libc::close(files_fd) };
+                let _ = fs::remove_file(&info_file);
+                return Err(TrashError::Io(e));
+            }
+            // Another filesystem, or one without RENAME_NOREPLACE (NFS, 9p):
+            // copy from the pinned parent and retire exactly what was copied
+            // (#192). The preload has deferred to this supervisor, so handing
+            // the syscall back made these deletes permanent (#195).
+            let copy = (|| {
+                let snapshot = if is_dir {
+                    Some(snapshot_directory_at(parent_fd, &cname)?)
+                } else {
+                    None
+                };
+                copy_source_at(parent_fd, &cname, files_fd, &cid, &stat)?;
+                if unsafe { libc::fsync(files_fd) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(snapshot)
+            })();
+            let snapshot = match copy {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    unsafe { libc::close(files_fd) };
+                    let _ = fs::remove_file(&info_file);
+                    return Err(TrashError::Io(e));
+                }
+            };
+            copied = true;
+            // The entry is complete from here on. A failed or partial source
+            // removal keeps it: the target's own syscall then decides, and at
+            // worst a duplicate remains in the trash.
+            let retired = match &snapshot {
+                Some(before) => retire_directory_snapshot_at(
+                    parent_fd,
+                    &cname,
+                    stat_identity(&stat),
+                    before,
+                    false,
+                ),
+                None => retire_copied_node_at(parent_fd, &cname, &stat),
+            };
+            match retired {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "trashd: warning: parts of '{}' changed while being moved and were left in place",
+                    display_path.display()
+                ),
+                Err(e) => {
+                    unsafe { libc::close(files_fd) };
+                    return Err(TrashError::Io(io::Error::other(format!(
+                        "copied to trash but could not remove the source: {e}"
+                    ))));
+                }
+            }
         }
 
         // The move completed: make sure a concurrent purge did not strip the
@@ -865,27 +942,31 @@ impl TrashStore {
         // st_size overwrite stays index-only so `trash ls` keeps showing the
         // pre-move recursive size for directories.
         let mut persisted_refresh = false;
-        if unsafe {
-            libc::fstatat(
-                files_fd,
-                cid.as_ptr(),
-                &mut moved_stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-        {
-            if moved_stat.st_ino != stat.st_ino || moved_stat.st_dev != stat.st_dev {
-                info.size = Some(moved_stat.st_size as u64);
+        // A copy is a new inode by design; its version was verified while
+        // copying, so only a rename gets this check.
+        if !copied {
+            if unsafe {
+                libc::fstatat(
+                    files_fd,
+                    cid.as_ptr(),
+                    &mut moved_stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                if moved_stat.st_ino != stat.st_ino || moved_stat.st_dev != stat.st_dev {
+                    info.size = Some(moved_stat.st_size as u64);
+                    info.sha256 = None;
+                    persisted_refresh = true;
+                } else if is_dir {
+                    info.size = Some(moved_stat.st_size as u64);
+                }
+            } else {
+                // What landed cannot be verified — drop the hash so restore does
+                // not compare new content against the pre-move hash forever.
                 info.sha256 = None;
                 persisted_refresh = true;
-            } else if is_dir {
-                info.size = Some(moved_stat.st_size as u64);
             }
-        } else {
-            // What landed cannot be verified — drop the hash so restore does
-            // not compare new content against the pre-move hash forever.
-            info.sha256 = None;
-            persisted_refresh = true;
         }
         // Persist the refresh: list()/restore() treat the .trashinfo sidecar
         // as the source of truth, so a hash/size corrected only in memory
@@ -1578,8 +1659,8 @@ impl TrashStore {
             .iter()
             .enumerate()
             .filter(|(i, _)| !purged[*i])
-            .map(|(_, e)| entry_disk_size(e))
-            .sum();
+            .map(|(_, e)| self.entry_disk_size(e))
+            .fold(0u64, u64::saturating_add);
         // max_size_gb == 0 means "no size limit", not "trim everything to 0".
         if max_size_bytes > 0 && total_size > max_size_bytes {
             let mut freed = 0u64;
@@ -1594,9 +1675,9 @@ impl TrashStore {
                 // Only count a purge that actually happened: a failed removal
                 // must stay in the accounting (and out of the freed total), or
                 // the trash silently exceeds max_size_gb (#106).
-                let size = entry_disk_size(&entries[i]);
+                let size = self.entry_disk_size(&entries[i]);
                 if self.purge_entry(&entries[i]).is_ok() {
-                    freed += size;
+                    freed = freed.saturating_add(size);
                     purged[i] = true;
                     purge_count += 1;
                 }
@@ -1713,7 +1794,7 @@ impl TrashStore {
                 });
             ps.count += 1;
             // Use actual disk size (may be smaller than info.size after compression)
-            ps.total_size += entry_disk_size(entry);
+            ps.total_size = ps.total_size.saturating_add(self.entry_disk_size(entry));
         }
 
         let mut result: Vec<PartitionStatus> = partitions.into_values().collect();
@@ -1725,9 +1806,45 @@ impl TrashStore {
     pub fn status(&self) -> Result<(u64, usize), TrashError> {
         let entries = self.list(None)?;
         // Use actual disk size (reflects compression savings)
-        let total_size: u64 = entries.iter().map(entry_disk_size).sum();
+        let total_size = entries
+            .iter()
+            .map(|entry| self.entry_disk_size(entry))
+            .fold(0u64, u64::saturating_add);
         let count = entries.len();
         Ok((total_size, count))
+    }
+
+    /// On-disk size of a trash entry for retention accounting and status.
+    ///
+    /// `fs::metadata().len()` on a DIRECTORY is the size of its inode (~4 KB),
+    /// not the tree — trusting it made auto-purge "free" only 4096 bytes per
+    /// purged tree and keep deleting far past the configured excess, and made
+    /// directory-heavy trashes look nearly empty. Directory trees therefore use
+    /// their recorded recursive size (`info.size`, captured by `dir_size()` at
+    /// trash time). Symlinks are never followed: a trashed link must count as
+    /// itself, not its target.
+    fn entry_disk_size(&self, entry: &TrashEntry) -> u64 {
+        match fs::symlink_metadata(&entry.trashed_path) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+                // Foreign (spec-compliant) entries carry no X-Trashd-Size; falling
+                // back to the directory INODE size under-counted each foreign tree
+                // at ~4 KiB, so retention never trimmed directory-heavy trashes
+                // (#115). Use the same capped walk trash-time sizing uses.
+                //
+                // The recorded size is sidecar text: only the private home trash
+                // is written by this user alone. A topdir root (removable media)
+                // may carry a forged value that would make the size cap purge
+                // every other root, so it never exceeds the measured tree (#193).
+                match entry.info.size {
+                    Some(recorded) if entry.trash_root == self.home => recorded,
+                    Some(recorded) => recorded.min(dir_size(&entry.trashed_path)),
+                    None => dir_size(&entry.trashed_path),
+                }
+            }
+            Ok(m) => m.len(),
+            // No data, nothing occupies the disk.
+            Err(_) => 0,
+        }
     }
 
     /// All known trash directories (home + per-mountpoint).
@@ -2229,40 +2346,6 @@ fn hash_file_verified(path: &Path, algorithm: &str, expect: (u64, u64)) -> io::R
     hash_reader(file, algorithm)
 }
 
-/// Cross-device trash copy for a regular file, with the same race hardening
-/// as [`hash_file_verified`]: the source is opened no-follow/non-blocking and
-/// its identity re-checked, so a swapped FIFO cannot block the copy and a
-/// swapped symlink cannot be read through. The destination is claimed
-/// exclusively; a failed copy leaves the partial dest for the caller's
-/// rollback to remove.
-fn copy_regular_verified(
-    src: &Path,
-    dst: &Path,
-    expect: (u64, u64),
-    created: &mut Option<(u64, u64)>,
-) -> io::Result<()> {
-    let mut input = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(src)?;
-    let m = input.metadata()?;
-    if !m.is_file() || (m.dev(), m.ino()) != expect {
-        return Err(io::Error::other(
-            "target changed while copying to the trash",
-        ));
-    }
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .mode(0o600)
-        .open(dst)?;
-    let metadata = output.metadata()?;
-    *created = Some((metadata.dev(), metadata.ino()));
-    io::copy(&mut input, &mut output)?;
-    Ok(())
-}
-
 fn hash_reader(mut file: impl Read, algorithm: &str) -> io::Result<String> {
     const CHUNK: usize = 256 * 1024;
     let mut buf = vec![0u8; CHUNK];
@@ -2344,269 +2427,39 @@ fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
 /// wrappers are deliberately avoided here: under a system-wide LD_PRELOAD the
 /// calling process is itself interposed, and an ordinary remove would trash
 /// the source a second time during cross-device cleanup (#104).
-fn raw_unlink_at(path: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    // libc::syscall — NOT the libc::unlinkat wrapper, which is an
-    // interposable symbol the preload hooks (that was the whole point).
-    if unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), 0) } == 0 {
+/// unlinkat(2) as a raw syscall. Store-internal removals must never go
+/// through the interposable libc wrapper: under a system-wide LD_PRELOAD the
+/// hook would trash them again (#104, #192, #196).
+fn raw_unlinkat(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::syscall(libc::SYS_unlinkat, parent, name.as_ptr(), flags) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
 }
 
-/// Recursively remove a directory tree with raw *at syscalls relative to
-/// pinned descriptors (see [`raw_unlink_at`] for why libc wrappers are
-/// avoided). Depth-limited like copy_tree.
-fn raw_remove_tree_at(path: &Path, depth: u32) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    const MAX_DEPTH: u32 = COPY_TREE_MAX_DEPTH;
-    if depth > MAX_DEPTH {
-        return Err(io::Error::other(format!(
-            "directory tree too deep (>{MAX_DEPTH} levels) — possible cycle"
-        )));
+/// Retire a copied non-directory source only if it is still exactly the
+/// version that was copied (#192). A replaced or modified file is the user's
+/// newer data: it stays, and the caller reports an incomplete move. A source
+/// that is already gone counts as retired.
+fn retire_copied_node_at(parent: RawFd, name: &CStr, copied: &libc::stat) -> io::Result<bool> {
+    match stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(current) if same_source_version(copied, &current) => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(true),
+        Err(error) => return Err(error),
     }
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe {
-        libc::syscall(
-            libc::SYS_newfstatat,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            &mut st as *mut libc::stat,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
+    match raw_unlinkat(parent, name, 0) {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(true),
+        Err(error) => Err(error),
     }
-    // A swapped symlink is unlinked as a file, never traversed.
-    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return raw_unlink_at(path);
-    }
-    // Open NOFOLLOW: a symlink swapped in between the fstatat above and this
-    // open must never be traversed — recursing into its target would gut an
-    // unrelated directory (round-3 regression review). ELOOP/ENOTDIR mean the
-    // name now names a symlink or non-directory: unlink THAT.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        let e = io::Error::last_os_error();
-        if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
-            return raw_unlink_at(path);
-        }
-        return Err(e);
-    }
-    let fd = fd as RawFd;
-    // Identity re-check: the fd must be the inode we just statted.
-    let mut opened: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::syscall(libc::SYS_fstat, fd, &mut opened as *mut libc::stat) } != 0
-        || opened.st_dev != st.st_dev
-        || opened.st_ino != st.st_ino
-    {
-        unsafe { libc::close(fd) };
-        return Err(io::Error::other("target changed while removing"));
-    }
-    let result = raw_remove_tree_fd(fd, depth);
-    unsafe { libc::close(fd) };
-    result?;
-    // ENOENT on the final rmdir: something else removed it first — done (std
-    // remove_dir_all tolerates the same).
-    if unsafe {
-        libc::syscall(
-            libc::SYS_unlinkat,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            libc::AT_REMOVEDIR,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ENOENT) {
-            Ok(())
-        } else {
-            Err(e)
-        }
-    }
-}
-
-fn raw_remove_tree_fd(dir_fd: RawFd, depth: u32) -> io::Result<()> {
-    if depth > COPY_TREE_MAX_DEPTH {
-        return Err(io::Error::other(format!(
-            "directory tree too deep (>{} levels) — possible cycle",
-            COPY_TREE_MAX_DEPTH
-        )));
-    }
-    for name in read_directory_names(dir_fd)? {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe {
-            libc::syscall(
-                libc::SYS_newfstatat,
-                dir_fd,
-                name.as_ptr(),
-                &mut st as *mut libc::stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            // A concurrent remover got here first — std tolerates ENOENT too.
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::ENOENT) {
-                continue;
-            }
-            return Err(e);
-        }
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            // NOFOLLOW: never traverse a child swapped to a symlink (round-3
-            // regression review); ELOOP/ENOTDIR → unlink the entry itself.
-            let child = unsafe {
-                libc::syscall(
-                    libc::SYS_openat,
-                    dir_fd,
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                )
-            };
-            if child < 0 {
-                let e = io::Error::last_os_error();
-                if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
-                    if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), 0) } != 0 {
-                        let e = io::Error::last_os_error();
-                        if e.raw_os_error() != Some(libc::ENOENT) {
-                            return Err(e);
-                        }
-                    }
-                    continue;
-                }
-                if e.raw_os_error() == Some(libc::ENOENT) {
-                    continue;
-                }
-                return Err(e);
-            }
-            let child = child as RawFd;
-            let mut opened: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::syscall(libc::SYS_fstat, child, &mut opened as *mut libc::stat) } != 0
-                || opened.st_dev != st.st_dev
-                || opened.st_ino != st.st_ino
-            {
-                unsafe { libc::close(child) };
-                return Err(io::Error::other("child changed while removing"));
-            }
-            let result = raw_remove_tree_fd(child, depth + 1);
-            unsafe { libc::close(child) };
-            result?;
-            if unsafe {
-                libc::syscall(
-                    libc::SYS_unlinkat,
-                    dir_fd,
-                    name.as_ptr(),
-                    libc::AT_REMOVEDIR,
-                )
-            } != 0
-            {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::ENOENT) {
-                    return Err(e);
-                }
-            }
-        } else if unsafe { libc::syscall(libc::SYS_unlinkat, dir_fd, name.as_ptr(), 0) } != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::ENOENT) {
-                return Err(e);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Copy a directory tree preserving symlinks and permissions.
 /// Depth-limited to prevent infinite recursion from symlink loops or
 /// bind mounts creating cycles.
 const COPY_TREE_MAX_DEPTH: u32 = 100;
-
-fn copy_tree(src: &Path, dst: &Path, created: &mut Option<(u64, u64)>) -> io::Result<()> {
-    copy_tree_inner(src, dst, 0, created)
-}
-
-fn copy_tree_inner(
-    src: &Path,
-    dst: &Path,
-    depth: u32,
-    created: &mut Option<(u64, u64)>,
-) -> io::Result<()> {
-    if depth > COPY_TREE_MAX_DEPTH {
-        return Err(io::Error::other(format!(
-            "directory tree too deep (>{COPY_TREE_MAX_DEPTH} levels) — possible cycle"
-        )));
-    }
-
-    let meta = fs::symlink_metadata(src)?;
-    fs::create_dir(dst)?;
-    if depth == 0 {
-        *created = file_identity(dst);
-    }
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let entry_meta = fs::symlink_metadata(entry.path())?;
-        let dest_path = dst.join(entry.file_name());
-
-        if entry_meta.file_type().is_symlink() {
-            // Re-create symlink (don't follow it)
-            let link_target = fs::read_link(entry.path())?;
-            std::os::unix::fs::symlink(&link_target, &dest_path)?;
-        } else if entry_meta.is_dir() {
-            copy_tree_inner(&entry.path(), &dest_path, depth + 1, created)?;
-        } else if entry_meta.file_type().is_fifo() {
-            // Recreate the named pipe so the directory round-trips on restore.
-            // (A FIFO carries no persistent data; fs::copy on one would block.)
-            // A silent failure here would drop the FIFO from the copy while
-            // the caller still removes the original tree.
-            use std::os::unix::ffi::OsStrExt;
-            let c = std::ffi::CString::new(dest_path.as_os_str().as_bytes())?;
-            if unsafe { libc::mkfifo(c.as_ptr(), (entry_meta.mode() & 0o7777) as libc::mode_t) }
-                != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        } else if entry_meta.file_type().is_char_device()
-            || entry_meta.file_type().is_block_device()
-            || entry_meta.file_type().is_socket()
-        {
-            // Device nodes need CAP_MKNOD to recreate and sockets are kernel
-            // rendezvous objects with no persistent data — skip them.
-        } else {
-            // Verified open (no-follow, non-blocking, identity re-check): a
-            // racer swapping a child for a FIFO must not block the copy and a
-            // symlink swap must not be read through (#111).
-            copy_regular_verified(
-                entry.path().as_path(),
-                &dest_path,
-                (entry_meta.dev(), entry_meta.ino()),
-                &mut None,
-            )?;
-            fs::set_permissions(&dest_path, entry_meta.permissions())?;
-        }
-    }
-
-    // Copy the directory's own permissions AFTER populating it: applying the
-    // source mode first would make read-only trees (e.g. mode 0555) fail on
-    // their very first child write — both when trashing cross-device and when
-    // restoring — leaving partial copies behind (#24). cp -a does the same.
-    fs::set_permissions(dst, meta.permissions())?;
-    Ok(())
-}
 
 /// Write `data` to `path` atomically: write to a temp file in the same
 /// directory, then rename over `path`. A crash / ENOSPC / kill mid-write can
@@ -2639,7 +2492,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 /// True when a data-absent entry is old enough for purge/empty to treat as
 /// fully retired. `trash()` writes the sidecar BEFORE the data lands, so a
 /// freshly-written data-absent sidecar may be an in-flight trash (the
-/// cross-device copy_tree window spans seconds) — stripping its sidecar
+/// cross-device copy window spans seconds) — stripping its sidecar
 /// would strand the completed move as an unrestorable orphan (#169).
 fn data_absence_is_retired(info_path: &Path) -> bool {
     const GRACE_SECS: u64 = 5;
@@ -2957,6 +2810,46 @@ fn is_copy_fallback_error(error: &io::Error) -> bool {
     )
 }
 
+/// Copy one source node into the trash for the cross-device path. Device
+/// nodes and sockets cannot be reproduced, so they abort the copy and nothing
+/// is retired, instead of being skipped and then deleted (#192).
+fn copy_source_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    source: &libc::stat,
+) -> io::Result<(u64, u64)> {
+    match source.st_mode & libc::S_IFMT {
+        libc::S_IFREG => copy_regular_at(src_parent, src_name, dst_parent, dst_name, source),
+        libc::S_IFLNK => copy_symlink_at(src_parent, src_name, dst_parent, dst_name, source),
+        libc::S_IFDIR => copy_directory_at(src_parent, src_name, dst_parent, dst_name, source, 0),
+        libc::S_IFIFO => {
+            if unsafe {
+                libc::mkfifoat(
+                    dst_parent,
+                    dst_name.as_ptr(),
+                    (source.st_mode & 0o7777) as libc::mode_t,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let identity =
+                stat_identity(&stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW)?);
+            validate_created_node(dst_parent, dst_name, libc::S_IFIFO, identity)?;
+            if let Err(error) = apply_node_metadata_at(dst_parent, dst_name, source) {
+                let _ = remove_created_at(dst_parent, dst_name, identity);
+                return Err(error);
+            }
+            Ok(identity)
+        }
+        _ => Err(io::Error::other(
+            "cannot trash device nodes or sockets across filesystems",
+        )),
+    }
+}
+
 /// Cross-device/unsupported-rename publication. Every destination node is
 /// claimed exclusively, and the source is retained until the entire copy is
 /// complete.
@@ -3028,7 +2921,13 @@ fn publish_copy_noreplace(
             // Retire only the exact source nodes captured before the copy.
             // New or replaced children are left in a residual orphan instead
             // of being deleted without ever reaching the destination.
-            match retire_directory_snapshot_at(src_parent, src_name, expected_identity, &before) {
+            match retire_directory_snapshot_at(
+                src_parent,
+                src_name,
+                expected_identity,
+                &before,
+                true,
+            ) {
                 Ok(true) => {}
                 Ok(false) => eprintln!(
                     "trashd: warning: restored directory but its trash copy changed during retirement; keeping the unmatched remainder as an orphan"
@@ -3092,12 +2991,11 @@ fn unlink_source_or_rollback(
             "restore destination changed before source retirement",
         ));
     }
-    if unsafe { libc::unlinkat(src_parent, src_name.as_ptr(), 0) } == 0 {
-        return Ok(());
+    if let Err(error) = raw_unlinkat(src_parent, src_name, 0) {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(error);
     }
-    let error = io::Error::last_os_error();
-    let _ = remove_created_at(dst_parent, dst_name, destination_identity);
-    Err(error)
+    Ok(())
 }
 
 fn copy_regular_at(
@@ -3381,6 +3279,7 @@ fn copy_node_at(
 }
 
 fn apply_fd_metadata(fd: RawFd, source: &libc::stat) -> io::Result<()> {
+    let mut mode = source.st_mode & 0o7777;
     if unsafe { libc::fchown(fd, source.st_uid, source.st_gid) } != 0 {
         let error = io::Error::last_os_error();
         if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
@@ -3388,15 +3287,19 @@ fn apply_fd_metadata(fd: RawFd, source: &libc::stat) -> io::Result<()> {
         {
             return Err(error);
         }
+        // Set-id bits belong to the original owner; on a copy owned by
+        // someone else they would grant that owner's privileges (#203).
+        mode &= !0o6000;
     }
     // chown may clear set-id bits, so permissions are always applied last.
-    if unsafe { libc::fchmod(fd, source.st_mode & 0o7777) } != 0 {
+    if unsafe { libc::fchmod(fd, mode) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
 fn apply_node_metadata_at(parent: RawFd, name: &CStr, source: &libc::stat) -> io::Result<()> {
+    let mut mode = source.st_mode & 0o7777;
     if unsafe { libc::fchownat(parent, name.as_ptr(), source.st_uid, source.st_gid, 0) } != 0 {
         let error = io::Error::last_os_error();
         if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
@@ -3404,8 +3307,9 @@ fn apply_node_metadata_at(parent: RawFd, name: &CStr, source: &libc::stat) -> io
         {
             return Err(error);
         }
+        mode &= !0o6000; // see apply_fd_metadata (#203)
     }
-    if unsafe { libc::fchmodat(parent, name.as_ptr(), source.st_mode & 0o7777, 0) } != 0 {
+    if unsafe { libc::fchmodat(parent, name.as_ptr(), mode, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -3520,10 +3424,13 @@ fn remove_created_at(parent: RawFd, name: &CStr, expected: (u64, u64)) -> io::Re
     if !identity_matches_at(parent, name, expected) {
         return Ok(());
     }
-    if unsafe { libc::unlinkat(parent, name.as_ptr(), flags) } == 0 {
+    // A raw syscall, NOT the interposable libc wrapper: this rollback runs
+    // with the trash-root lock held, and under a system-wide LD_PRELOAD the
+    // hooked wrapper trashed the half-written destination or blocked on that
+    // same lock (#196, as #104 for source retirement).
+    let Err(error) = raw_unlinkat(parent, name, flags) else {
         return Ok(());
-    }
-    let error = io::Error::last_os_error();
+    };
     if flags == libc::AT_REMOVEDIR && error.raw_os_error() == Some(libc::ENOTEMPTY) {
         Ok(())
     } else {
@@ -3564,11 +3471,16 @@ fn is_direct_snapshot_child(path: &[u8], prefix: &[u8]) -> bool {
     !remainder.is_empty() && !remainder.contains(&b'/')
 }
 
+/// Remove exactly the nodes captured in `snapshot`; anything new or changed
+/// stays (its parents too). `make_writable` lets restore retire trash
+/// directories whose modes it owns; the trash direction never changes the
+/// modes of directories it may leave behind in the user's tree (#192).
 fn retire_directory_snapshot_at(
     parent: RawFd,
     name: &CStr,
     expected_root: (u64, u64),
     snapshot: &[DirectorySnapshotEntry],
+    make_writable: bool,
 ) -> io::Result<bool> {
     let stat = stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW)?;
     if stat_identity(&stat) != expected_root || stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
@@ -3578,16 +3490,16 @@ fn retire_directory_snapshot_at(
     if stat_identity(&stat_fd(directory.as_raw_fd())?) != expected_root {
         return Ok(false);
     }
-    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+    if make_writable && unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let complete = retire_snapshot_directory_fd(directory.as_raw_fd(), &[], snapshot)?;
+    let complete =
+        retire_snapshot_directory_fd(directory.as_raw_fd(), &[], snapshot, make_writable)?;
     drop(directory);
     if !complete || !identity_matches_at(parent, name, expected_root) {
         return Ok(false);
     }
-    if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        let error = io::Error::last_os_error();
+    if let Err(error) = raw_unlinkat(parent, name, libc::AT_REMOVEDIR) {
         if matches!(
             error.raw_os_error(),
             Some(libc::ENOTEMPTY) | Some(libc::ENOENT)
@@ -3603,6 +3515,7 @@ fn retire_snapshot_directory_fd(
     directory: RawFd,
     prefix: &[u8],
     snapshot: &[DirectorySnapshotEntry],
+    make_writable: bool,
 ) -> io::Result<bool> {
     let expected_children: std::collections::BTreeSet<Vec<u8>> = snapshot
         .iter()
@@ -3619,7 +3532,7 @@ fn retire_snapshot_directory_fd(
             continue;
         };
         seen.insert(path.clone());
-        if !retire_snapshot_node_at(directory, &name, &path, expected, snapshot)? {
+        if !retire_snapshot_node_at(directory, &name, &path, expected, snapshot, make_writable)? {
             complete = false;
         }
     }
@@ -3635,6 +3548,7 @@ fn retire_snapshot_node_at(
     path: &[u8],
     expected: &DirectorySnapshotEntry,
     snapshot: &[DirectorySnapshotEntry],
+    make_writable: bool,
 ) -> io::Result<bool> {
     let stat = match stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW) {
         Ok(stat) if snapshot_entry_matches(expected, &stat) => stat,
@@ -3648,35 +3562,39 @@ fn retire_snapshot_node_at(
         if stat_identity(&stat_fd(directory.as_raw_fd())?) != stat_identity(&stat) {
             return Ok(false);
         }
-        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        if make_writable && unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let complete = retire_snapshot_directory_fd(directory.as_raw_fd(), path, snapshot)?;
+        let complete =
+            retire_snapshot_directory_fd(directory.as_raw_fd(), path, snapshot, make_writable)?;
         drop(directory);
         if !complete || !identity_matches_at(parent, name, stat_identity(&stat)) {
             return Ok(false);
         }
-        if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
-            return Ok(true);
-        }
+        retired(raw_unlinkat(parent, name, libc::AT_REMOVEDIR))
     } else {
         let current = stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW)?;
         if !snapshot_entry_matches(expected, &current) {
             return Ok(false);
         }
-        if unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } == 0 {
-            return Ok(true);
-        }
+        retired(raw_unlinkat(parent, name, 0))
     }
+}
 
-    let error = io::Error::last_os_error();
-    if matches!(
-        error.raw_os_error(),
-        Some(libc::ENOTEMPTY) | Some(libc::ENOENT)
-    ) {
-        Ok(false)
-    } else {
+/// A removal racing another remover (ENOENT) or a directory that gained
+/// entries (ENOTEMPTY) is "not retired", not a failure.
+fn retired(result: io::Result<()>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
         Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTEMPTY) | Some(libc::ENOENT)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -3827,32 +3745,6 @@ fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
         }
     }
     None
-}
-
-/// On-disk size of a trash entry for retention accounting and status.
-///
-/// `fs::metadata().len()` on a DIRECTORY is the size of its inode (~4 KB),
-/// not the tree — trusting it made auto-purge "free" only 4096 bytes per
-/// purged tree and keep deleting far past the configured excess, and made
-/// directory-heavy trashes look nearly empty. Directory trees therefore use
-/// their recorded recursive size (`info.size`, captured by `dir_size()` at
-/// trash time). Symlinks are never followed: a trashed link must count as
-/// itself, not its target.
-fn entry_disk_size(entry: &TrashEntry) -> u64 {
-    match fs::symlink_metadata(&entry.trashed_path) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
-            // Foreign (spec-compliant) entries carry no X-Trashd-Size; falling
-            // back to the directory INODE size under-counted each foreign tree
-            // at ~4 KiB, so retention never trimmed directory-heavy trashes
-            // (#115). Use the same capped walk trash-time sizing uses.
-            entry
-                .info
-                .size
-                .unwrap_or_else(|| dir_size(&entry.trashed_path))
-        }
-        Ok(m) => m.len(),
-        Err(_) => entry.info.size.unwrap_or(0),
-    }
 }
 
 /// Get disk usage percentage for the filesystem containing the given path.
@@ -4082,34 +3974,41 @@ mod tests {
     #[test]
     fn copy_publication_never_merges_existing_destinations() {
         let fixture = tempfile::tempdir().unwrap();
-        let source = fixture.path().join("source");
-        let destination = fixture.path().join("existing");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&destination).unwrap();
-        fs::write(source.join("file"), b"new").unwrap();
-        fs::write(destination.join("file"), b"original").unwrap();
-        let mut created = None;
+        fs::create_dir(fixture.path().join("source")).unwrap();
+        fs::create_dir(fixture.path().join("existing")).unwrap();
+        fs::write(fixture.path().join("source/file"), b"new").unwrap();
+        fs::write(fixture.path().join("existing/file"), b"original").unwrap();
+        let parent = fs::File::open(fixture.path()).unwrap();
+        let source_dir = fs::File::open(fixture.path().join("source")).unwrap();
+        let existing_dir = fs::File::open(fixture.path().join("existing")).unwrap();
+        let tree = CString::new("source").unwrap();
+        let existing = CString::new("existing").unwrap();
+        let file = CString::new("file").unwrap();
+
+        let tree_stat = stat_at(parent.as_raw_fd(), &tree, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        let error = copy_source_at(
+            parent.as_raw_fd(),
+            &tree,
+            parent.as_raw_fd(),
+            &existing,
+            &tree_stat,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+        let file_stat = stat_at(source_dir.as_raw_fd(), &file, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        let error = copy_source_at(
+            source_dir.as_raw_fd(),
+            &file,
+            existing_dir.as_raw_fd(),
+            &file,
+            &file_stat,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
         assert_eq!(
-            copy_tree(&source, &destination, &mut created)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
+            fs::read(fixture.path().join("existing/file")).unwrap(),
+            b"original"
         );
-        assert!(created.is_none());
-        assert_eq!(fs::read(destination.join("file")).unwrap(), b"original");
-        assert_eq!(
-            copy_regular_verified(
-                &source.join("file"),
-                &destination.join("file"),
-                file_identity(&source.join("file")).unwrap(),
-                &mut created
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert!(created.is_none());
-        assert_eq!(fs::read(destination.join("file")).unwrap(), b"original");
     }
 
     /// Create a temp file with content in a given directory.
@@ -5574,6 +5473,278 @@ mod tests {
         let restored = store.restore_resolved(&mut chosen, None, true).unwrap();
         assert_eq!(restored, f1);
         assert_eq!(fs::read_to_string(&f1).unwrap(), "newest");
+    }
+
+    /// A fresh directory on a filesystem other than the test stores' (tmpfs
+    /// /dev/shm), forcing trash() onto its cross-device copy path.
+    fn cross_device_dir(name: &str) -> Option<PathBuf> {
+        let store_dev = fs::metadata(env!("CARGO_MANIFEST_DIR")).ok()?.dev();
+        let base = Path::new("/dev/shm");
+        if fs::metadata(base).ok()?.dev() == store_dev {
+            return None;
+        }
+        let dir = base.join(format!("trashd-xdev-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    fn cross_device_store() -> (TrashStore, TempDir) {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
+        fs::create_dir_all(&base).unwrap();
+        let data = TempDir::with_prefix_in("data-", &base).unwrap();
+        let mut config = Config::default();
+        config.never_trash.clear(); // /dev/shm/* is excluded by default
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        let store = TrashStore::open_isolated(&data.path().join("Trash"), config).unwrap();
+        (store, data)
+    }
+
+    // Regression (#192): a node the cross-device copy cannot reproduce (a
+    // socket) was skipped by the copy and then deleted with the source tree.
+    #[test]
+    fn cross_device_trash_never_deletes_what_it_could_not_copy() {
+        let Some(dir) = cross_device_dir("socket") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("file"), "data").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(tree.join("sock")).unwrap();
+        let (store, _data) = cross_device_store();
+        let result = store.trash(&tree, None);
+        let socket_survived = tree.join("sock").exists();
+        let file_survived = tree.join("file").exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err(), "trash reported success: {result:?}");
+        assert!(
+            socket_survived && file_survived,
+            "uncopied source data was deleted"
+        );
+        assert!(
+            store.list(None).unwrap().is_empty(),
+            "a partial entry was left"
+        );
+    }
+
+    fn pinned_parent(dir: &Path) -> fs::File {
+        fs::File::open(dir).unwrap()
+    }
+
+    // Regression (#192): after copying, the source is retired by snapshot:
+    // a file created after the snapshot was never copied and must survive,
+    // and the user's directories keep their modes.
+    #[test]
+    fn source_retirement_keeps_files_created_after_the_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_store, _data, work, _) = test_store();
+        let tree = work.path().join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("early"), "copied").unwrap();
+        fs::write(tree.join("sub/early"), "copied").unwrap();
+        fs::set_permissions(tree.join("sub"), fs::Permissions::from_mode(0o750)).unwrap();
+        let parent = pinned_parent(work.path());
+        let name = CString::new("tree").unwrap();
+        let root =
+            stat_identity(&stat_at(parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW).unwrap());
+        let before = snapshot_directory_at(parent.as_raw_fd(), &name).unwrap();
+        fs::write(tree.join("sub/late"), "never copied").unwrap();
+
+        let complete =
+            retire_directory_snapshot_at(parent.as_raw_fd(), &name, root, &before, false).unwrap();
+        assert!(!complete);
+        assert!(!tree.join("early").exists());
+        assert_eq!(
+            fs::read_to_string(tree.join("sub/late")).unwrap(),
+            "never copied"
+        );
+        let mode = fs::metadata(tree.join("sub")).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o750,
+            "retirement changed a source directory's mode"
+        );
+    }
+
+    // Regression (#192): a single file replaced after it was copied is the
+    // user's new data, not the copied version: it must not be unlinked.
+    #[test]
+    fn source_retirement_keeps_a_replaced_file() {
+        let (_store, _data, work, _) = test_store();
+        let file = work.path().join("file");
+        fs::write(&file, "copied version").unwrap();
+        let parent = pinned_parent(work.path());
+        let name = CString::new("file").unwrap();
+        let copied = stat_at(parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        let replacement = work.path().join("file.new");
+        fs::write(&replacement, "newer version").unwrap();
+        fs::rename(&replacement, &file).unwrap();
+
+        assert!(!retire_copied_node_at(parent.as_raw_fd(), &name, &copied).unwrap());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "newer version");
+    }
+
+    // Regression (#203): the copy path kept set-id bits but not the owner, so
+    // root trashing (and later restoring) another user's set-uid program
+    // produced a root-owned set-uid file in that user's directory.
+    #[test]
+    fn cross_device_copy_never_moves_set_id_bits_to_another_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: changing a file's owner requires root");
+            return;
+        }
+        let Some(dir) = cross_device_dir("setuid") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let tool = dir.join("tool");
+        fs::write(&tool, "#!/bin/sh\\n").unwrap();
+        std::os::unix::fs::chown(&tool, Some(65534), Some(65534)).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o4755)).unwrap();
+        let (store, _data) = cross_device_store();
+        let id = store.trash(&tool, None);
+        let _ = fs::remove_dir_all(&dir);
+        let entry = store.find_entry(&id.unwrap()).unwrap();
+        let meta = fs::symlink_metadata(&entry.trashed_path).unwrap();
+        assert!(
+            meta.uid() == 65534 || meta.mode() & 0o6000 == 0,
+            "set-id bits on a copy owned by uid {}",
+            meta.uid()
+        );
+    }
+
+    /// Set or clear FS_IMMUTABLE_FL on a directory (root only).
+    fn set_immutable(dir: &Path, on: bool) -> bool {
+        const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+        const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
+        const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+        let Ok(file) = fs::File::open(dir) else {
+            return false;
+        };
+        let mut flags: libc::c_int = 0;
+        if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) } != 0 {
+            return false;
+        }
+        flags = if on {
+            flags | FS_IMMUTABLE_FL
+        } else {
+            flags & !FS_IMMUTABLE_FL
+        };
+        unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_SETFLAGS, &flags) == 0 }
+    }
+
+    // Regression (#204): only a cross-device move (or unsupported
+    // RENAME_NOREPLACE) may fall back to copying. An unrenamable source
+    // (EPERM/EACCES/EROFS) cannot be unlinked either: copying it only left
+    // a stray duplicate entry behind.
+    #[test]
+    fn unrenamable_source_is_not_copied_into_the_trash() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: setting the immutable flag requires root");
+            return;
+        }
+        let (store, _data, work, _) = test_store();
+        let locked = work.path().join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let file = create_file(&locked, "file", "kept");
+        if !set_immutable(&locked, true) {
+            eprintln!("SKIP: filesystem does not support the immutable flag");
+            return;
+        }
+        let result = store.trash(&file, None);
+        set_immutable(&locked, false);
+        assert!(result.is_err());
+        assert!(file.exists());
+        assert!(
+            store.list(None).unwrap().is_empty(),
+            "a stray copy was trashed"
+        );
+    }
+
+    // Regression (#192): the successful cross-device path still moves a tree.
+    #[test]
+    fn cross_device_trash_moves_a_tree() {
+        let Some(dir) = cross_device_dir("tree") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let tree = dir.join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/file"), "payload").unwrap();
+        let (store, _data) = cross_device_store();
+        let id = store.trash(&tree, None);
+        let source_left = tree.exists();
+        let _ = fs::remove_dir_all(&dir);
+        let id = id.unwrap();
+        assert!(!source_left, "source tree left behind");
+        let entry = store.find_entry(&id).unwrap();
+        assert_eq!(
+            fs::read_to_string(entry.trashed_path.join("sub/file")).unwrap(),
+            "payload"
+        );
+    }
+
+    // Regression (#193): X-Trashd-Size is sidecar text anyone with a topdir
+    // trash (a USB stick) controls. A forged value there must never exceed
+    // the tree actually on disk, or the size cap purges every other root.
+    #[test]
+    fn forged_topdir_directory_size_is_capped_by_the_measured_tree() {
+        let (store, _data, work, _) = test_store();
+        let tree = work.path().join("topdir-entry");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("small"), "x").unwrap();
+        let mut info = TrashInfo::new(work.path().join("original"));
+        info.size = Some(999_999_999_999_999_999);
+        let entry = TrashEntry {
+            id: "topdir-entry".into(),
+            info,
+            trashed_path: tree.clone(),
+            info_path: work.path().join("topdir-entry.trashinfo"),
+            trash_root: work.path().join(".Trash-1000"),
+            orphaned: false,
+            identity: None,
+            sidecar_version: None,
+        };
+        assert_eq!(store.entry_disk_size(&entry), dir_size(&tree));
+    }
+
+    // Regression (#193): recorded sizes are summed for the size cap; huge
+    // values must saturate instead of overflowing (a debug-build panic).
+    #[test]
+    fn huge_recorded_sizes_saturate_instead_of_overflowing() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
+        fs::create_dir_all(&base).unwrap();
+        let data = TempDir::with_prefix_in("data-", &base).unwrap();
+        let work = TempDir::with_prefix_in("work-", &base).unwrap();
+        let mut config = Config::default();
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 1.0;
+        config.retention.disk_pressure_percent = 0;
+        let store = TrashStore::open_isolated(&data.path().join("Trash"), config).unwrap();
+        for name in ["first", "second"] {
+            let tree = work.path().join(name);
+            fs::create_dir_all(&tree).unwrap();
+            let id = store.trash(&tree, None).unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            let sidecar = fs::read_to_string(&entry.info_path).unwrap();
+            let rewritten: String = sidecar
+                .lines()
+                .map(|line| {
+                    if line.starts_with("X-Trashd-Size=") {
+                        format!("X-Trashd-Size={}", u64::MAX / 2 + 1)
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&entry.info_path, rewritten + "\n").unwrap();
+        }
+        store.auto_purge().unwrap();
+        assert!(store.status().is_ok());
     }
 
     // Regression (#115): a foreign directory entry without X-Trashd-Size must

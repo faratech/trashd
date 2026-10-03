@@ -88,7 +88,7 @@ The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the k
 
 1. **Child** — Installs the BPF seccomp filter via `syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ...)`, passes the notification file descriptor to the parent via `SCM_RIGHTS` over a Unix socketpair, then `execvp()`'s the target command. Explicit wrapping sets `PR_SET_NO_NEW_PRIVS`; `--preserve-privileges` installs using CAP_SYS_ADMIN instead and falls back when unavailable.
 
-2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Absolute paths are confined to the target's pinned root. Relative walks that escape a pinned cwd/dirfd are handed back to the target kernel; the supervisor never retries them through a host-namespace display path. Validates notification IDs to mitigate TOCTOU races.
+2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Absolute paths are confined to the target's pinned root. Relative walks that escape a pinned cwd/dirfd (`..`, symlinks) resolve normally when the target shares the supervisor's root mount and mount namespace; for chrooted or namespaced targets they are handed back to the target kernel, and the supervisor never retries them through a host-namespace display path. A trash on another filesystem (or one without `RENAME_NOREPLACE`, such as NFS) is filled by copying from the pinned parent, as `trash()` does. trashd's own `trash` CLI and rm shim are never intercepted: their deletes are store-internal. Validates notification IDs to mitigate TOCTOU races.
 
 3. **Watchdog** — Holds a `dup()`'d copy of the notification fd. Monitors the supervisor via `waitpid()`. On supervisor death: immediately drains all pending notifications with `CONTINUE` (fail-safe — blocked processes resume with real deletes), then forks a new supervisor. If fork fails, enters emergency passthrough mode (responds `CONTINUE` until no filtered task remains). Once every filtered task has exited, the listener reports hangup and the supervisor and watchdog exit instead of retrying.
 
@@ -275,11 +275,13 @@ Listing, restore, purge, and empty all work across all partitions automatically.
 
 ### Cross-device move mechanics
 
-When `fs::rename()` fails (different filesystems), trashd falls back to copy + delete:
+When the rename cannot work (`EXDEV` across filesystems, or `EINVAL`/`ENOSYS` where `RENAME_NOREPLACE` is unsupported, e.g. NFS or 9p), trashd copies instead. Any other rename error (`EACCES`, `EPERM`, `EROFS`) is returned as is: the source could not be removed either.
 
-1. **Symlinks** — Recreated at the destination via `std::os::unix::fs::symlink()`. The link target is preserved exactly — the symlink itself is moved, not the target.
-2. **Directories** — Recursively copied via `copy_tree()`, which preserves permissions, recreates symlinks (doesn't follow them), and skips special files (FIFOs, devices, sockets). Depth-limited to 100 levels to prevent crashes from symlink loops or bind mount cycles.
-3. **Regular files** — Copied via `fs::copy()`, permissions set after writing (per spec — file might be made unwriteable by its own permissions).
+The copy works through pinned descriptors and never re-resolves the path:
+
+1. **Snapshot** — Directories are snapshotted (device, inode, mode, size, mtime, ctime of every node) before copying.
+2. **Copy** — Regular files, symlinks (recreated, never followed), directories and FIFOs are copied with exclusive creation; each file is checked to be unchanged after copying and synced. Owner, group and mode are preserved where permitted; set-id bits are dropped when the owner cannot be. Device nodes and sockets cannot be reproduced and abort the copy. Depth-limited to 100 levels.
+3. **Retire** — Only nodes that still match the snapshot (or, for a single file, the exact copied version) are removed from the source. Files created or changed during the move stay where they are, and the call reports the move as incomplete while keeping the complete trash entry.
 
 If the copy fails, the orphaned `.trashinfo` and any partial copy are cleaned up before returning the error.
 
@@ -292,7 +294,7 @@ Four layers, each optional, merged in order:
 1. **Hardcoded defaults** — Built into the binary
 2. **Global** `/etc/trashd/config.toml` — Admin-managed, applies to all users
 3. **User** `~/.config/trashd/config.toml` — Personal overrides
-4. **Per-directory** `.trashd.toml` — Project-level rules (searched up to 5 parent levels)
+4. **Per-directory** `.trashd.toml` — Project-level rules (nearest one found walking up to `/`)
 
 **Merge rules:**
 - **Scalars** (retention days, size limits, hash algorithm): user overrides global overrides defaults
@@ -390,6 +392,8 @@ only_trash = ["src/*", "*.config", "*.env"]
 
 Searched through all parent directories from the file being deleted. Global `never_trash` still wins over local `only_trash` — an admin-excluded pattern can't be overridden by a project config.
 
+A `.trashd.toml` only counts when it is a regular file owned by the deleting user (or root) that no one else can write. Anything else — a symlink, a file owned by another user (a shared directory, a USB stick) or a group/world-writable file — is ignored with a warning and, like an unparseable file, stops the search, so an ancestor's narrower rules never apply in its place. The fanotify daemon never reads per-directory files.
+
 ## Auto-purge and compression
 
 After every trash operation, trashd runs an automatic retention policy (throttled to at most once per `auto_purge_interval_secs`, default 60 seconds):
@@ -448,7 +452,7 @@ Changing `hash_algorithm` in the config does **not** require rehashing existing 
 
 Interception failures can fall back to permanent deletion:
 - **Shim** — Uses real deletion only for explicit bypasses and configured excluded paths. Unsafe or unavailable trash storage returns an error without deleting.
-- **Preload** — Rejects an unsafe trash directory with `EACCES`; other operational failures return the result of the real `unlink()`/`rmdir()`.
+- **Preload** — Rejects an unsafe trash directory (one another user could control) with `EACCES`. A trash that simply cannot be created — a service account whose home is `/nonexistent` or root-owned — lets the real `unlink()`/`rmdir()` run, and root running with another user's `HOME` uses its own home trash. Other operational failures return the result of the real call.
 - **Seccomp** — Responds with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` when pinned resolution or storage is unavailable, so the target kernel executes the syscall in the target's own namespace.
 - **Watchdog** — On supervisor crash, drains all pending notifications with `CONTINUE`
 

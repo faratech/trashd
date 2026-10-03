@@ -199,6 +199,16 @@ fi
 rm -f --permanent ~/.local/share/Trash/files/trashd_it_orphan
 
 # -----------------------------------------------------------------------
+# trashd-exec --version answers instead of running "--version" as the command
+# to wrap (#234); the profile hook relies on it to test the wrapper.
+# -----------------------------------------------------------------------
+if out=$("$EXEC" --version 2>&1) && [[ "$out" == "trashd-exec "* ]]; then
+    pass "trashd-exec --version"
+else
+    fail "trashd-exec --version" "unexpected output: $out"
+fi
+
+# -----------------------------------------------------------------------
 # seccomp layer end-to-end: real rm under trashd-exec must land in trash
 # via the fd-pinned supervisor (TRASHD_SECCOMP_ACTIVE makes the preload
 # defer so this exercises Layer 4 specifically).

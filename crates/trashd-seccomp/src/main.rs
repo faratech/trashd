@@ -49,6 +49,13 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Answer --version instead of wrapping a command named "--version" (#234);
+    // the profile hook runs it to check that the wrapper can start at all.
+    if args[1] == "--version" || args[1] == "-V" {
+        println!("trashd-exec {}", env!("TRASHD_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
     let preserve_privileges = args[1] == "--preserve-privileges";
     let mut start = if preserve_privileges { 2 } else { 1 };
     if args.get(start).is_some_and(|a| a == "--") {

@@ -282,6 +282,78 @@ def run():
             result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
             assert result.returncode == 0 and len(list((data / "Trash/info").glob("*.trashinfo"))) == 1, result.stderr
         print("PASS: nested trash lookalikes remain ordinary protected data")
+
+        # Service accounts (home /nonexistent, or a root-owned home) cannot
+        # create a trash. Their deletes must run, not fail with EACCES (#194).
+        # A failed cross-device restore rolls back its partial destination
+        # while holding the trash-root lock. That cleanup must be a raw
+        # syscall: through the hooked libc wrapper the preload in the CLI
+        # trashed the half-written file or blocked on the held lock (#196).
+        fixture, data, environment = focused_fixture("restore-rollback")
+        victim = fixture / "large"
+        victim.write_bytes(b"r" * (1024 * 1024))
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        tiny = fixture / "tiny"
+        tiny.mkdir()
+        subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "-o", "size=64k,mode=755", "none", str(tiny)], check=True)
+        try:
+            entries_before = sorted(p.name for p in (data / "Trash/info").iterdir())
+            restore_env = dict(environment)
+            restore_env.pop("TRASH_BYPASS", None)
+            try:
+                result = subprocess.run([cli, "restore", entries_before[0].removesuffix(".trashinfo"),
+                                         "--to", str(tiny / "large")],
+                                        env=restore_env, capture_output=True, timeout=20)
+            except subprocess.TimeoutExpired:
+                raise AssertionError("restore rollback deadlocked")
+            assert result.returncode != 0, "restore into a full filesystem must fail"
+            assert not (tiny / "large").exists(), "partial destination left behind"
+            assert not list(tiny.glob(".Trash*")), "rollback cleanup was trashed"
+            assert sorted(p.name for p in (data / "Trash/info").iterdir()) == entries_before
+        finally:
+            subprocess.run(["/usr/bin/umount", str(tiny)], check=True)
+        print("PASS: failed restore rolls back without re-interception")
+
+        # A .trashd.toml another user owns (a shared directory, a USB stick)
+        # must not turn this user's deletes into permanent ones (#207).
+        fixture, data, environment = focused_fixture("foreign-local-config")
+        local = fixture / ".trashd.toml"
+        local.write_text('never_trash = ["*"]\n')
+        os.chown(local, 65534, 65534)
+        victim = fixture / "victim"
+        victim.write_bytes(b"recoverable")
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        assert len(list((data / "Trash/info").glob("*.trashinfo"))) == 1, "foreign policy applied"
+        print("PASS: foreign-owned local policy is ignored")
+
+        root.chmod(0o755)  # the temporary root is 0700; uid 65534 must reach it
+        shared = root / "service-account"
+        shared.mkdir()
+        shared.chmod(0o1777)
+        for home in ["/nonexistent", "/"]:
+            victim = shared / f"victim-{len(home)}"
+            victim.write_bytes(b"service data")
+            os.chown(victim, 65534, 65534)
+            environment = {"PATH": "/usr/bin:/bin", "HOME": home, "LD_PRELOAD": library}
+            result = subprocess.run(
+                ["/usr/bin/unlink", str(victim)], env=environment, capture_output=True,
+                preexec_fn=lambda: (os.setgroups([]), os.setgid(65534), os.setuid(65534)))
+            assert result.returncode == 0 and not victim.exists(), (home, result.stderr)
+        print("PASS: accounts without a usable home trash delete normally")
+
+        # Root with another user's HOME (sudo -E, setuid tools) must not write
+        # into that user's tree, nor fail: it uses its own home trash (#194).
+        victim = shared / "root-victim"
+        victim.write_bytes(b"root data")
+        environment = {"PATH": "/usr/bin:/bin", "HOME": "/home/nobody", "LD_PRELOAD": library}
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        own_records = list(Path("/root/.local/share/Trash/info").glob("root-victim*.trashinfo"))
+        assert len(own_records) == 1, own_records
+        assert not Path("/home/nobody/.local").exists(), "wrote into another user's home"
+        print("PASS: root with a foreign HOME trashes into its own home")
     return 0
 
 

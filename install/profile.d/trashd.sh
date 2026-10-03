@@ -18,10 +18,20 @@ if [ "${TRASHD_SECCOMP_AUTO:-1}" != "0" ] && [ "$(id -u)" = "0" ] && [ -z "${TRA
     # Only wrap interactive login shells (not scripts, not subshells)
     case "$-" in
         *i*)
-            # Prevent login-shell recursion if listener installation fails.
-            # Only trashd-exec sets ACTIVE, after protection is established.
-            export TRASHD_SECCOMP_ATTEMPTED=1
-            exec /usr/local/bin/trashd-exec --preserve-privileges -- "$SHELL" -l
+            # Re-exec the shell that is running this script, not $SHELL: an
+            # unset or stale SHELL (docker exec, env -i, toolbox) made the exec
+            # fail and ended every root login, and a different SHELL silently
+            # replaced the user's shell (#200). Only exec once both the shell
+            # and the wrapper are known to start; otherwise stay unwrapped.
+            _trashd_shell="$(readlink /proc/$$/exe 2>/dev/null)"
+            if [ -n "$_trashd_shell" ] && [ -x "$_trashd_shell" ] \
+                && /usr/local/bin/trashd-exec --version >/dev/null 2>&1; then
+                # Prevent login-shell recursion if listener installation fails.
+                # Only trashd-exec sets ACTIVE, after protection is established.
+                export TRASHD_SECCOMP_ATTEMPTED=1
+                exec /usr/local/bin/trashd-exec --preserve-privileges -- "$_trashd_shell" -l
+            fi
+            unset _trashd_shell
             ;;
     esac
 fi

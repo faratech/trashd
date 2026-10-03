@@ -15,6 +15,44 @@
   test-loads the preload and every binary before changing anything. The
   preload previously required GLIBC_2.34, which would stop every program on
   older distributions once registered in `/etc/ld.so.preload` (#191).
+- Cross-device trashing copies through pinned descriptors and retires only
+  what it copied: files created or changed during the move, a tree or file
+  replaced meanwhile, and nodes the copy cannot reproduce (sockets, devices)
+  were permanently deleted by the path-based cleanup (#192). Copies are
+  synced before the source is removed, keep their owner (set-id bits are
+  dropped when the owner cannot be preserved, #203), and are only attempted
+  for `EXDEV`/unsupported `RENAME_NOREPLACE`, never for permission errors
+  that left stray duplicates (#204).
+- Retention never trusts a topdir sidecar's `X-Trashd-Size` beyond the tree
+  actually on disk, and size sums saturate: one forged entry on removable
+  media made auto-purge empty every trash root (#193).
+- The preload lets the real delete run when no trash can be created (service
+  accounts with a missing or root-owned home) instead of failing with
+  `EACCES`; root with another user's `HOME` uses its own home trash (#194).
+- Under trashd-exec, relative paths that escape the cwd resolve normally for
+  targets sharing the supervisor's root mount and mount namespace, trashes
+  on other filesystems (or without `RENAME_NOREPLACE`) are filled by copying,
+  and trashd's own CLI and shim are never intercepted. These deletes used to
+  be handed back to the kernel and became permanent because the preload had
+  deferred (#195).
+- A failed cross-device restore removes its partial destination with a raw
+  syscall: through the hooked libc wrapper the preload trashed it or blocked
+  on the trash-root lock the restore was holding (#196).
+- The fanotify daemon no longer keeps a descriptor open on every watched
+  mount, which made `umount` fail with `EBUSY` (#197), and resolves file
+  handles through a regular directory descriptor: current kernels reject
+  `O_PATH` mount descriptors, leaving every audited path unresolved (#240).
+- A per-directory `.trashd.toml` only counts when it is a regular file owned
+  by the deleting user or root that no one else can write; it is read without
+  following symlinks or blocking, and diagnostics never echo its content. The
+  root daemon never reads per-directory files: a symlink to `/etc/shadow`
+  leaked through parse errors into the journal (#198, #207).
+- `trash self-update` refuses prefixes other users can modify and
+  package-managed `/usr` instead of installing system-wide there (#199).
+- The login hook re-execs the running shell, and only after `trashd-exec
+  --version` succeeds: an empty or stale `SHELL` (docker exec, `env -i`)
+  ended every root login (#200). `trashd-exec --version` is answered instead
+  of being run as a command (#234).
 - `trashd-exec` no longer spins at 100% CPU (or hangs) when it inherits
   `SIGCHLD=SIG_IGN`, as root login shells do under WSL's `login`. The kernel
   reaped its children itself, leaving a permanently readable pidfd in the wait

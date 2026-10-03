@@ -17,6 +17,9 @@
 #[path = "../../trashd-common/src/legacy_config.rs"]
 mod legacy_config;
 #[allow(dead_code)]
+#[path = "../../trashd-common/src/local_trust.rs"]
+mod local_trust;
+#[allow(dead_code)]
 #[path = "../../trashd-common/src/mounts.rs"]
 mod mounts;
 #[path = "../../trashd-common/src/seccomp_identity.rs"]
@@ -657,24 +660,32 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
     };
     let mut dir = path.parent()?;
     loop {
+        // Only a regular file the deleting user (or root) owns and nobody
+        // else can write is policy; it is read without following symlinks
+        // or blocking, and diagnostics never echo its content (#198, #207).
         let cfg_path = dir.join(".trashd.toml");
-        if cfg_path.is_file() {
-            let mut local = match fs::read_to_string(&cfg_path) {
-                Ok(content) => match toml::from_str::<LocalConfig>(&content) {
+        match local_trust::read_local_config(dir) {
+            local_trust::LocalConfigFile::Absent => {}
+            local_trust::LocalConfigFile::Ignored(reason) => {
+                warn(format!("ignoring {}: it {reason}", cfg_path.display()));
+                return None;
+            }
+            local_trust::LocalConfigFile::Content(content) => {
+                let mut local = match toml::from_str::<LocalConfig>(&content) {
                     Ok(local) => local,
                     Err(e) => {
-                        warn(format!("ignoring broken {}: {e}", cfg_path.display()));
+                        warn(format!(
+                            "ignoring broken {}: {}",
+                            cfg_path.display(),
+                            e.message()
+                        ));
                         return None;
                     }
-                },
-                Err(e) => {
-                    warn(format!("ignoring unreadable {}: {e}", cfg_path.display()));
-                    return None;
-                }
-            };
-            local.never_trash = sanitize_patterns(local.never_trash, "never_trash");
-            local.only_trash = sanitize_patterns(local.only_trash, "only_trash");
-            return Some(local);
+                };
+                local.never_trash = sanitize_patterns(local.never_trash, "never_trash");
+                local.only_trash = sanitize_patterns(local.only_trash, "only_trash");
+                return Some(local);
+            }
         }
         dir = dir.parent()?; // None at the filesystem root
     }
@@ -729,9 +740,68 @@ fn should_skip_path(path: &Path) -> bool {
 // Trash directory selection (same-device or topdir)
 // ---------------------------------------------------------------------------
 
-fn trash_dir_for(path: &Path) -> Result<PathBuf, ()> {
+/// Why no trash directory could be used for a delete.
+enum StoreError {
+    /// It cannot be created or reached (no usable home, read-only, full).
+    /// The real delete runs, exactly as without trashd (#194).
+    Unavailable,
+    /// A path another user could control: refuse instead of writing there.
+    Unsafe,
+}
+
+impl From<io::Error> for StoreError {
+    /// OS failures mean "unavailable"; violations found by our own ownership
+    /// and type checks are constructed errors without an OS code.
+    fn from(error: io::Error) -> Self {
+        if error.raw_os_error().is_some() {
+            StoreError::Unavailable
+        } else {
+            StoreError::Unsafe
+        }
+    }
+}
+
+/// Prepare the HOME-derived trash; when it lies in a tree another user
+/// controls (root with a user's HOME via `sudo -E` or a setuid tool), use the
+/// effective user's own passwd home instead of refusing the delete (#194).
+fn prepared_home_trash(home_trash: PathBuf) -> Result<PathBuf, StoreError> {
+    match prepare_home_trash(&home_trash) {
+        Err(StoreError::Unsafe) => {
+            let own = passwd_home(unsafe { libc::geteuid() })
+                .map(|home| home.join(".local/share/Trash"))
+                .filter(|own| *own != home_trash)
+                .ok_or(StoreError::Unsafe)?;
+            prepare_home_trash(&own)?;
+            Ok(own)
+        }
+        Err(error) => Err(error),
+        Ok(()) => Ok(home_trash),
+    }
+}
+
+/// The home directory of `uid` from /etc/passwd. Read directly: NSS modules
+/// are not safe to load from inside a hooked unlink.
+fn passwd_home(uid: u32) -> Option<PathBuf> {
+    let passwd = fs::read("/etc/passwd").ok()?;
+    passwd.split(|&b| b == b'\n').find_map(|line| {
+        let fields: Vec<&[u8]> = line.split(|&b| b == b':').collect();
+        (fields.len() >= 7
+            && fields[2] == uid.to_string().as_bytes()
+            && fields[5].starts_with(b"/"))
+        .then(|| PathBuf::from(OsStr::from_bytes(fields[5])))
+    })
+}
+
+/// Device of `path`, or of its nearest existing ancestor (the home trash is
+/// only created once it is actually selected).
+fn existing_device(path: &Path) -> Option<u64> {
+    path.ancestors()
+        .find_map(|ancestor| fs::metadata(ancestor).ok())
+        .map(|meta| meta.dev())
+}
+
+fn trash_dir_for(path: &Path) -> Result<PathBuf, StoreError> {
     let home_trash = home_trash_dir();
-    prepare_home_trash(&home_trash)?;
 
     let file_dev = fs::symlink_metadata(path)
         .or_else(|_| {
@@ -742,10 +812,8 @@ fn trash_dir_for(path: &Path) -> Result<PathBuf, ()> {
         .ok()
         .map(|m| m.dev());
 
-    let home_dev = fs::metadata(&home_trash).ok().map(|m| m.dev());
-
-    if file_dev == home_dev {
-        return Ok(home_trash);
+    if file_dev.is_some() && file_dev == existing_device(&home_trash) {
+        return prepared_home_trash(home_trash);
     }
 
     let uid = unsafe { libc::geteuid() };
@@ -779,7 +847,7 @@ fn trash_dir_for(path: &Path) -> Result<PathBuf, ()> {
         }
     }
 
-    Ok(home_trash)
+    prepared_home_trash(home_trash)
 }
 
 fn trusted_topdir(path: &Path, uid: u32) -> bool {
@@ -792,18 +860,18 @@ fn trusted_topdir(path: &Path, uid: u32) -> bool {
     })
 }
 
-fn prepare_home_trash(home: &Path) -> Result<(), ()> {
+fn prepare_home_trash(home: &Path) -> Result<(), StoreError> {
     let uid = unsafe { libc::geteuid() };
     let fallback = PathBuf::from(format!("/tmp/trashd-home-{uid}"));
     if home == fallback.join("Trash") {
-        ensure_trusted_parent(&fallback, uid).map_err(|_| ())?;
-        ensure_private_dir(&fallback, uid, true).map_err(|_| ())?;
+        ensure_trusted_parent(&fallback, uid)?;
+        ensure_private_dir(&fallback, uid, true)?;
     } else if let Some(parent) = home.parent() {
-        ensure_trusted_ancestors(parent, uid).map_err(|_| ())?;
+        ensure_trusted_ancestors(parent, uid)?;
     }
-    ensure_private_dir(home, uid, true).map_err(|_| ())?;
-    ensure_private_dir(&home.join("files"), uid, true).map_err(|_| ())?;
-    ensure_private_dir(&home.join("info"), uid, true).map_err(|_| ())?;
+    ensure_private_dir(home, uid, true)?;
+    ensure_private_dir(&home.join("files"), uid, true)?;
+    ensure_private_dir(&home.join("info"), uid, true)?;
     Ok(())
 }
 
@@ -1077,7 +1145,8 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
     }
     let trash_dir = match trash_dir_for(path) {
         Ok(path) => path,
-        Err(()) => return TrashAttempt::UnsafeStore,
+        Err(StoreError::Unavailable) => return TrashAttempt::NotTrashed,
+        Err(StoreError::Unsafe) => return TrashAttempt::UnsafeStore,
     };
 
     let files_dir = trash_dir.join("files");

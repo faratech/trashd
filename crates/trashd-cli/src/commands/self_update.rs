@@ -302,6 +302,13 @@ pub fn run(check_only: bool) {
         return;
     }
 
+    // Decide where to install before downloading anything (#199).
+    let prefix = match detect_install_prefix() {
+        InstallPrefix::Default => None,
+        InstallPrefix::Custom(prefix) => Some(prefix),
+        InstallPrefix::Refused(reason) => fatal(format!("cannot self-update: {reason}")),
+    };
+
     // Find the right tarball for this architecture
     let arch = std::env::consts::ARCH;
     let tarball_arch = match arch {
@@ -450,7 +457,7 @@ pub fn run(check_only: bool) {
         cmd.arg(&install_script)
             .env("TRASH_BYPASS", "1")
             .current_dir(&install_dir);
-        if let Some(prefix) = detect_install_prefix() {
+        if let Some(prefix) = &prefix {
             cmd.env("PREFIX", prefix);
         }
         cmd.status()
@@ -472,7 +479,7 @@ pub fn run(check_only: bool) {
         // Non-root: escalate via sudo as before.
         let mut cmd = std::process::Command::new("sudo");
         cmd.arg("env").arg("TRASH_BYPASS=1");
-        if let Some(prefix) = detect_install_prefix() {
+        if let Some(prefix) = &prefix {
             cmd.arg(format!("PREFIX={}", prefix.display()));
         }
         cmd.arg("bash")
@@ -504,18 +511,55 @@ fn no_new_privs_set() -> bool {
     unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1 }
 }
 
+/// Where a self-update may reinstall. The installer runs as root and puts the
+/// preload into /etc/ld.so.preload (loaded by every process) and the profile
+/// hook into root logins, so only a prefix nobody but root can write is
+/// acceptable (#199).
+enum InstallPrefix {
+    /// install.sh's default (/usr/local), or not an installed layout.
+    Default,
+    /// The same custom PREFIX the running binary was installed with (#101).
+    Custom(PathBuf),
+    /// Refuse the update, with the reason.
+    Refused(String),
+}
+
 /// The prefix this binary is installed under (…/bin/trash → …), so a
 /// self-update reinstalls to the SAME location instead of silently
-/// reverting a custom PREFIX to /usr/local (#101). None when the layout
-/// doesn't match an installed binary or the prefix is already the default.
-fn detect_install_prefix() -> Option<PathBuf> {
-    let exe = std::fs::read_link("/proc/self/exe").ok()?;
-    let bin = exe.parent()?;
-    let prefix = bin.parent()?;
-    if !bin.ends_with("bin") || prefix == Path::new("/") || prefix == Path::new("/usr/local") {
-        return None;
+/// reverting a custom PREFIX to /usr/local (#101).
+fn detect_install_prefix() -> InstallPrefix {
+    match std::fs::read_link("/proc/self/exe") {
+        Ok(exe) => install_prefix_for(&exe),
+        Err(_) => InstallPrefix::Default,
     }
-    Some(prefix.to_path_buf())
+}
+
+fn install_prefix_for(exe: &Path) -> InstallPrefix {
+    let (Some(bin), Some(prefix)) = (exe.parent(), exe.parent().and_then(Path::parent)) else {
+        return InstallPrefix::Default;
+    };
+    if !bin.ends_with("bin") || prefix == Path::new("/") || prefix == Path::new("/usr/local") {
+        return InstallPrefix::Default;
+    }
+    if prefix == Path::new("/usr") {
+        return InstallPrefix::Refused(
+            "trashd in /usr belongs to your package manager; update it with the package manager"
+                .into(),
+        );
+    }
+    let root_controlled = prefix.ancestors().all(|dir| {
+        fs::symlink_metadata(dir)
+            .is_ok_and(|meta| meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0)
+    });
+    if !root_controlled {
+        return InstallPrefix::Refused(format!(
+            "{} can be modified by users other than root, and a system-wide install there \
+             would let them replace the library every process loads. Reinstall with \
+             `sudo ./install.sh` (default prefix /usr/local) instead",
+            prefix.display()
+        ));
+    }
+    InstallPrefix::Custom(prefix.to_path_buf())
 }
 
 fn fetch_release() -> GhRelease {
@@ -775,10 +819,35 @@ mod tests {
     fn install_prefix_detection_follows_proc_self_exe() {
         // Whatever this test binary is, detection must be total (no panic) and
         // must reject anything whose parent chain is not an installed layout.
-        if let Some(prefix) = detect_install_prefix() {
+        if let InstallPrefix::Custom(prefix) = detect_install_prefix() {
             assert!(prefix.is_absolute());
             assert_ne!(prefix, Path::new("/usr/local"));
         }
+    }
+
+    // Regression (#199): self-update reinstalls system-wide as root into the
+    // running binary's prefix. A prefix other users can write (~/.cargo, /tmp)
+    // would hand them the library every process loads; /usr belongs to the
+    // package manager.
+    #[test]
+    fn install_prefix_must_be_root_controlled() {
+        assert!(matches!(
+            install_prefix_for(Path::new("/usr/local/bin/trash")),
+            InstallPrefix::Default
+        ));
+        assert!(matches!(
+            install_prefix_for(Path::new("/usr/bin/trash")),
+            InstallPrefix::Refused(_)
+        ));
+        let user = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            install_prefix_for(&user.path().join("bin/trash")),
+            InstallPrefix::Refused(_)
+        ));
+        assert!(matches!(
+            install_prefix_for(Path::new("/usr/lib/bin/trash")),
+            InstallPrefix::Custom(prefix) if prefix == Path::new("/usr/lib")
+        ));
     }
 
     #[test]

@@ -53,11 +53,25 @@ fi
 echo "PASS: non-loadable preload is refused before any system change"
 
 stage "$WORK/good"
+mkdir -p /etc/profile.d  # absent in the sandbox; install.sh only writes the hook if it exists
 env PATH="$INSTALL_PATH" "$WORK/good/install.sh" > "$WORK/good.log" 2>&1 \
     || fail "installer failed: $(cat "$WORK/good.log")"
 grep -qx /usr/local/lib/trashd/libtrashd_preload.so /etc/ld.so.preload \
     || fail "preload not registered"
 [[ -x /usr/local/bin/trash ]] || fail "CLI not installed"
 echo "PASS: loadable build installs and registers the preload"
+
+# -----------------------------------------------------------------------
+# #200: the profile hook re-execs the RUNNING shell. An empty or stale SHELL
+# (docker exec, env -i, toolbox) used to end every root login, and a
+# different valid SHELL silently replaced the user's shell.
+# -----------------------------------------------------------------------
+[[ -f /etc/profile.d/trashd.sh ]] || fail "profile hook not installed"
+for shell_value in "" /bin/false; do
+    out=$(printf 'echo LOGIN_OK\nexit\n' | env -i PATH=/usr/bin:/bin HOME=/root \
+        SHELL="$shell_value" /bin/bash -i -c '. /etc/profile.d/trashd.sh' 2>/dev/null) || true
+    [[ "$out" == *LOGIN_OK* ]] || fail "root login with SHELL='$shell_value' did not reach a shell"
+done
+echo "PASS: root login hook survives an empty or stale SHELL"
 
 echo "install regression: all checks passed"

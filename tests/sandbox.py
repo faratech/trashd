@@ -170,6 +170,12 @@ def run(args, command):
         for name in ("resolv.conf", "localtime"):
             if (Path("/etc") / name).is_file():
                 shutil.copyfile(Path("/etc") / name, root / "etc" / name)
+        # Debian-style /usr/bin tools (awk, editor, ...) are alternatives
+        # symlinks through /etc/alternatives; expose those links read-only.
+        if Path("/etc/alternatives").is_dir():
+            (root / "etc/alternatives").mkdir(parents=True)
+            mount("--bind", "/etc/alternatives", root / "etc/alternatives")
+            mount("-o", "remount,bind,ro", root / "etc/alternatives")
         if Path("/etc/ssl/certs").is_dir():
             (root / "etc/ssl/certs").mkdir(parents=True)
             mount("--bind", "/etc/ssl/certs", root / "etc/ssl/certs")

@@ -99,6 +99,35 @@ impl TargetFs {
         self.root_fd
     }
 
+    /// True when a relative walk resolves for the target exactly as for this
+    /// process: the same root (mount and inode) in the same mount namespace,
+    /// so `..` and absolute symlinks reach the same inodes either way (#195).
+    /// Anything else (a chroot, even one into a bind mount of `/`, or another
+    /// namespace) keeps RESOLVE_BENEATH and #62's protection.
+    pub fn shares_our_view(&self) -> bool {
+        let Some(root) = self.root_fd else {
+            return false;
+        };
+        let (Some(theirs), Some(ours)) = (
+            mount_identity(root, c"", libc::AT_EMPTY_PATH),
+            mount_identity(libc::AT_FDCWD, c"/", 0),
+        ) else {
+            return false;
+        };
+        let namespace = |dir: RawFd, name: &CStr| {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, 0) } == 0)
+                .then_some((stat.st_dev, stat.st_ino))
+        };
+        let (Some(their_ns), Some(our_ns)) = (
+            namespace(self.procfd, c"ns/mnt"),
+            namespace(libc::AT_FDCWD, c"/proc/self/ns/mnt"),
+        ) else {
+            return false;
+        };
+        theirs == ours && their_ns == our_ns
+    }
+
     /// O_PATH fd on the target's cwd (for `AT_FDCWD`-relative paths).
     pub fn cwd(&self) -> Option<RawFd> {
         self.cwd_fd
@@ -115,6 +144,32 @@ impl TargetFs {
         let name = CString::new(format!("fd/{dirfd}"))?;
         open_task_directory(self.procfd, &name).ok_or_else(io::Error::last_os_error)
     }
+}
+
+/// (mount id, device, inode) of a directory, or None when the kernel cannot
+/// report a mount id (statx STATX_MNT_ID, Linux 5.8+).
+fn mount_identity(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<(u64, u32, u32, u64)> {
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    let mask = libc::STATX_INO | libc::STATX_MNT_ID;
+    if unsafe {
+        libc::statx(
+            dir,
+            name.as_ptr(),
+            flags | libc::AT_SYMLINK_NOFOLLOW,
+            mask,
+            &mut stx,
+        )
+    } != 0
+        || stx.stx_mask & libc::STATX_MNT_ID == 0
+    {
+        return None;
+    }
+    Some((
+        stx.stx_mnt_id,
+        stx.stx_dev_major,
+        stx.stx_dev_minor,
+        stx.stx_ino,
+    ))
 }
 
 fn open_task_directory(procfd: RawFd, name: &CStr) -> Option<RawFd> {
@@ -175,6 +230,20 @@ fn open_proc_dir(path: &str) -> Option<RawFd> {
 /// in its own namespace. Magic links are rejected in both modes. Returns an
 /// owned O_DIRECTORY fd for the parent.
 pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, absolute: bool) -> io::Result<RawFd> {
+    resolve_parent_with(
+        base_fd,
+        prefix,
+        if absolute {
+            libc::RESOLVE_IN_ROOT
+        } else {
+            libc::RESOLVE_BENEATH
+        },
+    )
+}
+
+/// `resolve_parent` with an explicit containment mode: RESOLVE_IN_ROOT,
+/// RESOLVE_BENEATH, or 0 for a target that shares this process's view.
+fn resolve_parent_with(base_fd: RawFd, prefix: &OsStr, containment: u64) -> io::Result<RawFd> {
     #[repr(C)]
     struct OpenHow {
         flags: u64,
@@ -191,12 +260,7 @@ pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, absolute: bool) -> io::Res
         // IN_ROOT matches how the target's own root clamps absolute walks.
         // BENEATH prevents a relative walk from escaping the pinned cwd/dirfd
         // into the supervisor's namespace. Mount crossings remain legal.
-        resolve: libc::RESOLVE_NO_MAGICLINKS
-            | if absolute {
-                libc::RESOLVE_IN_ROOT
-            } else {
-                libc::RESOLVE_BENEATH
-            },
+        resolve: libc::RESOLVE_NO_MAGICLINKS | containment,
     };
     let fd = unsafe {
         libc::syscall(
@@ -401,11 +465,14 @@ pub fn try_pinned(
     let parent: RawFd = if prefix.is_empty() || prefix == b"/" {
         base
     } else {
-        match resolve_parent(
-            base,
-            OsStr::from_bytes(prefix),
-            bytes.first() == Some(&b'/'),
-        ) {
+        let containment = if bytes.first() == Some(&b'/') {
+            libc::RESOLVE_IN_ROOT
+        } else if tfs.shares_our_view() {
+            0
+        } else {
+            libc::RESOLVE_BENEATH
+        };
+        match resolve_parent_with(base, OsStr::from_bytes(prefix), containment) {
             Ok(fd) => {
                 let g = FdGuard(fd);
                 let raw_fd = g.0;
@@ -609,11 +676,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pinned_relative_escape_defers_without_mutating_host_path() {
+    /// Relative paths that leave the cwd through `..` or a symlink.
+    fn escape_fixture(name: &str) -> (TrashStore, PathBuf, PathBuf, PathBuf, tempfile::TempDir) {
         use std::os::unix::fs::symlink;
-
-        let (store, work, _g) = setup("relative-escape");
+        let (store, work, guard) = setup(name);
         let outside = work.parent().unwrap().join("outside");
         std::fs::create_dir(&outside).unwrap();
         let dotdot_victim = outside.join("dotdot.txt");
@@ -621,22 +687,83 @@ mod tests {
         std::fs::write(&dotdot_victim, b"dotdot").unwrap();
         std::fs::write(&symlink_victim, b"symlink").unwrap();
         symlink(&outside, work.join("escape")).unwrap();
+        (store, work, dotdot_victim, symlink_victim, guard)
+    }
 
-        let mut child = spawn_with_cwd(&work);
-        let nr = if cfg!(target_arch = "x86_64") {
+    fn unlinkat_nr() -> i32 {
+        if cfg!(target_arch = "x86_64") {
             NR_UNLINKAT_X86_64
         } else {
             NR_UNLINKAT_AARCH64
-        };
-        let args: [u64; 6] = [libc::AT_FDCWD as u64, 0, 0, 0, 0, 0];
+        }
+    }
 
+    // Regression (#195): a target that shares the supervisor's root mount
+    // and mount namespace resolves `..` and symlinks exactly as the
+    // supervisor does. Handing those deletes back made them permanent, since
+    // the preload had already deferred to seccomp.
+    #[test]
+    fn pinned_relative_escape_is_trashed_for_a_target_sharing_our_view() {
+        let (store, work, dotdot_victim, symlink_victim, _g) = escape_fixture("relative-escape");
+        let mut child = spawn_with_cwd(&work);
+        let args: [u64; 6] = [libc::AT_FDCWD as u64, 0, 0, 0, 0, 0];
         for (raw, display) in [
             ("../outside/dotdot.txt", &dotdot_victim),
             ("escape/symlink.txt", &symlink_victim),
         ] {
             let decision = try_pinned(
                 child.id(),
-                nr,
+                unlinkat_nr(),
+                &args,
+                OsStr::new(raw),
+                display,
+                false,
+                -1,
+                0,
+                &store,
+            )
+            .expect("pinned attempt");
+            assert!(matches!(decision, Decision::Trashed), "{raw}: {decision:?}");
+            assert!(!display.exists(), "{raw}: not moved");
+        }
+        assert_eq!(store.list(None).unwrap().len(), 2);
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    // #62 still holds: in another mount namespace (or under another root)
+    // the same text can name a different inode, so escapes are handed back
+    // to the target's kernel and the host path is never touched.
+    #[test]
+    fn pinned_relative_escape_defers_for_a_foreign_mount_namespace() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: a private mount namespace requires root");
+            return;
+        }
+        let (store, work, dotdot_victim, symlink_victim, _g) = escape_fixture("foreign-escape");
+        let mut child = std::process::Command::new("/usr/bin/unshare")
+            .args(["-m", "--propagation", "private", "/bin/sh", "-c"])
+            .arg(format!("cd '{}' && exec sleep 30", work.display()))
+            .spawn()
+            .expect("spawn namespaced helper");
+        // unshare execs sh, which execs sleep in the same pid (comm, not exe:
+        // multi-call coreutils run every tool from one binary).
+        let target = (0..250)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id())).ok()?;
+                let cwd = std::fs::read_link(format!("/proc/{}/cwd", child.id())).ok()?;
+                (comm.trim() == "sleep" && cwd == work).then_some(child.id())
+            })
+            .expect("namespaced helper never started");
+        let args: [u64; 6] = [libc::AT_FDCWD as u64, 0, 0, 0, 0, 0];
+        for (raw, display) in [
+            ("../outside/dotdot.txt", &dotdot_victim),
+            ("escape/symlink.txt", &symlink_victim),
+        ] {
+            let decision = try_pinned(
+                target,
+                unlinkat_nr(),
                 &args,
                 OsStr::new(raw),
                 display,
@@ -652,10 +779,52 @@ mod tests {
             );
             assert!(display.exists(), "supervisor must not mutate {display:?}");
         }
-
         assert!(store.list(None).unwrap().is_empty());
         child.kill().unwrap();
         let _ = child.wait();
+    }
+
+    // Regression (#195): when the trash lives on another filesystem (or the
+    // filesystem lacks RENAME_NOREPLACE), the supervisor copies from the
+    // pinned parent instead of continuing into a permanent delete.
+    #[test]
+    fn pinned_cross_device_delete_is_trashed_not_continued() {
+        use std::os::unix::fs::MetadataExt;
+        let (store, _work, _g) = setup("cross-device");
+        let shm = PathBuf::from(format!("/dev/shm/trashd-pin-xdev-{}", std::process::id()));
+        std::fs::create_dir_all(&shm).unwrap();
+        if std::fs::metadata(&shm).unwrap().dev()
+            == std::fs::metadata(store.home_dir()).unwrap().dev()
+        {
+            eprintln!("SKIP: /dev/shm shares the store's filesystem");
+            return;
+        }
+        let victim = shm.join("victim.txt");
+        std::fs::write(&victim, b"cross-device").unwrap();
+        let mut child = spawn_with_cwd(&shm);
+        let decision = try_pinned(
+            child.id(),
+            unlinkat_nr(),
+            &[libc::AT_FDCWD as u64, 0, 0, 0, 0, 0],
+            OsStr::new("victim.txt"),
+            &victim,
+            false,
+            -1,
+            0,
+            &store,
+        )
+        .expect("pinned attempt");
+        child.kill().unwrap();
+        let _ = child.wait();
+        let survived = victim.exists();
+        let _ = std::fs::remove_dir_all(&shm);
+        assert!(matches!(decision, Decision::Trashed), "{decision:?}");
+        assert!(!survived);
+        let entries = store.list(None).unwrap();
+        assert_eq!(
+            std::fs::read(&entries[0].trashed_path).unwrap(),
+            b"cross-device"
+        );
     }
 
     #[test]

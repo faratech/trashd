@@ -82,8 +82,10 @@ const META_SIZE: usize = std::mem::size_of::<FanotifyEventMetadata>();
 /// statfs/fanotify filesystem identity: statfs's f_fsid as a comparable pair.
 type Fsid = Option<(i32, i32)>;
 
-/// Cached handle-resolution mount: path, O_PATH fd, and that fd's fsid (#97).
-type MountFd = (PathBuf, RawFd, Fsid);
+/// A mount that file handles can be resolved against: its path and fsid (#97).
+/// No descriptor is kept: an open fd pins the mount, so `umount` would fail
+/// with EBUSY for as long as trashd runs (#197).
+type WatchedMount = (PathBuf, Fsid);
 
 fn main() {
     // Die quietly on a closed stderr/journal pipe instead of panicking on a
@@ -181,7 +183,7 @@ fn run() -> io::Result<()> {
     // open_by_handle_at requires a mount fd on the same filesystem as the
     // handle; the fsid recorded beside each fd is what events are matched
     // against so a handle is never decoded against the WRONG filesystem (#97).
-    let mut mount_fds: Vec<MountFd> = Vec::new();
+    let mut mount_fds: Vec<WatchedMount> = Vec::new();
     for mount in &mount_list {
         if matches!(
             mount.fstype.as_str(),
@@ -189,14 +191,7 @@ fn run() -> io::Result<()> {
         ) {
             continue;
         }
-        let c_path = match std::ffi::CString::new(mount.path.to_string_lossy().as_bytes()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
-        if fd >= 0 {
-            mount_fds.push((mount.path.clone(), fd, fsid_of_path(&mount.path)));
-        }
+        mount_fds.push((mount.path.clone(), fsid_of_path(&mount.path)));
     }
 
     eprintln!("trashd: monitoring {} filesystem(s) for deletions", marked);
@@ -264,7 +259,7 @@ fn run() -> io::Result<()> {
                 let pid = event.pid as u32;
                 let proc_name = process_name(pid);
                 if let Some(ref p) = path {
-                    let skipped = config.should_skip(p);
+                    let skipped = audit_skipped(&config, p);
                     let ev = DeletionEvent {
                         path: Some(p.clone()),
                         pid,
@@ -300,6 +295,14 @@ fn run() -> io::Result<()> {
 /// We resolve the parent via open_by_handle_at and join with the filename.
 ///
 /// Falls back to reading /proc/self/fd/{event.fd} for FAN_DELETE_SELF.
+/// Whether an audited delete is annotated "(skipped)". Only configured policy
+/// counts: the daemon runs as root for every user's deletes, and a
+/// `.trashd.toml` beside a deleted file is untrusted input it must never read
+/// (a symlink to /etc/shadow leaked through parse errors, #198).
+fn audit_skipped(config: &Config, path: &std::path::Path) -> bool {
+    config.should_skip_configured(path)
+}
+
 /// Mounts that appear after startup are picked up at most this often.
 const MOUNT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -310,7 +313,7 @@ fn mount_refresh_due(last: std::time::Instant, now: std::time::Instant) -> bool 
 fn resolve_event_path(
     event_buf: &[u8],
     _event: &FanotifyEventMetadata,
-    mount_fds: &[MountFd],
+    mount_fds: &[WatchedMount],
 ) -> Option<PathBuf> {
     // Try to extract path from extended FID info (DFID_NAME for FAN_DELETE,
     // DFID for FAN_DELETE_SELF). No fd-based fallback: with FAN_REPORT_FID
@@ -355,7 +358,7 @@ fn event_fsid(event_buf: &[u8], fh_offset: usize) -> Fsid {
 ///   directly via open_by_handle_at. Type-1 records were never parsed before,
 ///   and with FAN_REPORT_FID groups delete events carry fd=FAN_NOFD, so the
 ///   old /proc/self/fd fallback could never fire either (#29).
-fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[MountFd]) -> Option<PathBuf> {
+fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[WatchedMount]) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
@@ -451,27 +454,43 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[MountFd]) -> Option<Pat
 fn resolve_handle_to_path(
     file_handle_ptr: *const u8,
     expected_fsid: Fsid,
-    mount_fds: &[MountFd],
+    mounts: &[WatchedMount],
 ) -> Option<PathBuf> {
-    let candidates: Vec<RawFd> = match expected_fsid {
-        Some(fsid) => mount_fds
-            .iter()
-            .filter(|(_, _, f)| *f == Some(fsid))
-            .map(|(_, fd, _)| *fd)
-            .collect(),
-        None => mount_fds.iter().map(|(_, fd, _)| *fd).collect(),
-    };
+    let candidates = mounts
+        .iter()
+        .filter(|(_, fsid)| expected_fsid.is_none() || *fsid == expected_fsid);
 
-    // open_by_handle_at requires a mount fd on the same filesystem as the handle.
-    for mount_fd in candidates {
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_open_by_handle_at,
-                mount_fd as libc::c_long,
-                file_handle_ptr as libc::c_long,
-                libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
+    // open_by_handle_at requires a mount fd on the same filesystem as the
+    // handle. Open it for this lookup only and re-check its fsid: the path
+    // may have been remounted since the last refresh. Not O_PATH: current
+    // kernels reject O_PATH mount descriptors here with EBADF, which left
+    // every audited path unresolved (#240).
+    for (path, fsid) in candidates {
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            continue;
+        };
+        let mount_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
+        if mount_fd < 0 {
+            continue;
+        }
+        let fd = if fsid.is_none() || fsid_of_fd(mount_fd) == *fsid {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_open_by_handle_at,
+                    mount_fd as libc::c_long,
+                    file_handle_ptr as libc::c_long,
+                    libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
+                )
+            }
+        } else {
+            -1
+        };
+        unsafe { libc::close(mount_fd) };
 
         if fd >= 0 {
             let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
@@ -483,25 +502,32 @@ fn resolve_handle_to_path(
     None
 }
 
-/// Diff a fresh /proc/mounts scan against the marked set; mark and open
-/// handle-resolution fds for anything new (#37), and RE-mark anything whose
+/// fstatfs f_fsid of an open descriptor (see `fsid_of_path`).
+fn fsid_of_fd(fd: RawFd) -> Fsid {
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+        return None;
+    }
+    let fsid: [i32; 2] = unsafe { std::mem::transmute(st.f_fsid) };
+    Some((fsid[0], fsid[1]))
+}
+
+/// Diff a fresh /proc/mounts scan against the marked set; mark anything new
+/// (#37) and record it for handle resolution, and RE-mark anything whose
 /// filesystem identity changed: a remount at the same path is a new
-/// superblock whose old mark and old cached fd died with the unmount (#98).
-fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<(PathBuf, Fsid)>, fds: &mut Vec<MountFd>) {
+/// superblock whose old mark died with the unmount (#98).
+fn refresh_mounts(
+    fan_fd: RawFd,
+    marked: &mut Vec<(PathBuf, Fsid)>,
+    watched: &mut Vec<WatchedMount>,
+) {
     let fresh = mounts::list_mounts();
     let live_paths: Vec<PathBuf> = fresh.iter().map(|m| m.path.clone()).collect();
 
-    // Drop state for mounts that vanished entirely (fd close; the fanotify
-    // mark died with the superblock).
+    // Drop state for mounts that vanished entirely (the fanotify mark died
+    // with the superblock).
     marked.retain(|(p, _)| live_paths.contains(p));
-    fds.retain(|(p, fd, _)| {
-        if live_paths.contains(p) {
-            true
-        } else {
-            unsafe { libc::close(*fd) };
-            false
-        }
-    });
+    watched.retain(|(p, _)| live_paths.contains(p));
 
     for mount in &fresh {
         if matches!(
@@ -547,21 +573,11 @@ fn refresh_mounts(fan_fd: RawFd, marked: &mut Vec<(PathBuf, Fsid)>, fds: &mut Ve
             Err(_) => continue,
         }
 
-        // Same reasoning for the handle-resolution fd: an O_PATH fd from
-        // before a remount points at the detached superblock and would fail
-        // (or misresolve) open_by_handle_at. Refresh it unconditionally.
-        if let Ok(c) = std::ffi::CString::new(mount.path.to_string_lossy().as_bytes()) {
-            let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_PATH) };
-            if fd >= 0 {
-                match fds.iter_mut().find(|(p, _, _)| p == &mount.path) {
-                    Some(entry) => {
-                        unsafe { libc::close(entry.1) };
-                        entry.1 = fd;
-                        entry.2 = fsid;
-                    }
-                    None => fds.push((mount.path.clone(), fd, fsid)),
-                }
-            }
+        // Record the current identity for handle resolution; descriptors are
+        // opened per lookup, so a remount needs nothing else.
+        match watched.iter_mut().find(|(p, _)| p == &mount.path) {
+            Some(entry) => entry.1 = fsid,
+            None => watched.push((mount.path.clone(), fsid)),
         }
     }
 }
@@ -605,6 +621,66 @@ fn fanotify_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression (#197): holding an O_PATH descriptor per watched mount kept
+    // every mount busy, so `umount` failed with EBUSY while trashd ran.
+    // Handles resolve through a descriptor opened for that one lookup.
+    #[test]
+    fn handles_resolve_without_held_mount_descriptors() {
+        use std::os::unix::ffi::OsStrExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: open_by_handle_at needs CAP_DAC_READ_SEARCH");
+            return;
+        }
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("handle-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("victim");
+        std::fs::write(&file, b"x").unwrap();
+        let mut handle = vec![0u8; 8 + 128];
+        handle[..4].copy_from_slice(&128u32.to_ne_bytes());
+        let mut mount_id: libc::c_int = 0;
+        let name = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let encoded = unsafe {
+            libc::syscall(
+                libc::SYS_name_to_handle_at,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                handle.as_mut_ptr(),
+                &mut mount_id,
+                0,
+            )
+        };
+        assert_eq!(encoded, 0, "{}", io::Error::last_os_error());
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let mount = mounts::list_mounts()
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|path| canonical.starts_with(path))
+            .max_by_key(|path| path.as_os_str().len())
+            .unwrap();
+        let fsid = fsid_of_path(&mount);
+        let watched: Vec<WatchedMount> = vec![(mount, fsid)];
+        let resolved = resolve_handle_to_path(handle.as_ptr(), fsid, &watched);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(resolved, Some(canonical));
+    }
+
+    // Regression (#198): the daemon runs as root for every user's deletes; a
+    // .trashd.toml beside a deleted file is attacker-controlled input and must
+    // never be read (a symlink to /etc/shadow leaked through parse errors).
+    #[test]
+    fn audit_annotation_ignores_local_policies() {
+        let dir = std::env::temp_dir().join(format!("trashd-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".trashd.toml"), "never_trash = [\"*\"]\n").unwrap();
+        let mut config = Config::default();
+        config.never_trash.clear();
+        let skipped = audit_skipped(&config, &dir.join("deleted"));
+        std::fs::remove_file(dir.join(".trashd.toml")).unwrap();
+        assert!(!skipped);
+    }
 
     // The queue drains after every batch of events, not only when idle: a
     // full mount re-scan per batch multiplied CPU under steady deletes.

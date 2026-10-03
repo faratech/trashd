@@ -171,6 +171,9 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
     };
 
     let config = Config::load();
+    let own = std::fs::read_link("/proc/self/exe")
+        .map(|exe| own_component_ids(&exe))
+        .unwrap_or_default();
     signal_ready(ready_fd, true);
 
     loop {
@@ -195,7 +198,7 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         };
 
         // Handle this notification (fail-safe: any error → CONTINUE)
-        handle_notification(fd, &notif, &store, &config);
+        handle_notification(fd, &notif, &store, &config, &own);
     }
 }
 
@@ -210,7 +213,13 @@ pub(crate) fn signal_ready(fd: i32, ready: bool) {
 }
 
 /// Handle a single notification.
-fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config: &Config) {
+fn handle_notification(
+    fd: i32,
+    notif: &SeccompNotif,
+    store: &TrashStore,
+    config: &Config,
+    own: &[(u64, u64)],
+) {
     // Check if the notification is still valid BEFORE touching the target's
     // /proc state: if the target died and its PID was recycled, the reads
     // below must not inspect an unrelated process's memory or fds (#92).
@@ -219,6 +228,13 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
         // Target likely gone. Send CONTINUE defensively — if the target is truly
         // dead, the response harmlessly fails with ENOENT. If the ioctl failed
         // spuriously, this prevents hanging the supervised process.
+        respond_continue(fd, notif.id);
+        return;
+    }
+
+    // trashd's own binaries remove only what their store logic decided to
+    // remove; re-trashing that deadlocked or duplicated data (#195, #196).
+    if is_own_component(notif.pid, own) {
         respond_continue(fd, notif.id);
         return;
     }
@@ -330,6 +346,31 @@ fn handle_notification(fd: i32, notif: &SeccompNotif, store: &TrashStore, config
     }
 }
 
+/// (device, inode) of trashd's own binaries installed beside this
+/// supervisor: the `trash` CLI and the rm shim (a release prefix keeps the
+/// shim in lib/trashd/bin; a build directory has both side by side).
+pub(crate) fn own_component_ids(supervisor_exe: &std::path::Path) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(dir) = supervisor_exe.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = vec![dir.join("trash"), dir.join("trashd-rm")];
+    if let Some(prefix) = dir.parent() {
+        candidates.push(prefix.join("lib/trashd/bin/rm"));
+    }
+    candidates
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| (meta.dev(), meta.ino()))
+        .collect()
+}
+
+fn is_own_component(pid: u32, own: &[(u64, u64)]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/proc/{pid}/exe"))
+        .is_ok_and(|meta| own.contains(&(meta.dev(), meta.ino())))
+}
+
 /// True when the TARGET process has TRASH_BYPASS=1 in its environment.
 ///
 /// The shim and preload layers check TRASH_BYPASS directly, but this layer
@@ -429,6 +470,26 @@ pub(crate) mod tests {
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert_eq!(status, 0, "loop kept running on a finished listener");
+    }
+
+    // Regression (#195, #196): trashd's own CLI and shim perform store-
+    // internal deletes (cross-device source retirement, restore rollback);
+    // intercepting them re-trashed data or deadlocked on the root lock.
+    // They are recognized by inode, never by name.
+    #[test]
+    fn own_binaries_are_recognized_by_inode() {
+        use std::path::PathBuf;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("own-binaries-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A hard link makes this test process "the installed trash CLI".
+        std::fs::hard_link(std::env::current_exe().unwrap(), dir.join("trash")).unwrap();
+        let installed = own_component_ids(&dir.join("trashd-exec"));
+        let elsewhere = own_component_ids(&dir.join("other/trashd-exec"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(is_own_component(std::process::id(), &installed));
+        assert!(!is_own_component(std::process::id(), &elsewhere));
     }
 
     #[test]
