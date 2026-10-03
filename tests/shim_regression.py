@@ -123,6 +123,22 @@ def main():
             assert stored.read_bytes() == b"recoverable"
         print("PASS: repeated force/recursive flags retain actual recoverable trash data")
 
+        # A trailing slash makes rm operate on a symlink's TARGET. Policy must
+        # be evaluated on that target too: a link in never-trash /tmp used to
+        # make the shim permanently delete the protected directory (#190).
+        decoy = root / "decoy"
+        decoy.mkdir()
+        (decoy / "keep").write_bytes(b"recoverable")
+        link = Path("/tmp/decoy-link")
+        link.symlink_to(decoy)
+        result = run(["-rf", f"{link}/"])
+        assert result.returncode == 0 and not decoy.exists(), result.stderr
+        matches = list((root / "data/Trash/files").glob("decoy*"))
+        assert len(matches) == 1, ("target permanently deleted instead of trashed", matches)
+        assert (matches[0] / "keep").read_bytes() == b"recoverable"
+        link.unlink()
+        print("PASS: trailing-slash symlink operands are trashed by their target's policy")
+
         # Raw terminal dots must be refused before normalization, even -f.
         for spelling in ["dot/.", "dot/./", "dot/..//"]:
             folder = root / "dot"

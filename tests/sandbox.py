@@ -23,6 +23,7 @@ ARTIFACTS = {
     "trashd-rm": "bin/trashd-rm",
     "trashd-exec": "bin/trashd-exec",
     "libtrashd_preload.so": "lib/libtrashd_preload.so",
+    "trashd": "bin/trashd",
 }
 
 
@@ -181,6 +182,13 @@ def run(args, command):
         ):
             if (repo / source).is_file():
                 shutil.copyfile(repo / source, root / "tests" / target)
+        # Installer sources for tests/install_regression.sh; the sandbox's /etc
+        # and /usr/local are tmpfs, so installing there never reaches the host.
+        (root / "src").mkdir()
+        shutil.copyfile(repo / "install.sh", root / "src/install.sh")
+        (root / "src/install.sh").chmod(0o755)
+        for name in ("install", "config"):
+            shutil.copytree(repo / name, root / "src" / name)
         for name, source in artifacts.items():
             shutil.copyfile(source, root / "opt/trashd" / ARTIFACTS[name])
             (root / "opt/trashd" / ARTIFACTS[name]).chmod(0o755)

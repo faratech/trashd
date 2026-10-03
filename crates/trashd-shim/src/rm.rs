@@ -122,7 +122,13 @@ fn main() -> ExitCode {
     // the whole tree (#2). Refuse operands that ARE the root unless
     // --no-preserve-root was given (matches GNU semantics — top-level
     // entries like /* expand to operands that are not "/" itself).
-    if args.recursive && !args.no_preserve_root && args.files.iter().any(|f| is_root_operand(f)) {
+    if args.recursive
+        && !args.no_preserve_root
+        && args
+            .files
+            .iter()
+            .any(|f| is_root_operand(&effective_operand(f)))
+    {
         eprintln!("rm: it is dangerous to operate recursively on '/'");
         eprintln!("rm: use --no-preserve-root to override the failsafe");
         return ExitCode::FAILURE;
@@ -215,19 +221,20 @@ fn main() -> ExitCode {
 
     let mut exit_code = ExitCode::SUCCESS;
 
-    for file in &args.files {
+    for operand in &args.files {
         // GNU rm refuses operands naming '.' or '..' (including `subdir/..`):
         // resolving them here would operate on the WRONG directory — a
         // trailing `..` collapsed to its parent's parent by normalize_path
         // used to trash the caller's CWD and report success (#83).
-        if is_dot_operand(file) {
+        if is_dot_operand(operand) {
             eprintln!(
                 "rm: refusing to remove '.' or '..': skipping directory '{}'",
-                file.display()
+                operand.display()
             );
             exit_code = ExitCode::FAILURE;
             continue;
         }
+        let file = &effective_operand(operand);
 
         let meta = match file.symlink_metadata() {
             Ok(m) => m,
@@ -436,11 +443,40 @@ impl RemovalBehavior {
     }
 }
 
-/// True when an operand IS the filesystem root ("/", "//", "///", ...).
-/// Matches GNU rm's preserve-root guard, which refuses exactly these.
+/// True when an operand IS the filesystem root. Like GNU rm's preserve-root
+/// guard this compares device and inode, so `/`, `//`, a bind mount of the
+/// root and a trailing-slash symlink to it (`link/` follows the link) are all
+/// refused, not just the literal spellings (#190).
 fn is_root_operand(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
     let mut comps = p.components();
-    matches!(comps.next(), Some(std::path::Component::RootDir)) && comps.next().is_none()
+    if matches!(comps.next(), Some(std::path::Component::RootDir)) && comps.next().is_none() {
+        return true;
+    }
+    match (std::fs::symlink_metadata(p), std::fs::metadata("/")) {
+        (Ok(operand), Ok(root)) => operand.dev() == root.dev() && operand.ino() == root.ino(),
+        _ => false,
+    }
+}
+
+/// The object rm actually removes. A trailing slash makes the kernel follow a
+/// final symlink (`rm -r link/` empties the link's target), so such an
+/// operand is resolved: policy, trashing and real deletion must all see the
+/// target, not the link's own location (#190). Other operands are unchanged.
+fn effective_operand(operand: &std::path::Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = operand.as_os_str().as_bytes();
+    let end = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    if end == 0 || end == bytes.len() {
+        return operand.to_path_buf();
+    }
+    let link = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..end]));
+    match link.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(operand).unwrap_or_else(|_| operand.to_path_buf())
+        }
+        _ => operand.to_path_buf(),
+    }
 }
 
 /// True when `p` is a mount point: its device differs from its parent's.
@@ -813,6 +849,33 @@ fn real_rm_inner(path: &PathBuf, recursive: bool, dir_only: bool) -> std::io::Re
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A fresh directory for symlink fixtures; nothing in it is ever removed.
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("trashd-shim-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // `rm -rf link/` operates on the link's TARGET (a trailing slash forces
+    // the kernel to follow it): a link to `/` must trip preserve-root like
+    // GNU's dev/ino check, not slip past a lexical comparison (#190).
+    #[test]
+    fn preserve_root_sees_through_a_trailing_slash_symlink() {
+        let dir = scratch("root");
+        let link = dir.join("rootlink");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let mut spelled = link.clone().into_os_string();
+        spelled.push("/");
+        assert!(is_root_operand(Path::new(&spelled)));
+        // Without the slash the operand is the symlink itself.
+        assert!(!is_root_operand(&link));
+    }
 
     // Standard GNU rm options that previously failed to parse — which made the
     // shim fall through to a PERMANENT delete instead of trashing.

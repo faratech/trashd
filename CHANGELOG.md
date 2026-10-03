@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- The rm shim resolves a trailing-slash symlink operand (`rm -rf link/`) to
+  the directory it actually removes. Policy was checked on the link's own
+  location while deletion went through it, so a link in never-trash `/tmp`
+  permanently deleted its target, and a link to `/` passed the lexical
+  preserve-root check. Preserve-root now compares device and inode like GNU
+  rm (#190).
+- Releases are built against a glibc 2.28 floor (`cargo zigbuild`), CI and
+  release fail when an artifact needs newer glibc symbols, and `install.sh`
+  test-loads the preload and every binary before changing anything. The
+  preload previously required GLIBC_2.34, which would stop every program on
+  older distributions once registered in `/etc/ld.so.preload` (#191).
 - `trashd-exec` no longer spins at 100% CPU (or hangs) when it inherits
   `SIGCHLD=SIG_IGN`, as root login shells do under WSL's `login`. The kernel
   reaped its children itself, leaving a permanently readable pidfd in the wait

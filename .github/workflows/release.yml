@@ -57,13 +57,20 @@ jobs:
       - name: Install target std for pinned toolchain
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
+      # Zig links against an old glibc (and cross-links aarch64), so the
+      # artifacts — above all the preload registered in /etc/ld.so.preload —
+      # load on every supported distribution, not only on the runner's (#191).
+      - name: Install zig cross linker
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.16.0 cargo-zigbuild==0.23.4
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+
+      - name: Install aarch64 strip
         if: matrix.arch == 'aarch64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+          sudo apt-get install -y binutils-aarch64-linux-gnu
 
       - name: Determine version
         id: version
@@ -89,9 +96,14 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28
         env:
           TRASHD_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Enforce glibc floor
+        run: |
+          R=target/${{ matrix.target }}/release
+          tests/glibc_floor.sh 2.28 "$R/libtrashd_preload.so" "$R/trashd-exec" "$R/trash" "$R/trashd-rm" "$R/trashd"
 
       - name: Run tests
         if: matrix.arch == 'x86_64'

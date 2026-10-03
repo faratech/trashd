@@ -248,6 +248,28 @@ else
     COMP_DIR="${BUILD_TARGET}/completions"
 fi
 
+# Refuse artifacts this system's dynamic loader cannot run (#191). The preload
+# goes into /etc/ld.so.preload, where a glibc symbol version the host lacks is
+# fatal to EVERY dynamically linked program, and the profile hook execs
+# trashd-exec for root login shells. Check everything before changing anything.
+loads_cleanly() {
+    _lc_what="$1"; shift
+    if _lc_err="$("$@" 2>&1 >/dev/null)" && [ -z "${_lc_err}" ]; then
+        return 0
+    fi
+    echo "error: ${_lc_what} cannot be loaded on this system:" >&2
+    [ -z "${_lc_err}" ] || printf '    %s\n' "${_lc_err}" >&2
+    echo "error: nothing was installed; use a build that matches this system's glibc" >&2
+    exit 1
+}
+loads_cleanly "${PRELOAD_DIR}/libtrashd_preload.so" \
+    env LD_PRELOAD="${PRELOAD_DIR}/libtrashd_preload.so" /bin/true
+loads_cleanly "${TARGET_DIR}/trash" "${TARGET_DIR}/trash" --version
+loads_cleanly "${TARGET_DIR}/trashd-rm" "${TARGET_DIR}/trashd-rm" --version
+loads_cleanly "${TARGET_DIR}/trashd" "${TARGET_DIR}/trashd" --version
+# TRASH_BYPASS=1 (exported above) makes trashd-exec exec its command directly.
+loads_cleanly "${TARGET_DIR}/trashd-exec" "${TARGET_DIR}/trashd-exec" /bin/true
+
 # Atomic artifact replacement: install to a temp name in the SAME directory,
 # then rename over the destination. `install` writing a live binary or .so in
 # place crashes running processes mapped to the old inode (and ETXTBSY aborts

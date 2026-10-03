@@ -12,7 +12,9 @@ TRASH_BYPASS=1 cargo test -p trashd-common --lib
 sudo ./install.sh                   # build + install all layers + man pages + completions
 sudo ./install.sh --uninstall       # remove all components (preserves trash; add --purge to delete trash too)
 sudo ./tests/integration.sh target/release  # sandboxed end-to-end checks; no installation
+sudo ./tests/install_regression.sh target/release  # install.sh inside the sandbox (tmpfs /etc, /usr/local)
 sudo python3 tests/shim_regression.py target/release/trashd-rm
+tests/glibc_floor.sh 2.28 <artifacts>       # release artifacts are built with cargo zigbuild --target <triple>.2.28
 ```
 
 Tests require `TRASH_BYPASS=1` when LD_PRELOAD is system-wide. Destructive unit tests use `TrashStore::open_isolated` with explicit temporary roots and configuration; `XDG_DATA_HOME` alone still exposes mounted trash through a production store. Never use `TrashStore::open()` for destructive unit tests.
