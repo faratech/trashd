@@ -43,6 +43,8 @@ jobs:
         run: TRASH_BYPASS=1 cargo test --workspace -- --test-threads=1
       - name: CLI and shim integration in disposable filesystem
         run: sudo env TRASH_BYPASS=1 ./tests/integration.sh target/release
+      - name: RPM spec lists exactly what make install stages
+        run: python3 tests/rpm_files_check.py
       - name: Installer behavior in disposable filesystem
         run: sudo env TRASH_BYPASS=1 ./tests/install_regression.sh target/release
       - name: Preload policy and raw filename round trips

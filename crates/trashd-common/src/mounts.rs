@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -356,13 +356,19 @@ pub(crate) fn is_safe_trash_root(path: &Path, uid: u32) -> bool {
 }
 
 /// Classify authenticated stores without creating or repairing directories.
-/// Keep a descriptor so removing files/info during cleanup does not invalidate
-/// a previously authenticated root, and inode reuse cannot impersonate it.
+/// Remember each authenticated root's identity so removing files/info during
+/// cleanup does not invalidate it, and a replacement inode cannot inherit it.
+///
+/// Identities only, no descriptors: a held descriptor pinned removable media
+/// so `umount` failed for as long as the process ran, and the lock is never
+/// held across syscalls, since a fork in another thread would otherwise leave
+/// it locked forever in the child (#206). The root itself is re-validated as
+/// a private directory of this user on every call.
 #[allow(dead_code)]
 pub(crate) fn is_trash_internal(path: &Path, home: &Path, trusted_home: bool) -> bool {
-    use std::os::fd::FromRawFd;
     use std::sync::{Mutex, OnceLock};
-    static ROOTS: OnceLock<Mutex<HashMap<PathBuf, fs::File>>> = OnceLock::new();
+    static ROOTS: OnceLock<Mutex<HashMap<PathBuf, (u64, u64)>>> = OnceLock::new();
+    let roots = ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
     let uid = unsafe { libc::geteuid() };
     let mut candidates = Vec::new();
     if trusted_home && path.starts_with(home) {
@@ -384,46 +390,38 @@ pub(crate) fn is_trash_internal(path: &Path, home: &Path, trusted_home: bool) ->
             }
         }
     }
-    let Ok(mut roots) = ROOTS.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
-        return false;
+    // Snapshot under a briefly held lock; contention means "no cache".
+    let known: HashMap<PathBuf, (u64, u64)> = match roots.try_lock() {
+        Ok(map) => map.clone(),
+        Err(_) => HashMap::new(),
+    };
+    let forget = |root: &PathBuf| {
+        if let Ok(mut map) = roots.try_lock() {
+            map.remove(root);
+        }
     };
     for root in candidates {
         if !validate_private_dir(&root, uid, false) {
-            roots.remove(&root);
+            forget(&root);
             continue;
         }
-        if let Some(pinned) = roots.get(&root) {
-            if let (Ok(old), Ok(current)) = (pinned.metadata(), root.symlink_metadata())
-                && old.dev() == current.dev()
-                && old.ino() == current.ino()
-            {
+        let Ok(meta) = root.symlink_metadata() else {
+            continue;
+        };
+        let identity = (meta.dev(), meta.ino());
+        if let Some(remembered) = known.get(&root) {
+            if *remembered == identity {
                 return true;
             }
-            roots.remove(&root);
+            forget(&root);
         }
         if !is_safe_trash_root(&root, uid) {
             continue;
         }
-        let Ok(name) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
-            continue;
-        };
-        let fd = unsafe {
-            libc::open(
-                name.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            continue;
+        if let Ok(mut map) = roots.try_lock() {
+            map.insert(root, identity);
         }
-        let pinned = unsafe { fs::File::from_raw_fd(fd) };
-        if let (Ok(old), Ok(current)) = (pinned.metadata(), root.symlink_metadata())
-            && old.dev() == current.dev()
-            && old.ino() == current.ino()
-        {
-            roots.insert(root, pinned);
-            return true;
-        }
+        return true;
     }
     false
 }
@@ -498,6 +496,35 @@ fn unescape_octal(field: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression (#206): authenticated trash roots were pinned with O_PATH
+    // descriptors that were never closed, so every long-running process that
+    // once deleted inside /media/usb/.Trash-1000 kept that mount busy.
+    #[test]
+    fn trash_root_classification_holds_no_descriptors() {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        for sub in ["", "files", "info"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join(sub))
+                .unwrap();
+        }
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert!(is_trash_internal(&root.join("files/x"), &root, true));
+        let held: Vec<PathBuf> = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|fd| fs::read_link(fd.ok()?.path()).ok())
+            .filter(|target| *target == canonical || *target == root)
+            .collect();
+        assert!(
+            held.is_empty(),
+            "descriptors still pin the trash root: {held:?}"
+        );
+        // The classification survives without a descriptor.
+        assert!(is_trash_internal(&root.join("info/y"), &root, true));
+    }
 
     #[test]
     fn authenticated_cleanup_cache_is_readonly_and_inode_bound() {

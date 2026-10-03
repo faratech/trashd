@@ -25,10 +25,12 @@ pub fn normalize(contents: &str) -> Result<toml::Value, toml::de::Error> {
                     // direction for a whitelist like only_trash (real
                     // deletes); bc1a5f5 originally rejected these outright.
                     // Keep the legacy compatibility, but stay loud (#150).
-                    eprintln!(
+                    // Through the including crate: inside the preload this
+                    // runs in arbitrary host processes (#208).
+                    crate::report_note(&format!(
                         "trashd: note: '{key}' applied from [retention] (legacy layout); \
                          move it to the top level to silence this"
-                    );
+                    ));
                     root.insert(key.to_owned(), legacy);
                 }
             }

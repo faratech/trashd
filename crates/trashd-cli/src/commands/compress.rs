@@ -137,7 +137,7 @@ fn compress_file_zstd(
     entry: &trashd_common::store::TrashEntry,
     size_before: u64,
 ) -> std::io::Result<Option<u64>> {
-    use trashd_common::store::write_trashinfo_atomic;
+    use trashd_common::store::set_compression_marker;
 
     use std::io::{Read, Seek};
     use std::os::fd::AsRawFd;
@@ -145,7 +145,6 @@ fn compress_file_zstd(
 
     let path = &entry.trashed_path;
     let info_path = &entry.info_path;
-    let info = &entry.info;
     // Open without following a replacement symlink, and don't block if the
     // entry was replaced with a FIFO after the caller inspected it.
     let mut input = std::fs::OpenOptions::new()
@@ -206,15 +205,20 @@ fn compress_file_zstd(
     store
         .validate_entry_locked(entry, &guard)
         .map_err(std::io::Error::other)?;
-    // 1) Marker first.
-    let mut marked = info.clone();
-    marked.compressed = Some("zstd".into());
-    write_trashinfo_atomic(info_path, &marked)?;
+    // The replacement keeps the original timestamps (#202).
+    tmp.as_file().set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(metadata.accessed()?)
+            .set_modified(metadata.modified()?),
+    )?;
+
+    // 1) Marker first, touching only that line of the on-disk sidecar (#218).
+    set_compression_marker(info_path, Some("zstd"))?;
 
     // 2) Then the atomic data swap.
     if let Err(e) = tmp.persist(path) {
         // Revert the marker: data is still plaintext.
-        let _ = write_trashinfo_atomic(info_path, info);
+        let _ = set_compression_marker(info_path, None);
         return Err(e.error);
     }
     Ok(Some(compressed_len))

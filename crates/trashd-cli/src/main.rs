@@ -29,7 +29,10 @@ fn main() {
     match cli.command {
         Commands::Log { lines } => commands::log::run(lines),
         Commands::Config(subcmd) => commands::config::run(subcmd),
-        Commands::SelfUpdate { check } => commands::self_update::run(check),
+        Commands::SelfUpdate {
+            check,
+            allow_unverified,
+        } => commands::self_update::run(check, allow_unverified),
         cmd => {
             let store = util::open_store();
             match cmd {
@@ -49,7 +52,9 @@ fn main() {
                     json,
                 ),
                 Commands::Find { query } => commands::find::run(&store, &query.to_string_lossy()),
-                Commands::Info { target } => commands::info::run(&store, &target.to_string_lossy()),
+                Commands::Info { target } => {
+                    commands::info::run(&store, &util::target_selector(&store, &target))
+                }
                 Commands::Restore {
                     target,
                     to,
@@ -57,14 +62,14 @@ fn main() {
                     all,
                 } => commands::restore::run(
                     &store,
-                    &target.to_string_lossy(),
+                    &util::target_selector(&store, &target),
                     to.as_deref(),
                     force,
                     all,
                 ),
                 Commands::Undo => commands::undo::run(&store),
                 Commands::Purge { target } => {
-                    commands::purge::run(&store, &target.to_string_lossy())
+                    commands::purge::run(&store, &util::target_selector(&store, &target))
                 }
                 Commands::Empty {
                     older,

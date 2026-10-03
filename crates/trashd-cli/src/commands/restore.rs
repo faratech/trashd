@@ -31,11 +31,16 @@ pub fn run(store: &TrashStore, target: &str, to: Option<&Path>, force: bool, all
                             .map(format_size)
                             .unwrap_or_else(|| "?".into()),
                         entry.info.original_path.display(),
-                        format!("[{}]", entry.id).dimmed(),
+                        entry.trashed_path.display().to_string().dimmed(),
                     );
                 }
                 if !entries.is_empty() {
-                    eprintln!("\n  {} {}", "trash restore".bold(), entries[0].id,);
+                    // The trashed path is unique even across trash roots (#210).
+                    eprintln!(
+                        "\n  {} {}",
+                        "trash restore".bold(),
+                        entries[0].trashed_path.display()
+                    );
                     eprintln!("  {} {} --all", "trash restore".bold(), target,);
                 }
             }

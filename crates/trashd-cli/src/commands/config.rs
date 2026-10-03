@@ -48,13 +48,13 @@ pub fn run(cmd: ConfigCmd) {
         }
         ConfigCmd::Add { key, value } => {
             let mut table = load_user_config_table();
-            config_list_add(&mut table, &key, &value);
+            config_list_add(&mut table, &key, &value, &Config::load().only_trash);
             write_user_config_table(&table);
             println!("{} added '{}' to {}", "Updated:".green().bold(), value, key);
         }
         ConfigCmd::Remove { key, value } => {
             let mut table = load_user_config_table();
-            if config_list_remove(&mut table, &key, &value) {
+            if config_list_remove(&mut table, &key, &value, &Config::load().only_trash) {
                 write_user_config_table(&table);
                 println!(
                     "{} removed '{}' from {}",
@@ -95,9 +95,7 @@ pub fn run(cmd: ConfigCmd) {
                 if let Some(parent) = user_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let default = Config::default();
-                let content = toml::to_string_pretty(&default).unwrap_or_default();
-                let _ = std::fs::write(&user_path, content);
+                let _ = std::fs::write(&user_path, commented_template(&Config::default()));
             }
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
             let status = std::process::Command::new(&editor).arg(&user_path).status();
@@ -189,6 +187,28 @@ fn write_user_config_table(table: &toml::Table) {
     }
 }
 
+/// The defaults as a fully commented template. Writing them as active values
+/// pinned every default in the user file, overriding the admin's
+/// /etc/trashd/config.toml on the first `config edit` (#211).
+fn commented_template(defaults: &Config) -> String {
+    let body = toml::to_string_pretty(defaults).unwrap_or_default();
+    let mut out = String::from(
+        "# trashd user configuration. Every line is commented out: uncomment\n\
+         # only what you want to change; the rest is inherited from\n\
+         # /etc/trashd/config.toml and the built-in defaults.\n\n",
+    );
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str("# ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn config_set_scalar(table: &mut toml::Table, key: &str, value: &str) -> bool {
     match key {
         "retention.max_age_days" => {
@@ -259,11 +279,25 @@ fn config_set_scalar(table: &mut toml::Table, key: &str, value: &str) -> bool {
     true
 }
 
-fn config_list_add(table: &mut toml::Table, key: &str, value: &str) {
+/// only_trash in the user file REPLACES the inherited whitelist, so a user
+/// file that does not set it yet starts from the effective list; otherwise
+/// adding one pattern silently dropped the admin's patterns (#211). The
+/// other lists extend the inherited ones and start empty.
+fn seed_inherited_whitelist(table: &mut toml::Table, key: &str, inherited: &[String]) {
+    if key == "only_trash" && !table.contains_key(key) {
+        table.insert(
+            key.into(),
+            toml::Value::Array(inherited.iter().cloned().map(toml::Value::String).collect()),
+        );
+    }
+}
+
+fn config_list_add(table: &mut toml::Table, key: &str, value: &str, inherited: &[String]) {
     match key {
         "never_trash" | "only_trash" | "bypass_processes" | "bypass_paths" => {}
         _ => fatal(format!("'{key}' is not a list — use 'trash config set'")),
     }
+    seed_inherited_whitelist(table, key, inherited);
     // The raw table bypasses schema validation, so an existing value can be a
     // non-array (e.g. `never_trash = "*.tmp"`): surface a readable error
     // instead of panicking (#94) — and never silently discard the mistyped
@@ -284,16 +318,55 @@ fn config_list_add(table: &mut toml::Table, key: &str, value: &str) {
     }
 }
 
-fn config_list_remove(table: &mut toml::Table, key: &str, value: &str) -> bool {
+fn config_list_remove(
+    table: &mut toml::Table,
+    key: &str,
+    value: &str,
+    inherited: &[String],
+) -> bool {
     match key {
         "never_trash" | "only_trash" | "bypass_processes" | "bypass_paths" => {}
         _ => fatal(format!("'{key}' is not a list — use 'trash config set'")),
     }
+    seed_inherited_whitelist(table, key, inherited);
     if let Some(arr) = table.get_mut(key).and_then(|v| v.as_array_mut()) {
         let before = arr.len();
         arr.retain(|v| v.as_str() != Some(value));
         arr.len() < before
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression (#211): only_trash in the user file REPLACES the inherited
+    // whitelist, so `config add only_trash` starting from an empty user list
+    // silently dropped the admin's patterns (their files became real deletes).
+    #[test]
+    fn adding_to_only_trash_keeps_the_inherited_whitelist() {
+        let mut table = toml::Table::new();
+        config_list_add(&mut table, "only_trash", "*.py", &["*.txt".to_string()]);
+        assert_eq!(
+            table["only_trash"],
+            toml::Value::Array(vec!["*.txt".into(), "*.py".into()])
+        );
+        // Extending lists still start empty: the layers merge.
+        config_list_add(&mut table, "never_trash", "*.log", &["*.tmp".to_string()]);
+        assert_eq!(
+            table["never_trash"],
+            toml::Value::Array(vec!["*.log".into()])
+        );
+    }
+
+    // Regression (#211): `config edit` seeded the user file with every default
+    // as an active value, overriding /etc/trashd/config.toml on first use.
+    #[test]
+    fn edit_template_sets_nothing() {
+        let template = commented_template(&Config::default());
+        assert!(template.contains("only_trash"));
+        assert!(template.parse::<toml::Table>().unwrap().is_empty());
     }
 }

@@ -1461,17 +1461,36 @@ impl TrashStore {
 
     /// Empty the trash (across all partitions).
     pub fn empty(&self, max_age_days: Option<u32>) -> Result<u64, TrashError> {
-        let entries = self.list(None)?;
-        let mut count = 0u64;
-        let now = chrono::Local::now();
+        let selected = self.entries_older_than(max_age_days)?;
+        Ok(self.empty_entries(&selected, max_age_days))
+    }
 
-        for entry in &entries {
-            if let Some(days) = max_age_days {
-                let age = now.signed_duration_since(entry.info.deletion_date);
-                if age.num_days() < days as i64 {
-                    continue;
+    /// Entries at least `max_age_days` old (all entries for `None`).
+    pub fn entries_older_than(
+        &self,
+        max_age_days: Option<u32>,
+    ) -> Result<Vec<TrashEntry>, TrashError> {
+        let now = chrono::Local::now();
+        Ok(self
+            .list(None)?
+            .into_iter()
+            .filter(|entry| match max_age_days {
+                Some(days) => {
+                    now.signed_duration_since(entry.info.deletion_date)
+                        .num_days()
+                        >= days as i64
                 }
-            }
+                None => true,
+            })
+            .collect())
+    }
+
+    /// Permanently delete exactly `entries`, e.g. the listing a user just
+    /// confirmed: re-listing purged items trashed while the prompt waited
+    /// (#217). Each entry is identity-checked, so a reused ID is never hit.
+    pub fn empty_entries(&self, entries: &[TrashEntry], max_age_days: Option<u32>) -> u64 {
+        let mut count = 0u64;
+        for entry in entries {
             if let Err(e) = self.purge_resolved(entry) {
                 if !matches!(e, TrashError::EntryNotFound(_)) {
                     eprintln!(
@@ -1491,7 +1510,7 @@ impl TrashStore {
                 let _ = crate::directorysizes::write_cache(&dir);
             }
         }
-        Ok(count)
+        count
     }
 
     /// Run auto_purge only if enough time has passed since the last run.
@@ -1575,12 +1594,17 @@ impl TrashStore {
             if entries[i].info.compressed.is_some() {
                 continue;
             }
+            // Entries other FreeDesktop tools created stay readable to them
+            // (#202).
+            if !entries[i].info.is_trashd_entry() {
+                continue;
+            }
             let path = entries[i].trashed_path.clone();
             let meta = match fs::symlink_metadata(&path) {
                 Ok(m) if m.is_file() => m,
                 _ => continue, // missing, dir, or symlink
             };
-            if meta.len() < 1024 || meta.len() > COMPRESS_MAX_BYTES {
+            if meta.len() < 1024 || meta.len() > COMPRESS_MAX_BYTES || has_xattrs(&path) {
                 continue;
             }
             // Hold the entry flock across validate → swap, mirroring the CLI
@@ -1642,10 +1666,11 @@ impl TrashStore {
                 // entry stays consistent.
                 let mut info = entries[i].info.clone();
                 info.compressed = Some("zstd".into());
-                if write_trashinfo_atomic(&entries[i].info_path, &info).is_ok() {
+                if set_compression_marker(&entries[i].info_path, Some("zstd")).is_ok() {
                     if atomic_write(&path, &compressed).is_err() {
-                        let _ = write_trashinfo_atomic(&entries[i].info_path, &entries[i].info);
+                        let _ = set_compression_marker(&entries[i].info_path, None);
                     } else {
+                        let _ = keep_times(&path, &meta);
                         entries[i].info = info;
                     }
                     entries[i].identity = file_identity(&path);
@@ -1693,14 +1718,29 @@ impl TrashStore {
             if let Some(usage_pct) = disk_usage_percent(&home)
                 && usage_pct >= pressure_pct as f64
             {
-                let surviving: usize = purged.iter().filter(|&&p| !p).count();
-                let to_purge = std::cmp::max(1, surviving / 10);
+                // Recent entries are never eligible: moving a file into the
+                // trash frees nothing, and purging the entry an `rm` just
+                // created turned it into a permanent delete (#201).
+                let eligible = |entry: &TrashEntry| {
+                    now.signed_duration_since(entry.info.deletion_date) >= PRESSURE_MIN_AGE
+                        && mounts::same_filesystem(&home, &entry.trash_root)
+                };
+                let candidates = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, entry)| !purged[*i] && eligible(entry))
+                    .count();
+                let to_purge = if candidates == 0 {
+                    0
+                } else {
+                    std::cmp::max(1, candidates / 10)
+                };
                 let mut purged_count = 0;
                 for i in (0..entries.len()).rev() {
                     if purged_count >= to_purge {
                         break;
                     }
-                    if purged[i] || !mounts::same_filesystem(&home, &entries[i].trash_root) {
+                    if purged[i] || !eligible(&entries[i]) {
                         continue;
                     }
                     if self.purge_entry(&entries[i]).is_ok() {
@@ -1869,12 +1909,47 @@ impl TrashStore {
         &self.config
     }
 
+    /// The selector (trashed path) of the entry whose original file name is
+    /// exactly `raw`. IDs are built from lossy names, so a non-UTF-8 name
+    /// must never reach ID matching through a lossy conversion: it matched
+    /// another entry's ID exactly, and purge deleted the wrong file (#209).
+    pub fn selector_for_raw_name(&self, raw: &OsStr) -> Result<String, TrashError> {
+        let entries = self.list(None)?;
+        let matching: Vec<&TrashEntry> = entries
+            .iter()
+            .filter(|e| e.info.original_path.file_name() == Some(raw))
+            .collect();
+        let lossy = raw.to_string_lossy().into_owned();
+        match matching.as_slice() {
+            [entry] => entry
+                .trashed_path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(TrashError::EntryNotFound(lossy)),
+            [] => Err(TrashError::EntryNotFound(lossy)),
+            _ => Err(TrashError::AmbiguousMatch {
+                pattern: lossy,
+                count: matching.len(),
+            }),
+        }
+    }
+
     /// Resolve a trash entry by exact ID (or filename fallback), refusing
     /// ambiguity when the same ID exists in more than one trash root — the
     /// same resolution rules restore/purge apply, so `trash info` can never
     /// describe a different copy than the one restore would publish (#148).
     pub fn find_entry(&self, id_or_pattern: &str) -> Result<TrashEntry, TrashError> {
         let entries = self.list(None)?;
+
+        // An entry's trashed path is unique even when two roots hold the
+        // same ID, so it selects exactly one entry (#210).
+        if id_or_pattern.starts_with('/')
+            && let Some(entry) = entries
+                .iter()
+                .find(|e| e.trashed_path == Path::new(id_or_pattern))
+        {
+            return Ok(entry.clone());
+        }
 
         // Exact ID match. IDs are unique WITHIN one trash dir, but two
         // partitions can hold entries with the same ID (same filename trashed
@@ -2212,7 +2287,7 @@ fn decompress_zstd_entry(entry: &mut TrashEntry, max_output: u64) -> io::Result<
         // Compression records the marker first. A crash in that narrow window
         // leaves ordinary plaintext plus a stale marker; clear only that known
         // state. A payload with real zstd magic must decode successfully.
-        write_trashinfo_atomic(&entry.info_path, &cleared)?;
+        set_compression_marker(&entry.info_path, None)?;
         entry.info = cleared;
         entry.sidecar_version = sidecar_version(&entry.info_path);
         return Ok(());
@@ -2267,12 +2342,13 @@ fn decompress_zstd_entry(entry: &mut TrashEntry, max_output: u64) -> io::Result<
     staging
         .persist(&entry.trashed_path)
         .map_err(|error| error.error)?;
+    let _ = keep_times(&entry.trashed_path, &metadata);
     entry.identity = file_identity(&entry.trashed_path);
 
     // Treat marker retirement as part of the transaction. If it fails, leave
     // the recoverable plaintext+marker state; the next restore recognizes the
     // missing magic and retries this write without decoding the file again.
-    write_trashinfo_atomic(&entry.info_path, &cleared)?;
+    set_compression_marker(&entry.info_path, None)?;
     entry.info = cleared;
     entry.sidecar_version = sidecar_version(&entry.info_path);
     Ok(())
@@ -2494,7 +2570,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 /// freshly-written data-absent sidecar may be an in-flight trash (the
 /// cross-device copy window spans seconds) — stripping its sidecar
 /// would strand the completed move as an unrestorable orphan (#169).
-fn data_absence_is_retired(info_path: &Path) -> bool {
+pub fn data_absence_is_retired(info_path: &Path) -> bool {
     const GRACE_SECS: u64 = 5;
     let sidecar_age = fs::symlink_metadata(info_path)
         .and_then(|m| m.modified())
@@ -2553,6 +2629,65 @@ pub fn normalize_conflict_base(path: &Path) -> PathBuf {
 /// the temp-file+rename dance.
 pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<()> {
     atomic_write(info_path, info.to_trashinfo_string().as_bytes())
+}
+
+/// Set or clear the `X-Trashd-Compressed` marker, leaving every other byte
+/// of the sidecar as it is on disk. Writing back a listed `TrashInfo` turned
+/// relative topdir `Path=` values absolute (list() resolves them), which broke
+/// restore once the drive was mounted elsewhere (#218).
+pub fn set_compression_marker(info_path: &Path, algorithm: Option<&str>) -> io::Result<()> {
+    let original = fs::read(info_path)?;
+    let mut text: Vec<u8> = Vec::with_capacity(original.len() + 32);
+    for line in original.split_inclusive(|&b| b == b'\n') {
+        if !line.starts_with(b"X-Trashd-Compressed=") {
+            text.extend_from_slice(line);
+        }
+    }
+    if let Some(algorithm) = algorithm {
+        if !text.is_empty() && !text.ends_with(b"\n") {
+            text.push(b'\n');
+        }
+        text.extend_from_slice(format!("X-Trashd-Compressed={algorithm}\n").as_bytes());
+    }
+    atomic_write(info_path, &text)
+}
+
+/// Give a swapped-in file the original's access and modification times, so
+/// compressing or decompressing an entry does not change what restore
+/// publishes (#202).
+fn keep_times(path: &Path, original: &fs::Metadata) -> io::Result<()> {
+    let times = [
+        libc::timespec {
+            tv_sec: original.atime(),
+            tv_nsec: original.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: original.mtime(),
+            tv_nsec: original.mtime_nsec(),
+        },
+    ];
+    let name = CString::new(path.as_os_str().as_bytes())?;
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Extended attributes (ACLs, labels, user data) would not survive the
+/// replacement inode, so such files are never auto-compressed (#202).
+fn has_xattrs(path: &Path) -> bool {
+    let Ok(name) = CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    unsafe { libc::llistxattr(name.as_ptr(), std::ptr::null_mut(), 0) != 0 }
 }
 
 struct RestoreDestination {
@@ -3747,6 +3882,9 @@ fn class_match(p: &[char], start: usize, c: char) -> Option<usize> {
     None
 }
 
+/// Minimum age before disk pressure may purge an entry (#201).
+const PRESSURE_MIN_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
 /// Get disk usage percentage for the filesystem containing the given path.
 fn disk_usage_percent(path: &Path) -> Option<f64> {
     let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
@@ -4211,6 +4349,8 @@ mod tests {
         fs::write(trash.join("files/old.txt"), &data).unwrap();
         let mut info = TrashInfo::new(PathBuf::from("/work/old.txt"));
         info.deletion_date = chrono::Local::now() - chrono::Duration::days(10);
+        // A trashd entry: only those are auto-compressed (#202).
+        info.size = Some(data.len() as u64);
         let sidecar = trash.join("info/old.txt.trashinfo");
         fs::write(&sidecar, info.to_trashinfo_string()).unwrap();
 
@@ -5684,6 +5824,148 @@ mod tests {
         assert_eq!(
             fs::read_to_string(entry.trashed_path.join("sub/file")).unwrap(),
             "payload"
+        );
+    }
+
+    /// Seed a week-old compressible entry with a hand-written sidecar.
+    fn seed_old_entry(store: &TrashStore, id: &str, sidecar_extra: &str) -> (PathBuf, PathBuf) {
+        let data = store.home.join("files").join(id);
+        fs::write(&data, "compressible ".repeat(1000)).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        fs::File::options()
+            .write(true)
+            .open(&data)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let info = store.home.join("info").join(format!("{id}.trashinfo"));
+        fs::write(
+            &info,
+            format!(
+                "[Trash Info]\nPath=docs/{id}\nDeletionDate=2000-01-01T00:00:00\n{sidecar_extra}"
+            ),
+        )
+        .unwrap();
+        (data, info)
+    }
+
+    fn zstd_magic(path: &Path) -> bool {
+        fs::read(path)
+            .unwrap()
+            .starts_with(&0xFD2FB528u32.to_le_bytes())
+    }
+
+    // Regression (#202): auto-compression rewrote entries other FreeDesktop
+    // tools created; restoring those elsewhere yields zstd bytes.
+    #[test]
+    fn auto_compression_leaves_foreign_entries_alone() {
+        let (store, _data, _work, _) = test_store();
+        let (data, info) = seed_old_entry(&store, "foreign.txt", "");
+        let sidecar = fs::read(&info).unwrap();
+        store.auto_purge().unwrap();
+        assert!(!zstd_magic(&data), "a foreign entry was compressed");
+        assert_eq!(fs::read(&info).unwrap(), sidecar);
+    }
+
+    // Regression (#202, #218): compressing a trashd entry keeps its mtime and
+    // its sidecar byte-exact apart from the marker. list() absolutizes
+    // relative topdir paths in memory; writing that back broke restore after
+    // the drive was mounted elsewhere.
+    #[test]
+    fn auto_compression_preserves_mtime_and_sidecar_text() {
+        let (store, _data, _work, _) = test_store();
+        let (data, info) = seed_old_entry(&store, "ours.txt", "X-Trashd-Size=13000\n");
+        let mtime = fs::metadata(&data).unwrap().modified().unwrap();
+        store.auto_purge().unwrap();
+        assert!(zstd_magic(&data), "trashd entry was not compressed");
+        assert_eq!(fs::metadata(&data).unwrap().modified().unwrap(), mtime);
+        assert_eq!(
+            fs::read_to_string(&info).unwrap(),
+            "[Trash Info]\nPath=docs/ours.txt\nDeletionDate=2000-01-01T00:00:00\n\
+             X-Trashd-Size=13000\nX-Trashd-Compressed=zstd\n"
+        );
+    }
+
+    // Regression (#217): `trash empty` confirmed a listing, then re-listed and
+    // purged whatever existed by then, including items trashed while the
+    // prompt was waiting.
+    #[test]
+    fn emptying_purges_exactly_the_confirmed_entries() {
+        let (store, _data, work, _) = test_store();
+        store
+            .trash(&create_file(work.path(), "shown", "a"), None)
+            .unwrap();
+        let shown = store.list(None).unwrap();
+        let late = store
+            .trash(&create_file(work.path(), "late", "b"), None)
+            .unwrap();
+        assert_eq!(store.empty_entries(&shown, None), 1);
+        let left: Vec<String> = store
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(left, vec![late]);
+    }
+
+    // Regression (#210): the same ID can exist in two trash roots, where
+    // only the entry's trashed path tells them apart; it must work as a
+    // selector for restore, purge and info.
+    #[test]
+    fn trashed_path_selects_its_entry() {
+        let (store, _data, work, _) = test_store();
+        let id = store
+            .trash(&create_file(work.path(), "notes.txt", "a"), None)
+            .unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let selector = entry.trashed_path.to_str().unwrap();
+        assert_eq!(
+            store.find_entry(selector).unwrap().info_path,
+            entry.info_path
+        );
+    }
+
+    // Regression (#209): IDs are built from lossy names, so a non-UTF-8
+    // target converted lossily exactly matched ANOTHER entry's ID, and purge
+    // permanently deleted the wrong file.
+    #[test]
+    fn raw_name_selects_the_entry_with_exactly_those_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let (store, _data, work, _) = test_store();
+        for raw in [b"\xff.txt".as_slice(), b"\xfe.txt".as_slice()] {
+            let path = work.path().join(OsStr::from_bytes(raw));
+            fs::write(&path, raw).unwrap();
+            store.trash(&path, None).unwrap();
+        }
+        let selector = store
+            .selector_for_raw_name(OsStr::from_bytes(b"\xfe.txt"))
+            .unwrap();
+        let entry = store.find_entry(&selector).unwrap();
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), b"\xfe.txt");
+    }
+
+    // Regression (#201): under disk pressure (90% by default) every run
+    // purged at least one entry, so `rm` could permanently delete the very
+    // file it had just reported as trashed. Recent entries are never
+    // eligible.
+    #[test]
+    fn disk_pressure_never_purges_a_just_trashed_entry() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
+        fs::create_dir_all(&base).unwrap();
+        let data = TempDir::with_prefix_in("data-", &base).unwrap();
+        let work = TempDir::with_prefix_in("work-", &base).unwrap();
+        let mut config = Config::default();
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 1; // always "under pressure"
+        let store = TrashStore::open_isolated(&data.path().join("Trash"), config).unwrap();
+        let file = create_file(work.path(), "fresh", "just deleted");
+        let id = store.trash(&file, None).unwrap();
+        store.auto_purge().unwrap();
+        assert!(
+            store.find_entry(&id).is_ok(),
+            "pressure purged a just-trashed entry"
         );
     }
 

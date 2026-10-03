@@ -92,6 +92,9 @@ pub fn print_json_entries(entries: &[trashd_common::store::TrashEntry]) {
         .map(|e| {
             serde_json::json!({
                 "id": e.id,
+                // Unique even when two trash roots hold the same id; accepted
+                // as a selector by restore, purge and info (#210).
+                "trashed_path": e.trashed_path.to_string_lossy(),
                 "original_path": e.info.original_path.to_string_lossy(),
                 "deletion_date": e.info.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string(),
                 "size": e.info.size,
@@ -128,6 +131,18 @@ pub fn confirm(msg: &str) -> bool {
 }
 
 /// Print a fatal error and exit.
+/// The selector for an entry named on the command line: UTF-8 targets as
+/// typed, anything else by its raw bytes. A lossy conversion matched another
+/// entry's ID exactly, so purge deleted the wrong file (#209).
+pub fn target_selector(store: &trashd_common::TrashStore, target: &std::ffi::OsStr) -> String {
+    match target.to_str() {
+        Some(target) => target.to_owned(),
+        None => store
+            .selector_for_raw_name(target)
+            .unwrap_or_else(|e| fatal(e)),
+    }
+}
+
 pub fn fatal(msg: impl std::fmt::Display) -> ! {
     eprintln!("{} {msg}", "trash: error:".red().bold());
     std::process::exit(1);

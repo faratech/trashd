@@ -245,7 +245,7 @@ fn write_update_check_cache_at(marker: &Path, version: &str) -> std::io::Result<
     Ok(())
 }
 
-pub fn run(check_only: bool) {
+pub fn run(check_only: bool, allow_unverified: bool) {
     let current = crate::VERSION;
 
     let release = if check_only {
@@ -423,6 +423,16 @@ pub fn run(check_only: bool) {
         fatal(e);
     }
     eprintln!("{}", "ok".green());
+
+    // The checksum comes from the same release as the tarball; only the
+    // build attestation shows where the artifact came from (#214).
+    eprint!("Verifying provenance... ");
+    let provenance = verify_provenance(&tarball_path);
+    if let Err(refusal) = provenance_gate(provenance, allow_unverified) {
+        eprintln!("{}", "not verified".red().bold());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        fatal(refusal);
+    }
 
     // Extract tarball
     eprint!("Extracting... ");
@@ -644,6 +654,54 @@ fn download_file(url: &str, dest: &std::path::Path, max_bytes: u64) -> Result<()
     Ok(())
 }
 
+/// Result of checking a release tarball's GitHub build attestation.
+enum Provenance {
+    Verified,
+    /// Could not be verified, with the reason (gh missing, not logged in,
+    /// no attestation, or a failed verification).
+    Unverified(String),
+}
+
+fn verify_provenance(tarball: &std::path::Path) -> Provenance {
+    match std::process::Command::new("gh")
+        .args(["attestation", "verify"])
+        .arg(tarball)
+        .args(["--repo", "faratech/trashd"])
+        .output()
+    {
+        Ok(output) if output.status.success() => Provenance::Verified,
+        Ok(output) => Provenance::Unverified(format!(
+            "gh attestation verify failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Provenance::Unverified("the GitHub CLI (gh) is not installed".into())
+        }
+        Err(error) => Provenance::Unverified(format!("could not run gh: {error}")),
+    }
+}
+
+/// install.sh runs as root, so an artifact of unproven origin needs the
+/// user's explicit consent (#214).
+fn provenance_gate(provenance: Provenance, allow_unverified: bool) -> Result<(), String> {
+    match provenance {
+        Provenance::Verified => {
+            eprintln!("{}", "ok".green());
+            Ok(())
+        }
+        Provenance::Unverified(reason) if allow_unverified => {
+            eprintln!("{} ({reason}); continuing as requested", "skipped".yellow());
+            Ok(())
+        }
+        Provenance::Unverified(reason) => Err(format!(
+            "cannot verify the release's build attestation: {reason}.\n  \
+             Install and log in to the GitHub CLI (`gh auth login`) so the \
+             attestation can be checked, or re-run with --allow-unverified \
+             to install without it"
+        )),
+    }
+}
+
 fn verify_sha256(tarball: &std::path::Path, sha_file: &std::path::Path) -> Result<(), String> {
     use sha2::Digest;
     let content =
@@ -823,6 +881,18 @@ mod tests {
             assert!(prefix.is_absolute());
             assert_ne!(prefix, Path::new("/usr/local"));
         }
+    }
+
+    // Regression (#214): the checksum comes from the same release as the
+    // tarball, so only the build attestation shows where an artifact that
+    // install.sh runs as root came from. Unverifiable releases need consent.
+    #[test]
+    fn provenance_gate_requires_attestation_or_consent() {
+        assert!(provenance_gate(Provenance::Verified, false).is_ok());
+        let unverified = || Provenance::Unverified("gh is not installed".into());
+        let refusal = provenance_gate(unverified(), false).unwrap_err();
+        assert!(refusal.contains("--allow-unverified") && refusal.contains("gh"));
+        assert!(provenance_gate(unverified(), true).is_ok());
     }
 
     // Regression (#199): self-update reinstalls system-wide as root into the

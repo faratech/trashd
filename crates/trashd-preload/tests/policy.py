@@ -255,7 +255,8 @@ def run():
         renameat2 = {"x86_64": 316, "aarch64": 276}[os.uname().machine]
         unlink_nr = {"x86_64": 87, "aarch64": 35}[os.uname().machine]
         def deny_move_and_cleanup():
-            force_install_error(errno.EPERM, renameat2)()
+            # EXDEV is the cross-device case that takes the copy path.
+            force_install_error(errno.EXDEV, renameat2)()
             force_install_error(errno.EACCES, unlink_nr)()
         for is_link in [False, True]:
             fixture, data, environment = focused_fixture("cleanup-failure-" + str(is_link))
@@ -268,12 +269,16 @@ def run():
             result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
                 capture_output=True, preexec_fn=deny_move_and_cleanup, timeout=10)
             assert result.returncode == 0 and victim.read_bytes() == b"complete recovery", result.stderr
+            assert victim.is_symlink() == is_link
+            # The injected filter fails EVERY unlink, including the removal of
+            # the now-redundant copy (#205), so one may remain here; it must
+            # then be complete, never a sidecar without its data.
             records = list((data / "Trash/info").glob("*.trashinfo"))
-            assert len(records) == 1
-            stored = data / "Trash/files" / records[0].stem
-            assert stored.read_bytes() == b"complete recovery"
-            assert stored.is_symlink() == is_link
-        print("PASS: failed source cleanup returns errno and retains complete recovery copies")
+            for record in records:
+                stored = data / "Trash/files" / record.stem
+                assert stored.read_bytes() == b"complete recovery"
+                assert stored.is_symlink() == is_link
+        print("PASS: failed source cleanup returns errno and never leaves a partial entry")
 
         for dirname in [".Trash", f".Trash-{os.geteuid()}"]:
             fixture, data, environment = focused_fixture("lookalike-" + dirname)
@@ -314,6 +319,50 @@ def run():
         finally:
             subprocess.run(["/usr/bin/umount", str(tiny)], check=True)
         print("PASS: failed restore rolls back without re-interception")
+
+        # When the copy succeeds but the source cannot be removed (read-only
+        # mount, unwritable parent), the verified copy is a pure duplicate:
+        # it must not stay behind in the trash (#205).
+        fixture, data, environment = focused_fixture("readonly-source")
+        source = fixture / "source"
+        source.mkdir()
+        (source / "victim").write_bytes(b"read-only data")
+        readonly = fixture / "readonly"
+        readonly.mkdir()
+        subprocess.run(["/usr/bin/mount", "--bind", str(source), str(readonly)], check=True)
+        subprocess.run(["/usr/bin/mount", "-o", "remount,bind,ro", str(readonly)], check=True)
+        try:
+            result = subprocess.run(["/usr/bin/unlink", str(readonly / "victim")], env=environment, capture_output=True)
+            assert result.returncode != 0, "unlink on a read-only mount reported success"
+            assert (readonly / "victim").read_bytes() == b"read-only data"
+            assert not list((data / "Trash/info").glob("*.trashinfo")), "stray recovery sidecar"
+            assert not list((data / "Trash/files").iterdir()), "stray recovery copy"
+        finally:
+            subprocess.run(["/usr/bin/umount", str(readonly)], check=True)
+        print("PASS: failed source removal leaves no duplicate in the trash")
+
+        # Preload diagnostics run inside arbitrary programs. With stderr on a
+        # closed pipe they must neither raise SIGPIPE in the host nor abort it
+        # (eprintln! panics on EPIPE inside an extern "C" hook) (#208).
+        import signal
+        for disposition in [signal.SIG_DFL, signal.SIG_IGN]:
+            fixture, data, environment = focused_fixture(f"closed-stderr-{int(disposition)}")
+            config_dir = fixture / "config" / "trashd"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text('only_trash = ["*.txt"\n')  # malformed: warns
+            victim = fixture / "victim"
+            victim.write_bytes(b"data")
+            reader, writer = os.pipe()
+            os.close(reader)
+            try:
+                result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment,
+                                        stdout=subprocess.DEVNULL, stderr=writer,
+                                        preexec_fn=lambda: signal.signal(signal.SIGPIPE, disposition))
+            finally:
+                os.close(writer)
+            assert result.returncode == 0, (disposition, result.returncode)
+            assert not victim.exists()
+        print("PASS: diagnostics never kill or abort the host on a closed stderr")
 
         # A .trashd.toml another user owns (a shared directory, a USB stick)
         # must not turn this user's deletes into permanent ones (#207).

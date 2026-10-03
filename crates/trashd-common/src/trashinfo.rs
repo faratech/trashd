@@ -22,6 +22,13 @@ pub struct TrashInfo {
 }
 
 impl TrashInfo {
+    /// True when trashd wrote this sidecar (it always records the PID and
+    /// size); entries created by other FreeDesktop tools carry none of the
+    /// `X-Trashd-*` fields.
+    pub fn is_trashd_entry(&self) -> bool {
+        self.pid.is_some() || self.size.is_some() || self.command.is_some() || self.sha256.is_some()
+    }
+
     pub fn new(original_path: PathBuf) -> Self {
         Self {
             original_path,

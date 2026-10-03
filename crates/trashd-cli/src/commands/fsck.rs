@@ -83,18 +83,27 @@ fn check_trash_dir(
     // Check for .trashinfo files without matching files
     if let Ok(entries) = std::fs::read_dir(&info_dir) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".trashinfo") {
+            // Raw bytes: a lossy name pointed at a different (missing) data
+            // file, so --fix deleted valid sidecars of non-UTF-8 entries (#212).
+            use std::os::unix::ffi::OsStrExt;
+            let name = entry.file_name();
+            let Some(stem) = name.as_bytes().strip_suffix(b".trashinfo") else {
                 continue;
-            }
-            let id = name.strip_suffix(".trashinfo").unwrap_or(&name);
+            };
+            let id = std::ffi::OsStr::from_bytes(stem);
             let file_path = files_dir.join(id);
+            let id = id.to_string_lossy();
             // symlink_metadata (not exists()): a DANGLING symlink in files/
             // is still an entry we must not silently discard by declaring its
             // trashinfo orphaned.
             if std::fs::symlink_metadata(&file_path)
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
             {
+                // A fresh sidecar may belong to a trash still in flight: its
+                // data lands after it (#169, #212).
+                if !trashd_common::store::data_absence_is_retired(&entry.path()) {
+                    continue;
+                }
                 orphaned_info += 1;
                 println!("  {} orphaned trashinfo (no file): {}", "WARN".yellow(), id);
                 if fix {
@@ -272,6 +281,67 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(fs::read(root.join("files/active")).unwrap(), b"complete");
         assert!(sidecar.is_file());
+    }
+
+    /// An entry whose sidecar is old enough to be past the in-flight grace.
+    fn aged_sidecar(
+        root: &std::path::Path,
+        id: &std::ffi::OsStr,
+        original: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let mut name = id.to_os_string();
+        name.push(".trashinfo");
+        let sidecar = root.join("info").join(name);
+        let info = trashd_common::trashinfo::TrashInfo::new(original.to_path_buf());
+        fs::write(&sidecar, info.to_trashinfo_string()).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        sidecar
+    }
+
+    // Regression (#212): a non-UTF-8 entry's data was looked up through a
+    // lossy name, looked missing, and --fix deleted its valid sidecar.
+    #[test]
+    fn fix_keeps_sidecars_of_non_utf8_entries() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        let id = std::ffi::OsStr::from_bytes(b"report-\xff");
+        fs::write(root.join("files").join(id), b"data").unwrap();
+        let sidecar = aged_sidecar(&root, id, &dir.path().join(id));
+        check_trash_dir(&store, &root, true);
+        assert!(
+            sidecar.exists(),
+            "valid sidecar of a non-UTF-8 entry was deleted"
+        );
+    }
+
+    // Regression (#212): a sidecar written moments ago can belong to a trash
+    // still in flight (its data lands afterwards), so it is not an orphan yet.
+    #[test]
+    fn fix_leaves_in_flight_sidecars_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        let sidecar = root.join("info/landing.trashinfo");
+        let info = trashd_common::trashinfo::TrashInfo::new(dir.path().join("landing"));
+        fs::write(&sidecar, info.to_trashinfo_string()).unwrap();
+        check_trash_dir(&store, &root, true);
+        assert!(sidecar.exists(), "an in-flight sidecar was removed");
+        // Once past the grace period, a sidecar without data is an orphan.
+        let aged = aged_sidecar(
+            &root,
+            std::ffi::OsStr::new("gone"),
+            &dir.path().join("gone"),
+        );
+        check_trash_dir(&store, &root, true);
+        assert!(!aged.exists());
     }
 
     // C1: `fsck --fix` must NEVER delete the data file just because its

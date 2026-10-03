@@ -53,6 +53,41 @@
   --version` succeeds: an empty or stale `SHELL` (docker exec, `env -i`)
   ended every root login (#200). `trashd-exec --version` is answered instead
   of being run as a command (#234).
+- Disk-pressure retention only purges entries at least an hour old: every run
+  purged at least one entry, even the one an `rm` had just trashed (#201).
+- Auto-compression only touches trashd's own entries (other tools' entries
+  stay readable to them), skips files with extended attributes, keeps
+  timestamps, and changes a sidecar only by its `X-Trashd-Compressed` line.
+  Writing back the listed metadata turned relative topdir `Path=` values
+  absolute and broke restore after a remount (#202, #218).
+- The preload only copies on `EXDEV` (or unsupported `RENAME_NOREPLACE`) and
+  removes its verified copy when the original cannot be unlinked; a retry
+  loop over a read-only mount filled the trash with duplicates (#205).
+- The preload no longer pins trash-root descriptors, which kept removable
+  media busy, and never holds its lock across syscalls (#206).
+- Preload diagnostics can no longer abort the host process (`eprintln!`
+  panics on `EPIPE`) or raise `SIGPIPE` in it; the "config changed" note
+  only appears with `TRASHD_PRELOAD_LOG=1` (#208).
+- `restore`, `purge` and `info` match non-UTF-8 names byte for byte instead
+  of through a lossy conversion that could select another entry (#209), and
+  accept an entry's trashed path, which stays unique when two partitions hold
+  the same ID (#210). `trash ls --json` reports it as `trashed_path`.
+- `trash config add/remove only_trash` start from the inherited whitelist
+  instead of silently replacing it, and `trash config edit` creates a fully
+  commented template instead of pinning every default (#211).
+- `trash fsck --fix` compares sidecar names byte for byte and leaves sidecars
+  of in-flight trash operations alone; it deleted valid sidecars of
+  non-UTF-8 entries (#212).
+- The RPM spec packages the daemon binary and requires Rust 1.97 and
+  systemd-rpm-macros; CI checks `%files` against `make install` (#213).
+- `trash self-update` verifies the release's build attestation with
+  `gh attestation verify` before running the installer as root, or requires
+  `--allow-unverified` (#214).
+- Uninstall removes per-user files as each home's owner and never through a
+  symlinked component (#215), warns instead of aborting on files it cannot
+  remove (read-only `/usr`, #241), and the installer no longer aborts where
+  `systemctl` exists but systemd is not running (#216).
+- `trash empty` purges exactly the entries its prompt showed (#217).
 - `trashd-exec` no longer spins at 100% CPU (or hangs) when it inherits
   `SIGCHLD=SIG_IGN`, as root login shells do under WSL's `login`. The kernel
   reaped its children itself, leaving a permanently readable pidfd in the wait

@@ -220,7 +220,7 @@ fn config() -> &'static PreloadConfig {
             // Full reload would require unsafe or a Mutex — not worth the
             // complexity in a preload .so. Log so users know to restart.
             if cached_mtime != 0 {
-                eprintln!("[trashd-preload] config changed — restart process to apply");
+                log_preload("config changed — restart process to apply");
             }
         }
     }
@@ -274,7 +274,10 @@ fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {
     {
         Ok(partial) => Some(partial),
         Err(error) => {
-            eprintln!("trashd-preload: bad config {}: {error}", path.display());
+            host_stderr(&format!(
+                "trashd-preload: bad config {}: {error}",
+                path.display()
+            ));
             None
         }
     }
@@ -631,7 +634,9 @@ fn sanitize_patterns(list: Vec<String>, what: &str) -> Vec<String> {
     list.into_iter()
         .filter(|p| {
             if p.contains('{') || p.contains('}') {
-                eprintln!("trashd-preload: WARNING: dropping unsupported {what} pattern '{p}'");
+                host_stderr(&format!(
+                    "trashd-preload: WARNING: dropping unsupported {what} pattern '{p}'"
+                ));
                 false
             } else {
                 true
@@ -655,7 +660,7 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let warn = |msg: String| {
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("trashd-preload: warning: {msg}");
+            host_stderr(&format!("trashd-preload: warning: {msg}"));
         }
     };
     let mut dir = path.parent()?;
@@ -1251,7 +1256,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         Ok(s) => s,
         Err(_) => return TrashAttempt::Error(libc::EINVAL),
     };
-    if unsafe {
+    let rename_error = if unsafe {
         libc::syscall(
             libc::SYS_renameat2,
             libc::AT_FDCWD,
@@ -1270,11 +1275,23 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
             dest.display()
         ));
         return TrashAttempt::Trashed;
-    }
+    } else {
+        io::Error::last_os_error().raw_os_error()
+    };
 
     if dest.symlink_metadata().is_ok() {
         let _ = fs::remove_file(&info_path);
         return TrashAttempt::Error(libc::EEXIST);
+    }
+    // Only a cross-device move (or an unsupported RENAME_NOREPLACE) calls for
+    // copying. Any other error (EACCES, EPERM, EROFS) makes the real unlink
+    // fail as well; copying first only stranded duplicates in the trash (#205).
+    if !matches!(
+        rename_error,
+        Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+    ) {
+        let _ = fs::remove_file(&info_path);
+        return TrashAttempt::NotTrashed;
     }
     // Cross-device: copy preserving symlinks, then remove original
     let meta = match fs::symlink_metadata(path) {
@@ -1301,11 +1318,14 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
             drop(guard);
             let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
             if ret != 0 {
-                return TrashAttempt::Error(
-                    io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO),
-                );
+                let errno = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                // The original is intact, so the verified copy is a pure
+                // duplicate: a retry loop must not fill the trash (#205).
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&info_path);
+                return TrashAttempt::Error(errno);
             }
             log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
             return TrashAttempt::Trashed;
@@ -1355,11 +1375,14 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
             drop(guard);
             let ret = unsafe { (real_unlink())(cpath.as_ptr()) };
             if ret != 0 {
-                return TrashAttempt::Error(
-                    io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO),
-                );
+                let errno = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                // The original is intact, so the verified copy is a pure
+                // duplicate: a retry loop must not fill the trash (#205).
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&info_path);
+                return TrashAttempt::Error(errno);
             }
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
             return TrashAttempt::Trashed;
@@ -1459,8 +1482,45 @@ fn log_preload(msg: &str) {
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        eprintln!("[trashd-preload] {msg}");
+        host_stderr(&format!("[trashd-preload] {msg}"));
     }
+}
+
+/// Write one diagnostic line to the HOST process's stderr. It must never hurt
+/// the host: `eprintln!` panics when the write fails, which aborts the host
+/// from inside an extern "C" hook, and writing to a closed pipe raises
+/// SIGPIPE in a program that may never write to stderr itself (#208). So
+/// SIGPIPE is blocked around the write and a SIGPIPE caused by it is
+/// consumed; errors are ignored and the caller's errno is preserved.
+fn host_stderr(msg: &str) {
+    let mut line = msg.as_bytes().to_vec();
+    line.push(b'\n');
+    unsafe {
+        let saved_errno = *libc::__errno_location();
+        let mut pipe: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut pipe);
+        libc::sigaddset(&mut pipe, libc::SIGPIPE);
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut pending);
+        let already_pending = libc::sigismember(&pending, libc::SIGPIPE) == 1;
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &pipe, &mut previous);
+        let written = libc::write(2, line.as_ptr().cast(), line.len());
+        if written < 0 && *libc::__errno_location() == libc::EPIPE && !already_pending {
+            let immediately = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            libc::sigtimedwait(&pipe, std::ptr::null_mut(), &immediately);
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        *libc::__errno_location() = saved_errno;
+    }
+}
+
+/// Diagnostics of modules shared with trashd-common (`#[path]` includes).
+pub(crate) fn report_note(msg: &str) {
+    host_stderr(msg);
 }
 
 fn cstr_to_path(s: *const libc::c_char) -> Option<PathBuf> {

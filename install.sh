@@ -56,6 +56,41 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     export PATH
     hash -r 2>/dev/null || true
 
+    # Remove only files that exist, and warn instead of aborting when one
+    # cannot be removed: on a read-only /usr (ostree/Silverblue, NixOS) even
+    # `rm -f` of an absent file fails with EROFS, and set -e aborted the
+    # uninstall halfway (#241).
+    remove_files() {
+        for _f in "$@"; do
+            if [ -e "$_f" ] || [ -L "$_f" ]; then
+                "$RM" -f -- "$_f" || echo "    warning: could not remove $_f" >&2
+            fi
+        done
+    }
+
+    # Remove a tree below a user's home as that home's owner, never through a
+    # symlinked component: as root, a planted ~/.config symlink made the
+    # uninstaller delete another user's files (#215).
+    remove_home_tree() {
+        _home="$1"; _rel="$2"; _path="$_home"
+        _old_ifs="$IFS"; IFS='/'
+        for _part in $_rel; do
+            _path="$_path/$_part"
+            if [ -L "$_path" ] || [ ! -d "$_path" ]; then
+                IFS="$_old_ifs"
+                return 0
+            fi
+        done
+        IFS="$_old_ifs"
+        _uid="$(stat -c %u -- "$_home")"; _gid="$(stat -c %g -- "$_home")"
+        if [ "$_uid" = 0 ]; then
+            "$RM" -rf -- "$_path"
+        else
+            setpriv --reuid="$_uid" --regid="$_gid" --clear-groups -- "$RM" -rf -- "$_path"
+        fi
+        echo "    Removed $_path"
+    }
+
     # 1. Remove the LD_PRELOAD entry FIRST — before deleting the .so — otherwise
     #    every dynamically-linked process errors about the missing library.
     if [ -f /etc/ld.so.preload ]; then
@@ -85,7 +120,7 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     fi
 
     # 3. Remove CLI binaries (current + legacy locations/names).
-    "$RM" -f "${BIN_DIR}/trash" "${BIN_DIR}/trashd-exec" "${BIN_DIR}/trashd" "${BIN_DIR}/trashd-daemon"
+    remove_files "${BIN_DIR}/trash" "${BIN_DIR}/trashd-exec" "${BIN_DIR}/trashd" "${BIN_DIR}/trashd-daemon"
     echo "    Removed binaries from ${BIN_DIR}"
 
     # 4. Remove the entire trashd lib tree in one shot: the rm shim (bin/), the
@@ -98,13 +133,13 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     # 5. Remove ALL trashd man pages: trash.1 plus every trash-<subcommand>.1
     #    (globbed, so new subcommands are covered without editing this list).
     MAN_DIR="${PREFIX}/share/man/man1"
-    "$RM" -f "${MAN_DIR}/trash.1" "${MAN_DIR}"/trash-*.1
+    remove_files "${MAN_DIR}/trash.1" "${MAN_DIR}"/trash-*.1
     echo "    Removed man pages"
 
     # 6. Remove shell completions: the PREFIX-relative paths this installer
     # uses, plus the system/Makefile locations so a mixed install (e.g. a
     # prior `make install` with the default prefix) is fully cleaned (#164).
-    "$RM" -f /etc/bash_completion.d/trash \
+    remove_files /etc/bash_completion.d/trash \
           "${PREFIX}/share/bash-completion/completions/trash" \
           /usr/local/share/bash-completion/completions/trash \
           "${PREFIX}/share/zsh/site-functions/_trash" \
@@ -126,10 +161,8 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
 
     # 9. Remove per-user configs for all users (and root).
     for home_dir in /home/* /root; do
-        if [ -d "${home_dir}/.config/trashd" ]; then
-            "$RM" -rf "${home_dir}/.config/trashd"
-            echo "    Removed ${home_dir}/.config/trashd"
-        fi
+        [ -d "$home_dir" ] && [ ! -L "$home_dir" ] || continue
+        remove_home_tree "$home_dir" ".config/trashd"
     done
 
     # 10. Optionally remove every FreeDesktop.org Trash spec v1.0 trash
@@ -138,10 +171,8 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     if [ "${PURGE}" -eq 1 ]; then
         echo "==> Removing all trash directories (--purge)..."
         for home_dir in /home/* /root; do
-            if [ -d "${home_dir}/.local/share/Trash" ]; then
-                "$RM" -rf "${home_dir}/.local/share/Trash"
-                echo "    Removed ${home_dir}/.local/share/Trash"
-            fi
+            [ -d "$home_dir" ] && [ ! -L "$home_dir" ] || continue
+            remove_home_tree "$home_dir" ".local/share/Trash"
         done
         while IFS= read -r mpoint; do
             for d in "${mpoint}"/.Trash-*; do
@@ -413,7 +444,10 @@ if [ -d /etc/profile.d ]; then
 fi
 
 echo "==> Installing fanotify daemon (Layer 3)..."
-if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+# /run/systemd/system exists only while systemd is PID 1. A systemctl binary
+# without a running systemd (WSL without systemd, containers) made
+# daemon-reload fail and aborted the install halfway under set -e (#216).
+if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     # Migrate from old trashd-daemon.service name
     if [ -f /etc/systemd/system/trashd-daemon.service ]; then
         systemctl stop trashd-daemon 2>/dev/null || true
@@ -436,7 +470,7 @@ if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             print out s
         }' \
         "$(dirname "$0")/install/systemd/trashd.service" > /etc/systemd/system/trashd.service
-    systemctl daemon-reload
+    systemctl daemon-reload || true
     systemctl enable trashd 2>/dev/null || true
     systemctl restart trashd 2>/dev/null || true
     if systemctl is-active --quiet trashd 2>/dev/null; then

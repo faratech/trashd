@@ -192,6 +192,7 @@ trash find ~/projects    # search by original path substring
 trash info <id>          # show full metadata: command, PID, size, hash, trash dir, storage path
 trash restore foo.txt    # restore to original location
 trash restore foo --to . # restore to current directory
+trash restore ~/.local/share/Trash/files/foo.txt  # select one entry by its trashed path
 trash undo               # restore the most recently trashed item
 trash purge foo.txt      # permanently delete a specific entry
 trash empty              # permanently empty all trash (prompts for confirmation)
@@ -211,6 +212,10 @@ trash fsck               # check trash directory integrity
 trash fsck --fix         # fix orphaned and corrupt entries
 trash --version          # show version
 ```
+
+`restore`, `purge` and `info` also accept an entry's trashed path (the `trashed_path` field of `trash ls --json`). It stays unique when the same name was trashed on two partitions, where the ID alone is ambiguous. Non-UTF-8 names are matched byte for byte.
+
+`trash self-update` verifies the release's build attestation with the GitHub CLI (`gh attestation verify`) before running the installer as root; without `gh`, pass `--allow-unverified` to install anyway. It only updates installations in a root-owned prefix and leaves package-managed `/usr` installs to the package manager. `trash config edit` starts from a fully commented template, so nothing is overridden until you uncomment it.
 
 ### Bypass trash when needed
 
@@ -400,11 +405,11 @@ After every trash operation, trashd runs an automatic retention policy (throttle
 
 **Phase 1 — Age purge:** Delete items older than `retention.max_age_days`.
 
-**Phase 2 — Auto-compress:** Before purging by size, compress items older than 7 days using native zstd (level 3). This reclaims space without losing data — often enough to avoid purging at all. Skips already-compressed files (detected by zstd magic `0xFD2FB528`), files under 1 KB, and directories. Only replaces the file if compression actually reduced the size.
+**Phase 2 — Auto-compress:** Before purging by size, compress items older than 7 days using native zstd (level 3). This reclaims space without losing data — often enough to avoid purging at all. Only trashd's own entries are compressed: entries other FreeDesktop tools created stay readable to those tools. Skips already-compressed files (detected by zstd magic `0xFD2FB528`), files under 1 KB, files with extended attributes, and directories. Only replaces the file if compression actually reduced the size; the replacement keeps the original timestamps, and the sidecar changes only by its `X-Trashd-Compressed` line.
 
-**Phase 3 — Size trim:** If total trash exceeds `retention.max_size_gb`, purge the oldest surviving items until under the limit.
+**Phase 3 — Size trim:** If total trash exceeds `retention.max_size_gb`, purge the oldest surviving items until under the limit. Sizes recorded in sidecars on removable media never count for more than the tree actually on disk.
 
-**Phase 4 — Disk pressure:** If the home trash filesystem exceeds `retention.disk_pressure_percent` usage, purge the oldest 10% of surviving items.
+**Phase 4 — Disk pressure:** If the home trash filesystem exceeds `retention.disk_pressure_percent` usage, purge the oldest 10% of surviving items that are at least an hour old. Recently trashed items are never purged for pressure, so `trash undo` keeps working right after a delete.
 
 ### Manual compression
 

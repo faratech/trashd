@@ -6,9 +6,12 @@ License:        MIT
 URL:            https://github.com/faratech/trashd
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
-BuildRequires:  rust >= 1.75
+# The workspace's rust-version; %{_unitdir} and the %systemd_* scriptlets
+# come from systemd-rpm-macros (#213).
+BuildRequires:  rust >= 1.97
 BuildRequires:  cargo
 BuildRequires:  gcc
+BuildRequires:  systemd-rpm-macros
 
 %description
 trashd intercepts destructive delete commands (rm, unlink, rmdir) and moves
@@ -36,7 +39,9 @@ cargo build --release
 %{_bindir}/trashd-exec
 %{_bindir}/trashd
 %dir %{_prefix}/lib/trashd
+%dir %{_prefix}/lib/trashd/bin
 %{_prefix}/lib/trashd/bin/rm
+%{_prefix}/lib/trashd/trashd
 %{_prefix}/lib/trashd/libtrashd_preload.so
 %config(noreplace) %{_sysconfdir}/trashd/config.toml
 %{_sysconfdir}/profile.d/trashd.sh

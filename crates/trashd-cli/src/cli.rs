@@ -115,6 +115,9 @@ pub enum Commands {
         /// Check for updates without installing
         #[arg(long)]
         check: bool,
+        /// Install even if the release's build attestation cannot be verified
+        #[arg(long)]
+        allow_unverified: bool,
     },
 }
 

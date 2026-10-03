@@ -11,7 +11,7 @@ pub fn run(store: &TrashStore, target: &str) {
         Ok(e) => e,
         Err(TrashError::AmbiguousMatch { pattern, count }) => fatal(format!(
             "'{pattern}' matches {count} entries in different trash roots — \
-             show a specific one from 'trash ls <pattern>' instead"
+             pass one entry's trashed path (from 'trash ls --json <pattern>') to select it"
         )),
         // A listing failure must surface as itself, not masquerade as "not
         // found" (restore/purge share find_entry and do the same).

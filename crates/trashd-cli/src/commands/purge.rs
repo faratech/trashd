@@ -11,7 +11,7 @@ pub fn run(store: &TrashStore, target: &str) {
         ),
         Err(TrashError::AmbiguousMatch { pattern, count }) => {
             eprintln!(
-                "{} '{}' matches {} items — use trash ID for exact match",
+                "{} '{}' matches {} items — pass one item's trashed path (right column) to select it",
                 "trash: ambiguous:".yellow().bold(),
                 pattern,
                 count,
@@ -22,7 +22,7 @@ pub fn run(store: &TrashStore, target: &str) {
                         "  {} {} {}",
                         entry.info.deletion_date.format("%Y-%m-%d %H:%M"),
                         entry.info.original_path.display(),
-                        entry.id.dimmed(),
+                        entry.trashed_path.display().to_string().dimmed(),
                     );
                 }
             }

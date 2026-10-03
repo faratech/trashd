@@ -53,59 +53,41 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
         return;
     }
 
-    // Confirmation prompt unless --yes. Listing failures must NOT masquerade
-    // as an empty trash here: unwrap_or_default() made a transient listing
-    // error print "Nothing to empty." and exit 0 without deleting anything
-    // (a silent fail-open the dry-run path never had) (#147).
+    // One listing drives both the prompt and the purge: re-listing after the
+    // confirmation also deleted items trashed while the prompt waited (#217).
+    // Listing failures must NOT masquerade as an empty trash: that printed
+    // "Nothing to empty." and exited 0 without deleting anything (#147).
+    let selected = match store.entries_older_than(days) {
+        Ok(entries) => entries,
+        Err(e) => fatal(e),
+    };
+    if selected.is_empty() {
+        println!("{}", "Nothing to empty.".dimmed());
+        return;
+    }
     if !yes {
-        let (prompt_size, prompt_count) = if let Some(d) = days {
-            let entries = match store.list(None) {
-                Ok(e) => e,
-                Err(e) => fatal(e),
-            };
-            let now = chrono::Local::now();
-            let mut size = 0u64;
-            let mut cnt = 0u64;
-            for entry in &entries {
-                let age = now.signed_duration_since(entry.info.deletion_date);
-                if age.num_days() >= d as i64 {
-                    cnt += 1;
-                    size += entry.info.size.unwrap_or(0);
-                }
-            }
-            (size, cnt)
-        } else {
-            match store.status() {
-                Ok((s, c)) => (s, c as u64),
-                Err(e) => fatal(e),
-            }
-        };
-        if prompt_count == 0 {
-            println!("{}", "Nothing to empty.".dimmed());
-            return;
-        }
+        let size: u64 = selected
+            .iter()
+            .map(|entry| entry.info.size.unwrap_or(0))
+            .fold(0, u64::saturating_add);
         if !confirm(&format!(
             "Permanently delete {} items ({})? [y/N] ",
-            prompt_count,
-            format_size(prompt_size),
+            selected.len(),
+            format_size(size),
         )) {
             println!("{}", "Cancelled.".dimmed());
             return;
         }
     }
 
-    match store.empty(days) {
-        Ok(count) => {
-            if count == 0 {
-                println!("{}", "Nothing to empty.".dimmed());
-            } else {
-                println!(
-                    "{} permanently deleted {} items",
-                    "Emptied:".green().bold(),
-                    count
-                );
-            }
-        }
-        Err(e) => fatal(e),
+    let count = store.empty_entries(&selected, days);
+    if count == 0 {
+        println!("{}", "Nothing to empty.".dimmed());
+    } else {
+        println!(
+            "{} permanently deleted {} items",
+            "Emptied:".green().bold(),
+            count
+        );
     }
 }

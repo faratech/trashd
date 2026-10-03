@@ -74,4 +74,31 @@ for shell_value in "" /bin/false; do
 done
 echo "PASS: root login hook survives an empty or stale SHELL"
 
+# -----------------------------------------------------------------------
+# #216: where systemctl exists but systemd is not running (WSL without
+# systemd, containers), the installer used to abort halfway under set -e.
+# -----------------------------------------------------------------------
+mkdir -p /etc/systemd/system "$WORK/fakebin"
+printf '#!/bin/sh\necho "System has not been booted with systemd" >&2\nexit 1\n' \
+    > "$WORK/fakebin/systemctl"
+chmod +x "$WORK/fakebin/systemctl"
+env PATH="$WORK/fakebin:$INSTALL_PATH" "$WORK/good/install.sh" > "$WORK/nosystemd.log" 2>&1 \
+    || fail "installer aborted without a running systemd: $(tail -3 "$WORK/nosystemd.log")"
+grep -q "installed successfully" "$WORK/nosystemd.log" || fail "installer did not finish"
+echo "PASS: installer completes where systemd is not running"
+
+# -----------------------------------------------------------------------
+# #215: uninstall removed per-user configs as root through paths users
+# control; a planted ~/.config symlink made root delete another user's files.
+# -----------------------------------------------------------------------
+mkdir -p /home/admin/trashd /home/test/.config/trashd /home/mallory
+echo keep > /home/admin/trashd/sentinel
+ln -s /home/admin /home/mallory/.config
+chown -h 1001:1001 /home/mallory /home/mallory/.config
+env PATH="$INSTALL_PATH" "$WORK/good/install.sh" --uninstall > "$WORK/uninstall.log" 2>&1 \
+    || fail "uninstall failed: $(tail -3 "$WORK/uninstall.log")"
+[[ -f /home/admin/trashd/sentinel ]] || fail "uninstall deleted through a planted symlink"
+[[ ! -e /home/test/.config/trashd ]] || fail "uninstall left a real per-user config"
+echo "PASS: uninstall never follows user-planted symlinks"
+
 echo "install regression: all checks passed"

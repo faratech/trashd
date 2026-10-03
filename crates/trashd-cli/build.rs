@@ -232,6 +232,12 @@ fn build_cli() -> Command {
                         .long("check")
                         .action(clap::ArgAction::SetTrue)
                         .help("Check for updates without installing"),
+                )
+                .arg(
+                    Arg::new("allow-unverified")
+                        .long("allow-unverified")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Install even if the release's build attestation cannot be verified"),
                 ),
         )
 }
