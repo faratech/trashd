@@ -29,7 +29,6 @@ const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
 const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
 
 const FAN_DELETE: u64 = 0x0000_0200;
-const FAN_DELETE_SELF: u64 = 0x0000_0400;
 // Without FAN_ONDIR in the mark mask the kernel drops every event carrying
 // FS_ISDIR — including on FAN_MARK_FILESYSTEM marks — so directory deletions
 // (rmdir, rm -rf of a dir-only tree) would never reach the audit log.
@@ -41,7 +40,14 @@ const FAN_ONDIR: u64 = 0x4000_0000;
 // entries are worse than missing rename coverage.
 const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 
-const FAN_EVENT_INFO_TYPE_DFID: u8 = 1;
+// FAN_DELETE_SELF deliberately NOT watched: FAN_DELETE already records each
+// removed name, and the extra event carried only the dead inode's own handle,
+// which no longer resolves, plus whichever pid dropped the last reference
+// (#228).
+
+/// The object's own handle. On a delete it names the removed inode, which
+/// cannot be opened once gone, so only DFID_NAME records are resolved.
+const FAN_EVENT_INFO_TYPE_FID: u8 = 1;
 const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
 
 /// fanotify event metadata (struct fanotify_event_metadata).
@@ -152,7 +158,7 @@ fn run() -> io::Result<()> {
         match fanotify_mark(
             fan_fd,
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-            FAN_DELETE | FAN_DELETE_SELF | FAN_ONDIR,
+            FAN_DELETE | FAN_ONDIR,
             &mount.path,
         ) {
             Ok(()) => {
@@ -173,10 +179,13 @@ fn run() -> io::Result<()> {
         }
     }
 
+    // Exiting here made Restart=always relaunch the daemon forever (#228).
+    // Idle instead: the mount refresh below marks filesystems that become
+    // markable later.
     if marked == 0 {
-        return Err(io::Error::other(
-            "no filesystems could be monitored — check permissions (need CAP_SYS_ADMIN)",
-        ));
+        eprintln!(
+            "trashd: no filesystem could be monitored (need CAP_SYS_ADMIN); waiting for a filesystem to mark"
+        );
     }
 
     // Open O_PATH fds to each watched mount point for open_by_handle_at.
@@ -229,23 +238,7 @@ fn run() -> io::Result<()> {
             return Err(err);
         }
 
-        let n = n as usize;
-        let mut offset = 0;
-
-        while offset + META_SIZE <= n {
-            let event = unsafe { &*(buf.as_ptr().add(offset) as *const FanotifyEventMetadata) };
-
-            if event.vers != FANOTIFY_METADATA_VERSION {
-                eprintln!("trashd: unexpected fanotify version {}", event.vers);
-                break;
-            }
-
-            let event_len = event.event_len as usize;
-            if event_len < META_SIZE {
-                eprintln!("trashd: corrupt event (event_len={})", event_len);
-                break;
-            }
-
+        for (event, record) in parse_events(&buf[..n as usize]) {
             // Queue overflow: events were DROPPED by the kernel — say so
             // loudly instead of silently producing an incomplete audit log
             // (#32).
@@ -254,8 +247,8 @@ fn run() -> io::Result<()> {
             }
 
             // Process event
-            if event.mask & (FAN_DELETE | FAN_DELETE_SELF) != 0 {
-                let path = resolve_event_path(&buf[offset..offset + event_len], event, &mount_fds);
+            if event.mask & FAN_DELETE != 0 {
+                let path = resolve_event_path(record, &event, &mount_fds);
                 let pid = event.pid as u32;
                 let proc_name = process_name(pid);
                 if let Some(ref p) = path {
@@ -282,19 +275,36 @@ fn run() -> io::Result<()> {
             if event.fd >= 0 {
                 unsafe { libc::close(event.fd) };
             }
-
-            offset += event_len;
         }
     }
 }
 
-/// Resolve the full path from a fanotify event.
-///
-/// With FAN_REPORT_DFID_NAME, FAN_DELETE events include extended info
-/// containing the parent directory's file handle and the deleted filename.
-/// We resolve the parent via open_by_handle_at and join with the filename.
-///
-/// Falls back to reading /proc/self/fd/{event.fd} for FAN_DELETE_SELF.
+/// Split one read() of the fanotify fd into (header, record) pairs. Headers
+/// are copied out with read_unaligned, since a byte buffer promises no
+/// alignment, and a record that claims more bytes than were read ends the
+/// batch instead of being sliced out of bounds (#228).
+fn parse_events(buf: &[u8]) -> Vec<(FanotifyEventMetadata, &[u8])> {
+    let mut events = Vec::new();
+    let mut offset = 0;
+    while offset + META_SIZE <= buf.len() {
+        let event = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanotifyEventMetadata)
+        };
+        if event.vers != FANOTIFY_METADATA_VERSION {
+            eprintln!("trashd: unexpected fanotify version {}", event.vers);
+            break;
+        }
+        let event_len = event.event_len as usize;
+        if event_len < META_SIZE || event_len > buf.len() - offset {
+            eprintln!("trashd: corrupt event (event_len={event_len})");
+            break;
+        }
+        events.push((event, &buf[offset..offset + event_len]));
+        offset += event_len;
+    }
+    events
+}
+
 /// Whether an audited delete is annotated "(skipped)". Only configured policy
 /// counts: the daemon runs as root for every user's deletes, and a
 /// `.trashd.toml` beside a deleted file is untrusted input it must never read
@@ -310,14 +320,18 @@ fn mount_refresh_due(last: std::time::Instant, now: std::time::Instant) -> bool 
     now.saturating_duration_since(last) >= MOUNT_REFRESH_INTERVAL
 }
 
+/// Resolve the full path from a fanotify event.
+///
+/// With FAN_REPORT_DFID_NAME, FAN_DELETE events include extended info
+/// containing the parent directory's file handle and the deleted filename.
+/// We resolve the parent via open_by_handle_at and join with the filename.
 fn resolve_event_path(
     event_buf: &[u8],
     _event: &FanotifyEventMetadata,
     mount_fds: &[WatchedMount],
 ) -> Option<PathBuf> {
-    // Try to extract path from extended FID info (DFID_NAME for FAN_DELETE,
-    // DFID for FAN_DELETE_SELF). No fd-based fallback: with FAN_REPORT_FID
-    // groups delete events always carry fd=FAN_NOFD, so it was dead code (#29).
+    // No fd-based fallback: with FAN_REPORT_FID groups delete events always
+    // carry fd=FAN_NOFD, so it was dead code (#29).
     extract_dfid_name_path(event_buf, mount_fds)
 }
 
@@ -351,39 +365,28 @@ fn event_fsid(event_buf: &[u8], fh_offset: usize) -> Fsid {
     ))
 }
 
-/// Parse extended FID info to get a path.
-///
-/// - DFID_NAME (type 2): parent dir handle + deleted filename → full path.
-/// - DFID (type 1): the inode's OWN handle (FAN_DELETE_SELF) → resolved
-///   directly via open_by_handle_at. Type-1 records were never parsed before,
-///   and with FAN_REPORT_FID groups delete events carry fd=FAN_NOFD, so the
-///   old /proc/self/fd fallback could never fire either (#29).
+/// Parse extended FID info to get a path from the DFID_NAME record: the parent
+/// directory's handle plus the deleted filename. Other records, such as the
+/// removed inode's own FID, are skipped (#228).
 fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[WatchedMount]) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
     while offset + info_hdr_size <= event_buf.len() {
-        let hdr = unsafe { &*(event_buf.as_ptr().add(offset) as *const FanotifyEventInfoHeader) };
+        let hdr = unsafe {
+            std::ptr::read_unaligned(
+                event_buf.as_ptr().add(offset) as *const FanotifyEventInfoHeader
+            )
+        };
 
         let info_len = hdr.len as usize;
         if info_len < info_hdr_size || offset + info_len > event_buf.len() {
             break;
         }
 
-        if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID {
-            let fid_hdr_size = std::mem::size_of::<FanotifyEventInfoFid>();
-            if info_len < fid_hdr_size + 8 {
-                break;
-            }
-            let fh_offset = offset + fid_hdr_size;
-            if fh_offset + 8 > event_buf.len() {
-                break;
-            }
-            // handle_bytes is not needed here: the kernel-returned handle is
-            // passed to open_by_handle_at by pointer, length-validated above.
-            let fsid = event_fsid(event_buf, fh_offset);
-            let file_handle_ptr = event_buf[fh_offset..].as_ptr();
-            return resolve_handle_to_path(file_handle_ptr, fsid, mount_fds);
+        if hdr.info_type == FAN_EVENT_INFO_TYPE_FID {
+            offset += info_len;
+            continue;
         }
 
         if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
@@ -547,7 +550,7 @@ fn refresh_mounts(
         match fanotify_mark(
             fan_fd,
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-            FAN_DELETE | FAN_DELETE_SELF | FAN_ONDIR,
+            FAN_DELETE | FAN_ONDIR,
             &mount.path,
         ) {
             Ok(()) => match marked.iter_mut().find(|(p, _)| p == &mount.path) {
@@ -696,6 +699,72 @@ mod tests {
             last,
             last + std::time::Duration::from_secs(1)
         ));
+    }
+
+    fn event_header(event_len: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&event_len.to_ne_bytes());
+        buf.push(FANOTIFY_METADATA_VERSION);
+        buf.push(0);
+        buf.extend_from_slice(&(META_SIZE as u16).to_ne_bytes());
+        buf.extend_from_slice(&FAN_DELETE.to_ne_bytes());
+        buf.extend_from_slice(&(-1i32).to_ne_bytes());
+        buf.extend_from_slice(&42i32.to_ne_bytes());
+        buf
+    }
+
+    fn info_record(info_type: u8, name: &[u8]) -> Vec<u8> {
+        let mut record = vec![info_type, 0, 0, 0];
+        record.extend_from_slice(&[0; 8]); // fsid
+        record.extend_from_slice(&8u32.to_ne_bytes()); // handle_bytes
+        record.extend_from_slice(&1i32.to_ne_bytes()); // handle_type
+        record.extend_from_slice(&[0; 8]); // f_handle
+        record.extend_from_slice(name);
+        record.push(0);
+        while record.len() % 4 != 0 {
+            record.push(0);
+        }
+        let len = record.len() as u16;
+        record[2..4].copy_from_slice(&len.to_ne_bytes());
+        record
+    }
+
+    // A record whose event_len runs past the bytes read must end the batch,
+    // not slice out of bounds (#228).
+    #[test]
+    fn event_records_never_overrun_the_read() {
+        let mut buf = event_header(META_SIZE as u32);
+        buf.extend(event_header(META_SIZE as u32 + 64));
+        let events = parse_events(&buf);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.pid, 42);
+        assert_eq!(events[0].1.len(), META_SIZE);
+    }
+
+    // Headers are copied out of a byte buffer, which promises no alignment.
+    #[test]
+    fn event_headers_parse_at_any_alignment() {
+        let mut storage = vec![0u8];
+        storage.extend(event_header(META_SIZE as u32));
+        let events = parse_events(&storage[1..]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.mask, FAN_DELETE);
+    }
+
+    // Type 1 is the deleted inode's own FID (named DFID before), which cannot
+    // be opened once it is gone; it must not hide the DFID_NAME record that
+    // names the deleted entry (#228).
+    #[test]
+    fn fid_records_do_not_hide_the_name_record() {
+        let mut buf = event_header(0);
+        buf.extend(info_record(FAN_EVENT_INFO_TYPE_FID, b""));
+        buf.extend(info_record(FAN_EVENT_INFO_TYPE_DFID_NAME, b"victim"));
+        let len = buf.len() as u32;
+        buf[..4].copy_from_slice(&len.to_ne_bytes());
+        assert_eq!(
+            extract_dfid_name_path(&buf, &[]),
+            Some(PathBuf::from("victim"))
+        );
     }
 
     // Regression (#97): the fsid recorded in a fanotify FID record must be

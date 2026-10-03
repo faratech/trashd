@@ -108,7 +108,8 @@ pub fn notify_desktop(summary: &str, body: &str) {
     if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
-    let _ = std::process::Command::new("notify-send")
+    let mut command = std::process::Command::new("notify-send");
+    command
         .args([
             "--app-name=trashd",
             "--icon=user-trash",
@@ -118,8 +119,20 @@ pub fn notify_desktop(summary: &str, body: &str) {
             body,
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let _ = spawn_reaped(command);
+}
+
+/// Start `command` without waiting for it, and reap it on a detached thread:
+/// a long-lived caller (the seccomp supervisor) otherwise kept one zombie per
+/// notification (#233). Returns the child's pid.
+fn spawn_reaped(mut command: std::process::Command) -> std::io::Result<u32> {
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
 }
 
 /// Encode a log field so one `write_log` call is always exactly one line:
@@ -175,7 +188,22 @@ fn write_log(home: &Path, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_field_bytes;
+    use super::{escape_field_bytes, spawn_reaped};
+
+    // Regression (#233): notify-send was spawned and never waited for, so a
+    // long-lived caller (the seccomp supervisor) kept one zombie per delete.
+    #[test]
+    fn notification_helpers_are_reaped() {
+        let pid = spawn_reaped(std::process::Command::new("true")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} was never reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     // A field that could contain a physical newline would forge the next
     // record in the operation log (#137) — the escape must guarantee one

@@ -47,8 +47,8 @@ pub fn run(store: &TrashStore, query: &str) {
             "{:<20} {:>10} {} {}",
             date,
             size,
-            entry.info.original_path.display(),
-            entry.id.dimmed(),
+            printable_path(&entry.info.original_path),
+            printable(&entry.id).dimmed(),
         );
     }
     println!("\n{} matches", matches.len());

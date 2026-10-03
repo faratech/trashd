@@ -76,7 +76,7 @@ BPF filter (`filter.rs`): architecture-specific — x86_64 traps `SYS_unlink`/`S
 
 ### trashd — fanotify monitor
 
-Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Resolves parent via `open_by_handle_at()` against cached per-mount O_PATH fds. Detection/audit only.
+Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+) and watches `FAN_DELETE` only. Resolves the parent via `open_by_handle_at()` with a directory fd opened per lookup on the mount whose fsid matches (no fds are held, so `umount` works). With nothing markable it idles and re-scans mounts each second. Detection/audit only.
 
 ## Key design decisions
 

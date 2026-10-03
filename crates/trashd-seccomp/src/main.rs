@@ -127,13 +127,15 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
             let notif_fd = match filter::install_filter(cookie) {
                 Ok(fd) => fd,
                 Err(e) => {
-                    eprintln!("trashd-exec: seccomp filter install failed: {e}");
-                    if e.raw_os_error() == Some(libc::EBUSY) {
-                        eprintln!(
-                            "trashd-exec: an inherited notification listener prevents another listener"
-                        );
-                    }
-                    eprintln!("trashd-exec: continuing with preload/shim fallback, if available");
+                    // One line: every root login on WSL lands here (#235).
+                    let cause = if e.raw_os_error() == Some(libc::EBUSY) {
+                        "an inherited notification listener prevents another".to_string()
+                    } else {
+                        e.to_string()
+                    };
+                    eprintln!(
+                        "trashd-exec: seccomp filter install failed ({cause}); continuing with preload/shim fallback"
+                    );
                     // Only an established listener may disable preload. A
                     // stale inherited marker must never survive fallback.
                     unsafe { std::env::remove_var("TRASHD_SECCOMP_ACTIVE") };
@@ -517,6 +519,54 @@ fn wait_for_startup(
     }
 }
 
+/// The pids of `parent`'s children. The task `children` file needs
+/// CONFIG_PROC_CHILDREN, which some kernels lack; without it the parent field
+/// of every /proc/<pid>/stat is scanned instead (#232).
+fn child_pids(children_file: &std::path::Path, parent: i32) -> io::Result<Vec<i32>> {
+    match std::fs::read_to_string(children_file) {
+        Ok(list) => Ok(list
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(std::fs::read_dir("/proc")?
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| {
+                // The command name may contain spaces or ')': ppid is the
+                // second field after its closing parenthesis.
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        let (_, rest) = stat.rsplit_once(')')?;
+                        rest.split_whitespace().nth(1)?.parse::<i32>().ok()
+                    })
+                    == Some(parent)
+            })
+            .collect()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Who receives a forwarded HUP/INT/TERM: the original command while it
+/// lives, else every adopted descendant still in our session. One that called
+/// setsid() (a daemon) left the terminal's session on purpose and would never
+/// see its hangup without this wrapper (#231). Every pid here is an unreaped
+/// child, so it cannot have been recycled.
+fn signal_recipients(
+    targets: &std::collections::BTreeMap<i32, OwnedFd>,
+    original: i32,
+) -> Vec<i32> {
+    if targets.contains_key(&original) {
+        return vec![original];
+    }
+    let session = unsafe { libc::getsid(0) };
+    targets
+        .keys()
+        .copied()
+        .filter(|&pid| unsafe { libc::getsid(pid) } == session)
+        .collect()
+}
+
 /// Wait for the original command and all protected descendants. Subreaper
 /// adoption keeps them in the broker's ancestry even after their parents exit.
 ///
@@ -549,13 +599,10 @@ fn wait_for_children(
     loop {
         if refresh {
             let mut reaped = false;
-            let children =
-                std::fs::read_to_string(format!("/proc/self/task/{}/children", unsafe {
-                    libc::getpid()
-                }))?;
-            let mut candidates: std::collections::BTreeSet<i32> = children
-                .split_whitespace()
-                .filter_map(|p| p.parse::<i32>().ok())
+            let us = unsafe { libc::getpid() };
+            let children = std::path::PathBuf::from(format!("/proc/self/task/{us}/children"));
+            let mut candidates: std::collections::BTreeSet<i32> = child_pids(&children, us)?
+                .into_iter()
                 .filter(|&pid| Some(pid) != watchdog_pid)
                 .collect();
             // A process the kernel already reaped is never listed, and a
@@ -622,12 +669,8 @@ fn wait_for_children(
             refresh = false;
         }
         for sig in pending_signals.drain(..) {
-            if let Some(fd) = targets.get(&original) {
-                signal_pidfd(fd.as_raw_fd(), sig);
-            } else {
-                for fd in targets.values() {
-                    signal_pidfd(fd.as_raw_fd(), sig);
-                }
+            for pid in signal_recipients(&targets, original) {
+                signal_pidfd(targets[&pid].as_raw_fd(), sig);
             }
         }
         let mut fds = vec![
@@ -1048,6 +1091,58 @@ mod tests {
             assert_eq!(child.0, 0);
             unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
         });
+    }
+
+    // Regression (#231): once the original command exited, HUP/INT/TERM went
+    // to every adopted descendant, including daemons that called setsid()
+    // and would never receive the terminal's hangup without this wrapper.
+    #[test]
+    fn hangups_skip_descendants_that_left_the_session() {
+        use std::os::unix::process::CommandExt;
+        let mut plain = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut daemon = unsafe {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        let mut targets = std::collections::BTreeMap::new();
+        for child in [&plain, &daemon] {
+            let pid = child.id() as i32;
+            targets.insert(pid, open_pidfd(pid).unwrap());
+        }
+        // The original (pid 0 here: already reaped) is gone.
+        let recipients = signal_recipients(&targets, 0);
+        for child in [&mut plain, &mut daemon] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(recipients, vec![plain.id() as i32]);
+    }
+
+    // Regression (#232): without CONFIG_PROC_CHILDREN the children file is
+    // missing and the wait failed outright; the /proc ppid scan finds them.
+    #[test]
+    fn children_are_found_without_the_children_file() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let found = child_pids(std::path::Path::new("/proc/self/task/0/children"), unsafe {
+            libc::getpid()
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found.unwrap().contains(&(child.id() as i32)));
     }
 
     #[test]

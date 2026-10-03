@@ -88,6 +88,64 @@
   remove (read-only `/usr`, #241), and the installer no longer aborts where
   `systemctl` exists but systemd is not running (#216).
 - `trash empty` purges exactly the entries its prompt showed (#217).
+- A filesystem mounted at two paths (bind mounts) is listed and purged once,
+  not once per mount point (#219).
+- Concurrent processes no longer run the same auto-purge at once; a run in
+  progress makes the others skip (#220).
+- An unreadable trash root other than the home trash (a stale mount, a
+  permission change) is skipped with a warning instead of failing `trash ls`
+  for every root and aborting retention (#221).
+- A home trash behind a symlinked ancestor owned by root or the user
+  (ostree's `/home`, a stowed `~/.local`) is usable again; symlinks owned by
+  other users are still refused (#222).
+- A symlink operand is sized as the link, not as its target; the 10,000-entry
+  size cap only flags trees that exceed it; and percent-decoding of `Path=`
+  takes exactly two hex digits, keeping a stray `%` literal (#223).
+- `bypass_processes` also matches script names such as `pip` or `npm`, whose
+  executable is `python3` or `node` (#224).
+- The preload retries under a fresh id when another FreeDesktop tool takes the
+  trash name between the claim and the move; `unlink` failed with `EEXIST`,
+  which callers never expect (#225).
+- The seccomp supervisor judges `never_trash` and records `Path=` from the
+  pinned parent directory, not from the spelling the program used: a path
+  such as `/proc/self/cwd/x` matched `/proc/*` and was deleted permanently,
+  or was recorded at the supervisor's own working directory (#226).
+- `trashd-cleanup.timer` is installed by `install.sh`, `make install` and the
+  RPM as a disabled per-user unit, for the install prefix. Its service passes
+  `-y`: without it the prompt read `/dev/null` and nothing was purged (#227).
+- The fanotify daemon no longer watches `FAN_DELETE_SELF`, which added a
+  second, unresolvable record per delete; it reads event headers without
+  assuming alignment, stops at a record that overruns the read, and skips
+  FID records rather than letting them hide the name. With nothing markable
+  it now waits for a filesystem instead of exiting into a `Restart=always`
+  loop (#228).
+- Uninstall removes only trashd's entries from `/etc/ld.so.preload`, keeping
+  other libraries listed on the same line, and only the man pages it
+  installed (a `trash-*.1` glob removed trash-cli's). `make install` no
+  longer compiles (run `make` first, without sudo), `make uninstall` stops
+  and disables the daemon, and the README no longer claims that packages
+  register the preload (#229).
+- `trash config` refuses to edit a config it cannot read instead of
+  replacing it, writes atomically (through a symlinked config to its target),
+  rejects values the next load would reject (integers above `i64::MAX`,
+  non-finite or negative sizes, percentages above 100), and runs `$EDITOR`
+  through the shell so it can carry arguments. Absolute times that a DST
+  change repeats or skips are accepted, and `ls`, `find` and `info` escape
+  control and bidi characters from sidecars (#230).
+- After the original command exits, `trashd-exec` forwards hangups only to
+  descendants still in its session, not to daemons that left it with
+  `setsid()` (#231), and finds its children through `/proc/*/stat` on kernels
+  without `CONFIG_PROC_CHILDREN` (#232).
+- Desktop notifications are reaped on a background thread instead of leaving
+  a zombie per delete in long-lived processes (#233).
+- A failed seccomp filter install (as on every WSL root login) prints one
+  line instead of three (#235).
+- Releases compute their version once for every build leg (#236), the quick
+  installer installs the release it was published with (#237), and the tag
+  points at the built commit rather than wherever `main` is by then (#238).
+  The weekly dependency update runs the sandboxed integration, preload and
+  seccomp suites before opening its PR, and the PR text no longer claims CI
+  ran on it (#239).
 - `trashd-exec` no longer spins at 100% CPU (or hangs) when it inherits
   `SIGCHLD=SIG_IGN`, as root login shells do under WSL's `login`. The kernel
   reaped its children itself, leaving a permanently readable pidfd in the wait

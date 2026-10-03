@@ -32,6 +32,11 @@ stage() {
     cp /src/install.sh "$dir/"
     cp -r /src/install/. "$dir/install/"
     cp /src/config/trashd.toml "$dir/config/"
+    # trash-future stands in for a subcommand newer than any fixed list.
+    mkdir -p "$dir/share/man/man1"
+    for page in trash trash-ls trash-future; do
+        printf '.TH %s 1\n' "$page" > "$dir/share/man/man1/$page.1"
+    done
 }
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -88,9 +93,33 @@ grep -q "installed successfully" "$WORK/nosystemd.log" || fail "installer did no
 echo "PASS: installer completes where systemd is not running"
 
 # -----------------------------------------------------------------------
+# #227: the cleanup timer was never installed, and its service prompted on
+# /dev/null and did nothing. Trash is per-user, so both ship as user units,
+# rendered for the install prefix and left disabled.
+# -----------------------------------------------------------------------
+check_cleanup_units() {
+    local prefix="$1" unit=/etc/systemd/user/trashd-cleanup.service
+    [[ -f "$unit" && -f /etc/systemd/user/trashd-cleanup.timer ]] || fail "cleanup units not installed"
+    grep -qx "ExecStart=$prefix/bin/trash empty --older 30d -y" "$unit" \
+        || fail "cleanup service does not run unattended from $prefix: $(grep ExecStart "$unit")"
+    [[ ! -e /etc/systemd/user/timers.target.wants/trashd-cleanup.timer ]] || fail "cleanup timer enabled by default"
+}
+check_cleanup_units /usr/local
+echo "PASS: cleanup units install disabled and run without a prompt"
+
+# -----------------------------------------------------------------------
 # #215: uninstall removed per-user configs as root through paths users
 # control; a planted ~/.config symlink made root delete another user's files.
 # -----------------------------------------------------------------------
+# #229: ld.so.preload is a list separated by whitespace or colons. Uninstall
+# deleted whole lines, dropping other libraries listed beside ours, and its
+# trash-*.1 glob removed trash-cli's man pages.
+LIBC=$(ldd /bin/true | awk '/libc\.so/ {print $3}')
+[[ -f "$LIBC" ]] || fail "cannot locate libc for the co-located preload entry"
+printf '%s /usr/local/lib/trashd/libtrashd_preload.so\n' "$LIBC" > /etc/ld.so.preload
+MAN1=/usr/local/share/man/man1
+[[ -f $MAN1/trash-future.1 ]] || fail "staged man pages not installed"
+echo "trash-cli" > $MAN1/trash-put.1
 mkdir -p /home/admin/trashd /home/test/.config/trashd /home/mallory
 echo keep > /home/admin/trashd/sentinel
 ln -s /home/admin /home/mallory/.config
@@ -100,5 +129,39 @@ env PATH="$INSTALL_PATH" "$WORK/good/install.sh" --uninstall > "$WORK/uninstall.
 [[ -f /home/admin/trashd/sentinel ]] || fail "uninstall deleted through a planted symlink"
 [[ ! -e /home/test/.config/trashd ]] || fail "uninstall left a real per-user config"
 echo "PASS: uninstall never follows user-planted symlinks"
+[[ "$(cat /etc/ld.so.preload 2>/dev/null)" == "$LIBC" ]] \
+    || fail "co-located preload entry lost: '$(cat /etc/ld.so.preload 2>/dev/null)'"
+[[ -f $MAN1/trash-put.1 ]] || fail "uninstall removed trash-cli's man page"
+for page in trash.1 trash-ls.1 trash-future.1; do
+    [[ ! -e $MAN1/$page ]] || fail "uninstall left $page"
+done
+echo "PASS: uninstall removes only trashd's preload entries and man pages"
+
+# #229: make install compiled as root, and make uninstall left the unit
+# running. Here there is no build tree, so make install must refuse.
+if out=$(cd /src && env PATH="$INSTALL_PATH" make install 2>&1); then
+    fail "make install succeeded without built artifacts"
+fi
+[[ "$out" == *"make build"* && "$out" != *"cargo build"* ]] \
+    || fail "make install did not refuse cleanly: $out"
+mkdir -p /run/systemd/system
+printf '#!/bin/sh\necho "$*" >> %s\n' "$WORK/systemctl.log" > "$WORK/fakebin/systemctl"
+printf '%s:/usr/local/lib/trashd/libtrashd_preload.so\n' "$LIBC" > /etc/ld.so.preload
+(cd /src && env PATH="$WORK/fakebin:$INSTALL_PATH" make uninstall > "$WORK/make-un.log" 2>&1) \
+    || fail "make uninstall failed: $(tail -3 "$WORK/make-un.log")"
+rmdir /run/systemd/system
+grep -qx "disable --now trashd" "$WORK/systemctl.log" || fail "make uninstall left the unit running"
+[[ "$(cat /etc/ld.so.preload 2>/dev/null)" == "$LIBC" ]] \
+    || fail "make uninstall dropped a co-located preload entry"
+echo "PASS: make install never builds; make uninstall stops the unit"
+
+env PATH="$INSTALL_PATH" PREFIX=/work/custom "$WORK/good/install.sh" > "$WORK/custom.log" 2>&1 \
+    || fail "custom prefix install failed: $(tail -3 "$WORK/custom.log")"
+check_cleanup_units /work/custom
+env PATH="$INSTALL_PATH" PREFIX=/work/custom "$WORK/good/install.sh" --uninstall > "$WORK/custom-un.log" 2>&1 \
+    || fail "custom prefix uninstall failed: $(tail -3 "$WORK/custom-un.log")"
+[[ ! -e /etc/systemd/user/trashd-cleanup.service && ! -e /etc/systemd/user/trashd-cleanup.timer ]] \
+    || fail "uninstall left the cleanup units"
+echo "PASS: cleanup units follow PREFIX and are removed on uninstall"
 
 echo "install regression: all checks passed"

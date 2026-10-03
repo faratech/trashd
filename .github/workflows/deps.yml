@@ -15,7 +15,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       contents: read
     outputs:
@@ -46,6 +46,18 @@ jobs:
       - name: Run tests
         if: steps.diff.outputs.changed == 'true'
         run: TRASH_BYPASS=1 cargo test --workspace --locked -- --test-threads=1
+
+      # The PR is opened with GITHUB_TOKEN, which does not trigger CI on it,
+      # so the sandboxed end-to-end suites must run here (#239).
+      - name: Sandboxed integration, preload and seccomp suites
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          sudo env TRASH_BYPASS=1 ./tests/integration.sh target/release
+          sudo env TRASH_BYPASS=1 python3 tests/sandbox.py --build-dir target/release -- \
+            /usr/bin/python3 /tests/preload_policy.py /opt/trashd/lib/libtrashd_preload.so /opt/trashd/bin/trash
+          sudo sysctl -w kernel.yama.ptrace_scope=1
+          sudo env TRASH_BYPASS=1 REQUIRE_SECCOMP=1 python3 tests/sandbox.py --build-dir target/release -- \
+            /usr/bin/python3 /tests/seccomp_regression.py
 
       - name: Validate updated lockfile
         if: steps.diff.outputs.changed == 'true'
@@ -109,6 +121,9 @@ jobs:
           body: |
             Automated dependency update via `cargo update`.
 
-            Tests pass with the updated lockfile.
+            The update job built this lockfile and passed the unit tests plus
+            the sandboxed integration, preload and seccomp suites. This PR was
+            opened with `GITHUB_TOKEN`, so CI does not run on it by itself:
+            close and reopen it to run CI before merging.
           branch: deps/weekly-update
           delete-branch: true

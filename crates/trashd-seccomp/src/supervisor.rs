@@ -251,8 +251,11 @@ fn handle_notification(
             return;
         }
     };
-    // Best-effort full path: drives config eligibility, logging and the
-    // .trashinfo Path= field. NEVER used to touch the inode anymore (#6).
+    // Best-effort full path for logging and the .trashinfo Path= field when
+    // the pinned parent cannot name itself. Never used to touch the inode
+    // (#6), nor for never_trash: a spelling such as `/proc/self/cwd/x` says
+    // nothing about where the file lives, so the store judges the path
+    // derived from the pinned parent instead (#226).
     let display = match mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args) {
         Ok(p) => p,
         Err(_) => {
@@ -298,12 +301,6 @@ fn handle_notification(
             respond_continue(fd, notif.id);
             return;
         }
-    }
-
-    // Check never-trash list
-    if config.should_skip(&display) {
-        respond_continue(fd, notif.id);
-        return;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -396,9 +393,7 @@ fn process_bypassed(pid: u32, bypass: &[String]) -> bool {
     }
     let mut cur = pid;
     for _ in 0..16 {
-        if let Some(name) = process_name(cur)
-            && bypass.contains(&name)
-        {
+        if process_names(cur).iter().any(|name| bypass.contains(name)) {
             return true;
         }
         match parent_pid(cur) {
@@ -418,17 +413,23 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.get(1)?.parse().ok()
 }
 
-/// Best-effort process name from /proc/{pid}/exe (basename), falling back to
-/// /proc/{pid}/comm.
-fn process_name(pid: u32) -> Option<String> {
+fn process_names(pid: u32) -> Vec<String> {
+    // Both the executable's basename and the kernel's comm: for a script,
+    // comm is the script's own name (pip, npm) while the executable is its
+    // interpreter, so bypass entries for script tools never matched (#224).
+    let mut names = Vec::with_capacity(2);
     if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
         && let Some(name) = exe.file_name()
     {
-        return Some(name.to_string_lossy().into_owned());
+        names.push(name.to_string_lossy().into_owned());
     }
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        let comm = comm.trim().to_string();
+        if !names.contains(&comm) {
+            names.push(comm);
+        }
+    }
+    names
 }
 
 /// Passthrough mode: respond CONTINUE to every notification.
@@ -490,6 +491,30 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(is_own_component(std::process::id(), &installed));
         assert!(!is_own_component(std::process::id(), &elsewhere));
+    }
+
+    // Regression (#224): bypass names were compared with the executable's
+    // basename only, so script tools (pip is python3.x, npm is node) never
+    // matched their bypass_processes entries. The kernel's comm carries the
+    // script's name.
+    #[test]
+    fn bypass_matches_script_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("pip");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new(&script).spawn().unwrap();
+        let pid = child.id();
+        let comm_ready = (0..250).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "pip")
+        });
+        let bypassed = process_bypassed(pid, &["pip".to_string()]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(comm_ready, "script never started");
+        assert!(bypassed, "a running `pip` script was not recognized");
     }
 
     #[test]

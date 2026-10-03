@@ -243,6 +243,13 @@ pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, absolute: bool) -> io::Res
 
 /// `resolve_parent` with an explicit containment mode: RESOLVE_IN_ROOT,
 /// RESOLVE_BENEATH, or 0 for a target that shares this process's view.
+/// Absolute path of a pinned directory as this process sees it, or None for
+/// an unlinked or unreachable directory.
+fn pinned_directory_path(directory: RawFd) -> Option<std::path::PathBuf> {
+    let path = std::fs::read_link(format!("/proc/self/fd/{directory}")).ok()?;
+    (path.is_absolute() && !path.as_os_str().as_bytes().ends_with(b" (deleted)")).then_some(path)
+}
+
 fn resolve_parent_with(base_fd: RawFd, prefix: &OsStr, containment: u64) -> io::Result<RawFd> {
     #[repr(C)]
     struct OpenHow {
@@ -512,10 +519,20 @@ pub fn try_pinned(
         return Ok(Decision::Errno(libc::ENOTDIR));
     }
 
+    // Policy and the recorded Path= follow where the pinned parent really is,
+    // not how the target spelled it (`/proc/self/cwd/x`, `/dev/fd/N/x`, `..`):
+    // re-resolving a spelling here reads the SUPERVISOR's view (#226). Our
+    // /proc path names the parent only when the target shares that view.
+    let physical = tfs
+        .shares_our_view()
+        .then(|| pinned_directory_path(parent))
+        .flatten()
+        .map(|directory| directory.join(name));
+    let display = physical.as_deref().unwrap_or(display);
+
     // The move itself: renameat(pinned_parent, name -> trash/files/<id>)
-    // inside TrashStore::trash_at. Config eligibility runs on the display
-    // path — name-based policy, exactly like the kernel's own name-based
-    // unlink semantics; trash_at re-checks for parity with other layers.
+    // inside TrashStore::trash_at, which applies config eligibility to that
+    // path for parity with the other layers.
     match store.trash_at_checked(parent, name, display, Some("seccomp"), || {
         notify_fd < 0 || crate::supervisor::notif_id_valid(notify_fd, notify_id)
     }) {
@@ -904,6 +921,49 @@ mod tests {
         );
         child.kill().unwrap();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn pinned_policy_and_record_follow_the_pinned_parent() {
+        // The display string is only a spelling: `/proc/self/cwd/x` matches a
+        // `/proc/*` exclusion although the file lives in an ordinary
+        // directory. Policy and Path= come from the pinned parent (#226).
+        let fixture = tempfile::Builder::new()
+            .prefix("spelling")
+            .tempdir()
+            .unwrap();
+        let work = fixture.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let config = trashd_common::Config {
+            never_trash: vec!["/proc/*".into()],
+            only_trash: Vec::new(),
+            ..Default::default()
+        };
+        let store = TrashStore::open_isolated(&fixture.path().join("trash"), config).unwrap();
+        let victim = work.join("victim.txt");
+        std::fs::write(&victim, b"spelled elsewhere").unwrap();
+
+        let mut child = spawn_with_cwd(&work);
+        let nr = libc::SYS_unlinkat as i32;
+        let args: [u64; 6] = [libc::AT_FDCWD as u64, 0, 0, 0, 0, 0];
+        let decision = try_pinned(
+            child.id(),
+            nr,
+            &args,
+            OsStr::new("victim.txt"),
+            Path::new("/proc/self/cwd/victim.txt"),
+            false,
+            -1,
+            0,
+            &store,
+        );
+        child.kill().unwrap();
+        let _ = child.wait();
+
+        assert!(matches!(decision.unwrap(), Decision::Trashed));
+        let entries = store.list(None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].info.original_path, victim);
     }
 
     #[test]

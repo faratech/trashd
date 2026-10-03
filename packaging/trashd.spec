@@ -46,6 +46,8 @@ cargo build --release
 %config(noreplace) %{_sysconfdir}/trashd/config.toml
 %{_sysconfdir}/profile.d/trashd.sh
 %{_unitdir}/trashd.service
+%{_userunitdir}/trashd-cleanup.service
+%{_userunitdir}/trashd-cleanup.timer
 %{_mandir}/man1/trash.1*
 %{_datadir}/bash-completion/completions/trash
 %{_datadir}/zsh/site-functions/_trash

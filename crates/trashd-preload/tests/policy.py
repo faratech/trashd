@@ -364,6 +364,75 @@ def run():
             assert not victim.exists()
         print("PASS: diagnostics never kill or abort the host on a closed stderr")
 
+        # A FreeDesktop tool that ignores trashd's lock can take files/<id>
+        # between our id claim and the rename. A fanotify permission event
+        # holds the sidecar write while the racer takes that name; unlink must
+        # then trash under a fresh id, never fail with EEXIST (#225).
+        import ctypes, select, struct, threading
+        def race_for_name(info_dir, files_dir, name, stop, raced):
+            libc = ctypes.CDLL(None, use_errno=True)
+            fan = libc.fanotify_init(0x4 | 0x1, os.O_RDONLY)  # FAN_CLASS_CONTENT | FAN_CLOEXEC
+            assert fan >= 0, os.strerror(ctypes.get_errno())
+            # FAN_MARK_ADD of FAN_OPEN_PERM | FAN_EVENT_ON_CHILD on info/.
+            assert libc.fanotify_mark(fan, 1, 0x10000 | 0x08000000, -100, bytes(info_dir)) == 0
+            opens = 0
+            try:
+                while not stop.is_set():
+                    if not select.select([fan], [], [], 0.05)[0]:
+                        continue
+                    buffer = os.read(fan, 4096)
+                    offset = 0
+                    while offset + 24 <= len(buffer):
+                        length, _, _, _, _, fd, _ = struct.unpack_from("IBBHQii", buffer, offset)
+                        offset += length
+                        if os.readlink(f"/proc/self/fd/{fd}").endswith(f"/{name}.trashinfo"):
+                            opens += 1
+                            # Open 1 is the O_EXCL claim; open 2 writes the claimed record.
+                            if opens == 2:
+                                (files_dir / name).write_bytes(b"racer")
+                                raced.set()
+                        os.write(fan, struct.pack("iI", fd, 0x01))  # FAN_ALLOW
+                        os.close(fd)
+            finally:
+                os.close(fan)
+        fixture, data, environment = focused_fixture("claimed-name-race")
+        for sub in ("files", "info"):
+            (data / "Trash" / sub).mkdir(parents=True, mode=0o700)
+        victim = fixture / "victim"
+        victim.write_bytes(b"keep")
+        stop, raced = threading.Event(), threading.Event()
+        racer = threading.Thread(target=race_for_name, args=(data / "Trash/info", data / "Trash/files", "victim", stop, raced))
+        racer.start()
+        try:
+            code = ("import os,sys\n"
+                    "try: os.unlink(sys.argv[1])\n"
+                    "except OSError as e: print(e.errno)\n"
+                    "else: print('unlinked')")
+            result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
+                                    capture_output=True, text=True, timeout=10)
+        finally:
+            stop.set(); racer.join()
+        assert raced.is_set(), "the racer never saw the claimed sidecar being written"
+        assert result.stdout.strip() == "unlinked" and not victim.exists(), (result.stdout, result.stderr)
+        assert (data / "Trash/files/victim").read_bytes() == b"racer"
+        records = list((data / "Trash/info").glob("*.trashinfo"))
+        assert len(records) == 1 and records[0].stem != "victim", records
+        assert (data / "Trash/files" / records[0].stem).read_bytes() == b"keep"
+        print("PASS: a name taken after the claim is retried under a fresh id")
+
+        # A trusted symlinked ancestor (ostree's /home, a stowed ~/.local)
+        # must not make the trash unusable (#222).
+        fixture, _, environment = focused_fixture("symlinked-home")
+        (fixture / "real-share").mkdir()
+        (fixture / "share-link").symlink_to("real-share")
+        environment["XDG_DATA_HOME"] = str(fixture / "share-link")
+        victim = fixture / "victim"
+        victim.write_bytes(b"recoverable")
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        assert len(list((fixture / "real-share/Trash/info").glob("*.trashinfo"))) == 1
+        print("PASS: trusted symlinked trash ancestors are followed")
+
         # A .trashd.toml another user owns (a shared directory, a USB stick)
         # must not turn this user's deletes into permanent ones (#207).
         fixture, data, environment = focused_fixture("foreign-local-config")

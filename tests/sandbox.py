@@ -193,6 +193,7 @@ def run(args, command):
         (root / "src").mkdir()
         shutil.copyfile(repo / "install.sh", root / "src/install.sh")
         (root / "src/install.sh").chmod(0o755)
+        shutil.copyfile(repo / "Makefile", root / "src/Makefile")
         for name in ("install", "config"):
             shutil.copytree(repo / name, root / "src" / name)
         for name, source in artifacts.items():

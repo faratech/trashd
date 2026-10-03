@@ -431,9 +431,15 @@ pub(crate) fn is_trash_internal(path: &Path, home: &Path, trusted_home: bool) ->
 pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
     let uid = unsafe { libc::geteuid() };
     let mut dirs: HashMap<PathBuf, String> = HashMap::new();
+    // A filesystem mounted at two paths (a bind mount) exposes the same trash
+    // root twice; it was double-counted by retention and made every ID in it
+    // ambiguous. Roots are identified by device and inode (#219).
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut first_sighting =
+        |root: &Path| fs::metadata(root).is_ok_and(|meta| seen.insert((meta.dev(), meta.ino())));
 
     // Always include home trash
-    if is_safe_trash_root(home_trash, uid) {
+    if is_safe_trash_root(home_trash, uid) && first_sighting(home_trash) {
         dirs.insert(home_trash.to_path_buf(), "home".into());
     }
 
@@ -450,6 +456,7 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
         // read-only enumeration must not create trash dirs on every mount (#38).
         if let Some(shared) = check_shared_trash(&mount.path, uid, false)
             && is_safe_trash_root(&shared, uid)
+            && first_sighting(&shared)
         {
             dirs.entry(shared).or_insert(label.clone());
         }
@@ -458,6 +465,7 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
         let topdir = mount.path.join(format!(".Trash-{uid}"));
         if check_private_topdir_trash(&mount.path, uid, false)
             .is_some_and(|path| is_safe_trash_root(&path, uid))
+            && first_sighting(&topdir)
         {
             dirs.entry(topdir).or_insert(label);
         }

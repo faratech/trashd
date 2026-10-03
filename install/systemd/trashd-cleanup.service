@@ -2,6 +2,10 @@
 Description=trashd periodic trash cleanup
 Documentation=https://github.com/faratech/trashd
 
+# A user unit: trash is per-user. Enable the timer with
+#   systemctl --user enable --now trashd-cleanup.timer
+# Installers template the trash path for their prefix. -y because stdin is
+# /dev/null here, where the confirmation prompt would cancel the run.
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/trash empty --older 30d
+ExecStart=/usr/local/bin/trash empty --older 30d -y

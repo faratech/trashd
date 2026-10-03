@@ -68,7 +68,7 @@ pub fn run(
             .size
             .map(format_size)
             .unwrap_or_else(|| "?".into());
-        let path = entry.info.original_path.to_string_lossy();
+        let path = printable_path(&entry.info.original_path);
         let max_path = if multi_part { 40 } else { 50 };
         let path_display = truncate_path(&path, max_path);
 
@@ -89,7 +89,7 @@ pub fn run(
                 size,
                 disk,
                 path_display,
-                entry.id.dimmed()
+                printable(&entry.id).dimmed()
             );
         } else {
             println!(
@@ -97,7 +97,7 @@ pub fn run(
                 date,
                 size,
                 path_display,
-                entry.id.dimmed()
+                printable(&entry.id).dimmed()
             );
         }
     }

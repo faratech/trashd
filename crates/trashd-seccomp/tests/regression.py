@@ -280,7 +280,10 @@ def run():
                     assert process.wait(timeout=5) == 0
                 finally:
                     stop(process)
-            assert "seccomp filter install failed" in log_path.read_text()
+            # One line per failed start: every WSL root login hits EBUSY (#235).
+            warnings = [entry for entry in log_path.read_text().splitlines()
+                        if entry.startswith("trashd-exec:")]
+            assert len(warnings) == 1 and "seccomp filter install failed" in warnings[0], warnings
         print("PASS: EBUSY/EPERM clear ACTIVE and retain preload recovery", flush=True)
 
         # On a clean kernel this installs a listener successfully, then fails

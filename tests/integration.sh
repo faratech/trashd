@@ -209,6 +209,25 @@ else
 fi
 
 # -----------------------------------------------------------------------
+# With nothing markable the daemon exited, and Restart=always restarted it
+# forever (#228). Unprivileged fanotify (Linux 5.13+) initializes but cannot
+# mark a filesystem; the daemon must keep running and pick mounts up when
+# they become markable.
+# -----------------------------------------------------------------------
+DAEMON=/opt/trashd/bin/trashd
+status=0
+timeout 3 setpriv --reuid 65534 --regid 65534 --clear-groups \
+    "$DAEMON" --foreground > /work/daemon-idle.log 2>&1 || status=$?
+if grep -q "fanotify_init failed\|Operation not permitted (os error 1)$" /work/daemon-idle.log \
+    && ! grep -q "fanotify initialized" /work/daemon-idle.log; then
+    skip "Daemon idles when nothing is markable (no unprivileged fanotify)"
+elif [[ $status -eq 124 ]] && grep -q "waiting for a filesystem" /work/daemon-idle.log; then
+    pass "Daemon idles when nothing is markable"
+else
+    fail "Daemon idles when nothing is markable" "exit $status: $(tail -2 /work/daemon-idle.log)"
+fi
+
+# -----------------------------------------------------------------------
 # seccomp layer end-to-end: real rm under trashd-exec must land in trash
 # via the fd-pinned supervisor (TRASHD_SECCOMP_ACTIVE makes the preload
 # defer so this exercises Layer 4 specifically).
@@ -294,6 +313,23 @@ else
     fail "trash ls --json outputs JSON" "no JSON output"
 fi
 trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# One trash root reachable through two mount paths is listed once (#219):
+# duplicates were double-counted by retention and made IDs ambiguous.
+# -----------------------------------------------------------------------
+mkdir -p /work/dedup-a /work/dedup-b
+mount -t tmpfs -o mode=755 trashd-dedup /work/dedup-a
+mount --bind /work/dedup-a /work/dedup-b
+echo "dedup" > /work/dedup-a/trashd_it_dedup.txt
+rm /work/dedup-a/trashd_it_dedup.txt
+DEDUP_COUNT=$(trash ls --json 2>/dev/null | python3 -c 'import json, sys; print(sum(1 for e in json.load(sys.stdin) if e["original_path"].endswith("trashd_it_dedup.txt")))')
+if [[ "$DEDUP_COUNT" == 1 ]]; then
+    pass "Bind-mounted trash root listed once"
+else
+    fail "Bind-mounted trash root listed once" "listed $DEDUP_COUNT times"
+fi
+umount /work/dedup-b /work/dedup-a
 
 # -----------------------------------------------------------------------
 # trash config show

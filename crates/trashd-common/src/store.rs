@@ -390,10 +390,12 @@ impl TrashStore {
         let mut info = TrashInfo::new(trashinfo_path);
         info.command = command.map(|s| s.to_string());
         info.pid = Some(std::process::id());
-        info.size = Some(if meta.is_file() {
-            meta.size()
-        } else {
+        // `meta` is lstat data: a symlink counts as itself, never its target
+        // (walking the target could hang on a dead mount, #223).
+        info.size = Some(if meta.is_dir() {
             dir_size(&abs_path)
+        } else {
+            meta.size()
         });
 
         // Compute file hash for small files only (configurable, default 1 MB).
@@ -995,14 +997,40 @@ impl TrashStore {
     /// List all items across all trash directories, newest first.
     pub fn list(&self, pattern: Option<&str>) -> Result<Vec<TrashEntry>, TrashError> {
         let mut entries = Vec::new();
-
-        for (trash_dir, _label) in self.all_trash_dirs() {
-            self.list_in_dir(&trash_dir, pattern, &mut entries)?;
-        }
+        let roots: Vec<PathBuf> = self
+            .all_trash_dirs()
+            .into_iter()
+            .map(|(dir, _)| dir)
+            .collect();
+        self.list_roots(&roots, pattern, &mut entries)?;
 
         // Sort newest first
         entries.sort_by_key(|b| std::cmp::Reverse(b.info.deletion_date));
         Ok(entries)
+    }
+
+    /// List several roots. One unreadable non-home root (a broken USB stick)
+    /// is skipped with a warning instead of failing ls/restore/purge for
+    /// every other root (#221); the home root still fails loudly, so a broken
+    /// trash never reads as an empty one (#147).
+    fn list_roots(
+        &self,
+        roots: &[PathBuf],
+        pattern: Option<&str>,
+        entries: &mut Vec<TrashEntry>,
+    ) -> Result<(), TrashError> {
+        for root in roots {
+            if let Err(e) = self.list_in_dir(root, pattern, entries) {
+                if *root == self.home {
+                    return Err(e);
+                }
+                eprintln!(
+                    "trashd: warning: skipping unreadable trash {}: {e}",
+                    root.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// List items in a single trash directory.
@@ -1516,6 +1544,12 @@ impl TrashStore {
     /// Run auto_purge only if enough time has passed since the last run.
     /// Uses a timestamp file to avoid scanning the entire trash on every deletion.
     fn maybe_auto_purge(&self) -> Result<(), TrashError> {
+        // One purge at a time per home: concurrent runs each trimmed the full
+        // excess, deleting far more than the limits required (#220). A held
+        // lock means a purge is already running, so this one is skipped.
+        let Some(_running) = self.try_lock_auto_purge() else {
+            return Ok(());
+        };
         let interval = self.config.auto_purge_interval_secs;
         if interval == 0 {
             return self.auto_purge();
@@ -1538,6 +1572,22 @@ impl TrashStore {
             .open(&marker);
 
         self.auto_purge()
+    }
+
+    /// Non-blocking exclusive lock on `.trashd/auto_purge.lock`; `None` when
+    /// another process holds it (or it cannot be opened).
+    fn try_lock_auto_purge(&self) -> Option<fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.home.join(".trashd/auto_purge.lock"))
+            .ok()?;
+        (unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
+            .then_some(lock)
     }
 
     /// Enforce retention policy: purge expired items and trim by size.
@@ -1643,7 +1693,11 @@ impl TrashStore {
             if let Ok(compressed) = zstd::encode_all(data.as_slice(), 3)
                 && compressed.len() < data.len()
             {
-                let guard = self.lock_trash_root(&entries[i].trash_root)?;
+                // One unlockable root must not abandon retention for the
+                // others (#221).
+                let Ok(guard) = self.lock_trash_root(&entries[i].trash_root) else {
+                    continue;
+                };
                 if self.validate_entry_locked(&entries[i], &guard).is_err() {
                     continue;
                 }
@@ -2181,15 +2235,25 @@ fn ensure_trusted_parent(path: &Path, uid: u32) -> io::Result<()> {
 /// component before descending through it. This avoids following an
 /// attacker-provided symlink while preparing a configured XDG/HOME path.
 fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
-    use std::path::Component;
-
     let directory = if directory.is_absolute() {
         directory.to_path_buf()
     } else {
         std::env::current_dir()?.join(directory)
     };
+    ensure_trusted_ancestors_from(&directory, uid, 0)
+}
+
+/// Symlinked ancestors (ostree's /home -> var/home, a stowed ~/.local) are
+/// followed when the link itself belongs to root or this user: the directory
+/// holding it was validated earlier in this walk, so nobody else can replace
+/// it. The target is then validated from the root like any other path; links
+/// owned by anyone else are still refused (#222).
+fn ensure_trusted_ancestors_from(directory: &Path, uid: u32, hops: u32) -> io::Result<()> {
+    use std::path::Component;
+
+    let components: Vec<Component> = directory.components().collect();
     let mut current = PathBuf::from("/");
-    for component in directory.components() {
+    for (index, component) in components.iter().enumerate() {
         match component {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => current.push(name),
@@ -2214,6 +2278,20 @@ fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
         }
 
         let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() && (metadata.uid() == 0 || metadata.uid() == uid) {
+            if hops >= 40 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many symbolic links among trash ancestors",
+                ));
+            }
+            let base = current.parent().unwrap_or_else(|| Path::new("/"));
+            let mut resolved = lexically_normalized(&base.join(fs::read_link(&current)?));
+            for rest in &components[index + 1..] {
+                resolved.push(rest.as_os_str());
+            }
+            return ensure_trusted_ancestors_from(&resolved, uid, hops + 1);
+        }
         let mode = metadata.permissions().mode();
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
@@ -2230,6 +2308,23 @@ fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve `.` and `..` textually. Only applied to a symlink target joined to
+/// a directory this walk already validated as a real, non-symlink path.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    normalized
 }
 
 /// Decompress a marked entry with bounded memory and bounded output. The
@@ -2469,16 +2564,18 @@ fn dir_size_capped(path: &Path) -> (u64, bool) {
     let mut total = 0u64;
     let mut count = 0u64;
     dir_size_inner(path, &mut total, &mut count);
-    (total, count >= DIR_SIZE_MAX_FILES)
+    // The walk visits one entry past the cap, so a tree of exactly the cap
+    // is not mistaken for an oversized one (#223).
+    (total, count > DIR_SIZE_MAX_FILES)
 }
 
 fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
-    if *count >= DIR_SIZE_MAX_FILES {
+    if *count > DIR_SIZE_MAX_FILES {
         return;
     }
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
-            if *count >= DIR_SIZE_MAX_FILES {
+            if *count > DIR_SIZE_MAX_FILES {
                 return;
             }
             *count += 1;
@@ -2499,10 +2596,6 @@ fn dir_size_inner(path: &Path, total: &mut u64, count: &mut u64) {
     }
 }
 
-/// Unlink one filesystem entry with a raw `unlinkat` syscall. Hookable libc
-/// wrappers are deliberately avoided here: under a system-wide LD_PRELOAD the
-/// calling process is itself interposed, and an ordinary remove would trash
-/// the source a second time during cross-device cleanup (#104).
 /// unlinkat(2) as a raw syscall. Store-internal removals must never go
 /// through the interposable libc wrapper: under a system-wide LD_PRELOAD the
 /// hook would trash them again (#104, #192, #196).
@@ -3924,8 +4017,9 @@ pub fn is_parent_bypassed(bypass_list: &[String]) -> bool {
             Some(p) if p > 1 => p,
             _ => break,
         };
-        if let Some(name) = process_name(ppid)
-            && bypass_list.contains(&name)
+        if process_names(ppid)
+            .iter()
+            .any(|name| bypass_list.contains(name))
         {
             return true;
         }
@@ -3946,17 +4040,23 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.get(1)?.parse().ok()
 }
 
-fn process_name(pid: u32) -> Option<String> {
-    // Try /proc/pid/exe first (resolves to actual binary)
+pub(crate) fn process_names(pid: u32) -> Vec<String> {
+    // Both the executable's basename and the kernel's comm: for a script,
+    // comm is the script's own name (pip, npm) while the executable is its
+    // interpreter, so bypass entries for script tools never matched (#224).
+    let mut names = Vec::with_capacity(2);
     if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe"))
         && let Some(name) = exe.file_name()
     {
-        return Some(name.to_string_lossy().into_owned());
+        names.push(name.to_string_lossy().into_owned());
     }
-    // Fallback: /proc/pid/comm
-    fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
+    if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+        let comm = comm.trim().to_string();
+        if !names.contains(&comm) {
+            names.push(comm);
+        }
+    }
+    names
 }
 
 #[cfg(test)]
@@ -4190,11 +4290,19 @@ mod tests {
 
     #[test]
     fn store_rejects_symlinked_missing_ancestor_without_creating_through_it() {
+        // A link someone else owns could be retargeted by them; following it
+        // would let them choose where this user's trash is created. (A link
+        // the user or root owns is followed, see #222.)
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: a foreign-owned symlink needs root to create");
+            return;
+        }
         let base = tempfile::tempdir().unwrap();
         let redirected = base.path().join("redirected");
         fs::create_dir(&redirected).unwrap();
         let link = base.path().join("data-link");
         std::os::unix::fs::symlink(&redirected, &link).unwrap();
+        std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
         let root = link.join("new").join("Trash");
 
         assert!(TrashStore::open_isolated(&root, Config::default()).is_err());
@@ -5883,6 +5991,125 @@ mod tests {
             fs::read_to_string(&info).unwrap(),
             "[Trash Info]\nPath=docs/ours.txt\nDeletionDate=2000-01-01T00:00:00\n\
              X-Trashd-Size=13000\nX-Trashd-Compressed=zstd\n"
+        );
+    }
+
+    // Regression (#223): a symlink operand was sized by walking its target.
+    #[test]
+    fn symlink_operand_is_sized_as_itself() {
+        let (store, _data, work, _) = test_store();
+        let target = work.path().join("big-dir");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("payload"), vec![0u8; 1 << 20]).unwrap();
+        let link = work.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_len = fs::symlink_metadata(&link).unwrap().len();
+        let id = store.trash(&link, None).unwrap();
+        assert_eq!(store.find_entry(&id).unwrap().info.size, Some(link_len));
+    }
+
+    // Regression (#223): a tree of exactly the cap was reported as capped.
+    #[test]
+    fn size_cap_flags_only_trees_that_exceed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..DIR_SIZE_MAX_FILES {
+            fs::write(dir.path().join(i.to_string()), b"").unwrap();
+        }
+        assert!(
+            !dir_size_capped(dir.path()).1,
+            "exactly the cap is not over it"
+        );
+        fs::write(dir.path().join("one-more"), b"").unwrap();
+        assert!(dir_size_capped(dir.path()).1);
+    }
+
+    // Regression (#222): a symlinked ancestor (ostree's /home -> var/home, a
+    // stowed ~/.local) made the store refuse to open, so the shim refused
+    // every rm. A symlink this user or root owns, inside a trusted directory,
+    // is followed and its target validated; anyone else's is still refused.
+    #[test]
+    fn trusted_symlinked_ancestors_are_followed() {
+        let base = tempfile::tempdir().unwrap();
+        fs::create_dir(base.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", base.path().join("link")).unwrap();
+        let store = TrashStore::open_isolated(&base.path().join("link/Trash"), Config::default());
+        assert!(store.is_ok(), "{:?}", store.err());
+        assert!(base.path().join("real/Trash/files").is_dir());
+
+        if unsafe { libc::geteuid() } == 0 {
+            fs::create_dir(base.path().join("other")).unwrap();
+            let foreign = base.path().join("foreign");
+            std::os::unix::fs::symlink("other", &foreign).unwrap();
+            std::os::unix::fs::lchown(&foreign, Some(65534), Some(65534)).unwrap();
+            assert!(TrashStore::open_isolated(&foreign.join("Trash"), Config::default()).is_err());
+        }
+    }
+
+    // Regression (#221): one unreadable root made list() fail for EVERY root,
+    // breaking ls, restore and purge everywhere. It is skipped instead.
+    #[test]
+    fn an_unreadable_root_does_not_hide_the_others() {
+        let (store, _data, work, _) = test_store();
+        store
+            .trash(&create_file(work.path(), "kept", "a"), None)
+            .unwrap();
+        let mut entries = Vec::new();
+        // A broken second root: its info "directory" is a regular file.
+        let broken = work.path().join("broken-root");
+        fs::create_dir_all(broken.join("files")).unwrap();
+        fs::write(broken.join("info"), b"not a directory").unwrap();
+        store
+            .list_roots(&[store.home.clone(), broken], None, &mut entries)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    // Regression (#220): concurrent auto-purges each trimmed the full excess
+    // (the throttle marker was check-then-touch without a lock). A purge
+    // already running elsewhere makes this one a no-op.
+    #[test]
+    fn auto_purge_skips_while_another_purge_runs() {
+        use std::os::fd::AsRawFd;
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
+        fs::create_dir_all(&base).unwrap();
+        let data = TempDir::with_prefix_in("data-", &base).unwrap();
+        let work = TempDir::with_prefix_in("work-", &base).unwrap();
+        let mut config = Config::default();
+        config.retention.max_age_days = 1;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        config.auto_purge_interval_secs = 0;
+        let store = TrashStore::open_isolated(&data.path().join("Trash"), config).unwrap();
+        let id = store
+            .trash(&create_file(work.path(), "expired", "old"), None)
+            .unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let sidecar = fs::read_to_string(&entry.info_path).unwrap();
+        let aged: String = sidecar
+            .lines()
+            .map(|l| {
+                if l.starts_with("DeletionDate=") {
+                    "DeletionDate=2000-01-01T00:00:00"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&entry.info_path, aged + "\n").unwrap();
+
+        let lock = fs::File::create(store.home.join(".trashd/auto_purge.lock")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        store.maybe_auto_purge().unwrap();
+        assert!(
+            store.find_entry(&id).is_ok(),
+            "purged while another purge held the lock"
+        );
+        drop(lock);
+        store.maybe_auto_purge().unwrap();
+        assert!(
+            store.find_entry(&id).is_err(),
+            "expired entry survived an unlocked purge"
         );
     }
 

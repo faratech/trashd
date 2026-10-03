@@ -1,6 +1,7 @@
 use crate::cli::ConfigCmd;
 use crate::util::*;
 use colored::Colorize;
+use std::path::Path;
 use trashd_common::config::Config;
 
 pub fn run(cmd: ConfigCmd) {
@@ -35,7 +36,7 @@ pub fn run(cmd: ConfigCmd) {
         }
         ConfigCmd::Set { key, value } => {
             let mut table = load_user_config_table();
-            if config_set_scalar(&mut table, &key, &value) {
+            if config_set_scalar(&mut table, &key, &value).unwrap_or_else(|e| fatal(e)) {
                 write_user_config_table(&table);
                 println!("{} {} = {}", "Set:".green().bold(), key, value);
             } else {
@@ -98,7 +99,7 @@ pub fn run(cmd: ConfigCmd) {
                 let _ = std::fs::write(&user_path, commented_template(&Config::default()));
             }
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-            let status = std::process::Command::new(&editor).arg(&user_path).status();
+            let status = editor_command(&editor, &user_path).status();
             match status {
                 Ok(s) if s.success() => {}
                 Ok(s) => fatal(format!("{editor} exited with {s}")),
@@ -159,21 +160,26 @@ fn config_get(config: &Config, key: &str) -> Option<String> {
     })
 }
 
-fn load_user_config_table() -> toml::Table {
-    let path = Config::user_config_path();
-    // A missing file is the ordinary first-write case. An existing file that
-    // does not parse must STOP the edit: rewriting the table from scratch
-    // here would silently discard every pre-existing setting (#143).
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match content.parse::<toml::Table>() {
-            Ok(table) => table,
-            Err(e) => fatal(format!(
+/// The user config as a table. Only a missing file starts empty: any other
+/// read error (invalid UTF-8, EACCES, a directory) stops the edit, since the
+/// rewrite would replace a file that was never read (#230). A file that does
+/// not parse stops it too: rewriting the table from scratch would discard
+/// every existing setting (#143).
+fn read_config_table(path: &Path) -> Result<toml::Table, String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content.parse::<toml::Table>().map_err(|e| {
+            format!(
                 "refusing to edit {}: the existing config does not parse:\n{e}\nFix or remove the file, then re-run",
                 path.display()
-            )),
-        },
-        Err(_) => toml::Table::new(),
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) => Err(format!("refusing to edit {}: {e}", path.display())),
     }
+}
+
+fn load_user_config_table() -> toml::Table {
+    read_config_table(&Config::user_config_path()).unwrap_or_else(|e| fatal(e))
 }
 
 fn write_user_config_table(table: &toml::Table) {
@@ -182,9 +188,57 @@ fn write_user_config_table(table: &toml::Table) {
         let _ = std::fs::create_dir_all(parent);
     }
     let content = toml::to_string_pretty(table).unwrap_or_default();
-    if let Err(e) = std::fs::write(&path, content) {
+    if let Err(e) = write_config_file(&path, &content) {
         fatal(format!("write config: {e}"));
     }
+}
+
+/// Replace the config atomically: write a synced sibling temporary and rename
+/// it over the file, so a crash or a full disk never leaves a truncated
+/// config (#230). A symlinked config (dotfiles) is replaced at its target,
+/// and an existing file keeps its mode.
+fn write_config_file(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(std::io::Error::other("config path has no file name"));
+    };
+    let mode = std::fs::metadata(&target)
+        .map(|meta| meta.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    let temporary = dir.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(content.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// EDITOR may carry arguments ("code --wait"), so it runs through the shell
+/// as git runs it, with the path passed as "$1" rather than spliced in (#230).
+fn editor_command(editor: &str, path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg(editor)
+        .arg(path);
+    command
 }
 
 /// The defaults as a fully commented template. Writing them as active values
@@ -209,74 +263,64 @@ fn commented_template(defaults: &Config) -> String {
     out
 }
 
-fn config_set_scalar(table: &mut toml::Table, key: &str, value: &str) -> bool {
+/// The user file's [retention] table. An existing scalar `retention` must
+/// error, not panic (#145), and never be silently discarded by the rewrite.
+fn retention_table(table: &mut toml::Table) -> Result<&mut toml::Table, String> {
+    table
+        .entry("retention")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            "'retention' in the user config is not a table — fix or remove it, then re-run".into()
+        })
+}
+
+/// Set a scalar key: Ok(false) for an unknown or list key. Values are checked
+/// before anything is stored, against what loading the file accepts: a u64
+/// above i64::MAX wrapped negative and made the next load reject the whole
+/// file, and nan/inf/negative sizes or percentages above 100 were stored as
+/// given (#230).
+fn config_set_scalar(table: &mut toml::Table, key: &str, value: &str) -> Result<bool, String> {
     match key {
         "retention.max_age_days" => {
-            let v: u32 = value.parse().unwrap_or_else(|_| fatal("expected integer"));
-            // An existing scalar `retention` must error, not panic (#145) —
-            // and never be silently discarded by the rewrite.
-            let ret = match table
-                .entry("retention")
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                .as_table_mut()
-            {
-                Some(t) => t,
-                None => fatal(
-                    "'retention' in the user config is not a table — fix or remove it, then re-run",
-                ),
-            };
-            ret.insert("max_age_days".into(), toml::Value::Integer(v as i64));
+            let v: u32 = value.parse().map_err(|_| "expected integer")?;
+            retention_table(table)?.insert("max_age_days".into(), toml::Value::Integer(v.into()));
         }
         "retention.max_size_gb" => {
-            let v: f64 = value.parse().unwrap_or_else(|_| fatal("expected number"));
-            let ret = match table
-                .entry("retention")
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                .as_table_mut()
-            {
-                Some(t) => t,
-                None => fatal(
-                    "'retention' in the user config is not a table — fix or remove it, then re-run",
-                ),
-            };
-            ret.insert("max_size_gb".into(), toml::Value::Float(v));
+            let v: f64 = value.parse().map_err(|_| "expected number")?;
+            if !v.is_finite() || v < 0.0 {
+                return Err("expected a finite, non-negative number".into());
+            }
+            retention_table(table)?.insert("max_size_gb".into(), toml::Value::Float(v));
         }
         "retention.disk_pressure_percent" => {
             let v: u8 = value
                 .parse()
-                .unwrap_or_else(|_| fatal("expected integer 0-100"));
-            let ret = match table
-                .entry("retention")
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                .as_table_mut()
-            {
-                Some(t) => t,
-                None => fatal(
-                    "'retention' in the user config is not a table — fix or remove it, then re-run",
-                ),
-            };
-            ret.insert(
+                .ok()
+                .filter(|v| *v <= 100)
+                .ok_or("expected integer 0-100")?;
+            retention_table(table)?.insert(
                 "disk_pressure_percent".into(),
-                toml::Value::Integer(v as i64),
+                toml::Value::Integer(v.into()),
             );
         }
         "max_file_size_mb"
         | "max_dir_size_mb"
         | "sha256_max_size_mb"
         | "auto_purge_interval_secs" => {
-            let v: u64 = value.parse().unwrap_or_else(|_| fatal("expected integer"));
-            table.insert(key.into(), toml::Value::Integer(v as i64));
+            let v: u64 = value.parse().map_err(|_| "expected integer")?;
+            let v = i64::try_from(v).map_err(|_| format!("expected integer 0-{}", i64::MAX))?;
+            table.insert(key.into(), toml::Value::Integer(v));
         }
         "hash_algorithm" => {
             if value != "xxhash" && value != "sha256" {
-                fatal("hash_algorithm must be 'xxhash' or 'sha256'");
+                return Err("hash_algorithm must be 'xxhash' or 'sha256'".into());
             }
             table.insert(key.into(), toml::Value::String(value.into()));
         }
-        "never_trash" | "only_trash" | "bypass_processes" | "bypass_paths" => return false,
-        _ => return false,
+        _ => return Ok(false),
     }
-    true
+    Ok(true)
 }
 
 /// only_trash in the user file REPLACES the inherited whitelist, so a user
@@ -359,6 +403,95 @@ mod tests {
             table["never_trash"],
             toml::Value::Array(vec!["*.log".into()])
         );
+    }
+
+    // Regression (#230): an existing config that cannot be read (invalid
+    // UTF-8, EACCES) was treated as empty and then overwritten.
+    #[test]
+    fn unreadable_config_is_refused_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"never_trash = [\"\xff\"]\n").unwrap();
+        assert!(read_config_table(&path).is_err());
+        assert!(
+            read_config_table(dir.path()).is_err(),
+            "a directory is not a config"
+        );
+        assert!(
+            read_config_table(&dir.path().join("missing.toml"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Regression (#230): the config was rewritten in place, so a crash or a
+    // full disk mid-write left it truncated. The replacement is renamed into
+    // place, keeps the file's mode, and writes through a symlinked config.
+    #[test]
+    fn config_writes_replace_the_file_atomically() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles.toml");
+        std::fs::write(&real, "old = 1\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let before = std::fs::metadata(&real).unwrap().ino();
+
+        write_config_file(&link, "new = 2\n").unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new = 2\n");
+        let after = std::fs::metadata(&real).unwrap();
+        assert_ne!(
+            after.ino(),
+            before,
+            "replaced by rename, not rewritten in place"
+        );
+        assert_eq!(after.mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "no temporary left"
+        );
+    }
+
+    // Regression (#230): u64 values above i64::MAX wrapped negative, so the
+    // next load rejected the whole file; nan/inf/negative sizes and
+    // percentages above 100 were stored as given.
+    #[test]
+    fn out_of_range_values_are_rejected() {
+        let mut table = toml::Table::new();
+        assert!(config_set_scalar(&mut table, "max_file_size_mb", "18446744073709551615").is_err());
+        for bad in ["nan", "inf", "-1"] {
+            assert!(
+                config_set_scalar(&mut table, "retention.max_size_gb", bad).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(config_set_scalar(&mut table, "retention.disk_pressure_percent", "101").is_err());
+        assert!(
+            table.is_empty(),
+            "rejected values must not be stored: {table:?}"
+        );
+        assert_eq!(
+            config_set_scalar(&mut table, "retention.disk_pressure_percent", "100"),
+            Ok(true)
+        );
+        assert_eq!(
+            config_set_scalar(&mut table, "retention.max_size_gb", "1.5"),
+            Ok(true)
+        );
+    }
+
+    // Regression (#230): EDITOR="code --wait" was run as one program name.
+    #[test]
+    fn editor_runs_through_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with space.toml");
+        let status = editor_command("touch -m", &path).status().unwrap();
+        assert!(status.success());
+        assert!(path.exists());
     }
 
     // Regression (#211): `config edit` seeded the user file with every default

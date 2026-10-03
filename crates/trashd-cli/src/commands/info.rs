@@ -20,8 +20,11 @@ pub fn run(store: &TrashStore, target: &str) {
     };
 
     println!("{}", "Trash Entry".bold().underline());
-    println!("  ID:            {}", entry.id);
-    println!("  Original path: {}", entry.info.original_path.display());
+    println!("  ID:            {}", printable(&entry.id));
+    println!(
+        "  Original path: {}",
+        printable_path(&entry.info.original_path)
+    );
     println!(
         "  Deleted:       {}",
         entry.info.deletion_date.format("%Y-%m-%d %H:%M:%S")
@@ -43,7 +46,7 @@ pub fn run(store: &TrashStore, target: &str) {
     println!("  Type:          {file_type}");
 
     if let Some(ref cmd) = entry.info.command {
-        println!("  Command:       {cmd}");
+        println!("  Command:       {}", printable(cmd));
     }
     if let Some(pid) = entry.info.pid {
         println!("  PID:           {pid}");
@@ -52,8 +55,8 @@ pub fn run(store: &TrashStore, target: &str) {
         println!("  Size:          {} ({} bytes)", format_size(size), size);
     }
     if let Some(ref hash) = entry.info.sha256 {
-        println!("  Hash:          {hash}");
+        println!("  Hash:          {}", printable(hash));
     }
-    println!("  Trash dir:     {}", entry.trash_root.display());
-    println!("  Stored at:     {}", entry.trashed_path.display());
+    println!("  Trash dir:     {}", printable_path(&entry.trash_root));
+    println!("  Stored at:     {}", printable_path(&entry.trashed_path));
 }

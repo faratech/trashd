@@ -423,8 +423,9 @@ fn process_is_bypassed(cfg: &PreloadConfig, mut pid: u32) -> bool {
         return false;
     }
     for _ in 0..=10 {
-        if let Some(name) = process_name(pid)
-            && cfg.bypass_processes.contains(&name)
+        if process_names(pid)
+            .iter()
+            .any(|name| cfg.bypass_processes.contains(name))
         {
             return true;
         }
@@ -446,15 +447,23 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.get(1)?.parse().ok()
 }
 
-fn process_name(pid: u32) -> Option<String> {
+fn process_names(pid: u32) -> Vec<String> {
+    // Both the executable's basename and the kernel's comm: for a script,
+    // comm is the script's own name (pip, npm) while the executable is its
+    // interpreter, so bypass entries for script tools never matched (#224).
+    let mut names = Vec::with_capacity(2);
     if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe"))
         && let Some(name) = exe.file_name()
     {
-        return Some(name.to_string_lossy().into_owned());
+        names.push(name.to_string_lossy().into_owned());
     }
-    fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
+    if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+        let comm = comm.trim().to_string();
+        if !names.contains(&comm) {
+            names.push(comm);
+        }
+    }
+    names
 }
 
 /// Check if a path is inside a trash directory (should never be intercepted).
@@ -475,13 +484,15 @@ fn dir_size_capped(path: &Path) -> (u64, bool) {
     const MAX_FILES: u64 = 10_000;
     let mut total = 0u64;
     let mut count = 0u64;
+    // One entry past the cap is visited, so a tree of exactly the cap is not
+    // mistaken for an oversized one (same rule as trashd-common, #223).
     fn walk(path: &Path, total: &mut u64, count: &mut u64, max: u64) {
-        if *count >= max {
+        if *count > max {
             return;
         }
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
-                if *count >= max {
+                if *count > max {
                     return;
                 }
                 *count += 1;
@@ -500,7 +511,7 @@ fn dir_size_capped(path: &Path) -> (u64, bool) {
         }
     }
     walk(path, &mut total, &mut count, MAX_FILES);
-    (total, count >= MAX_FILES)
+    (total, count > MAX_FILES)
 }
 
 /// Match a single never_trash/only_trash pattern against a path string.
@@ -942,15 +953,23 @@ fn ensure_trusted_parent(path: &Path, uid: u32) -> io::Result<()> {
 }
 
 fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
-    use std::path::Component;
-
     let directory = if directory.is_absolute() {
         directory.to_path_buf()
     } else {
         std::env::current_dir()?.join(directory)
     };
+    ensure_trusted_ancestors_from(&directory, uid, 0)
+}
+
+/// Same rule as trashd-common: a symlinked ancestor owned by root or this
+/// user (ostree's /home, a stowed ~/.local) is followed and its target
+/// validated from the root; anyone else's link is refused (#222).
+fn ensure_trusted_ancestors_from(directory: &Path, uid: u32, hops: u32) -> io::Result<()> {
+    use std::path::Component;
+
+    let components: Vec<Component> = directory.components().collect();
     let mut current = PathBuf::from("/");
-    for component in directory.components() {
+    for (index, component) in components.iter().enumerate() {
         match component {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => current.push(name),
@@ -974,6 +993,20 @@ fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
             Err(error) => return Err(error),
         }
         let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() && (metadata.uid() == 0 || metadata.uid() == uid) {
+            if hops >= 40 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many symbolic links among trash ancestors",
+                ));
+            }
+            let base = current.parent().unwrap_or_else(|| Path::new("/"));
+            let mut resolved = lexically_normalized(&base.join(fs::read_link(&current)?));
+            for rest in &components[index + 1..] {
+                resolved.push(rest.as_os_str());
+            }
+            return ensure_trusted_ancestors_from(&resolved, uid, hops + 1);
+        }
         let mode = metadata.permissions().mode();
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
@@ -987,6 +1020,23 @@ fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve `.` and `..` textually; only applied to a symlink target joined
+/// to a directory the walk already validated.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    normalized
 }
 
 /// Unescape /proc/mounts octal sequences (the kernel escapes only whitespace
@@ -1126,6 +1176,9 @@ enum TrashAttempt {
 /// before the move and bail out if the file was REPLACED in between (#44) —
 /// trashing the new inode would capture content the caller never asked to
 /// delete, and then report success for it.
+/// Fresh ids to claim when another writer takes `files/<id>` first.
+const MAX_CLAIM_ATTEMPTS: u32 = 8;
+
 fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return TrashAttempt::NotTrashed;
@@ -1175,18 +1228,10 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         }
         Err(e) => return TrashAttempt::Error(e.raw_os_error().unwrap_or(libc::EIO)),
     };
-    // Atomic unique ID via O_CREAT|O_EXCL
     let base_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".into());
-
-    let (id, info_path) = match unique_id_atomic(&info_dir, &files_dir, &base_name) {
-        Some(v) => v,
-        None => return TrashAttempt::NotTrashed,
-    };
-
-    let dest = files_dir.join(&id);
 
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -1232,57 +1277,76 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         std::process::id(),
     );
 
-    if fs::write(&info_path, &trashinfo).is_err() {
-        let _ = fs::remove_file(&info_path);
-        return TrashAttempt::NotTrashed;
-    }
-
-    // TOCTOU re-check just before the move (#44)
-    match fs::symlink_metadata(path) {
-        Ok(now) if now.dev() == expect_dev && now.ino() == expect_ino => {}
-        Ok(_) => {
-            let _ = fs::remove_file(&info_path);
-            return TrashAttempt::NotTrashed; // replaced — let the real unlink handle the path
-        }
-        Err(_) => {} // vanished; rename below fails cleanly
-    }
-
-    // Move the file
     let source = match CString::new(path.as_os_str().as_bytes()) {
         Ok(s) => s,
         Err(_) => return TrashAttempt::Error(libc::EINVAL),
     };
-    let target = match CString::new(dest.as_os_str().as_bytes()) {
-        Ok(s) => s,
-        Err(_) => return TrashAttempt::Error(libc::EINVAL),
-    };
-    let rename_error = if unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    } == 0
-    {
-        // A concurrent purge may have stripped the sidecar while the data was
-        // absent mid-move; a completed move must never land as an orphan (#169).
-        log_preload(&format!(
-            "trashed: {} -> {}",
-            path.display(),
-            dest.display()
-        ));
-        return TrashAttempt::Trashed;
-    } else {
-        io::Error::last_os_error().raw_os_error()
-    };
 
-    if dest.symlink_metadata().is_ok() {
-        let _ = fs::remove_file(&info_path);
-        return TrashAttempt::Error(libc::EEXIST);
-    }
+    // Atomic unique ID via O_CREAT|O_EXCL. A FreeDesktop tool that ignores our
+    // lock can still take files/<id> between the claim and the move; claim a
+    // fresh id then, since unlink never fails with EEXIST (#225).
+    let mut attempts = 0;
+    let (info_path, dest, rename_error) = loop {
+        let (id, info_path) = match unique_id_atomic(&info_dir, &files_dir, &base_name) {
+            Some(v) => v,
+            None => return TrashAttempt::NotTrashed,
+        };
+        let dest = files_dir.join(&id);
+
+        if fs::write(&info_path, &trashinfo).is_err() {
+            let _ = fs::remove_file(&info_path);
+            return TrashAttempt::NotTrashed;
+        }
+
+        // TOCTOU re-check just before the move (#44)
+        match fs::symlink_metadata(path) {
+            Ok(now) if now.dev() == expect_dev && now.ino() == expect_ino => {}
+            Ok(_) => {
+                let _ = fs::remove_file(&info_path);
+                return TrashAttempt::NotTrashed; // replaced — let the real unlink handle the path
+            }
+            Err(_) => {} // vanished; rename below fails cleanly
+        }
+
+        // Move the file
+        let target = match CString::new(dest.as_os_str().as_bytes()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = fs::remove_file(&info_path);
+                return TrashAttempt::Error(libc::EINVAL);
+            }
+        };
+        if unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            // A concurrent purge may have stripped the sidecar while the data was
+            // absent mid-move; a completed move must never land as an orphan (#169).
+            log_preload(&format!(
+                "trashed: {} -> {}",
+                path.display(),
+                dest.display()
+            ));
+            return TrashAttempt::Trashed;
+        }
+        let rename_error = io::Error::last_os_error().raw_os_error();
+        if rename_error == Some(libc::EEXIST) || dest.symlink_metadata().is_ok() {
+            let _ = fs::remove_file(&info_path);
+            attempts += 1;
+            if attempts < MAX_CLAIM_ATTEMPTS {
+                continue;
+            }
+            return TrashAttempt::NotTrashed;
+        }
+        break (info_path, dest, rename_error);
+    };
     // Only a cross-device move (or an unsupported RENAME_NOREPLACE) calls for
     // copying. Any other error (EACCES, EPERM, EROFS) makes the real unlink
     // fail as well; copying first only stranded duplicates in the trash (#205).
@@ -1349,16 +1413,15 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         // swapping the file for a FIFO must not block the copy forever, and
         // a symlink swap must not be read through (#111).
         let mut created = None;
-        if let Err(e) = copy_regular_verified(path, &dest, meta.dev(), meta.ino(), &mut created) {
+        // Losing the files/<id> race on the O_EXCL create falls back like any
+        // other copy failure; unlink never fails with EEXIST (#225).
+        if copy_regular_verified(path, &dest, meta.dev(), meta.ino(), &mut created).is_err() {
             if created.is_some()
                 && fs::symlink_metadata(&dest).ok().map(|m| (m.dev(), m.ino())) == created
             {
                 let _ = fs::remove_file(&dest);
             }
             let _ = fs::remove_file(&info_path);
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                return TrashAttempt::Error(libc::EEXIST);
-            }
             return TrashAttempt::NotTrashed;
         }
         {
@@ -1903,7 +1966,8 @@ mod tests {
         let mut cfg = PreloadConfig::default();
         cfg.bypass_processes.clear();
         assert!(!process_is_bypassed(&cfg, pid));
-        cfg.bypass_processes.push(process_name(pid).unwrap());
+        cfg.bypass_processes
+            .push(process_names(pid).into_iter().next().unwrap());
         assert!(process_is_bypassed(&cfg, pid));
         cfg.bypass_processes.clear();
         cfg.bypass_paths.push(
@@ -1977,8 +2041,14 @@ mod tests {
 
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&private, &link).unwrap();
+        // The trash directory itself is never a symlink.
         assert!(ensure_private_dir(&link, uid, true).is_err());
-        assert!(ensure_trusted_ancestors(&link.join("new"), uid).is_err());
-        assert!(!private.join("new").exists());
+        // Ancestors may be links the user or root owns (#222); a link owned
+        // by anyone else is refused and nothing is created through it.
+        if uid == 0 {
+            std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
+            assert!(ensure_trusted_ancestors(&link.join("new"), uid).is_err());
+            assert!(!private.join("new").exists());
+        }
     }
 }

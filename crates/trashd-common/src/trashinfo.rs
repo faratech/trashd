@@ -196,37 +196,27 @@ fn encode_path(path: &Path) -> String {
 
 /// Decode a percent-encoded path from .trashinfo into raw bytes.
 fn decode_percent(s: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            match (chars.next(), chars.next()) {
-                (Some(hi), Some(lo)) => {
-                    if let Ok(val) =
-                        u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap_or(""), 16)
-                    {
-                        bytes.push(val);
-                    } else {
-                        // Invalid hex digits — preserve literally
-                        bytes.push(b'%');
-                        bytes.push(hi);
-                        bytes.push(lo);
-                    }
-                }
-                (Some(hi), None) => {
-                    // Truncated sequence — preserve literally
-                    bytes.push(b'%');
-                    bytes.push(hi);
-                }
-                _ => {
-                    bytes.push(b'%');
-                }
-            }
+    // Exactly two ASCII hex digits: from_str_radix accepted a sign ("%+F"),
+    // and consuming both bytes of an invalid escape swallowed a following
+    // '%' (#223). Anything else stays literal.
+    let bytes = s.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hex = |b: u8| (b as char).to_digit(16).unwrap() as u8;
+            decoded.push(hex(bytes[i + 1]) << 4 | hex(bytes[i + 2]));
+            i += 3;
         } else {
-            bytes.push(b);
+            decoded.push(bytes[i]);
+            i += 1;
         }
     }
-    bytes
+    decoded
 }
 
 /// Decode a percent-encoded path from .trashinfo.
@@ -245,6 +235,15 @@ fn decode_path(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression (#223): from_str_radix accepts a sign ("%+F" decoded as
+    // 0x0F), and an invalid escape swallowed the next '%' with it.
+    #[test]
+    fn percent_decoding_takes_exactly_two_hex_digits() {
+        assert_eq!(decode_percent("%+F"), b"%+F");
+        assert_eq!(decode_percent("%A%41"), b"%AA");
+        assert_eq!(decode_percent("%41%zz%"), b"A%zz%");
+    }
 
     #[test]
     fn round_trip_simple_path() {

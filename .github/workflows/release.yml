@@ -27,8 +27,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # One version for every build leg: each leg computing its own date-based
+  # version could straddle UTC midnight and name its tarball differently from
+  # the other leg and the tag (#236).
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+            # Tag-push trigger: trust the pushed tag verbatim (never suffix-bump it,
+            # or the loop would see its own tag and turn v0.1.3 into v0.1.3.1)
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [ -n "${VERSION_INPUT}" ]; then
+            VERSION="${VERSION_INPUT}"
+            # Check if tag exists, append .N if so
+            BASE_VERSION="${VERSION}"
+            SUFFIX=0
+            while git tag -l "v${VERSION}" | grep -q .; do
+              SUFFIX=$((SUFFIX + 1))
+              VERSION="${BASE_VERSION}.${SUFFIX}"
+            done
+          else
+            VERSION=$(date -u +%Y.%m.%d)
+          fi
+          # The version reaches tarball names and a sed substitution in the
+          # quick installer: allow only tag-safe characters.
+          if ! printf '%s' "${VERSION}" | grep -Eqx '[0-9A-Za-z][0-9A-Za-z.+-]*'; then
+            echo "error: invalid release version '${VERSION}'" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
   # Build for both architectures
   build:
+    needs: version
     strategy:
       matrix:
         include:
@@ -40,8 +83,6 @@ jobs:
             arch: aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -72,33 +113,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y binutils-aarch64-linux-gnu
 
-      - name: Determine version
-        id: version
-        env:
-          VERSION_INPUT: ${{ github.event.inputs.version }}
-        run: |
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            # Tag-push trigger: trust the pushed tag verbatim (never suffix-bump it,
-            # or the loop would see its own tag and turn v0.1.3 into v0.1.3.1)
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [ -n "${VERSION_INPUT}" ]; then
-            VERSION="${VERSION_INPUT}"
-            # Check if tag exists, append .N if so
-            BASE_VERSION="${VERSION}"
-            SUFFIX=0
-            while git tag -l "v${VERSION}" | grep -q .; do
-              SUFFIX=$((SUFFIX + 1))
-              VERSION="${BASE_VERSION}.${SUFFIX}"
-            done
-          else
-            VERSION=$(date -u +%Y.%m.%d)
-          fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
       - name: Build release binaries
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28
         env:
-          TRASHD_VERSION: ${{ steps.version.outputs.version }}
+          TRASHD_VERSION: ${{ needs.version.outputs.version }}
 
       - name: Enforce glibc floor
         run: |
@@ -111,7 +129,7 @@ jobs:
 
       - name: Package release tarball
         env:
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           VERSION="${RELEASE_VERSION}"
           STAGING="trashd-${VERSION}-linux-${{ matrix.arch }}"
@@ -173,7 +191,7 @@ jobs:
 
   # Create GitHub Release with all artifacts
   release:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -184,14 +202,13 @@ jobs:
       - name: Determine version
         id: version
         env:
-          BUILD_VERSION: ${{ needs.build.outputs.version }}
+          BUILD_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          # Reuse the build job's version verbatim: recomputing a date-based
+          # Reuse the version job's output verbatim: recomputing a date-based
           # version here could straddle UTC midnight and mint a tag that does
-          # not match the built tarball names (breaking the quick installer,
-          # which derives the asset name from the tag).
+          # not match the built tarball names.
           if [ -z "${BUILD_VERSION}" ]; then
-            echo "error: build job did not export a version" >&2
+            echo "error: version job did not export a version" >&2
             exit 1
           fi
           echo "version=${BUILD_VERSION}" >> $GITHUB_OUTPUT
@@ -202,14 +219,20 @@ jobs:
           path: artifacts
 
       - name: Create quick-install script
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           cat > artifacts/install-trashd.sh << 'INSTALLER'
           #!/usr/bin/env bash
           set -euo pipefail
-          # trashd installer — downloads and installs the latest release
+          # trashd installer — downloads and installs the release it was published with
           # Usage: curl -fsSL https://github.com/faratech/trashd/releases/latest/download/install-trashd.sh | sudo bash
 
           REPO="faratech/trashd"
+          # Baked in at release time: a versioned or prerelease download URL
+          # installs that release, not whatever releases/latest is (#237).
+          VERSION="@RELEASE_VERSION@"
+          TAG="v${VERSION}"
           ARCH=$(uname -m)
           case "$ARCH" in
             x86_64|amd64) ARCH="x86_64" ;;
@@ -217,14 +240,11 @@ jobs:
             *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
           esac
 
-          echo "==> Detecting latest release..."
-          LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
-          VERSION="${LATEST#v}"
           echo "    Version: ${VERSION}"
           echo "    Architecture: ${ARCH}"
 
           TARBALL="trashd-${VERSION}-linux-${ARCH}.tar.gz"
-          URL="https://github.com/${REPO}/releases/download/${LATEST}/${TARBALL}"
+          URL="https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}"
 
           TMPDIR=$(mktemp -d)
           trap 'rm -rf "${TMPDIR}"' EXIT
@@ -240,6 +260,9 @@ jobs:
           export TRASH_BYPASS=1
           ./install.sh
           INSTALLER
+          # The version job admits only [0-9A-Za-z.+-], so this is a literal.
+          sed -i "s/@RELEASE_VERSION@/${RELEASE_VERSION}/" artifacts/install-trashd.sh
+          grep -q '^VERSION="'"${RELEASE_VERSION}"'"$' artifacts/install-trashd.sh
           chmod +x artifacts/install-trashd.sh
 
       - name: Create GitHub Release (also creates the tag)
@@ -264,8 +287,10 @@ jobs:
           # Build checksums section
           CHECKSUMS=$(cat artifacts/trashd-linux-*/trashd-*.sha256 2>/dev/null || echo "see .sha256 files")
 
+          # Tag the commit that was built, not whatever main points at by
+          # the time this job runs (#238).
           gh release create "v${VERSION}" \
-            --target main \
+            --target "${GITHUB_SHA}" \
             --title "trashd ${VERSION}" \
             --notes "## trashd ${VERSION}
 

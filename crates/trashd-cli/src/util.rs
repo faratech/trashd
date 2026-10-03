@@ -57,7 +57,7 @@ pub fn parse_time_spec(
 
     // Absolute: "2026-03-20T14:00:00", "2026-03-20T14:00", or "2026-03-20"
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-        && let Some(local) = dt.and_local_timezone(chrono::Local).single()
+        && let Some(local) = local_instant(dt)
     {
         return local;
     }
@@ -66,7 +66,7 @@ pub fn parse_time_spec(
         && s.matches('-').count() == 2
         && let Ok(dt) =
             chrono::NaiveDateTime::parse_from_str(&format!("{s}:00"), "%Y-%m-%dT%H:%M:%S")
-        && let Some(local) = dt.and_local_timezone(chrono::Local).single()
+        && let Some(local) = local_instant(dt)
     {
         return local;
     }
@@ -74,7 +74,7 @@ pub fn parse_time_spec(
         && s.matches('-').count() == 2
         && let Ok(dt) =
             chrono::NaiveDateTime::parse_from_str(&format!("{s}T00:00:00"), "%Y-%m-%dT%H:%M:%S")
-        && let Some(local) = dt.and_local_timezone(chrono::Local).single()
+        && let Some(local) = local_instant(dt)
     {
         return local;
     }
@@ -84,6 +84,47 @@ pub fn parse_time_spec(
         "trash: error:".red().bold(),
     );
     std::process::exit(1);
+}
+
+/// A local wall-clock time as an instant. A time that a DST change repeats
+/// takes its earlier instant, and one it skips resolves to the end of the
+/// gap; `.single()` rejected both (#230). chrono's `earliest()` is not used:
+/// for `Local` it returned the later instant of a repeated time.
+fn local_instant(naive: chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::LocalResult;
+    // Gaps last at most a few hours; the first valid minute ends this one.
+    (0..=24 * 60).find_map(|minutes| {
+        match naive
+            .checked_add_signed(chrono::TimeDelta::minutes(minutes))?
+            .and_local_timezone(chrono::Local)
+        {
+            LocalResult::Single(instant) => Some(instant),
+            LocalResult::Ambiguous(a, b) => Some(a.min(b)),
+            LocalResult::None => None,
+        }
+    })
+}
+
+/// `s` for human output, with control and bidi-override characters escaped:
+/// names and sidecar fields come from the filesystem, and could otherwise
+/// move the cursor, clear the screen, or reorder a line (#230).
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control()
+            || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A path for human output; see [`printable`].
+pub fn printable_path(path: &std::path::Path) -> String {
+    printable(&path.to_string_lossy())
 }
 
 pub fn print_json_entries(entries: &[trashd_common::store::TrashEntry]) {
@@ -157,3 +198,45 @@ pub fn open_store() -> trashd_common::TrashStore {
 }
 
 pub use std::path::PathBuf;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression (#230): crafted sidecars could put terminal escapes and
+    // newlines into `ls`, `find` and `info` output.
+    #[test]
+    fn human_output_escapes_control_characters() {
+        assert_eq!(
+            printable("a\x1b[2Jb\nc\u{202e}d\u{7f}"),
+            "a\\u{1b}[2Jb\\u{a}c\\u{202e}d\\u{7f}"
+        );
+        assert_eq!(printable("caf\u{e9} \\ ok"), "caf\u{e9} \\ ok");
+    }
+
+    // Regression (#230): `.single()` rejected local times that a DST change
+    // repeats or skips. Ambiguous times take the earlier instant; skipped
+    // times resolve to the first instant after the gap. Local time is
+    // process-wide, so this runs in a child with its own TZ.
+    #[test]
+    fn local_times_around_dst_changes_resolve() {
+        if std::env::var_os("TRASHD_DST_CHILD").is_some() {
+            let now = chrono::Local::now();
+            let repeated = parse_time_spec("2026-11-01T01:30", &now);
+            assert_eq!(repeated.to_rfc3339(), "2026-11-01T01:30:00-04:00");
+            let skipped = parse_time_spec("2026-03-08T02:30", &now);
+            assert_eq!(skipped.to_rfc3339(), "2026-03-08T03:00:00-04:00");
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "util::tests::local_times_around_dst_changes_resolve",
+            ])
+            .env("TZ", "America/New_York")
+            .env("TRASHD_DST_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}

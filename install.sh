@@ -95,7 +95,22 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     #    every dynamically-linked process errors about the missing library.
     if [ -f /etc/ld.so.preload ]; then
         if grep -q "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
-            sed -i '\|libtrashd_preload.so|d' /etc/ld.so.preload
+            # The file lists libraries separated by whitespace or colons, with
+            # `#` comments. Drop only our entries: deleting whole lines lost
+            # other libraries that shared a line with ours (#229).
+            awk '{
+                line = $0; comment = ""
+                if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) }
+                if (line !~ /libtrashd_preload\.so/) { print $0; next }
+                n = split(line, entry, /[ \t:]+/); out = ""
+                for (i = 1; i <= n; i++)
+                    if (entry[i] != "" && entry[i] !~ /(^|\/)libtrashd_preload\.so$/)
+                        out = out (out == "" ? "" : " ") entry[i]
+                if (comment != "") out = out (out == "" ? "" : " ") comment
+                if (out != "") print out
+            }' /etc/ld.so.preload > /etc/ld.so.preload.trashd-new
+            chmod 0644 /etc/ld.so.preload.trashd-new
+            mv -f /etc/ld.so.preload.trashd-new /etc/ld.so.preload
             echo "    Removed from /etc/ld.so.preload"
         fi
         # Drop the file entirely if nothing else is left in it.
@@ -115,6 +130,7 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
         done
         systemctl daemon-reload 2>/dev/null || true
     fi
+    remove_files /etc/systemd/user/trashd-cleanup.service /etc/systemd/user/trashd-cleanup.timer
     if pkill -x trashd 2>/dev/null; then
         echo "    Stopped running trashd daemon"
     fi
@@ -123,18 +139,31 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     remove_files "${BIN_DIR}/trash" "${BIN_DIR}/trashd-exec" "${BIN_DIR}/trashd" "${BIN_DIR}/trashd-daemon"
     echo "    Removed binaries from ${BIN_DIR}"
 
-    # 4. Remove the entire trashd lib tree in one shot: the rm shim (bin/), the
+    # 4. Remove the man pages this prefix's install recorded, before the lib
+    #    tree that holds the record. A trash-*.1 glob also removed other
+    #    packages' pages, such as trash-cli's trash-put.1 (#229). Installs
+    #    older than the record get the pages v0.1.8 shipped.
+    MAN_DIR="${PREFIX}/share/man/man1"
+    if [ -f "${LIB_DIR}/man-pages" ]; then
+        MAN_PAGES=$(cat "${LIB_DIR}/man-pages")
+    else
+        MAN_PAGES="trash.1 trash-compress.1 trash-config.1 trash-du.1 trash-empty.1
+            trash-find.1 trash-fsck.1 trash-info.1 trash-log.1 trash-ls.1 trash-purge.1
+            trash-restore.1 trash-self-update.1 trash-status.1 trash-undo.1"
+    fi
+    for _page in $MAN_PAGES; do
+        case "$_page" in
+            trash.1 | trash-*.1) remove_files "${MAN_DIR}/${_page}" ;;
+        esac
+    done
+    echo "    Removed man pages"
+
+    # 5. Remove the entire trashd lib tree in one shot: the rm shim (bin/), the
     #    stashed real rm (real/), the preload .so, and the daemon binary.
     if [ -d "${LIB_DIR}" ]; then
         "$RM" -rf "${LIB_DIR}"
         echo "    Removed ${LIB_DIR}"
     fi
-
-    # 5. Remove ALL trashd man pages: trash.1 plus every trash-<subcommand>.1
-    #    (globbed, so new subcommands are covered without editing this list).
-    MAN_DIR="${PREFIX}/share/man/man1"
-    remove_files "${MAN_DIR}/trash.1" "${MAN_DIR}"/trash-*.1
-    echo "    Removed man pages"
 
     # 6. Remove shell completions: the PREFIX-relative paths this installer
     # uses, plus the system/Makefile locations so a mixed install (e.g. a
@@ -366,8 +395,11 @@ MAN_DIR="${PREFIX}/share/man/man1"
 echo "==> Installing man pages..."
 if [ -d "${MAN_SRC}" ]; then
     mkdir -p "${MAN_DIR}"
+    # Recorded so uninstall removes exactly these pages (#229).
+    : > "${LIB_DIR}/man-pages"
     for f in "${MAN_SRC}"/*.1; do
         install -Dm644 "$f" "${MAN_DIR}/$(basename "$f")"
+        basename "$f" >> "${LIB_DIR}/man-pages"
     done
     echo "    Installed man pages to ${MAN_DIR}"
 else
@@ -482,6 +514,27 @@ if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v system
 else
     echo "    systemd not available, skipping daemon install"
     echo "    Run manually: sudo trashd --foreground"
+fi
+
+# The cleanup timer is a per-user unit (trash is per-user), installed disabled
+# with its trash path templated for this prefix (#227). Users opt in with
+# `systemctl --user enable --now trashd-cleanup.timer`.
+if [ -d /etc/systemd ]; then
+    mkdir -p /etc/systemd/user
+    awk -v trash="${BIN_DIR}/trash" '
+        {
+            s = $0; out = ""
+            while ((i = index(s, "/usr/local/bin/trash")) > 0) {
+                out = out substr(s, 1, i - 1) trash
+                s = substr(s, i + length("/usr/local/bin/trash"))
+            }
+            print out s
+        }' \
+        "$(dirname "$0")/install/systemd/trashd-cleanup.service" > /etc/systemd/user/trashd-cleanup.service
+    install -m644 "$(dirname "$0")/install/systemd/trashd-cleanup.timer" /etc/systemd/user/trashd-cleanup.timer
+    chmod 0644 /etc/systemd/user/trashd-cleanup.service
+    echo "    Installed trashd-cleanup.timer (user unit, disabled)"
+    echo "    Enable per user: systemctl --user enable --now trashd-cleanup.timer"
 fi
 
 echo "==> Installing global config..."

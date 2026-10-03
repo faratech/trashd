@@ -20,6 +20,7 @@ MACROS = {
     "_prefix": "/usr",
     "_sysconfdir": "/etc",
     "_unitdir": "/usr/lib/systemd/system",
+    "_userunitdir": "/usr/lib/systemd/user",
     "_mandir": "/usr/share/man",
     "_datadir": "/usr/share",
 }
@@ -47,7 +48,8 @@ def main():
     with tempfile.TemporaryDirectory() as stage:
         subprocess.run(
             ["make", "-s", "-C", str(REPO), "install", f"DESTDIR={stage}",
-             "PREFIX=/usr", f"UNITDIR={MACROS['_unitdir']}"],
+             "PREFIX=/usr", f"UNITDIR={MACROS['_unitdir']}",
+             f"USERUNITDIR={MACROS['_userunitdir']}"],
             check=True, stdout=subprocess.DEVNULL,
         )
         root = pathlib.Path(stage)

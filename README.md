@@ -62,7 +62,7 @@ In GUI sessions (when `$DISPLAY` or `$WAYLAND_DISPLAY` is set), sends a desktop 
 
 A shared library that hooks `unlink()`, `unlinkat()`, `rmdir()`, and `remove()` at the libc level using `dlsym(RTLD_NEXT, ...)`. (glibc's `remove()` calls hidden internal aliases that hooking `unlink`/`rmdir` cannot reach, so it is interposed directly.) Catches deletions from any dynamically-linked program — Python's `os.remove()`, Perl's `unlink`, Go's `os.Remove()`, compiled C programs, anything that calls libc.
 
-Enabled system-wide via `/etc/ld.so.preload` (installed automatically). The library is intentionally standalone — no dependency on `trashd-common` or SQLite — to keep the `.so` small (~870 KB) and avoid pulling heavy dependencies into every process on the system.
+Enabled system-wide via `/etc/ld.so.preload`, which `install.sh` and a native `make install` register. Distribution packages built from `packaging/` install the library without registering it: add its path to `/etc/ld.so.preload` to enable the layer. The library is intentionally standalone — no dependency on `trashd-common` or SQLite — to keep the `.so` small (~870 KB) and avoid pulling heavy dependencies into every process on the system.
 
 Key safety mechanisms:
 - **Re-entrancy guard** — A thread-local `Cell<bool>` prevents internal `rename()`/`mkdir()` calls during trash operations from re-entering the hooked `unlink()`.
@@ -139,6 +139,8 @@ The install script:
 5. Adds `libtrashd_preload.so` to `/etc/ld.so.preload` (system-wide)
 6. Installs `/etc/profile.d/trashd.sh` (PATH shim + seccomp wrapper)
 7. Installs and starts the `trashd` systemd service
+   and a per-user `trashd-cleanup.timer` (disabled; enable it with
+   `systemctl --user enable --now trashd-cleanup.timer` to purge items older than 30 days weekly)
 8. Installs man pages to `/usr/local/share/man/man1/`
 9. Installs shell completions for bash, zsh, and fish
 10. Creates global config at `/etc/trashd/config.toml`
@@ -160,6 +162,16 @@ Removes all binaries, libraries, config, man pages, shell completions, the syste
 Pass `--purge` to also remove **all FreeDesktop.org trash directories** across all users and all mount points: `~/.local/share/Trash/` for every user in `/home/` and `/root`, plus `$mountpoint/.Trash-$UID/` and `$mountpoint/.Trash/` on every mounted filesystem. This permanently destroys trashed files.
 
 ### Manual install
+
+`make` builds as your own user; `sudo make install` only copies the build
+output and never compiles as root:
+
+```bash
+make
+sudo make install
+```
+
+Or by hand:
 
 ```bash
 cargo build --release --locked

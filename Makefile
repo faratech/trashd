@@ -3,6 +3,7 @@ BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/trashd
 MANDIR ?= $(PREFIX)/share/man/man1
 UNITDIR ?= /usr/lib/systemd/system
+USERUNITDIR ?= /usr/lib/systemd/user
 DESTDIR ?=
 
 COMPLETIONS_BASH ?= $(PREFIX)/share/bash-completion/completions
@@ -31,7 +32,15 @@ test:
 clean:
 	cargo clean
 
-install: build
+# install never builds: under sudo, cargo's build scripts and proc macros
+# would run as root (#229). Run `make` first as your own user.
+install:
+	@for artifact in trash trashd-rm trashd-exec trashd libtrashd_preload.so; do \
+		if [ ! -f target/release/$$artifact ]; then \
+			echo "error: target/release/$$artifact is missing; run 'make build' first (without sudo)" >&2; \
+			exit 1; \
+		fi; \
+	done
 	install -Dm755 target/release/trash $(DESTDIR)$(BINDIR)/trash
 	install -Dm755 target/release/trashd-rm $(DESTDIR)$(LIBDIR)/bin/rm
 	install -Dm755 target/release/trashd-exec $(DESTDIR)$(BINDIR)/trashd-exec
@@ -62,6 +71,12 @@ install: build
 	awk -v daemon="$(LIBDIR)/trashd" '{ s = $$0; out = ""; while ((i = index(s, "/usr/local/lib/trashd/trashd")) > 0) { out = out substr(s, 1, i-1) daemon; s = substr(s, i + length("/usr/local/lib/trashd/trashd")) } print out s }' \
 		install/systemd/trashd.service > $(DESTDIR)$(UNITDIR)/trashd.service
 	chmod 0644 $(DESTDIR)$(UNITDIR)/trashd.service
+	# The cleanup timer is a per-user unit, shipped disabled (#227).
+	mkdir -p $(DESTDIR)$(USERUNITDIR)
+	awk -v trash="$(BINDIR)/trash" '{ s = $$0; out = ""; while ((i = index(s, "/usr/local/bin/trash")) > 0) { out = out substr(s, 1, i-1) trash; s = substr(s, i + length("/usr/local/bin/trash")) } print out s }' \
+		install/systemd/trashd-cleanup.service > $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.service
+	chmod 0644 $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.service
+	install -Dm644 install/systemd/trashd-cleanup.timer $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.timer
 	# Native installs only (DESTDIR staging must never touch the host):
 	# register Layer 2 system-wide, matching install.sh (#160).
 	if [ -z "$(DESTDIR)" ]; then \
@@ -82,6 +97,10 @@ install: build
 	install -Dm644 target/completions/trash.fish $(DESTDIR)$(COMPLETIONS_FISH)/trash.fish
 
 uninstall:
+	# Stop the daemon before its binary goes away (#229).
+	if [ -z "$(DESTDIR)" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then \
+		systemctl disable --now trashd 2>/dev/null || true; \
+	fi
 	rm -f $(DESTDIR)$(BINDIR)/trash
 	rm -f $(DESTDIR)$(BINDIR)/trashd-exec
 	rm -f $(DESTDIR)$(BINDIR)/trashd
@@ -89,13 +108,20 @@ uninstall:
 	# the install step and install.sh's uninstall step 1): a dangling entry
 	# makes every dynamic process print an ld.so error forever (#166).
 	if [ -z "$(DESTDIR)" ] && grep -qs "$(LIBDIR)/libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then \
-		sed -i '\|$(LIBDIR)/libtrashd_preload.so|d' /etc/ld.so.preload; \
+		awk -v lib="$(LIBDIR)/libtrashd_preload.so" '{ line = $$0; comment = ""; if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) } if (index(line, lib) == 0) { print $$0; next } n = split(line, entry, /[ \t:]+/); out = ""; for (i = 1; i <= n; i++) if (entry[i] != "" && entry[i] != lib) out = out (out == "" ? "" : " ") entry[i]; if (comment != "") out = out (out == "" ? "" : " ") comment; if (out != "") print out }' \
+			/etc/ld.so.preload > /etc/ld.so.preload.trashd-new; \
+		chmod 0644 /etc/ld.so.preload.trashd-new; \
+		mv -f /etc/ld.so.preload.trashd-new /etc/ld.so.preload; \
 		[ -s /etc/ld.so.preload ] || rm -f /etc/ld.so.preload; \
 		echo "==> Removed LD_PRELOAD layer from /etc/ld.so.preload"; \
 	fi
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -f $(DESTDIR)/etc/profile.d/trashd.sh
 	rm -f $(DESTDIR)$(UNITDIR)/trashd.service
+	rm -f $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.service $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.timer
+	if [ -z "$(DESTDIR)" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then \
+		systemctl daemon-reload 2>/dev/null || true; \
+	fi
 	rm -f $(DESTDIR)$(MANDIR)/trash.1
 	rm -f $(DESTDIR)$(COMPLETIONS_BASH)/trash
 	rm -f $(DESTDIR)$(COMPLETIONS_ZSH)/_trash
