@@ -1229,7 +1229,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "trashd"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "libc",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "trashd-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "clap",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "trashd-common"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "dirs",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "trashd-preload"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "dirs",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "trashd-seccomp"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "libc",
  "tempfile",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "trashd-shim"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "clap",
  "libc",
