@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.10 (2026-10-12)
+
+### Fixed
+
+- All 24 bugs from the post-0.1.9 audit (#229, #243–#265), including a
+  cross-device trash that could permanently destroy both copies of a file
+  when a purge raced it (#243), a preload process-bypass verdict cached
+  for a process's whole lifetime (#249), and partial trees left behind by
+  failed cross-device copies (#244). Every fix ships with a regression
+  test; the full list is in the commit history and the closed issues.
+
+### Changed
+
+- Rust toolchain updated to 1.99.0 (latest stable) and all dependencies
+  updated to their latest releases (clap 4.6.7, chrono 0.4.45, rusqlite
+  0.40.2, ureq 3.4.2, zstd 0.14.2, and the rest). CI's Clippy gate now
+  passes with `--all-targets`.
+
 ## 0.1.9 (2026-10-03)
 
 ### Fixed
