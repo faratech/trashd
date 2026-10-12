@@ -278,7 +278,7 @@ mod tests {
         // 20th token. comm contains spaces and a paren here on purpose.
         let stat = "1 (weird ) name) S 0 1 1 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 98765 1234";
         assert_eq!(parse_start_time(stat), Some(98765));
-        assert_eq!(proc_start_time(unsafe { libc::getpid() }).is_some(), true);
+        assert!(proc_start_time(unsafe { libc::getpid() }).is_some());
     }
 
     #[test]
