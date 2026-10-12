@@ -31,7 +31,8 @@ pub(crate) fn log_trash_in(
     write_log(
         home,
         &format!(
-            "TRASH id={trash_id} path={} cmd={}",
+            "TRASH id={} path={} cmd={}",
+            escape_field_bytes(trash_id.as_bytes()),
             escape_field(original_path.as_os_str()),
             escape_field_bytes(cmd.as_bytes()),
         ),
@@ -47,7 +48,8 @@ pub(crate) fn log_restore_in(home: &Path, trash_id: &str, restored_to: &Path) {
     write_log(
         home,
         &format!(
-            "RESTORE id={trash_id} to={}",
+            "RESTORE id={} to={}",
+            escape_field_bytes(trash_id.as_bytes()),
             escape_field(restored_to.as_os_str()),
         ),
     );
@@ -59,7 +61,12 @@ pub fn log_purge(trash_id: &str) {
 }
 
 pub(crate) fn log_purge_in(home: &Path, trash_id: &str) {
-    write_log(home, &format!("PURGE id={trash_id}"));
+    // The ID is attacker-influenced (it derives from a filename): escape it
+    // like every other field or a newline in it forges the next record (#254).
+    write_log(
+        home,
+        &format!("PURGE id={}", escape_field_bytes(trash_id.as_bytes())),
+    );
 }
 
 /// Log an empty operation.
@@ -188,7 +195,21 @@ fn write_log(home: &Path, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_field_bytes, spawn_reaped};
+    use super::{escape_field_bytes, log_purge_in, log_restore_in, log_trash_in, spawn_reaped};
+
+    // Regression (#254): the trash ID was interpolated unescaped, so an ID
+    // containing a newline forged a second operations.log record.
+    #[test]
+    fn log_writers_escape_the_trash_id() {
+        let home = tempfile::tempdir().unwrap();
+        let evil = "evil\n2099-01-01 pid=1 PURGE id=forged";
+        log_purge_in(home.path(), evil);
+        log_restore_in(home.path(), evil, std::path::Path::new("/tmp/x"));
+        log_trash_in(home.path(), std::path::Path::new("/tmp/x"), evil, None);
+        let log = std::fs::read_to_string(home.path().join(".trashd/operations.log")).unwrap();
+        assert_eq!(log.lines().count(), 3, "forged extra line in: {log}");
+        assert!(log.contains("evil\\x0a2099"), "ID not escaped in: {log}");
+    }
 
     // Regression (#233): notify-send was spawned and never waited for, so a
     // long-lived caller (the seccomp supervisor) kept one zombie per delete.

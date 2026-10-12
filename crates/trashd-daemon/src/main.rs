@@ -276,6 +276,16 @@ fn run() -> io::Result<()> {
                 unsafe { libc::close(event.fd) };
             }
         }
+
+        // Also refresh after a busy batch: under a continuous delete stream
+        // read() never returns EAGAIN, so the idle-branch refresh alone
+        // starved and mounts appearing after startup were never marked
+        // until a >=1s idle gap (#253). Throttled by the same interval.
+        let now = std::time::Instant::now();
+        if mount_refresh_due(last_refresh, now) {
+            refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
+            last_refresh = now;
+        }
     }
 }
 

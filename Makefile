@@ -25,6 +25,12 @@ update:
 
 build:
 	cargo build --release
+	@# Optional i686 preload (#229): only where the target is installed; a
+	@# failure here loses only the 32-bit library, never the build.
+	@if [ "$$(uname -m)" = "x86_64" ] && [ -d "$$(rustc --print sysroot 2>/dev/null)/lib/rustlib/i686-unknown-linux-gnu" ]; then \
+		cargo build --release -p trashd-preload --target i686-unknown-linux-gnu \
+			|| echo "warning: i686 preload build failed; continuing without it" >&2; \
+	fi
 
 test:
 	TRASH_BYPASS=1 cargo test --workspace
@@ -50,6 +56,13 @@ install:
 	install -Dm755 target/release/trashd $(DESTDIR)$(LIBDIR)/trashd
 	ln -sf $(LIBDIR)/trashd $(DESTDIR)$(BINDIR)/trashd
 	install -Dm755 target/release/libtrashd_preload.so $(DESTDIR)$(LIBDIR)/libtrashd_preload.so
+	@# Per-ABI layout for the $LIB registration below, when the optional
+	@# i686 preload was built (#229).
+	@if [ -f target/i686-unknown-linux-gnu/release/libtrashd_preload.so ]; then \
+		install -Dm755 target/release/libtrashd_preload.so $(DESTDIR)$(LIBDIR)/lib64/libtrashd_preload.so; \
+		install -Dm755 target/i686-unknown-linux-gnu/release/libtrashd_preload.so $(DESTDIR)$(LIBDIR)/lib/libtrashd_preload.so; \
+		echo "==> Installed 32-bit preload (registered via \$$LIB)"; \
+	fi
 	# Shipped defaults only: never reset an admin's policy on a re-run
 	# (install.sh and %config(noreplace) already behave this way) (#161).
 	if [ -n "$(DESTDIR)" ] || [ ! -f /etc/trashd/config.toml ]; then \
@@ -80,17 +93,24 @@ install:
 	# Native installs only (DESTDIR staging must never touch the host):
 	# register Layer 2 system-wide, matching install.sh (#160).
 	if [ -z "$(DESTDIR)" ]; then \
-		if ! grep -qs "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then \
+		entry="$(LIBDIR)/libtrashd_preload.so"; \
+		if [ -f target/i686-unknown-linux-gnu/release/libtrashd_preload.so ]; then \
+			entry="$(LIBDIR)/\$$LIB/libtrashd_preload.so"; \
+		fi; \
+		if ! awk -v lib="$(LIBDIR)/libtrashd_preload.so" -v libalt="$(LIBDIR)/\$$LIB/libtrashd_preload.so" '{ line = $$0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib || e[i] == libalt) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then \
 			mkdir -p /etc; \
 			if [ -s /etc/ld.so.preload ] && [ "$$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then \
 				printf '\n' >> /etc/ld.so.preload; \
 			fi; \
-			echo "$(LIBDIR)/libtrashd_preload.so" >> /etc/ld.so.preload; \
+			echo "$$entry" >> /etc/ld.so.preload; \
 			echo "==> Enabled LD_PRELOAD layer via /etc/ld.so.preload"; \
 		fi; \
 	fi
-	# Man page
-	install -Dm644 target/man/trash.1 $(DESTDIR)$(MANDIR)/trash.1
+	# Man pages: the full generated set, not only trash.1 (#260)
+	@for page in target/man/*.1; do \
+		[ -e "$$page" ] || { echo "error: no man pages in target/man; run 'make build' first" >&2; exit 1; }; \
+		install -Dm644 "$$page" "$(DESTDIR)$(MANDIR)/$$(basename "$$page")"; \
+	done
 	# Shell completions
 	install -Dm644 target/completions/trash.bash $(DESTDIR)$(COMPLETIONS_BASH)/trash
 	install -Dm644 target/completions/_trash $(DESTDIR)$(COMPLETIONS_ZSH)/_trash
@@ -107,8 +127,8 @@ uninstall:
 	# Remove the LD_PRELOAD registration BEFORE deleting the .so (mirror of
 	# the install step and install.sh's uninstall step 1): a dangling entry
 	# makes every dynamic process print an ld.so error forever (#166).
-	if [ -z "$(DESTDIR)" ] && grep -qs "$(LIBDIR)/libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then \
-		awk -v lib="$(LIBDIR)/libtrashd_preload.so" '{ line = $$0; comment = ""; if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) } if (index(line, lib) == 0) { print $$0; next } n = split(line, entry, /[ \t:]+/); out = ""; for (i = 1; i <= n; i++) if (entry[i] != "" && entry[i] != lib) out = out (out == "" ? "" : " ") entry[i]; if (comment != "") out = out (out == "" ? "" : " ") comment; if (out != "") print out }' \
+	if [ -z "$(DESTDIR)" ] && grep -qsF "$(LIBDIR)/" /etc/ld.so.preload 2>/dev/null; then \
+		awk -v lib="$(LIBDIR)/libtrashd_preload.so" -v libalt="$(LIBDIR)/\$$LIB/libtrashd_preload.so" '{ line = $$0; comment = ""; if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) } if (index(line, lib) == 0 && index(line, libalt) == 0) { print $$0; next } n = split(line, entry, /[ \t:]+/); out = ""; for (i = 1; i <= n; i++) if (entry[i] != "" && entry[i] != lib && entry[i] != libalt) out = out (out == "" ? "" : " ") entry[i]; if (comment != "") out = out (out == "" ? "" : " ") comment; if (out != "") print out }' \
 			/etc/ld.so.preload > /etc/ld.so.preload.trashd-new; \
 		chmod 0644 /etc/ld.so.preload.trashd-new; \
 		mv -f /etc/ld.so.preload.trashd-new /etc/ld.so.preload; \
@@ -118,11 +138,18 @@ uninstall:
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -f $(DESTDIR)/etc/profile.d/trashd.sh
 	rm -f $(DESTDIR)$(UNITDIR)/trashd.service
+	rm -f $(DESTDIR)/etc/systemd/system/trashd.service
 	rm -f $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.service $(DESTDIR)$(USERUNITDIR)/trashd-cleanup.timer
+	rm -f $(DESTDIR)/etc/systemd/user/trashd-cleanup.service $(DESTDIR)/etc/systemd/user/trashd-cleanup.timer
+	rm -f $(DESTDIR)/etc/systemd/system/multi-user.target.wants/trashd.service
+	rm -f $(DESTDIR)$(UNITDIR)/multi-user.target.wants/trashd.service
+	rm -f $(DESTDIR)/etc/systemd/user/timers.target.wants/trashd-cleanup.timer $(DESTDIR)$(USERUNITDIR)/timers.target.wants/trashd-cleanup.timer
 	if [ -z "$(DESTDIR)" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then \
 		systemctl daemon-reload 2>/dev/null || true; \
 	fi
-	rm -f $(DESTDIR)$(MANDIR)/trash.1
+	@for page in target/man/*.1; do \
+		[ -e "$$page" ] && rm -f "$(DESTDIR)$(MANDIR)/$$(basename "$$page")"; \
+	done; rm -f $(DESTDIR)$(MANDIR)/trash.1
 	rm -f $(DESTDIR)$(COMPLETIONS_BASH)/trash
 	rm -f $(DESTDIR)$(COMPLETIONS_ZSH)/_trash
 	rm -f $(DESTDIR)$(COMPLETIONS_FISH)/trash.fish

@@ -2,13 +2,19 @@ use crate::util::*;
 use colored::Colorize;
 use trashd_common::TrashStore;
 
+/// Glob introducers recognised by `simple_glob_match`; `[` opens a
+/// character class, which `ls` already honoured but `find` did not (#257).
+pub(crate) fn has_glob_chars(query: &str) -> bool {
+    query.contains(['*', '?', '['])
+}
+
 pub fn run(store: &TrashStore, query: &str) {
     let entries = match store.list(None) {
         Ok(e) => e,
         Err(e) => fatal(e),
     };
 
-    let has_glob = query.contains('*') || query.contains('?');
+    let has_glob = has_glob_chars(query);
 
     let matches: Vec<_> = entries
         .iter()
@@ -52,4 +58,19 @@ pub fn run(store: &TrashStore, query: &str) {
         );
     }
     println!("\n{} matches", matches.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_glob_chars;
+
+    // Regression (#257): `[a].txt` took the substring path and never matched.
+    #[test]
+    fn character_class_counts_as_glob() {
+        assert!(has_glob_chars("[a].txt"));
+        assert!(has_glob_chars("*.txt"));
+        assert!(has_glob_chars("a?.txt"));
+        assert!(!has_glob_chars("plain.txt"));
+        assert!(trashd_common::store::simple_glob_match("[a].txt", "a.txt"));
+    }
 }

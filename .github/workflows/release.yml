@@ -60,6 +60,15 @@ jobs:
             done
           else
             VERSION=$(date -u +%Y.%m.%d)
+            # Same collision bumping as the explicit branch: a second
+            # dispatch on the same UTC day must not mint an existing
+            # tag and fail only after both builds finish (#264).
+            BASE_VERSION="${VERSION}"
+            SUFFIX=0
+            while git tag -l "v${VERSION}" | grep -q .; do
+              SUFFIX=$((SUFFIX + 1))
+              VERSION="${BASE_VERSION}.${SUFFIX}"
+            done
           fi
           # The version reaches tarball names and a sed substitution in the
           # quick installer: allow only tag-safe characters.
@@ -287,6 +296,11 @@ jobs:
           # Build checksums section
           CHECKSUMS=$(cat artifacts/trashd-linux-*/trashd-*.sha256 2>/dev/null || echo "see .sha256 files")
 
+          # Retryable: re-running after a partial release must upload to
+          # the existing release instead of failing at create (#264).
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" --clobber ${ASSETS}
+          else
           # Tag the commit that was built, not whatever main points at by
           # the time this job runs (#238).
           gh release create "v${VERSION}" \
@@ -327,6 +341,7 @@ jobs:
           \`\`\`" \
             ${PRERELEASE} \
             ${ASSETS}
+          fi
 
       - name: Release summary
         env:

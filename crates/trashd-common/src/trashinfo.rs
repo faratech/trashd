@@ -123,7 +123,18 @@ impl TrashInfo {
                         }
                         // Spec: Path value is percent-encoded bytes — don't trim
                         // (leading/trailing spaces in encoded form are meaningful)
-                        path = Some(decode_path(value));
+                        let decoded = decode_path(value);
+                        // An encoded slash (%2f) hides a separator from the
+                        // per-segment check above: "%2e%2e%2fsecret" decodes
+                        // to "../secret" (#256). Re-check the fully decoded
+                        // components.
+                        if decoded
+                            .components()
+                            .any(|c| c == std::path::Component::ParentDir)
+                        {
+                            return None;
+                        }
+                        path = Some(decoded);
                     }
                     "DeletionDate" if date.is_none() => {
                         if let Ok(naive) =
@@ -238,6 +249,23 @@ mod tests {
 
     // Regression (#223): from_str_radix accepts a sign ("%+F" decoded as
     // 0x0F), and an invalid escape swallowed the next '%' with it.
+    // Regression (#256): an encoded slash hides a separator from the
+    // per-segment dot check, so "%2e%2e%2f" must be rejected after decoding.
+    #[test]
+    fn encoded_slash_dot_segments_are_rejected() {
+        for path in [
+            "/tmp/%2e%2e%2fsecret",
+            "/tmp/%2E%2E%2Fsecret",
+            "/%2e%2e%2f%2e%2e%2fetc/passwd",
+        ] {
+            let content = format!("[Trash Info]\nPath={path}\nDeletionDate=2026-01-01T00:00:00\n");
+            assert!(
+                TrashInfo::from_trashinfo(&content).is_none(),
+                "accepted traversal path {path}"
+            );
+        }
+    }
+
     #[test]
     fn percent_decoding_takes_exactly_two_hex_digits() {
         assert_eq!(decode_percent("%+F"), b"%+F");

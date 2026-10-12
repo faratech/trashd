@@ -86,6 +86,26 @@ pub struct TrashEntry {
     sidecar_version: Option<SidecarVersion>,
 }
 
+/// True when an entry's data and sidecar paths are the pair its trash root
+/// layout requires. Compared on raw filename bytes, not the lossy String
+/// ID, so non-UTF-8 entry names validate against their real paths (#247).
+fn entry_paths_match(entry: &TrashEntry) -> bool {
+    let Some(data_name) = entry.trashed_path.file_name() else {
+        return false;
+    };
+    let Some(info_name) = entry.info_path.file_name() else {
+        return false;
+    };
+    let stem = info_name.as_bytes();
+    entry.trashed_path.parent() == Some(entry.trash_root.join("files").as_path())
+        && entry.info_path.parent() == Some(entry.trash_root.join("info").as_path())
+        && stem.len() > ".trashinfo".len()
+        && stem.ends_with(b".trashinfo")
+        && &stem[..stem.len() - ".trashinfo".len()] == data_name.as_bytes()
+        && data_name != OsStr::new(".")
+        && data_name != OsStr::new("..")
+}
+
 impl TrashStore {
     pub fn open() -> Result<Self, TrashError> {
         Self::open_with(Self::home_trash_dir(), Config::load(), false)
@@ -114,18 +134,7 @@ impl TrashStore {
         entry: &TrashEntry,
         guard: &RootMutationGuard,
     ) -> Result<(), TrashError> {
-        if guard.root() != entry.trash_root
-            || entry.trashed_path != entry.trash_root.join("files").join(&entry.id)
-            || entry.info_path
-                != entry
-                    .trash_root
-                    .join("info")
-                    .join(format!("{}.trashinfo", entry.id))
-            || entry.id.is_empty()
-            || Path::new(&entry.id).components().count() != 1
-            || entry.id == "."
-            || entry.id == ".."
-        {
+        if guard.root() != entry.trash_root || !entry_paths_match(entry) || entry.id.is_empty() {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
         for path in [&entry.trashed_path, &entry.info_path] {
@@ -330,7 +339,9 @@ impl TrashStore {
         if meta.is_dir() && self.config.max_dir_size_mb > 0 {
             let (dir_size_bytes, capped) = dir_size_capped(&abs_path);
             let dir_size_mb = dir_size_bytes / (1024 * 1024);
-            if capped || dir_size_mb > self.config.max_dir_size_mb {
+            // Compare exact bytes: truncating to whole MiB first accepted
+            // directories up to ~1 MiB over the cap (#245).
+            if capped || dir_size_bytes > self.config.max_dir_size_mb.saturating_mul(1024 * 1024) {
                 return Err(TrashError::TooLarge {
                     path: abs_path,
                     size_mb: dir_size_mb,
@@ -505,8 +516,14 @@ impl TrashStore {
                     let _ = idx.insert(&id, &info, &trash_dir);
                 }
                 // Source retirement can trap into a seccomp supervisor that
-                // needs this same root lock. The recovery pair is committed.
-                drop(guard.take());
+                // needs this same root lock, so only under an active seccomp
+                // filter is the lock released before retiring. Otherwise the
+                // lock is held through retirement: dropping it let a waiting
+                // purge delete the fresh trash copy, after which retiring
+                // the source destroyed both copies (#243).
+                if std::env::var_os("TRASHD_SECCOMP_ACTIVE").is_some_and(|v| v == "1") {
+                    drop(guard.take());
+                }
                 // Raw syscalls throughout: the system-wide preload would
                 // otherwise trash the source a second time (#104).
                 let complete = match &snapshot {
@@ -573,6 +590,51 @@ impl TrashStore {
 
         // The move completed: make sure a concurrent purge did not strip the
         // sidecar while the data was absent mid-move (#169).
+
+        // On the seccomp path the root lock was released before retirement
+        // (#243): re-acquire it and verify the entry survived. Reporting
+        // success for a copy a purge already deleted would hide data loss.
+        if guard.is_none() {
+            let _verify_guard = self.lock_trash_root(&trash_dir)?;
+            if fs::symlink_metadata(&dest).is_err() || !info_file.exists() {
+                return Err(TrashError::EntryNotFound(id.clone()));
+            }
+        }
+
+        // Post-move identity refresh for the rename path (#246, mirroring
+        // trash_at): the final component may have been replaced between the
+        // hash/size reads and the rename, so the sidecar must describe the
+        // inode that actually landed in the trash.
+        if !copy_done {
+            match fs::symlink_metadata(&dest) {
+                Ok(dest_meta) if (dest_meta.dev(), dest_meta.ino()) != (meta.dev(), meta.ino()) => {
+                    info.size = Some(if dest_meta.is_dir() {
+                        dir_size(&dest)
+                    } else {
+                        dest_meta.size()
+                    });
+                    info.sha256 = if dest_meta.is_file()
+                        && hash_limit > 0
+                        && dest_meta.size() <= hash_limit
+                    {
+                        hash_file_verified(
+                            &dest,
+                            &self.config.hash_algorithm,
+                            (dest_meta.dev(), dest_meta.ino()),
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
+                    let _ = write_trashinfo_atomic(&info_file, &info);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    info.sha256 = None;
+                    let _ = write_trashinfo_atomic(&info_file, &info);
+                }
+            }
+        }
 
         // Update index (best-effort; it's only a cache). The database lives in
         // the HOME trash only — cross-partition entries written there were
@@ -696,7 +758,7 @@ impl TrashStore {
             let (bytes, capped) = dir_size_capped(Path::new(&proc_link));
             unsafe { libc::close(dfd) };
             let dir_size_mb = bytes / (1024 * 1024);
-            if capped || dir_size_mb > self.config.max_dir_size_mb {
+            if capped || bytes > self.config.max_dir_size_mb.saturating_mul(1024 * 1024) {
                 return Err(TrashError::TooLarge {
                     path: display_path.clone(),
                     size_mb: dir_size_mb,
@@ -1059,10 +1121,18 @@ impl TrashStore {
 
         for entry in fs::read_dir(&info_dir)? {
             let entry = entry?;
-            let filename = entry.file_name().to_string_lossy().into_owned();
+            let raw_filename = entry.file_name();
+            let filename = raw_filename.to_string_lossy().into_owned();
             if !filename.ends_with(".trashinfo") {
                 continue;
             }
+            // The on-disk stem in raw bytes: the String ID is lossy for
+            // non-UTF-8 names, and paths built from it point nowhere (#247).
+            let raw_stem = entry
+                .path()
+                .file_stem()
+                .map(|s| s.to_os_string())
+                .unwrap_or_default();
 
             let id = filename
                 .strip_suffix(".trashinfo")
@@ -1107,7 +1177,7 @@ impl TrashStore {
                 }
             }
 
-            let trashed_path = files_dir.join(&id);
+            let trashed_path = files_dir.join(&raw_stem);
             let identity = file_identity(&trashed_path);
             entries.push(TrashEntry {
                 identity,
@@ -1129,7 +1199,8 @@ impl TrashStore {
             let mut orphans = Vec::new();
             if let Ok(file_entries) = fs::read_dir(&files_dir) {
                 for fe in file_entries.flatten() {
-                    let name = fe.file_name().to_string_lossy().into_owned();
+                    let raw_name = fe.file_name();
+                    let name = raw_name.to_string_lossy().into_owned();
                     if !known_ids.contains(&name) {
                         // Apply pattern filter to orphans too
                         if let Some(pat) = pattern
@@ -1137,16 +1208,18 @@ impl TrashStore {
                         {
                             continue;
                         }
-                        let trashed_path = files_dir.join(&name);
+                        // Real on-disk paths in raw bytes (#247).
+                        let trashed_path = fe.path();
+                        let mut raw_info_name = raw_name.clone();
+                        raw_info_name.push(".trashinfo");
+                        let info_path = info_dir.join(&raw_info_name);
                         orphans.push(TrashEntry {
                             identity: file_identity(&trashed_path),
-                            sidecar_version: sidecar_snapshot(
-                                &info_dir.join(format!("{name}.trashinfo")),
-                            ),
+                            sidecar_version: sidecar_snapshot(&info_path),
                             id: name.clone(),
                             info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
                             trashed_path,
-                            info_path: info_dir.join(format!("{name}.trashinfo")),
+                            info_path,
                             trash_root: trash_dir.to_path_buf(),
                             orphaned: true,
                         });
@@ -1225,19 +1298,7 @@ impl TrashStore {
         target: Option<&Path>,
         maintain: bool,
     ) -> Result<PathBuf, TrashError> {
-        if (self.isolated && entry.trash_root != self.home)
-            || entry.trashed_path != entry.trash_root.join("files").join(&entry.id)
-            || entry.info_path
-                != entry
-                    .trash_root
-                    .join("info")
-                    .join(format!("{}.trashinfo", entry.id))
-            || Path::new(&entry.id).components().count() != 1
-            || !matches!(
-                Path::new(&entry.id).components().next(),
-                Some(std::path::Component::Normal(_))
-            )
-        {
+        if (self.isolated && entry.trash_root != self.home) || !entry_paths_match(entry) {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
         // Orphaned entries (files/ item with no .trashinfo) carry a synthetic
@@ -1354,8 +1415,16 @@ impl TrashStore {
         }
 
         let source_parent = open_directory_nofollow(&entry.trash_root.join("files"))?;
-        let source_name = CString::new(entry.id.as_bytes())
-            .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
+        // Raw filename bytes, not the lossy String ID: a non-UTF-8 entry's
+        // on-disk name differs from its display ID (#247).
+        let source_name = CString::new(
+            entry
+                .trashed_path
+                .file_name()
+                .map(|n| n.as_bytes())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
         let source_stat = stat_at(
             source_parent.as_raw_fd(),
             &source_name,
@@ -1841,6 +1910,13 @@ impl TrashStore {
         };
         let guard = self.lock_trash_root(&entry.trash_root)?;
         self.validate_entry_locked(entry, &guard)?;
+        // A phantom entry (neither data nor sidecar on disk) must not
+        // report a successful purge of nothing (#247).
+        if fs::symlink_metadata(&entry.trashed_path).is_err()
+            && fs::symlink_metadata(&entry.info_path).is_err()
+        {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
         match fs::symlink_metadata(&entry.trashed_path) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
                 fs::remove_dir_all(&entry.trashed_path)?
@@ -3197,6 +3273,115 @@ fn publish_copy_noreplace(
     }
 }
 
+fn stat_times(stat: &libc::stat) -> [libc::timespec; 2] {
+    [
+        libc::timespec {
+            tv_sec: stat.st_atime,
+            tv_nsec: stat.st_atime_nsec as _,
+        },
+        libc::timespec {
+            tv_sec: stat.st_mtime,
+            tv_nsec: stat.st_mtime_nsec as _,
+        },
+    ]
+}
+
+/// Preserve the source's timestamps on a cross-device copy (#248): the
+/// rename path keeps them for free, the copy path must apply them.
+fn apply_fd_times(fd: RawFd, source: &libc::stat) -> io::Result<()> {
+    let times = stat_times(source);
+    if unsafe { libc::futimens(fd, times.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn apply_times_at(parent: RawFd, name: &CStr, source: &libc::stat) -> io::Result<()> {
+    let times = stat_times(source);
+    if unsafe {
+        libc::utimensat(
+            parent,
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Best-effort extended-attribute copy for cross-device copies (#248).
+/// Failures (unsupported fs, permissions) never fail the move itself.
+fn copy_xattrs_fd(source: RawFd, destination: RawFd) {
+    let size = unsafe { libc::flistxattr(source, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return;
+    }
+    let mut names = vec![0u8; size as usize];
+    if unsafe { libc::flistxattr(source, names.as_mut_ptr().cast(), names.len()) } < 0 {
+        return;
+    }
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let Ok(cname) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let vsize = unsafe { libc::fgetxattr(source, cname.as_ptr(), std::ptr::null_mut(), 0) };
+        if vsize < 0 {
+            continue;
+        }
+        let mut value = vec![0u8; vsize as usize];
+        if unsafe {
+            libc::fgetxattr(
+                source,
+                cname.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        } < 0
+        {
+            continue;
+        }
+        unsafe {
+            libc::fsetxattr(
+                destination,
+                cname.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            );
+        }
+    }
+}
+
+/// Recursively remove a destination tree this copy created after a failed
+/// copy (#244). `remove_created_at` alone retains a non-empty directory,
+/// which left partial trees behind as unrestorable orphans (trash) or
+/// permanently blocked every restore retry. The root identity is verified
+/// first, so a replaced destination is never touched.
+fn remove_created_tree_at(parent: RawFd, name: &CStr, expected: (u64, u64)) -> io::Result<()> {
+    let stat = match stat_at(parent, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) if stat_identity(&stat) == expected => stat,
+        Ok(_) => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return remove_created_at(parent, name, expected);
+    }
+    let dir = open_directory_at(parent, name, true, false)?;
+    if stat_identity(&stat_fd(dir.as_raw_fd())?) != expected {
+        return Ok(());
+    }
+    for child in read_directory_names(dir.as_raw_fd())? {
+        let child_stat = stat_at(dir.as_raw_fd(), &child, libc::AT_SYMLINK_NOFOLLOW)?;
+        remove_created_tree_at(dir.as_raw_fd(), &child, stat_identity(&child_stat))?;
+    }
+    drop(dir);
+    remove_created_at(parent, name, expected)
+}
+
 fn unlink_source_or_rollback(
     src_parent: RawFd,
     src_name: &CStr,
@@ -3286,6 +3471,8 @@ fn copy_regular_at(
             ));
         }
         apply_fd_metadata(destination.as_raw_fd(), expected)?;
+        copy_xattrs_fd(source.as_raw_fd(), destination.as_raw_fd());
+        apply_fd_times(destination.as_raw_fd(), expected)?;
         destination.sync_all()
     })();
     drop(destination);
@@ -3328,6 +3515,7 @@ fn copy_symlink_at(
         let _ = remove_created_at(dst_parent, dst_name, destination_identity);
         return Err(error);
     }
+    let _ = apply_times_at(dst_parent, dst_name, expected);
     Ok(destination_identity)
 }
 
@@ -3450,12 +3638,14 @@ fn copy_directory_at(
                 depth + 1,
             )?;
         }
-        apply_fd_metadata(destination.as_raw_fd(), expected)
+        apply_fd_metadata(destination.as_raw_fd(), expected)?;
+        copy_xattrs_fd(source.as_raw_fd(), destination.as_raw_fd());
+        apply_fd_times(destination.as_raw_fd(), expected)
     })();
 
     drop(destination);
     if let Err(error) = copied {
-        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        let _ = remove_created_tree_at(dst_parent, dst_name, destination_identity);
         return Err(error);
     }
     Ok(destination_identity)
@@ -5777,6 +5967,34 @@ mod tests {
         );
     }
 
+    // Regression (#244): a failed cross-device restore copy (a socket in the
+    // trashed tree cannot be reproduced) left a partial tree at the original
+    // path, so every retry failed RestoreConflict forever.
+    #[test]
+    fn failed_cross_device_restore_leaves_no_partial_tree() {
+        let Some(dir) = cross_device_dir("restore-partial") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("file"), "data").unwrap();
+        let (store, _data) = cross_device_store();
+        let id = store.trash(&tree, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(entry.trashed_path.join("sock")).unwrap();
+        let result = store.restore(&id, None);
+        assert!(result.is_err(), "restore reported success: {result:?}");
+        assert!(!tree.exists(), "partial tree left at the original path");
+        // Removing the uncopiable node makes the same entry restorable.
+        drop(_listener);
+        fs::remove_file(entry.trashed_path.join("sock")).unwrap();
+        let restored = store.restore(&id, None).unwrap();
+        assert_eq!(fs::read_to_string(restored.join("file")).unwrap(), "data");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn pinned_parent(dir: &Path) -> fs::File {
         fs::File::open(dir).unwrap()
     }
@@ -5933,6 +6151,86 @@ mod tests {
             fs::read_to_string(entry.trashed_path.join("sub/file")).unwrap(),
             "payload"
         );
+    }
+
+    // Regression (#245): the directory cap compared truncated whole MiB,
+    // accepting directories up to ~1 MiB over the limit.
+    #[test]
+    fn dir_size_limit_compares_exact_bytes() {
+        let (mut store, _data, work, _) = test_store();
+        store.config.max_dir_size_mb = 1;
+        let dir = work.path().join("bigdir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("payload"), vec![0u8; 1_572_864]).unwrap();
+        let result = store.trash(&dir, None);
+        assert!(
+            matches!(result, Err(TrashError::TooLarge { .. })),
+            "1.5 MiB directory accepted under a 1 MiB cap: {result:?}"
+        );
+        assert!(dir.exists(), "rejected directory was moved");
+    }
+
+    // Regression (#248): the cross-device copy path dropped timestamps the
+    // rename path preserves.
+    #[test]
+    fn cross_device_trash_preserves_timestamps() {
+        let Some(dir) = cross_device_dir("times") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let file = dir.join("old-file");
+        fs::write(&file, "payload").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let (store, _data) = cross_device_store();
+        let id = store.trash(&file, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let mtime = fs::symlink_metadata(&entry.trashed_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let restored = store.restore(&id, None).unwrap();
+        let restored_mtime = fs::metadata(&restored).unwrap().modified().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(mtime, old, "trash copy lost the source mtime");
+        assert_eq!(restored_mtime, old, "restored file lost the source mtime");
+    }
+
+    // Regression (#247): listing built trashed_path from the lossy String
+    // ID, so a non-UTF-8 entry pointed nowhere, could not be restored, and
+    // purge reported success while deleting nothing.
+    #[test]
+    fn non_utf8_entry_lists_real_path_and_purges() {
+        use std::os::unix::ffi::OsStrExt;
+        let (store, _data, _work, _) = test_store();
+        let trash = store.home.clone();
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        let raw_id: &[u8] = b"raw-\xff-entry";
+        let data_path = trash
+            .join("files")
+            .join(std::ffi::OsStr::from_bytes(raw_id));
+        fs::write(&data_path, "payload").unwrap();
+        let mut sidecar_name = std::ffi::OsString::from(std::ffi::OsStr::from_bytes(raw_id));
+        sidecar_name.push(".trashinfo");
+        fs::write(
+            trash.join("info").join(&sidecar_name),
+            "[Trash Info]\nPath=/tmp/raw-entry\nDeletionDate=2026-01-01T00:00:00\n",
+        )
+        .unwrap();
+        let entries = store.list(None).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.trashed_path == data_path)
+            .expect("non-UTF-8 entry not listed with its real path");
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), b"payload");
+        store.purge_resolved(entry).unwrap();
+        assert!(!data_path.exists(), "purge deleted nothing but reported Ok");
     }
 
     /// Seed a week-old compressible entry with a hand-written sidecar.

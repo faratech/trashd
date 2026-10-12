@@ -228,6 +228,9 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
     // supervisor a SIBLING of the watchdog — waitpid always returned ECHILD,
     // triggering an instant fake failover with two supervisors racing on one
     // notification fd (#5).
+    // Captured before the fork so the watchdog can tell this process from
+    // a different process later reusing its PID — including PID 1 (#252).
+    let orchestrator_start = watchdog::proc_start_time(unsafe { libc::getpid() });
     let watchdog_pid = unsafe { libc::fork() };
     match watchdog_pid {
         -1 => return Err(io::Error::last_os_error()),
@@ -241,6 +244,7 @@ fn run(command_args: &[String], preserve_privileges: bool) -> io::Result<ExitCod
                 notif_fd,
                 broker_client.as_raw_fd(),
                 ready_client.as_raw_fd(),
+                orchestrator_start,
             );
             // run_watchdog never returns (it's a ! function)
         }
@@ -876,16 +880,39 @@ mod tests {
     use super::*;
 
     fn isolated_case(case: impl FnOnce() + std::panic::UnwindSafe) {
+        // Serialize forked cases: forking a multithreaded harness while a
+        // sibling thread holds the environment or allocator lock leaves the
+        // child blocked on a lock that will never be released in it, and a
+        // watchdog alarm set in the child survives execve into the exec'd
+        // harness (#251). The parent therefore owns the deadline instead.
+        static ISOLATED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ISOLATED_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let helper = unsafe { libc::fork() };
         assert!(helper >= 0);
         if helper == 0 {
-            unsafe { libc::alarm(10) };
             let result = std::panic::catch_unwind(case);
             unsafe { libc::_exit(i32::from(result.is_err())) };
         }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(helper, &mut status, 0) }, helper);
-        assert_eq!(status, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) };
+            if waited == helper {
+                assert_eq!(status, 0, "isolated case helper failed");
+                return;
+            }
+            assert!(waited == 0, "waitpid for isolated case helper failed");
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(helper, libc::SIGKILL);
+                    libc::waitpid(helper, &mut status, 0);
+                }
+                panic!("isolated case helper timed out after 20s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]

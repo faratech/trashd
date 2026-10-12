@@ -22,16 +22,21 @@ pub fn run(store: &TrashStore, top: usize) {
         "ID".bold(),
     );
 
-    let total: u64 = entries.iter().filter_map(|e| e.info.size).sum();
+    let total = saturating_total_size(entries.iter().filter_map(|e| e.info.size));
     for entry in entries.iter().take(top) {
         let size = entry
             .info
             .size
             .map(format_size)
             .unwrap_or_else(|| "?".into());
-        let path = entry.info.original_path.to_string_lossy();
+        let path = printable_path(&entry.info.original_path);
         let path_display = truncate_path(&path, 50);
-        println!("{:>10} {:<30} {}", size, path_display, entry.id.dimmed());
+        println!(
+            "{:>10} {:<30} {}",
+            size,
+            path_display,
+            printable(&entry.id).dimmed()
+        );
     }
 
     if entries.len() > top {

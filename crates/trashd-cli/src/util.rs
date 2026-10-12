@@ -16,6 +16,11 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Sum entry sizes without overflowing on crafted sidecar values (#255).
+pub fn saturating_total_size(sizes: impl Iterator<Item = u64>) -> u64 {
+    sizes.fold(0u64, u64::saturating_add)
+}
+
 pub fn parse_duration_days(s: &str) -> Option<u32> {
     let s = s.trim();
     if let Some(d) = s.strip_suffix('d') {
@@ -202,6 +207,16 @@ pub use std::path::PathBuf;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression (#255): two u64::MAX sidecar sizes panicked `trash du`.
+    #[test]
+    fn size_total_saturates_instead_of_overflowing() {
+        assert_eq!(
+            saturating_total_size([u64::MAX, u64::MAX, 1].into_iter()),
+            u64::MAX
+        );
+        assert_eq!(saturating_total_size([1, 2].into_iter()), 3);
+    }
 
     // Regression (#230): crafted sidecars could put terminal escapes and
     // newlines into `ls`, `find` and `info` output.

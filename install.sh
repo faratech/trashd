@@ -94,17 +94,19 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     # 1. Remove the LD_PRELOAD entry FIRST — before deleting the .so — otherwise
     #    every dynamically-linked process errors about the missing library.
     if [ -f /etc/ld.so.preload ]; then
-        if grep -q "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
+        if awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib || e[i] == libalt) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then
             # The file lists libraries separated by whitespace or colons, with
-            # `#` comments. Drop only our entries: deleting whole lines lost
-            # other libraries that shared a line with ours (#229).
-            awk '{
+            # `#` comments. Drop only this prefix's exact entries (flat or
+            # $LIB form): deleting whole lines lost other libraries sharing
+            # a line (#229), and dropping any libtrashd_preload.so token
+            # deregistered a different prefix's install (#261).
+            awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{
                 line = $0; comment = ""
                 if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) }
-                if (line !~ /libtrashd_preload\.so/) { print $0; next }
+                if (index(line, lib) == 0 && index(line, libalt) == 0) { print $0; next }
                 n = split(line, entry, /[ \t:]+/); out = ""
                 for (i = 1; i <= n; i++)
-                    if (entry[i] != "" && entry[i] !~ /(^|\/)libtrashd_preload\.so$/)
+                    if (entry[i] != "" && entry[i] != lib && entry[i] != libalt)
                         out = out (out == "" ? "" : " ") entry[i]
                 if (comment != "") out = out (out == "" ? "" : " ") comment
                 if (out != "") print out
@@ -121,16 +123,28 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     #    lingering process (covers manual / non-systemd starts).
     if command -v systemctl >/dev/null 2>&1; then
         for svc in trashd trashd-daemon; do
-            if [ -f "/etc/systemd/system/${svc}.service" ]; then
-                systemctl stop "$svc" 2>/dev/null || true
-                systemctl disable "$svc" 2>/dev/null || true
-                "$RM" -f "/etc/systemd/system/${svc}.service"
-                echo "    Removed ${svc}.service"
-            fi
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
         done
         systemctl daemon-reload 2>/dev/null || true
     fi
-    remove_files /etc/systemd/user/trashd-cleanup.service /etc/systemd/user/trashd-cleanup.timer
+    # Units live in /etc/systemd/system (install.sh) or /usr/lib/systemd/
+    # system (Makefile/packaging): remove both, plus enablement symlinks,
+    # so a cross-installer uninstall leaves no dangling unit (#262).
+    for _unitdir in /etc/systemd/system /usr/lib/systemd/system; do
+        for svc in trashd trashd-daemon; do
+            remove_files "${_unitdir}/${svc}.service" \
+                "${_unitdir}/multi-user.target.wants/${svc}.service"
+        done
+    done
+    for _userdir in /etc/systemd/user /usr/lib/systemd/user; do
+        remove_files "${_userdir}/trashd-cleanup.service" "${_userdir}/trashd-cleanup.timer" \
+            "${_userdir}/timers.target.wants/trashd-cleanup.timer" \
+            "${_userdir}/default.target.wants/trashd-cleanup.service"
+    done
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
     if pkill -x trashd 2>/dev/null; then
         echo "    Stopped running trashd daemon"
     fi
@@ -228,10 +242,17 @@ fi
 
 # Detect pre-built binaries (tarball install) vs source install
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Optional 32-bit preload (#229): set when an i686 build is available, so
+# 32-bit processes get a matching library via a $LIB preload entry instead
+# of wrong-ELF-class errors from the 64-bit-only library.
+PRELOAD32_SRC=""
 if [ -f "${SCRIPT_DIR}/bin/trash" ]; then
     # Tarball install — binaries already built
     TARGET_DIR="${SCRIPT_DIR}/bin"
     PRELOAD_DIR="${SCRIPT_DIR}/lib"
+    if [ -f "${SCRIPT_DIR}/lib/libtrashd_preload32.so" ]; then
+        PRELOAD32_SRC="${SCRIPT_DIR}/lib/libtrashd_preload32.so"
+    fi
     MAN_SRC="${SCRIPT_DIR}/share/man/man1"
     COMP_DIR="${SCRIPT_DIR}/share/completions"
     echo "==> Installing from pre-built release..."
@@ -250,6 +271,18 @@ else
         fi
     }
     trap cleanup_build_stage EXIT
+
+    # Optional i686 preload build (#229), run with the same privileges as
+    # the main build. Exits 3 (skip) when the i686 target is not installed;
+    # a failed build only loses the 32-bit library, never the install.
+    cat > "${BUILD_STAGE}/build-i686.sh" <<'EOF'
+#!/bin/sh
+sysroot="$(rustc --print sysroot 2>/dev/null)" || exit 3
+[ -d "$sysroot/lib/rustlib/i686-unknown-linux-gnu" ] || exit 3
+exec cargo build --release --locked --manifest-path="$1" -p trashd-preload \
+    --target i686-unknown-linux-gnu
+EOF
+    chmod 0644 "${BUILD_STAGE}/build-i686.sh"
 
     BUILD_TARGET="${BUILD_STAGE}/target"
     if [ "$(id -u)" -eq 0 ]; then
@@ -296,10 +329,25 @@ else
             PATH="${BUILD_HOME}/.cargo/bin:${PATH}" \
             CARGO_TARGET_DIR="${BUILD_TARGET}" \
             cargo build --release --locked --manifest-path="${SCRIPT_DIR}/Cargo.toml"
+        if [ "$(uname -m)" = "x86_64" ] && runuser -u "${BUILD_USER}" -- env \
+            -u CARGO_HOME \
+            -u RUSTUP_HOME \
+            HOME="${BUILD_HOME}" \
+            PATH="${BUILD_HOME}/.cargo/bin:${PATH}" \
+            CARGO_TARGET_DIR="${BUILD_TARGET}" \
+            sh "${BUILD_STAGE}/build-i686.sh" "${SCRIPT_DIR}/Cargo.toml"; then
+            PRELOAD32_SRC="${BUILD_TARGET}/i686-unknown-linux-gnu/release/libtrashd_preload.so"
+            echo "    Built 32-bit (i686) preload library"
+        fi
     else
         echo "==> Building trashd with locked dependencies..."
         CARGO_TARGET_DIR="${BUILD_TARGET}" \
             cargo build --release --locked --manifest-path="${SCRIPT_DIR}/Cargo.toml"
+        if [ "$(uname -m)" = "x86_64" ] && CARGO_TARGET_DIR="${BUILD_TARGET}" \
+            sh "${BUILD_STAGE}/build-i686.sh" "${SCRIPT_DIR}/Cargo.toml"; then
+            PRELOAD32_SRC="${BUILD_TARGET}/i686-unknown-linux-gnu/release/libtrashd_preload.so"
+            echo "    Built 32-bit (i686) preload library"
+        fi
     fi
 
     TARGET_DIR="${BUILD_TARGET}/release"
@@ -434,21 +482,34 @@ fi
 echo "==> Installing LD_PRELOAD library (Layer 2)..."
 atomic_install "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
 echo "    Installed ${LIB_DIR}/libtrashd_preload.so"
+PRELOAD_ENTRY="${LIB_DIR}/libtrashd_preload.so"
+if [ -n "${PRELOAD32_SRC}" ] && [ -f "${PRELOAD32_SRC}" ]; then
+    # Per-ABI layout: one $LIB entry resolves to lib64/ for 64-bit and lib/
+    # for 32-bit processes, so 32-bit programs load the i686 library instead
+    # of erroring on the 64-bit one (#229).
+    atomic_install "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/lib64/libtrashd_preload.so"
+    atomic_install "${PRELOAD32_SRC}" "${LIB_DIR}/lib/libtrashd_preload.so"
+    PRELOAD_ENTRY="${LIB_DIR}/\$LIB/libtrashd_preload.so"
+    echo "    Installed 32-bit preload ${LIB_DIR}/lib/libtrashd_preload.so (registered via \$LIB)"
+fi
 # Enable system-wide: catches unlink/rmdir from any dynamically-linked program.
 # Ensure a trailing newline first — appending after a file that lacks one would
 # glue our entry onto the previous line and corrupt the whole preload list.
-if ! grep -qs "libtrashd_preload.so" /etc/ld.so.preload 2>/dev/null; then
+# Either this prefix's flat or $LIB entry counts as registered (#261, #229).
+if ! awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib || e[i] == libalt) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then
     if [ -s /etc/ld.so.preload ] && [ "$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then
         printf '\n' >> /etc/ld.so.preload
     fi
-    echo "${LIB_DIR}/libtrashd_preload.so" >> /etc/ld.so.preload
+    echo "${PRELOAD_ENTRY}" >> /etc/ld.so.preload
     echo "    Enabled system-wide via /etc/ld.so.preload"
 else
     echo "    Already in /etc/ld.so.preload"
 fi
 
 echo "==> Installing PATH + seccomp hook (Layers 1 & 4)..."
+PROFILE_HOOK_INSTALLED=0
 if [ -d /etc/profile.d ]; then
+    PROFILE_HOOK_INSTALLED=1
     # Template the actual install prefix into the profile script: the shipped
     # file hardcodes /usr/local, but a PREFIX=... install puts the shim and
     # trashd-exec elsewhere and the layers would silently never activate (#101).
@@ -548,9 +609,17 @@ fi
 echo "    Per-user overrides: ~/.config/trashd/config.toml"
 
 echo ""
-echo "==> trashd installed successfully! All layers active."
-echo ""
-echo "    Start a new shell or run: source /etc/profile.d/trashd.sh"
+if [ "$PROFILE_HOOK_INSTALLED" -eq 1 ]; then
+    echo "==> trashd installed successfully! All layers active."
+    echo ""
+    echo "    Start a new shell or run: source /etc/profile.d/trashd.sh"
+else
+    # Without /etc/profile.d the hook was skipped: Layers 1 and 4 never
+    # activate in new shells, so do not claim all layers are active (#265).
+    echo "==> trashd installed, but WARNING: /etc/profile.d not found - profile hook skipped." >&2
+    echo "    Layers 1 (PATH shim) and 4 (seccomp) will NOT activate in new shells." >&2
+    echo "    Install the hook manually: install -Dm644 install/profile.d/trashd.sh /etc/profile.d/trashd.sh" >&2
+fi
 echo ""
 echo "    Active layers:"
 echo "      Layer 1 — PATH shim:    rm -> trash (via PATH)"

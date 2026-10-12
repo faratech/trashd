@@ -48,6 +48,9 @@ pub fn run(cmd: ConfigCmd) {
             }
         }
         ConfigCmd::Add { key, value } => {
+            // Refuse patterns the loader would silently drop on every read,
+            // instead of reporting success for a no-op write (#259).
+            validate_list_pattern(&value).unwrap_or_else(|e| fatal(e));
             let mut table = load_user_config_table();
             config_list_add(&mut table, &key, &value, &Config::load().only_trash);
             write_user_config_table(&table);
@@ -336,6 +339,17 @@ fn seed_inherited_whitelist(table: &mut toml::Table, key: &str, inherited: &[Str
     }
 }
 
+/// The loader's pattern rules, applied at write time (#259).
+fn validate_list_pattern(value: &str) -> Result<(), String> {
+    if trashd_common::config::pattern_is_supported(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported pattern '{value}' (brace expansion is not supported)"
+        ))
+    }
+}
+
 fn config_list_add(table: &mut toml::Table, key: &str, value: &str, inherited: &[String]) {
     match key {
         "never_trash" | "only_trash" | "bypass_processes" | "bypass_paths" => {}
@@ -492,6 +506,16 @@ mod tests {
         let status = editor_command("touch -m", &path).status().unwrap();
         assert!(status.success());
         assert!(path.exists());
+    }
+
+    // Regression (#259): `config add` reported success for brace patterns
+    // the loader drops on every read.
+    #[test]
+    fn brace_patterns_are_rejected_at_add_time() {
+        assert!(validate_list_pattern("{a,b}.py").is_err());
+        assert!(validate_list_pattern("a}.py").is_err());
+        assert!(validate_list_pattern("*.py").is_ok());
+        assert!(validate_list_pattern("*.[ch]").is_ok());
     }
 
     // Regression (#211): `config edit` seeded the user file with every default

@@ -31,11 +31,12 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
                 }
             }
             count += 1;
-            total_size += entry.info.size.unwrap_or(0);
+            // Saturating: a crafted X-Trashd-Size can be u64::MAX (#255).
+            total_size = total_size.saturating_add(entry.info.size.unwrap_or(0));
             println!(
                 "  {} {} {}",
                 entry.info.deletion_date.format("%Y-%m-%d %H:%M"),
-                entry.info.original_path.display(),
+                printable_path(&entry.info.original_path),
                 format_size(entry.info.size.unwrap_or(0)).dimmed(),
             );
         }

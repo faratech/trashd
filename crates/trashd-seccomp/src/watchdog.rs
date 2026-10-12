@@ -24,19 +24,49 @@ extern "C" fn forward_term_and_exit(sig: libc::c_int) {
     unsafe { libc::_exit(0) };
 }
 
+/// The start time (clock ticks since boot) of `pid` from /proc, or None.
+/// Distinguishes a process from a later process reusing its PID.
+pub fn proc_start_time(pid: i32) -> Option<u64> {
+    parse_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Parse field 22 (starttime) out of a /proc/<pid>/stat line. The comm field
+/// may contain spaces and parens, so fields are counted from the last ')'.
+pub fn parse_start_time(stat: &str) -> Option<u64> {
+    let after_comm = stat.rfind(')')? + 2;
+    // after_comm starts at field 3 (state), so starttime is index 19.
+    stat.get(after_comm..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 /// Run the watchdog loop. This never returns under normal operation.
 ///
 /// - `notif_fd`: a dup'd copy of the seccomp notification fd
-pub fn run_watchdog(notif_fd: i32, broker_fd: i32, ready_fd: i32) -> ! {
+/// - `orchestrator_start`: the orchestrator's /proc start time, captured by
+///   the orchestrator before forking, so its identity survives PID reuse
+pub fn run_watchdog(
+    notif_fd: i32,
+    broker_fd: i32,
+    ready_fd: i32,
+    orchestrator_start: Option<u64>,
+) -> ! {
     // Same fork→prctl race #93 fixed for the supervisor: PR_SET_PDEATHSIG
     // only covers orchestrator deaths AFTER it takes effect, so bail out if
     // the orchestrator vanished in the window — an orphaned watchdog would
     // otherwise respawn a supervisor that holds the notification fd forever.
+    // The parent is identified by PID + start time, not PID alone: when the
+    // orchestrator legitimately IS PID 1 (container init), PPID 1 is the
+    // live orchestrator, not proof of reparenting (#252).
     let parent_at_spawn = unsafe { libc::getppid() };
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
     }
-    if unsafe { libc::getppid() } != parent_at_spawn || parent_at_spawn == 1 {
+    if unsafe { libc::getppid() } != parent_at_spawn
+        || orchestrator_start.is_some_and(|start| proc_start_time(parent_at_spawn) != Some(start))
+    {
         // Already reparented: the orchestrator died before prctl took effect.
         unsafe {
             libc::close(notif_fd);
@@ -239,6 +269,17 @@ fn set_nonblocking(fd: i32, nonblock: bool) {
 mod tests {
     use super::*;
     use crate::supervisor::tests::{exits_cleanly, finished_listener};
+
+    // Regression (#252): PID + start time identifies the orchestrator, so a
+    // legitimate PID 1 parent is not mistaken for reparenting to init.
+    #[test]
+    fn start_time_parses_despite_a_spaced_comm() {
+        // Fields after ')' start at field 3; starttime (field 22) is the
+        // 20th token. comm contains spaces and a paren here on purpose.
+        let stat = "1 (weird ) name) S 0 1 1 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 98765 1234";
+        assert_eq!(parse_start_time(stat), Some(98765));
+        assert_eq!(proc_start_time(unsafe { libc::getpid() }).is_some(), true);
+    }
 
     #[test]
     fn emergency_passthrough_ends_when_the_listener_is_finished() {

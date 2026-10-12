@@ -14,7 +14,15 @@ shift
 
 status=0
 for artifact in "$@"; do
-    needed="$(objdump -T "$artifact" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"
+    # pipefail made grep's no-match exit 1 kill the script before the
+    # no-versioned-symbols branch could run (#263); a non-ELF artifact
+    # failed the same opaque way, so diagnose it explicitly.
+    if ! dump="$(objdump -T "$artifact" 2>/dev/null)"; then
+        echo "FAIL    $artifact: not a readable ELF/object file (objdump failed)" >&2
+        status=1
+        continue
+    fi
+    needed="$(printf '%s\n' "$dump" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1 || true)"
     if [ -z "$needed" ]; then
         echo "ok      $artifact (no versioned glibc symbols)"
     elif [ "$(printf '%s\n%s\n' "$needed" "$floor" | sort -V | tail -1)" != "$floor" ]; then

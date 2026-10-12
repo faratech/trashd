@@ -390,20 +390,44 @@ fn seccomp_deferred(claimed: bool, verified: bool) -> bool {
     claimed && verified
 }
 
-/// Cache by PID, so children of a fork re-evaluate their own process tree.
+/// Cache key for the bypass verdict: PID, parent PID, and the verdict.
+/// Including the parent makes a reparented process re-evaluate its tree.
+fn bypass_cache_key(pid: u32, ppid: u32, bypassed: bool) -> u64 {
+    (u64::from(pid) << 32) | (u64::from(ppid) << 1) | u64::from(bypassed)
+}
+
+fn bypass_cache_hit(cached: u64, pid: u32, ppid: u32) -> Option<bool> {
+    if cached >> 32 == u64::from(pid) && (cached >> 1) & 0x7fff_ffff == u64::from(ppid) {
+        Some(cached & 1 != 0)
+    } else {
+        None
+    }
+}
+
+/// Cache by PID and parent PID, so children of a fork - and processes whose
+/// bypass ancestor died and left them reparented - re-evaluate their tree.
+/// Caching by PID alone kept the verdict for the process's whole lifetime,
+/// so a long-lived worker spawned by git/make/cargo deleted permanently
+/// forever after that ancestor exited (#249).
 fn is_process_bypassed() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CACHED: AtomicU64 = AtomicU64::new(0);
+    static CACHED_AT: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
-    let cached = CACHED.load(Ordering::Relaxed);
-    if cached >> 1 == u64::from(pid) {
-        return cached & 1 != 0;
+    let ppid = parent_pid(pid).unwrap_or(0);
+    // A grandparent's death does not change this process's PPID, so the
+    // verdict also expires: re-walk the tree at least every few seconds.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let fresh = now.saturating_sub(CACHED_AT.load(Ordering::Relaxed)) <= 5;
+    if fresh && let Some(hit) = bypass_cache_hit(CACHED.load(Ordering::Relaxed), pid, ppid) {
+        return hit;
     }
     let bypassed = process_is_bypassed(config(), pid);
-    CACHED.store(
-        (u64::from(pid) << 1) | u64::from(bypassed),
-        Ordering::Relaxed,
-    );
+    CACHED.store(bypass_cache_key(pid, ppid, bypassed), Ordering::Relaxed);
+    CACHED_AT.store(now, Ordering::Relaxed);
     bypassed
 }
 
@@ -1869,6 +1893,21 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression (#249): the bypass verdict was cached by PID alone for the
+    // process's whole lifetime. A new parent (reparenting after the bypass
+    // ancestor died) must miss the cache and force a re-walk.
+    #[test]
+    fn bypass_cache_misses_after_reparenting() {
+        let key = bypass_cache_key(4242, 100, true);
+        assert_eq!(bypass_cache_hit(key, 4242, 100), Some(true));
+        assert_eq!(bypass_cache_hit(key, 4242, 1), None);
+        assert_eq!(bypass_cache_hit(key, 4243, 100), None);
+        assert_eq!(
+            bypass_cache_hit(bypass_cache_key(7, 1, false), 7, 1),
+            Some(false)
+        );
+    }
 
     #[test]
     fn policy_globs_match_complete_patterns() {

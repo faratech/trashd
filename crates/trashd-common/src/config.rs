@@ -465,10 +465,16 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// expansion). Such patterns would otherwise silently behave wrong; in an
 /// only_trash whitelist that means nothing matches and EVERY delete becomes
 /// permanent (#4). Warn loudly so misconfiguration is visible.
+/// Whether the matcher can honour this pattern. Brace expansion is the
+/// one syntax it cannot; the loader drops such patterns (#259).
+pub fn pattern_is_supported(pattern: &str) -> bool {
+    !pattern.contains(['{', '}'])
+}
+
 fn sanitize_patterns(list: &[String], what: &str) -> Vec<String> {
     list.iter()
         .filter(|p| {
-            if p.contains('{') || p.contains('}') {
+            if !pattern_is_supported(p) {
                 eprintln!(
                     "trashd: WARNING: dropping unsupported {what} pattern '{p}' \
                      (brace expansion is not supported)"

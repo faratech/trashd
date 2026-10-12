@@ -10,7 +10,12 @@ use trashd_common::store::is_parent_bypassed;
 /// Supports all standard rm flags. Files are moved to ~/.local/share/Trash/
 /// and can be restored with `trash restore` or `trash undo`.
 #[derive(Parser)]
-#[command(name = "rm", disable_help_flag = true, args_override_self = true)]
+#[command(
+    name = "rm",
+    disable_help_flag = true,
+    args_override_self = true,
+    infer_long_args = true
+)]
 struct Rm {
     /// Remove directories and their contents recursively
     #[arg(short = 'r', short_alias = 'R', long = "recursive")]
@@ -51,7 +56,7 @@ struct Rm {
     one_file_system: bool,
 
     /// Accepted for GNU rm compatibility. Optional value `all` is allowed.
-    #[arg(long = "preserve-root", num_args = 0..=1, require_equals = true, value_name = "all")]
+    #[arg(long = "preserve-root", num_args = 0..=1, require_equals = true, value_name = "all", value_parser = clap::builder::PossibleValuesParser::new(["all"]))]
     preserve_root: Option<String>,
 
     /// Accepted for GNU rm compatibility.
@@ -896,6 +901,21 @@ mod tests {
                 "should parse (not bypass to permanent delete): {argv:?}"
             );
         }
+    }
+
+    // Regression (#250): GNU rm accepts unambiguous long-option prefixes,
+    // and rejects --preserve-root values other than "all".
+    #[test]
+    fn gnu_prefix_abbreviations_and_preserve_root_values() {
+        let a = Rm::try_parse_from(["rm", "--rec", "-f", "dir"]).unwrap();
+        assert!(a.recursive && a.force);
+        let b = Rm::try_parse_from(["rm", "--verb", "f"]).unwrap();
+        assert!(b.verbose);
+        assert!(
+            Rm::try_parse_from(["rm", "--preserve-root=foo", "-f", "f"]).is_err(),
+            "arbitrary --preserve-root values must be rejected like GNU rm"
+        );
+        assert!(Rm::try_parse_from(["rm", "--preserve-root=all", "-f", "f"]).is_ok());
     }
 
     // A bare --interactive must default to "always" and NOT swallow the file.
