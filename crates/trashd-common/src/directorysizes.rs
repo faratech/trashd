@@ -29,7 +29,7 @@ pub fn read_cache(trash_dir: &Path) -> HashMap<Vec<u8>, DirSizeEntry> {
     let cache_path = trash_dir.join("directorysizes");
     let mut entries = HashMap::new();
 
-    let content = match fs::read_to_string(&cache_path) {
+    let content = match crate::trashinfo::read_regular_text_file(&cache_path) {
         Ok(c) => c,
         Err(_) => return entries,
     };
@@ -207,6 +207,18 @@ fn decode_name(s: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn fifo_cache_is_ignored_and_replaced_without_blocking() {
+        use std::ffi::CString;
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = fixture.path().join("directorysizes");
+        let name = CString::new(cache.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_cache(fixture.path()).is_empty());
+        write_cache(fixture.path()).unwrap();
+        assert!(cache.symlink_metadata().unwrap().is_file());
+    }
 
     #[test]
     fn cache_reuses_unchanged_trees_and_refreshes_only_invalid_entries() {

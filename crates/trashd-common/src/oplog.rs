@@ -6,7 +6,7 @@
 //! Format: `TIMESTAMP OP [details]`
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -87,19 +87,63 @@ pub(crate) fn log_empty_in(home: &Path, count: u64, filter: Option<&str>) {
 
 /// Read the last N lines of the operation log.
 pub fn read_log(max_lines: usize) -> Vec<String> {
-    let path = log_path();
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    read_log_file(&log_path(), max_lines)
+}
 
-    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-
-    if lines.len() <= max_lines {
-        lines
-    } else {
-        lines[lines.len() - max_lines..].to_vec()
+fn read_log_file(path: &Path, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
     }
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .and_then(require_regular_log)
+        .and_then(|mut file| read_log_tail(&mut file, max_lines))
+        .unwrap_or_default()
+}
+
+fn require_regular_log(file: fs::File) -> io::Result<fs::File> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "operation log is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_log_tail(reader: &mut (impl Read + Seek), max_lines: usize) -> io::Result<Vec<String>> {
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+    let end = reader.seek(SeekFrom::End(0))?;
+    let mut position = end;
+    let mut remaining = max_lines;
+    let mut reversed = Vec::new();
+    let mut chunk = [0u8; 8192];
+    'chunks: while position > 0 {
+        let length = position.min(chunk.len() as u64) as usize;
+        position -= length as u64;
+        reader.seek(SeekFrom::Start(position))?;
+        reader.read_exact(&mut chunk[..length])?;
+        for index in (0..length).rev() {
+            let byte = chunk[index];
+            // A terminating newline belongs to the last record; every
+            // earlier newline separates two records, including empty ones.
+            if byte == b'\n' && position + index as u64 != end - 1 {
+                remaining -= 1;
+                if remaining == 0 {
+                    break 'chunks;
+                }
+            }
+            reversed.push(byte);
+        }
+    }
+    reversed.reverse();
+    let content = String::from_utf8(reversed)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(content.lines().map(str::to_owned).collect())
 }
 
 /// Get the path to the operation log file.
@@ -182,7 +226,9 @@ fn write_log(home: &Path, message: &str) {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(&path)
+        .and_then(require_regular_log)
         .and_then(|mut f| {
             f.set_permissions(fs::Permissions::from_mode(0o600))?;
             f.write_all(line.as_bytes())
@@ -195,7 +241,108 @@ fn write_log(home: &Path, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_field_bytes, log_purge_in, log_restore_in, log_trash_in, spawn_reaped};
+    use super::{
+        escape_field_bytes, log_purge_in, log_restore_in, log_trash_in, read_log_file,
+        read_log_tail, spawn_reaped,
+    };
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+
+    #[test]
+    fn special_logs_cannot_block_or_modify_an_external_target() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(".trashd/operations.log");
+        std::fs::create_dir(log.parent().unwrap()).unwrap();
+        let name = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_log_file(&log, 1).is_empty());
+        log_purge_in(home.path(), "fifo");
+        assert!(log.symlink_metadata().unwrap().file_type().is_fifo());
+        std::fs::remove_file(&log).unwrap();
+
+        let target = home.path().join("external");
+        std::fs::write(&target, "unchanged\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &log).unwrap();
+        assert!(read_log_file(&log, 1).is_empty());
+        log_purge_in(home.path(), "link");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged\n");
+        assert_eq!(
+            target.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn log_tail_preserves_line_semantics_and_chunk_boundaries() {
+        // The first backwards chunk starts inside the two-byte character.
+        let boundary = format!("old\né{}\n", "x".repeat(8190));
+        for content in [
+            "",
+            "\n",
+            "\n\n",
+            "a",
+            "a\n",
+            "a\r\n",
+            "a\r",
+            "a\n\nb",
+            "a\n\n",
+            "a\r\nb\nc\r\n",
+            &boundary,
+        ] {
+            let lines: Vec<_> = content.lines().map(str::to_owned).collect();
+            for count in [0, 1, 2, 3, usize::MAX] {
+                let expected = &lines[lines.len().saturating_sub(count)..];
+                let actual =
+                    read_log_tail(&mut io::Cursor::new(content.as_bytes()), count).unwrap();
+                assert_eq!(
+                    actual,
+                    expected,
+                    "content length={}, count={count}",
+                    content.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_tail_reads_only_requested_history() {
+        struct Counted {
+            file: std::fs::File,
+            bytes_read: usize,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.file.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.file.seek(position)
+            }
+        }
+        // A sparse historical prefix proves the amount of I/O is bounded
+        // without creating a large fixture or relying on timing/RSS.
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"\nold\nlatest\n").unwrap();
+        let mut reader = Counted {
+            file,
+            bytes_read: 0,
+        };
+        assert!(read_log_tail(&mut reader, 0).unwrap().is_empty());
+        assert_eq!(reader.bytes_read, 0);
+        assert_eq!(read_log_tail(&mut reader, 1).unwrap(), ["latest"]);
+        assert!(
+            reader.bytes_read <= 8192,
+            "read {} historical bytes",
+            reader.bytes_read
+        );
+    }
 
     // Regression (#254): the trash ID was interpolated unescaped, so an ID
     // containing a newline forged a second operations.log record.

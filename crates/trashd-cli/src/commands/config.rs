@@ -169,7 +169,7 @@ fn config_get(config: &Config, key: &str) -> Option<String> {
 /// not parse stops it too: rewriting the table from scratch would discard
 /// every existing setting (#143).
 fn read_config_table(path: &Path) -> Result<toml::Table, String> {
-    match std::fs::read_to_string(path) {
+    match trashd_common::config_file::read(path) {
         Ok(content) => content.parse::<toml::Table>().map_err(|e| {
             format!(
                 "refusing to edit {}: the existing config does not parse:\n{e}\nFix or remove the file, then re-run",
@@ -423,6 +423,7 @@ mod tests {
     // UTF-8, EACCES) was treated as empty and then overwritten.
     #[test]
     fn unreadable_config_is_refused_not_replaced() {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, b"never_trash = [\"\xff\"]\n").unwrap();
@@ -436,6 +437,10 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_config_table(&path).is_err());
     }
 
     // Regression (#230): the config was rewritten in place, so a crash or a
@@ -451,6 +456,10 @@ mod tests {
         let link = dir.path().join("config.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let before = std::fs::metadata(&real).unwrap().ino();
+        assert_eq!(
+            read_config_table(&link).unwrap()["old"].as_integer(),
+            Some(1)
+        );
 
         write_config_file(&link, "new = 2\n").unwrap();
 

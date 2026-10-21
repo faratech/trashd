@@ -14,6 +14,8 @@
 //!   TRASH_BYPASS=1       — disable interception entirely
 //!   TRASHD_PRELOAD_LOG=1 — log interceptions to stderr
 
+#[path = "../../trashd-common/src/config_file.rs"]
+mod config_file;
 #[path = "../../trashd-common/src/legacy_config.rs"]
 mod legacy_config;
 #[allow(dead_code)]
@@ -268,7 +270,7 @@ fn config_mtime() -> i64 {
 }
 
 fn load_partial_config(path: &Path) -> Option<PartialPreloadConfig> {
-    let content = fs::read_to_string(path).ok()?;
+    let content = config_file::read(path).ok()?;
     match legacy_config::normalize(&content)
         .and_then(|value| value.try_into::<PartialPreloadConfig>())
     {
@@ -414,7 +416,10 @@ fn is_process_bypassed() -> bool {
     static CACHED: AtomicU64 = AtomicU64::new(0);
     static CACHED_AT: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
-    let ppid = parent_pid(pid).unwrap_or(0);
+    // This runs on every hook, even while the verdict is cached. A direct
+    // getppid preserves reparenting detection without opening, reading and
+    // parsing /proc/self/stat for each deletion.
+    let ppid = unsafe { libc::getppid() } as u32;
     // A grandparent's death does not change this process's PPID, so the
     // verdict also expires: re-walk the tree at least every few seconds.
     let now = std::time::SystemTime::now()
@@ -1984,6 +1989,24 @@ mod tests {
         config.merge(load_partial_config(&path).expect("legacy config must load"));
         assert_eq!(config.only_trash, ["*.txt"]);
         assert_eq!(config.max_file_size_mb, 9);
+    }
+
+    #[test]
+    fn loader_accepts_symlinked_config_and_ignores_fifo() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("dotfiles.toml");
+        std::fs::write(&target, "max_file_size_mb = 17\n").unwrap();
+        let path = directory.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            load_partial_config(&path).unwrap().max_file_size_mb,
+            Some(17)
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(load_partial_config(&path).is_none());
     }
 
     #[test]

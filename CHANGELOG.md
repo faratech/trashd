@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Trash listing and repair reject FIFO, symlink and other nonregular
+  `.trashinfo` files without blocking; a FIFO `directorysizes` cache is
+  ignored and replaced (#266). Nonregular operation logs cannot hang reads
+  or completed trash operations (#275). Retention locks and markers reject
+  special files, and marker updates cannot truncate a symlink target (#277).
+- Global and user configuration reject nonregular files without blocking
+  command startup or preload initialization; symlinked configs remain
+  supported (#278).
+- Distinct non-UTF-8 trash names remain visible, ambiguous display IDs are
+  refused, and `fsck --fix` applies confirmation to the exact file selected
+  (#267, #271).
+- The rm shim accepts ordinary files and symlinks with `-d`, and accepted
+  abbreviations of its custom bypass options work with the real rm
+  (#268, #272), including when `TRASH_BYPASS=1` is also set (#276).
+
+### Performance
+
+- `trash log` reads only the requested tail of its history, avoiding memory
+  exhaustion and false empty results for large operation logs (#269).
+- Preload checks its current parent with `getppid` instead of reopening
+  `/proc` on every deletion (#270). Report-only and clean repair scans avoid
+  redundant store listings, and orphan repair uses direct path lookups
+  (#271).
+- Seccomp reuses each captured pathname instead of reading target memory
+  twice (#273). Restore selects the stored hash algorithm and verifies files
+  in one pass while retaining compatibility with both digest formats (#274).
+
 ## 0.1.10 (2026-10-12)
 
 ### Fixed

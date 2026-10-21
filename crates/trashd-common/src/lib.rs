@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_file;
 pub mod directorysizes;
 pub mod index;
 pub(crate) mod local_trust;

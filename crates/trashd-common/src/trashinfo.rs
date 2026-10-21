@@ -1,5 +1,33 @@
 use chrono::{DateTime, Local, NaiveDateTime};
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+/// Read a regular metadata file without following symlinks or waiting for a
+/// FIFO writer. Check the opened descriptor, so a replacement between lookup
+/// and open cannot turn the read into a stream from a special file.
+pub(crate) fn read_regular_text_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Read a .trashinfo sidecar. Special files and symlinks are invalid metadata,
+/// including ones substituted while a listing or integrity check is running.
+pub fn read_sidecar(path: &Path) -> io::Result<String> {
+    read_regular_text_file(path)
+}
 
 /// Represents a .trashinfo metadata file per FreeDesktop.org Trash spec.
 #[derive(Debug, Clone)]
@@ -246,6 +274,36 @@ fn decode_path(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecar_reader_accepts_only_regular_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let regular = fixture.path().join("regular.trashinfo");
+        fs::write(&regular, "metadata").unwrap();
+        assert_eq!(read_sidecar(&regular).unwrap(), "metadata");
+
+        let fifo = fixture.path().join("fifo.trashinfo");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let socket = fixture.path().join("socket.trashinfo");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let link = fixture.path().join("link.trashinfo");
+        symlink(&regular, &link).unwrap();
+        for invalid in [&fifo, &socket, &link, fixture.path()] {
+            assert!(read_sidecar(invalid).is_err(), "accepted {invalid:?}");
+        }
+        // Arbitrary regular files keep the ordinary UTF-8 read contract.
+        fs::write(&regular, b"\xff").unwrap();
+        assert_eq!(
+            read_sidecar(&regular).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     // Regression (#223): from_str_radix accepts a sign ("%+F" decoded as
     // 0x0F), and an invalid escape swallowed the next '%' with it.

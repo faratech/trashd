@@ -119,9 +119,11 @@ fn check_trash_dir(
             }
 
             // Check if trashinfo is parseable
-            if let Ok(content) = std::fs::read_to_string(entry.path())
-                && trashd_common::trashinfo::TrashInfo::from_trashinfo(&content).is_none()
-            {
+            let usable = trashd_common::trashinfo::read_sidecar(&entry.path())
+                .ok()
+                .and_then(|content| trashd_common::trashinfo::TrashInfo::from_trashinfo(&content))
+                .is_some();
+            if !usable {
                 corrupt_info += 1;
                 println!("  {} corrupt trashinfo: {}", "WARN".yellow(), id);
                 // NEVER delete the data file just because its metadata is
@@ -141,52 +143,67 @@ fn check_trash_dir(
         }
     }
 
-    // Capture candidates while publication is excluded, then release the
-    // guard before asking the user. purge_resolved revalidates after consent.
-    let snapshots = store.list(None).unwrap_or_default();
-    drop(guard);
-    // Check for files without matching .trashinfo
+    // Capture candidates while publication is excluded. Use the raw name
+    // for sidecar lookup: different Unix names can have the same lossy ID.
+    let mut candidates = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&files_dir) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let info_path = info_dir.join(format!("{name}.trashinfo"));
+            let mut info_name = entry.file_name();
+            info_name.push(".trashinfo");
+            let info_path = info_dir.join(info_name);
             if !sidecar_is_usable(&info_path) {
-                orphaned_files += 1;
-                println!(
-                    "  {} orphaned file (no trashinfo): {}",
-                    "WARN".yellow(),
-                    name
-                );
-                if fix {
-                    // Orphaned data may be recoverable user data (a crash or a
-                    // failed restore can produce exactly this state). Deleting
-                    // it permanently in an automatic "fix" is against the
-                    // preserve-data philosophy — require explicit per-item
-                    // confirmation. symlink_metadata so dangling symlinks are
-                    // classified correctly, not followed.
-                    let Some(snapshot) = snapshots
-                        .iter()
-                        .find(|e| e.trash_root == *trash_dir && e.id == name && e.orphaned)
-                    else {
-                        continue;
-                    };
-                    if crate::util::confirm(&format!(
-                        "    permanently delete orphaned '{}'? This cannot be undone [y/N] ",
-                        entry.path().display()
-                    )) {
-                        let res = store.purge_resolved(snapshot);
-                        match res {
-                            Ok(()) => println!("    {}", "removed".green()),
-                            Err(e) => println!("    {} {e}", "failed:".red()),
-                        }
-                    } else {
-                        println!(
-                            "    {} data preserved at {} (recover manually)",
-                            "kept".green(),
-                            entry.path().display()
-                        );
-                    }
+                candidates.push(entry);
+            }
+        }
+    }
+
+    // Snapshots are needed only for a repair that can actually purge an
+    // orphan. Avoid rereading all roots for report-only or clean checks.
+    // Index by the actual path both to keep colliding lossy IDs distinct
+    // and to avoid a linear search through the trash for every orphan.
+    let snapshots: std::collections::HashMap<_, _> = if fix && !candidates.is_empty() {
+        store
+            .list(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.trash_root == trash_dir && entry.orphaned)
+            .map(|entry| (entry.trashed_path.clone(), entry))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    drop(guard);
+    // Release the guard before asking the user. purge_resolved revalidates
+    // the captured entry after consent.
+    orphaned_files += candidates.len();
+    for entry in candidates {
+        let name = entry.file_name();
+        println!(
+            "  {} orphaned file (no trashinfo): {}",
+            "WARN".yellow(),
+            name.to_string_lossy()
+        );
+        if fix {
+            // Orphaned data can be recoverable user data. Require explicit
+            // per-item confirmation before permanently deleting it.
+            let Some(snapshot) = snapshots.get(&entry.path()) else {
+                continue;
+            };
+            if crate::util::confirm(&format!(
+                "    permanently delete orphaned '{}'? This cannot be undone [y/N] ",
+                entry.path().display()
+            )) {
+                let res = store.purge_resolved(snapshot);
+                match res {
+                    Ok(()) => println!("    {}", "removed".green()),
+                    Err(e) => println!("    {} {e}", "failed:".red()),
                 }
+            } else {
+                println!(
+                    "    {} data preserved at {} (recover manually)",
+                    "kept".green(),
+                    entry.path().display()
+                );
             }
         }
     }
@@ -227,7 +244,7 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
                 continue;
             }
             let id = name.strip_suffix(".trashinfo").unwrap_or(&name).to_string();
-            if let Ok(content) = std::fs::read_to_string(entry.path())
+            if let Ok(content) = trashd_common::trashinfo::read_sidecar(&entry.path())
                 && let Some(info) = trashd_common::trashinfo::TrashInfo::from_trashinfo(&content)
             {
                 entries.push((id, info, trash_dir.to_path_buf()));
@@ -243,6 +260,34 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn special_sidecars_are_reported_without_reading_or_deleting_them() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        let fifo = root.join("info/fifo.trashinfo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        symlink(&fifo, root.join("info/link.trashinfo")).unwrap();
+        fs::create_dir(root.join("info/directory.trashinfo")).unwrap();
+        for name in ["fifo", "link", "directory"] {
+            fs::write(root.join("files").join(name), b"recoverable").unwrap();
+        }
+
+        assert_eq!(check_trash_dir(&store, &root, false), (0, 3, 3));
+        assert_eq!(rebuild_index(&root).unwrap(), 0);
+        assert!(fifo.symlink_metadata().unwrap().file_type().is_fifo());
+        for name in ["fifo", "link", "directory"] {
+            assert_eq!(
+                fs::read(root.join("files").join(name)).unwrap(),
+                b"recoverable"
+            );
+        }
+    }
 
     #[test]
     fn fix_waits_for_writer_publication() {
@@ -315,11 +360,57 @@ mod tests {
         let id = std::ffi::OsStr::from_bytes(b"report-\xff");
         fs::write(root.join("files").join(id), b"data").unwrap();
         let sidecar = aged_sidecar(&root, id, &dir.path().join(id));
-        check_trash_dir(&store, &root, true);
+        assert_eq!(check_trash_dir(&store, &root, true), (0, 0, 0));
         assert!(
             sidecar.exists(),
             "valid sidecar of a non-UTF-8 entry was deleted"
         );
+    }
+
+    #[test]
+    fn fix_only_purges_the_raw_orphan_that_was_confirmed() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+
+        if let Some(root) = std::env::var_os("TRASHD_FSCK_CHILD_ROOT") {
+            let root = std::path::PathBuf::from(root);
+            let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+            assert_eq!(check_trash_dir(&store, &root, true), (0, 2, 0));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        let _store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        for name in [b"entry-\xff", b"entry-\xfe"] {
+            fs::write(
+                root.join("files").join(std::ffi::OsStr::from_bytes(name)),
+                name,
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = fs::read_dir(root.join("files"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::fsck::tests::fix_only_purges_the_raw_orphan_that_was_confirmed",
+                "--nocapture",
+            ])
+            .env("TRASHD_FSCK_CHILD_ROOT", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"y\nn\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!entries[0].exists(), "the confirmed orphan must be deleted");
+        assert!(entries[1].exists(), "the declined orphan must be preserved");
     }
 
     // Regression (#212): a sidecar written moments ago can belong to a trash
