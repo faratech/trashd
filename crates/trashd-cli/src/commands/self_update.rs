@@ -49,15 +49,20 @@ fn update_check_marker_from(
 
 fn cached_update_check() -> Option<String> {
     let marker = update_check_marker()?;
+    cached_update_check_at(&marker)
+}
+
+fn cached_update_check_at(marker: &Path) -> Option<String> {
     validate_cache_parent(marker.parent()?).ok()?;
 
     // O_NOFOLLOW rejects a marker symlink instead of reading an attacker-chosen
-    // target. Limit the tiny cache record so a corrupted file cannot allocate
-    // arbitrary memory during an update check.
+    // target; O_NONBLOCK lets the descriptor check reject a FIFO without
+    // waiting for a writer. Limit the tiny cache record so a corrupted file
+    // cannot allocate arbitrary memory during an update check.
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&marker)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(marker)
         .ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
@@ -941,6 +946,19 @@ mod tests {
             fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn cache_read_accepts_regular_marker_and_ignores_fifo_without_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("trashd/last-update-check");
+        write_update_check_cache_at(&marker, "9.9.9").unwrap();
+        assert_eq!(cached_update_check_at(&marker).as_deref(), Some("9.9.9"));
+
+        fs::remove_file(&marker).unwrap();
+        let name = CString::new(marker.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(cached_update_check_at(&marker).is_none());
     }
 
     #[test]

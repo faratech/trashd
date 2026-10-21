@@ -12,6 +12,7 @@
 - Global and user configuration reject nonregular files without blocking
   command startup or preload initialization; symlinked configs remain
   supported (#278).
+- Update checks reject a FIFO cache instead of waiting for a writer (#279).
 - Distinct non-UTF-8 trash names remain visible, ambiguous display IDs are
   refused, and `fsck --fix` applies confirmation to the exact file selected
   (#267, #271).
@@ -26,7 +27,8 @@
 - Preload checks its current parent with `getppid` instead of reopening
   `/proc` on every deletion (#270). Report-only and clean repair scans avoid
   redundant store listings, and orphan repair uses direct path lookups
-  (#271).
+  (#271). Throttled retention skips opening and locking its state file
+  (#277).
 - Seccomp reuses each captured pathname instead of reading target memory
   twice (#273). Restore selects the stored hash algorithm and verifies files
   in one pass while retaining compatibility with both digest formats (#274).

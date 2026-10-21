@@ -1619,7 +1619,7 @@ impl TrashStore {
         // Most deletions are throttled. A recent regular marker lets them
         // avoid opening/flocking a retention lock at all; never follow a
         // symlink that could suppress retention using another file's mtime.
-        if interval > 0 && fs::symlink_metadata(&marker).is_ok_and(&recent) {
+        if interval > 0 && fs::symlink_metadata(&marker).is_ok_and(recent) {
             return Ok(());
         }
         // One purge at a time per home: concurrent runs each trimmed the full
