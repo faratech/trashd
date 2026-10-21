@@ -21,11 +21,11 @@ jobs:
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       - name: Update dependencies
         run: cargo update
@@ -71,7 +71,7 @@ jobs:
 
       - name: Upload validated lockfile
         if: steps.diff.outputs.changed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: updated-cargo-lock
           path: Cargo.lock
@@ -87,12 +87,12 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Download validated lockfile
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: updated-cargo-lock
           path: ${{ runner.temp }}/updated-cargo-lock
@@ -113,7 +113,7 @@ jobs:
           install -m 0644 -- "${lock}" Cargo.lock
 
       - name: Create PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ github.token }}
           commit-message: 'chore: update dependencies'
