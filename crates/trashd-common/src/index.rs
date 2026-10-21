@@ -22,6 +22,20 @@ fn cantopen(error: &std::io::Error) -> rusqlite::Error {
     )
 }
 
+fn configure_cache_journal(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Query the returned mode: filesystems that cannot use WAL may retain a
+    // rollback journal even when the requested pragma itself succeeds.
+    let wal = conn
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+        .is_ok_and(|mode| mode.eq_ignore_ascii_case("wal"));
+    // This database is a derived cache, never the authoritative trash record.
+    // WAL+NORMAL preserves consistency and application-crash durability while
+    // recent cache changes may roll back after power/system failure. SQLite
+    // still syncs checkpoints. Keep FULL whenever WAL was not confirmed; do
+    // not apply this policy to sidecar, copied-data, or restored-file syncs.
+    conn.pragma_update(None, "synchronous", if wal { "NORMAL" } else { "FULL" })
+}
+
 impl TrashIndex {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         // SQLite creates new database files with the process umask (typically
@@ -47,9 +61,7 @@ impl TrashIndex {
         // A transient lock must never demote a protection layer to real `rm`:
         // wait for the lock instead of returning SQLITE_BUSY immediately.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        // WAL allows a reader and a writer to coexist; ignore if the
-        // filesystem (e.g. some network mounts) refuses it.
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        configure_cache_journal(&conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS trash_entries (
                 id TEXT PRIMARY KEY,
@@ -165,6 +177,76 @@ mod tests {
     use super::*;
     use crate::trashinfo::TrashInfo;
     use std::path::PathBuf;
+
+    #[test]
+    fn wal_cache_uses_normal_sync_and_remains_visible_to_fresh_connections() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("index.sqlite");
+        let index = TrashIndex::open(&path).unwrap();
+        let mode: String = index
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = index
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(synchronous, 1);
+        let root = fixture.path().join("Trash");
+        let info = TrashInfo::new(PathBuf::from("/original"));
+        index.insert("entry", &info, &root).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT original_path FROM trash_entries WHERE id='entry'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "/original"
+        );
+        index.delete_in("entry", &root).unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM trash_entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(index.rebuild(&[("rebuilt".into(), info, root)]).unwrap(), 1);
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM trash_entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reader
+                .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn a_non_wal_cache_keeps_full_sync() {
+        // SQLite cannot switch an in-memory database to WAL, so the returned
+        // mode deterministically exercises the filesystem fallback policy.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
+        configure_cache_journal(&conn).unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "memory");
+        assert_eq!(synchronous, 2);
+    }
 
     // The database file must be owner-only no matter the ambient umask:
     // SQLite alone would create it 0644 (issue #79).

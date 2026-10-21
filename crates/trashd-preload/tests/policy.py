@@ -56,6 +56,7 @@ def run():
             if local is not None:
                 (fixture / ".trashd.toml").write_text(local)
             victim = os.path.join(os.fsencode(fixture), os.fsencode(filename))
+            os.makedirs(os.path.dirname(victim), exist_ok=True)
             with open(victim, "wb") as stream:
                 stream.truncate(size)
             env = dict(os.environ, LD_PRELOAD=library,
@@ -85,6 +86,22 @@ def run():
         case("executable-bypass", f'bypass_paths = [{json.dumps(str(Path("/usr/bin/unlink").resolve()))}]\n', trashed=False)
         case("unrelated-executable", 'bypass_paths = ["/nonexistent/program"]\n')
         case("self-bypass", 'bypass_processes = ["unlink"]\n', trashed=False)
+        # Rustup retires many toolchain files under ~/.rustup/tmp; those
+        # housekeeping deletes must bypass by default (#282). Execute real
+        # scripts bearing each process name, rather than changing argv[0].
+        # A similarly named unrelated process must still protect its data.
+        proxy_dir = root / "process-proxies"
+        proxy_dir.mkdir()
+        for name in ["rustup", "rustup-init", "rustup-helper"]:
+            proxy = proxy_dir / name
+            proxy.write_text("#!/usr/bin/python3\nimport os,sys\n"
+                             "assert open('/proc/self/comm').read().rstrip('\\n') "
+                             "== os.path.basename(sys.argv[0])\n"
+                             "os.unlink(sys.argv[1])\n")
+            proxy.chmod(0o755)
+            case(f"default-{name}-housekeeping", "", filename=".rustup/tmp/toolchain-backup",
+                 trashed=name == "rustup-helper",
+                 command=lambda victim, proxy=proxy: [str(proxy), victim])
         shell_name = Path("/bin/sh").resolve().name
         ancestor_rule = f"bypass_processes = [{json.dumps(shell_name)}]\n"
         case("ancestor-bypass", ancestor_rule, trashed=False,
@@ -100,6 +117,24 @@ def run():
              local='only_trash = ["local-relative/*.py*"]\n')
         case("global-veto", 'never_trash = ["file?.c"]\n', filename="file1.c", trashed=False,
              local='only_trash = ["*.[ch]"]\n')
+        # Repeated calls in one process must see local-policy changes at
+        # once. Sharing the hook's clock sample must not cache exclusions or
+        # whitelist verdicts between deletions (#283, #285).
+        live_policy = (
+            "import os,sys\nfrom pathlib import Path\n"
+            "victim=Path(sys.argv[1]); policy=victim.parent/'.trashd.toml'\n"
+            "records=Path(os.environ['XDG_DATA_HOME'])/'Trash/info'\n"
+            "policy.write_text('only_trash = [\\\"*.keep\\\"]\\n')\n"
+            "os.unlink(victim)\nassert not list(records.glob('*.trashinfo'))\n"
+            "policy.write_text('only_trash = [\\\"victim\\\"]\\n')\n"
+            "victim.write_bytes(b'protected'); os.unlink(victim)\n"
+            "assert len(list(records.glob('*.trashinfo')))==1\n"
+            "policy.write_text('never_trash = [\\\"victim\\\"]\\n')\n"
+            "victim.write_bytes(b'excluded'); os.unlink(victim)\n"
+            "assert len(list(records.glob('*.trashinfo')))==1\n"
+        )
+        case("live-local-policy", "",
+             command=lambda victim: ["/usr/bin/python3", "-c", live_policy, victim])
         # A policy key nested under [retention] (legacy layout) is still
         # applied — but loudly, not silently (#150).
         case("legacy-retention-promoted", '[retention]\nonly_trash = ["*.txt"]\n',
@@ -192,6 +227,29 @@ def run():
             environment.pop("TRASHD_SECCOMP_ACTIVE", None)
             environment.pop("TRASHD_SECCOMP_COOKIE", None)
             return fixture, data, environment
+
+        # A PID captured once per operation must be refreshed after fork;
+        # process-global PID caches would publish the parent's PID (#298).
+        fixture, data, environment = focused_fixture("operation-pid")
+        pid_code = (
+            "import os,signal,sys\nfrom pathlib import Path\n"
+            "signal.signal(signal.SIGCHLD,signal.SIG_DFL)\n"
+            "root=Path(sys.argv[1]); info=Path(os.environ['XDG_DATA_HOME'])/'Trash/info'\n"
+            "def remove(name):\n"
+            " victim=root/name; victim.write_bytes(b'pid check'); os.unlink(victim)\n"
+            " record=next(info.glob(name+'*.trashinfo'))\n"
+            " assert 'X-Trashd-PID='+str(os.getpid())+'\\n' in record.read_text()\n"
+            "remove('parent-before')\n"
+            "child=os.fork()\n"
+            "if child==0:\n remove('child'); os._exit(0)\n"
+            "assert os.waitpid(child,0)[1]==0\n"
+            "remove('parent-after')\n"
+        )
+        result = subprocess.run(["/usr/bin/python3", "-c", pid_code, str(fixture)],
+                                env=environment, capture_output=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert len(list((data / "Trash/info").glob("*.trashinfo"))) == 3
+        print("PASS: per-operation PID remains correct in parent and forked child")
 
         for name, spelling in [("dot-parent", "./victim"), ("dotdot-parent", "child/../victim"),
                                ("excluded-spelling", "/tmp/../work/{relative}/victim")]:
@@ -430,8 +488,37 @@ def run():
         victim.write_bytes(b"recoverable")
         result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
         assert result.returncode == 0 and not victim.exists(), result.stderr
-        assert len(list((fixture / "real-share/Trash/info").glob("*.trashinfo"))) == 1
-        print("PASS: trusted symlinked trash ancestors are followed")
+        records = list((fixture / "real-share/Trash/info").glob("*.trashinfo"))
+        assert len(records) == 1
+        # Restore retires the sidecar while holding the root lock. Its
+        # preload hook must recognize the physical trash path, too (#289).
+        result = subprocess.run([cli, "restore", records[0].stem], env=environment,
+                                capture_output=True, timeout=10)
+        assert result.returncode == 0 and victim.read_bytes() == b"recoverable", result.stderr
+        assert not records[0].exists()
+        assert not list((fixture / "real-share/Trash/files").iterdir())
+        print("PASS: trusted symlinked trash ancestors support preload-enabled restore")
+
+        # A foreign symlink must not authenticate its target as our home
+        # trash, even when the target itself is a private files/info tree.
+        fixture, _, environment = focused_fixture("foreign-home-ancestor")
+        target = fixture / "real-share"
+        for sub in ["Trash", "Trash/files", "Trash/info"]:
+            (target / sub).mkdir(parents=True, mode=0o700)
+        link = fixture / "share-link"
+        link.symlink_to("real-share")
+        os.lchown(link, 65534, 65534)
+        environment["XDG_DATA_HOME"] = str(link)
+        victim = target / "Trash/files/foreign-ancestor-victim"
+        victim.write_bytes(b"still protected")
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment,
+                                capture_output=True, timeout=10)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        records = list(Path("/root/.local/share/Trash/info").glob("foreign-ancestor-victim*.trashinfo"))
+        assert len(records) == 1, "foreign home ancestor caused permanent deletion"
+        stored = Path("/root/.local/share/Trash/files") / records[0].stem
+        assert stored.read_bytes() == b"still protected"
+        print("PASS: foreign symlinked home ancestors never bypass protection")
 
         # A .trashd.toml another user owns (a shared directory, a USB stick)
         # must not turn this user's deletes into permanent ones (#207).

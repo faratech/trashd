@@ -64,7 +64,7 @@ pub struct TrashStore {
     /// Optional SQLite cache. It is NEVER the source of truth (list() scans
     /// .trashinfo files), so a failure to open it must not stop trashing —
     /// otherwise transient lock contention would demote callers to real `rm`.
-    index: Option<TrashIndex>,
+    index: std::cell::OnceCell<Option<TrashIndex>>,
 }
 
 /// A single entry in the trash.
@@ -134,26 +134,39 @@ impl TrashStore {
         entry: &TrashEntry,
         guard: &RootMutationGuard,
     ) -> Result<(), TrashError> {
+        self.validated_entry_metadata_locked(entry, guard)
+            .map(|_| ())
+    }
+
+    fn validated_entry_metadata_locked(
+        &self,
+        entry: &TrashEntry,
+        guard: &RootMutationGuard,
+    ) -> Result<(Option<fs::Metadata>, Option<fs::Metadata>), TrashError> {
         if guard.root() != entry.trash_root || !entry_paths_match(entry) || entry.id.is_empty() {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        for path in [&entry.trashed_path, &entry.info_path] {
-            if let Err(e) = fs::symlink_metadata(path)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                return Err(e.into());
-            }
-        }
-        let version = if entry.orphaned {
-            sidecar_snapshot(&entry.info_path)
-        } else {
-            sidecar_version(&entry.info_path)
+        let read_metadata = |path: &Path| match fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(TrashError::Io(error)),
         };
-        if file_identity(&entry.trashed_path) != entry.identity || version != entry.sidecar_version
-        {
+        let data = read_metadata(&entry.trashed_path)?;
+        let sidecar = read_metadata(&entry.info_path)?;
+        let identity = data
+            .as_ref()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let version = sidecar.as_ref().and_then(|metadata| {
+            if entry.orphaned || metadata.is_file() {
+                Some(SidecarVersion::from_metadata(metadata))
+            } else {
+                None
+            }
+        });
+        if identity != entry.identity || version != entry.sidecar_version {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        Ok(())
+        Ok((data, sidecar))
     }
 
     fn open_with(home: PathBuf, config: Config, isolated: bool) -> Result<Self, TrashError> {
@@ -176,21 +189,10 @@ impl TrashStore {
         ensure_private_dir(&home.join("info"), uid, true)?;
         ensure_private_dir(&home.join(".trashd"), uid, true)?;
 
-        // The index is an optional accelerator. If it can't be opened (lock
-        // contention, corruption, read-only FS) we degrade to no-index rather
-        // than failing — the authoritative files and sidecars remain usable.
-        let index = match TrashIndex::open(&home.join(crate::index::REL_PATH)) {
-            Ok(idx) => Some(idx),
-            Err(e) => {
-                eprintln!("trashd: warning: trash index unavailable ({e}); continuing without it");
-                None
-            }
-        };
-
         let home = fs::canonicalize(home)?;
         Ok(Self {
             config,
-            index,
+            index: std::cell::OnceCell::new(),
             home,
             isolated,
             #[cfg(test)]
@@ -198,6 +200,35 @@ impl TrashStore {
             #[cfg(test)]
             cache_refreshes: std::cell::Cell::new(0),
         })
+    }
+
+    /// The filesystem sidecars are authoritative. Read-only operations never
+    /// open SQLite; initialize its optional cache only when a mutation needs
+    /// it, retaining the same best-effort failure behavior for that store.
+    fn index(&self) -> Option<&TrashIndex> {
+        self.index
+            .get_or_init(|| match TrashIndex::open(&self.home.join(crate::index::REL_PATH)) {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    eprintln!("trashd: warning: trash index unavailable ({error}); continuing without it");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    fn index_for_root(&self, root: &Path) -> Option<&TrashIndex> {
+        if root != self.home
+            && self.index.get().is_none()
+            && matches!(
+                self.home.join(crate::index::REL_PATH).try_exists(),
+                Ok(false)
+            )
+        {
+            // No home rows exist to maintain for a foreign-root mutation.
+            return None;
+        }
+        self.index()
     }
 
     /// The home trash directory per FreeDesktop spec.
@@ -511,7 +542,7 @@ impl TrashStore {
                 files.sync_all()?;
                 copy_done = true;
                 if trash_dir == home_trash
-                    && let Some(idx) = self.index.as_ref()
+                    && let Some(idx) = self.index()
                 {
                     let _ = idx.insert(&id, &info, &trash_dir);
                 }
@@ -642,7 +673,7 @@ impl TrashStore {
         // .trashinfo scan (#40).
         if guard.is_some()
             && trash_dir == home_trash
-            && let Some(idx) = self.index.as_ref()
+            && let Some(idx) = self.index()
         {
             let _ = idx.insert(&id, &info, &trash_dir);
         }
@@ -1042,7 +1073,7 @@ impl TrashStore {
         unsafe { libc::close(files_fd) };
 
         if trash_dir == home_trash
-            && let Some(idx) = self.index.as_ref()
+            && let Some(idx) = self.index()
         {
             let _ = idx.insert(&id, &info, &trash_dir);
         }
@@ -1081,29 +1112,88 @@ impl TrashStore {
         pattern: Option<&str>,
         entries: &mut Vec<TrashEntry>,
     ) -> Result<(), TrashError> {
-        for root in roots {
-            if let Err(e) = self.list_in_dir(root, pattern, entries) {
-                if *root == self.home {
-                    return Err(e);
-                }
-                eprintln!(
-                    "trashd: warning: skipping unreadable trash {}: {e}",
-                    root.display()
-                );
-            }
-        }
-        Ok(())
+        self.visit_roots(roots, pattern, &mut |entry, _| entries.push(entry))
     }
 
-    /// List items in a single trash directory.
+    /// Visit entries with the data metadata already needed for their identity.
+    /// Status can aggregate each snapshot immediately instead of retaining a
+    /// sorted listing and statting every entry for a second time.
+    fn visit_roots(
+        &self,
+        roots: &[PathBuf],
+        pattern: Option<&str>,
+        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
+    ) -> Result<(), TrashError> {
+        self.visit_roots_for_id(roots, pattern, None, visitor)
+            .map(|_| ())
+    }
+
+    /// A name-only prefilter still traverses every directory entry, preserving
+    /// scan errors, while exact selectors need only open their own sidecars.
+    fn visit_roots_for_id(
+        &self,
+        roots: &[PathBuf],
+        pattern: Option<&str>,
+        only_id: Option<&OsStr>,
+        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
+    ) -> Result<Vec<(PathBuf, TrashError)>, TrashError> {
+        let mut parser = crate::trashinfo::TrashInfoParser::default();
+        let mut deferred_warnings: Vec<(PathBuf, TrashError)> = Vec::new();
+        for root in roots {
+            if let Err(e) = self.visit_in_dir(root, pattern, only_id, &mut parser, visitor) {
+                if *root == self.home {
+                    for (root, error) in deferred_warnings {
+                        Self::warn_unreadable_root(&root, error);
+                    }
+                    return Err(e);
+                }
+                if only_id.is_some() {
+                    // A missing exact ID falls back to a complete scan. Let
+                    // that scan report failures once, without duplicate
+                    // warnings from its preliminary name-only pass.
+                    deferred_warnings.push((root.clone(), e));
+                } else {
+                    Self::warn_unreadable_root(root, e);
+                }
+            }
+        }
+        Ok(deferred_warnings)
+    }
+
+    fn warn_unreadable_root(root: &Path, error: TrashError) {
+        eprintln!(
+            "trashd: warning: skipping unreadable trash {}: {error}",
+            root.display()
+        );
+    }
+
+    #[cfg(test)]
     fn list_in_dir(
         &self,
         trash_dir: &Path,
         pattern: Option<&str>,
         entries: &mut Vec<TrashEntry>,
     ) -> Result<(), TrashError> {
+        self.visit_in_dir(
+            trash_dir,
+            pattern,
+            None,
+            &mut crate::trashinfo::TrashInfoParser::default(),
+            &mut |entry, _| entries.push(entry),
+        )
+    }
+
+    /// Visit items in a single trash directory.
+    fn visit_in_dir(
+        &self,
+        trash_dir: &Path,
+        pattern: Option<&str>,
+        only_id: Option<&OsStr>,
+        parser: &mut crate::trashinfo::TrashInfoParser,
+        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
+    ) -> Result<(), TrashError> {
         // Orphan detection below must compare against ids from THIS directory
-        // only: the entries vec is shared across all trash roots, so an
+        // only: visitors may aggregate across all trash roots, so an
         // orphaned files/<id> in root B would otherwise be hidden by a real
         // entry with the same id in root A.
         let info_dir = trash_dir.join("info");
@@ -1122,6 +1212,14 @@ impl TrashStore {
         for entry in fs::read_dir(&info_dir)? {
             let entry = entry?;
             let raw_filename = entry.file_name();
+            // Compare raw stems: a lossy ID can collapse distinct filenames,
+            // and even the unusual ".trashinfo" leaf has file_stem semantics
+            // that must agree with the full scan below.
+            if let Some(id) = only_id
+                && Path::new(&raw_filename).file_stem() != Some(id)
+            {
+                continue;
+            }
             let filename = raw_filename.to_string_lossy().into_owned();
             if !filename.ends_with(".trashinfo") {
                 continue;
@@ -1140,17 +1238,16 @@ impl TrashStore {
                 .to_string();
             #[cfg(test)]
             self.sidecar_reads.set(self.sidecar_reads.get() + 1);
-            let sidecar_version = sidecar_version(&entry.path());
-            let content = match crate::trashinfo::read_sidecar(&entry.path()) {
-                Ok(c) => c,
+            let (content, metadata) = match crate::trashinfo::read_sidecar_snapshot(&entry.path()) {
+                Ok(snapshot) => snapshot,
                 Err(_) => continue,
             };
-            if sidecar_version.is_none() || sidecar_version != self::sidecar_version(&entry.path())
-            {
+            let sidecar_version = Some(SidecarVersion::from_metadata(&metadata));
+            if sidecar_version != self::sidecar_version(&entry.path()) {
                 continue;
             }
 
-            let mut info = match TrashInfo::from_trashinfo(&content) {
+            let mut info = match parser.parse(&content) {
                 Some(i) => i,
                 None => continue,
             };
@@ -1178,17 +1275,23 @@ impl TrashStore {
             }
 
             let trashed_path = files_dir.join(&raw_stem);
-            let identity = file_identity(&trashed_path);
-            entries.push(TrashEntry {
-                identity,
-                sidecar_version,
-                id,
-                info,
-                trashed_path,
-                info_path: entry.path(),
-                trash_root: trash_dir.to_path_buf(),
-                orphaned: false,
-            });
+            let data_metadata = fs::symlink_metadata(&trashed_path).ok();
+            let identity = data_metadata
+                .as_ref()
+                .map(|metadata| (metadata.dev(), metadata.ino()));
+            visitor(
+                TrashEntry {
+                    identity,
+                    sidecar_version,
+                    id,
+                    info,
+                    trashed_path,
+                    info_path: entry.path(),
+                    trash_root: trash_dir.to_path_buf(),
+                    orphaned: false,
+                },
+                data_metadata,
+            );
         }
 
         // Spec: "If info file corresponding to file in $trash/files is unavailable,
@@ -1196,10 +1299,14 @@ impl TrashStore {
         // Scan files/ for entries without matching .trashinfo.
         if files_dir.exists() {
             let known_ids = seen_ids;
-            let mut orphans = Vec::new();
             if let Ok(file_entries) = fs::read_dir(&files_dir) {
                 for fe in file_entries.flatten() {
                     let raw_name = fe.file_name();
+                    if let Some(id) = only_id
+                        && raw_name != id
+                    {
+                        continue;
+                    }
                     if !known_ids.contains(&raw_name) {
                         let name = raw_name.to_string_lossy().into_owned();
                         // Apply pattern filter to orphans too
@@ -1213,20 +1320,26 @@ impl TrashStore {
                         let mut raw_info_name = raw_name.clone();
                         raw_info_name.push(".trashinfo");
                         let info_path = info_dir.join(&raw_info_name);
-                        orphans.push(TrashEntry {
-                            identity: file_identity(&trashed_path),
-                            sidecar_version: sidecar_snapshot(&info_path),
-                            id: name.clone(),
-                            info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
-                            trashed_path,
-                            info_path,
-                            trash_root: trash_dir.to_path_buf(),
-                            orphaned: true,
-                        });
+                        let data_metadata = fs::symlink_metadata(&trashed_path).ok();
+                        let identity = data_metadata
+                            .as_ref()
+                            .map(|metadata| (metadata.dev(), metadata.ino()));
+                        visitor(
+                            TrashEntry {
+                                identity,
+                                sidecar_version: sidecar_snapshot(&info_path),
+                                id: name.clone(),
+                                info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
+                                trashed_path,
+                                info_path,
+                                trash_root: trash_dir.to_path_buf(),
+                                orphaned: true,
+                            },
+                            data_metadata,
+                        );
                     }
                 }
             }
-            entries.extend(orphans);
         }
 
         Ok(())
@@ -1240,6 +1353,17 @@ impl TrashStore {
     ) -> Result<PathBuf, TrashError> {
         let mut entry = self.find_entry(id_or_pattern)?;
         self.restore_resolved(&mut entry, target, true)
+    }
+
+    /// Restore one resolved entry with immediate cache/index maintenance.
+    /// Reuse the mutable snapshot when retrying a conflicting destination:
+    /// decompression may refresh its identity and metadata before a retry.
+    pub fn restore_entry(
+        &self,
+        entry: &mut TrashEntry,
+        target: Option<&Path>,
+    ) -> Result<PathBuf, TrashError> {
+        self.restore_resolved(entry, target, true)
     }
 
     /// Restore a previously resolved batch without re-enumerating the store.
@@ -1277,7 +1401,13 @@ impl TrashStore {
                 result
             })
             .collect();
-        if let Some(index) = &self.index {
+        let index_root = retired_ids
+            .iter()
+            .find(|(_, root)| *root == self.home)
+            .or_else(|| retired_ids.first());
+        if let Some((_, root)) = index_root
+            && let Some(index) = self.index_for_root(root)
+        {
             let _ = index.delete_many(&retired_ids);
         }
         for root in roots {
@@ -1290,6 +1420,24 @@ impl TrashStore {
         #[cfg(test)]
         self.cache_refreshes.set(self.cache_refreshes.get() + 1);
         let _ = crate::directorysizes::write_cache(root);
+    }
+
+    fn refresh_cache_after_removal(&self, entry: &TrashEntry, was_directory: bool) {
+        // The cache contains directories only. Removing a non-directory with
+        // no cached raw-name row cannot change it, so avoid a complete scan.
+        // Rebuild stale rows and damaged caches as before; cache failures are
+        // best-effort and never turn a completed removal into an error.
+        let needs_refresh = was_directory
+            || entry.trashed_path.file_name().is_none_or(|name| {
+                match crate::directorysizes::cache_contains_name(&entry.trash_root, name) {
+                    Ok(present) => present,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                }
+            });
+        if needs_refresh {
+            self.refresh_cache(&entry.trash_root);
+        }
     }
 
     fn restore_resolved(
@@ -1356,8 +1504,12 @@ impl TrashStore {
         if destination_exists(&destination)? {
             return Err(TrashError::RestoreConflict(restore_to));
         }
+        let stored_metadata = fs::symlink_metadata(&entry.trashed_path).ok();
         if entry.identity.is_none()
-            || file_identity(&entry.trashed_path) != entry.identity
+            || stored_metadata
+                .as_ref()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                != entry.identity
             || entry.sidecar_version.is_none()
             || sidecar_version(&entry.info_path) != entry.sidecar_version
         {
@@ -1373,9 +1525,9 @@ impl TrashStore {
         // crash/ENOSPC can never truncate the only copy.
         // symlink_metadata: never decode THROUGH a trashed symlink onto its
         // target (#12).
-        let stored_is_regular = fs::symlink_metadata(&entry.trashed_path)
-            .map(|m| m.is_file())
-            .unwrap_or(false);
+        let stored_is_regular = stored_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file());
         if entry.info.compressed.as_deref() == Some("zstd") && stored_is_regular {
             let configured = self.config.max_file_size_mb.saturating_mul(1024 * 1024);
             const HARD_DECOMPRESS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
@@ -1403,16 +1555,9 @@ impl TrashStore {
             .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
 
         let root_guard = self.lock_trash_root(&entry.trash_root)?;
+        // Refresh after decompression and all lock waits. The validator checks
+        // both the data identity and complete sidecar version under this guard.
         self.validate_entry_locked(entry, &root_guard)?;
-        if file_identity(&entry.trashed_path) != entry.identity
-            || sidecar_version(&entry.info_path) != entry.sidecar_version
-        {
-            // A replaced ID belongs to another operation; leave its data and
-            // sidecar alone instead of retiring somebody else's new entry.
-            // Post-lock, this also catches a compressor swap that completed
-            // while we waited: the inode is no longer ours.
-            return Err(TrashError::EntryNotFound(entry.id.clone()));
-        }
 
         let source_parent = open_directory_nofollow(&entry.trash_root.join("files"))?;
         // Raw filename bytes, not the lossy String ID: a non-UTF-8 entry's
@@ -1498,10 +1643,13 @@ impl TrashStore {
         }
 
         if maintain {
-            if let Some(idx) = self.index.as_ref() {
+            if let Some(idx) = self.index_for_root(&entry.trash_root) {
                 let _ = idx.delete_in(&entry.id, &entry.trash_root);
             }
-            self.refresh_cache(&entry.trash_root);
+            self.refresh_cache_after_removal(
+                entry,
+                source_stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            );
         }
 
         // Log operation
@@ -1542,9 +1690,7 @@ impl TrashStore {
     pub fn purge(&self, id: &str) -> Result<(), TrashError> {
         let entry = self.find_entry(id)?;
 
-        self.purge_resolved(&entry)?;
-        // Refresh directorysizes so a purged directory's entry is dropped.
-        let _ = crate::directorysizes::write_cache(&entry.trash_root);
+        self.purge_resolved_with_maintenance(&entry, true)?;
         crate::oplog::log_purge_in(&self.home, &entry.id);
         Ok(())
     }
@@ -1798,14 +1944,6 @@ impl TrashStore {
                 if self.validate_entry_locked(&entries[i], &guard).is_err() {
                     continue;
                 }
-                // Re-validate the entry before mutating ANYTHING: a concurrent
-                // restore/purge that retired this entry while we encoded must
-                // not be resurrected by our marker write or data swap (#105).
-                if file_identity(&entries[i].trashed_path) != entries[i].identity
-                    || sidecar_version(&entries[i].info_path) != entries[i].sidecar_version
-                {
-                    continue;
-                }
                 // Record the compression marker BEFORE swapping the data
                 // (#28): a crash in the window then leaves plain data with a
                 // stale marker — which restore recognizes by the missing zstd
@@ -1931,60 +2069,75 @@ impl TrashStore {
 
     /// Retire the exact listed snapshot, never a newly resolved reused ID.
     pub fn purge_resolved(&self, entry: &TrashEntry) -> Result<(), TrashError> {
+        self.purge_resolved_with_maintenance(entry, false)
+    }
+
+    fn purge_resolved_with_maintenance(
+        &self,
+        entry: &TrashEntry,
+        maintain: bool,
+    ) -> Result<(), TrashError> {
         let _data_lock = match lock_entry_file(&entry.trashed_path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
         let guard = self.lock_trash_root(&entry.trash_root)?;
-        self.validate_entry_locked(entry, &guard)?;
+        let (data, sidecar) = self.validated_entry_metadata_locked(entry, &guard)?;
         // A phantom entry (neither data nor sidecar on disk) must not
         // report a successful purge of nothing (#247).
-        if fs::symlink_metadata(&entry.trashed_path).is_err()
-            && fs::symlink_metadata(&entry.info_path).is_err()
-        {
+        if data.is_none() && sidecar.is_none() {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        match fs::symlink_metadata(&entry.trashed_path) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+        let was_directory = data.as_ref().is_some_and(|metadata| metadata.is_dir());
+        match data {
+            Some(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
                 fs::remove_dir_all(&entry.trashed_path)?
             }
-            Ok(_) => fs::remove_file(&entry.trashed_path)?,
-            Err(e)
-                if e.kind() == io::ErrorKind::NotFound
-                    && data_absence_is_retired(&entry.info_path) => {}
-            Err(e) => return Err(e.into()),
+            Some(_) => fs::remove_file(&entry.trashed_path)?,
+            None if data_absence_is_retired(&entry.info_path) => {}
+            None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
         }
         match fs::remove_file(&entry.info_path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        if let Some(idx) = self.index.as_ref() {
+        if let Some(idx) = self.index_for_root(&entry.trash_root) {
             let _ = idx.delete_in(&entry.id, &entry.trash_root);
+        }
+        if maintain {
+            self.refresh_cache_after_removal(entry, was_directory);
         }
         Ok(())
     }
 
     /// Get per-partition trash status.
     pub fn status_per_partition(&self) -> Result<Vec<PartitionStatus>, TrashError> {
-        let entries = self.list(None)?;
+        self.status_in_roots(&self.all_trash_dirs())
+    }
+
+    fn status_in_roots(
+        &self,
+        roots: &[(PathBuf, String)],
+    ) -> Result<Vec<PartitionStatus>, TrashError> {
         let mut partitions: std::collections::HashMap<PathBuf, PartitionStatus> =
             std::collections::HashMap::new();
 
-        for (dir, label) in self.all_trash_dirs() {
+        for (dir, label) in roots {
             partitions.entry(dir.clone()).or_insert(PartitionStatus {
-                trash_dir: dir,
-                label,
+                trash_dir: dir.clone(),
+                label: label.clone(),
                 total_size: 0,
                 count: 0,
             });
         }
 
-        for entry in &entries {
+        let paths: Vec<PathBuf> = roots.iter().map(|(path, _)| path.clone()).collect();
+        self.visit_roots(&paths, None, &mut |entry, metadata| {
             let ps = partitions
                 .entry(entry.trash_root.clone())
-                .or_insert(PartitionStatus {
+                .or_insert_with(|| PartitionStatus {
                     trash_dir: entry.trash_root.clone(),
                     label: entry.trash_root.to_string_lossy().into_owned(),
                     total_size: 0,
@@ -1992,8 +2145,10 @@ impl TrashStore {
                 });
             ps.count += 1;
             // Use actual disk size (may be smaller than info.size after compression)
-            ps.total_size = ps.total_size.saturating_add(self.entry_disk_size(entry));
-        }
+            ps.total_size = ps
+                .total_size
+                .saturating_add(self.entry_disk_size_from_metadata(&entry, metadata.as_ref()));
+        })?;
 
         let mut result: Vec<PartitionStatus> = partitions.into_values().collect();
         result.sort_by_key(|b| std::cmp::Reverse(b.total_size));
@@ -2002,14 +2157,15 @@ impl TrashStore {
 
     /// Total status across all partitions.
     pub fn status(&self) -> Result<(u64, usize), TrashError> {
-        let entries = self.list(None)?;
-        // Use actual disk size (reflects compression savings)
-        let total_size = entries
+        Ok(self
+            .status_per_partition()?
             .iter()
-            .map(|entry| self.entry_disk_size(entry))
-            .fold(0u64, u64::saturating_add);
-        let count = entries.len();
-        Ok((total_size, count))
+            .fold((0u64, 0usize), |(size, count), partition| {
+                (
+                    size.saturating_add(partition.total_size),
+                    count + partition.count,
+                )
+            }))
     }
 
     /// On-disk size of a trash entry for retention accounting and status.
@@ -2022,8 +2178,17 @@ impl TrashStore {
     /// trash time). Symlinks are never followed: a trashed link must count as
     /// itself, not its target.
     fn entry_disk_size(&self, entry: &TrashEntry) -> u64 {
-        match fs::symlink_metadata(&entry.trashed_path) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+        let metadata = fs::symlink_metadata(&entry.trashed_path).ok();
+        self.entry_disk_size_from_metadata(entry, metadata.as_ref())
+    }
+
+    fn entry_disk_size_from_metadata(
+        &self,
+        entry: &TrashEntry,
+        metadata: Option<&fs::Metadata>,
+    ) -> u64 {
+        match metadata {
+            Some(m) if m.is_dir() && !m.file_type().is_symlink() => {
                 // Foreign (spec-compliant) entries carry no X-Trashd-Size; falling
                 // back to the directory INODE size under-counted each foreign tree
                 // at ~4 KiB, so retention never trimmed directory-heavy trashes
@@ -2039,9 +2204,9 @@ impl TrashStore {
                     None => dir_size(&entry.trashed_path),
                 }
             }
-            Ok(m) => m.len(),
+            Some(m) => m.len(),
             // No data, nothing occupies the disk.
-            Err(_) => 0,
+            None => 0,
         }
     }
 
@@ -2097,8 +2262,72 @@ impl TrashStore {
     /// same resolution rules restore/purge apply, so `trash info` can never
     /// describe a different copy than the one restore would publish (#148).
     pub fn find_entry(&self, id_or_pattern: &str) -> Result<TrashEntry, TrashError> {
-        let entries = self.list(None)?;
+        let roots: Vec<PathBuf> = self
+            .all_trash_dirs()
+            .into_iter()
+            .map(|(dir, _)| dir)
+            .collect();
+        self.find_entry_in_roots(&roots, id_or_pattern)
+    }
 
+    fn find_entry_in_roots(
+        &self,
+        roots: &[PathBuf],
+        id_or_pattern: &str,
+    ) -> Result<TrashEntry, TrashError> {
+        let selector = Path::new(id_or_pattern);
+        // Replacement characters may stand for multiple non-UTF-8 raw names.
+        // Filename/glob fallbacks also need the complete listing. Ordinary
+        // exact IDs and selectors within a known files/ directory can filter
+        // raw names before reading sidecars, without changing their snapshots.
+        let ordinary_leaf = |name: &str| {
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                && !name.contains(['/', '\0', '\u{fffd}', '*', '?', '[', ']'])
+        };
+        let only_id = if ordinary_leaf(id_or_pattern) {
+            Some(OsStr::new(id_or_pattern))
+        } else if selector.is_absolute()
+            && roots
+                .iter()
+                .any(|root| selector.parent() == Some(root.join("files").as_path()))
+        {
+            selector
+                .file_name()
+                .filter(|name| name.to_str().is_some_and(ordinary_leaf))
+        } else {
+            None
+        };
+
+        if let Some(id) = only_id {
+            let mut entries = Vec::new();
+            let warnings = self
+                .visit_roots_for_id(roots, None, Some(id), &mut |entry, _| entries.push(entry))?;
+            let matched = if selector.is_absolute() {
+                entries.iter().any(|entry| entry.trashed_path == selector)
+            } else {
+                entries.iter().any(|entry| entry.id == id_or_pattern)
+            };
+            if matched {
+                for (root, error) in warnings {
+                    Self::warn_unreadable_root(&root, error);
+                }
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.info.deletion_date));
+                return Self::resolve_listed_entry(&entries, id_or_pattern);
+            }
+        }
+
+        let mut entries = Vec::new();
+        self.list_roots(roots, None, &mut entries)?;
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.info.deletion_date));
+        Self::resolve_listed_entry(&entries, id_or_pattern)
+    }
+
+    fn resolve_listed_entry(
+        entries: &[TrashEntry],
+        id_or_pattern: &str,
+    ) -> Result<TrashEntry, TrashError> {
         // An entry's trashed path is unique even when two roots hold the
         // same ID, so it selects exactly one entry (#210).
         if id_or_pattern.starts_with('/')
@@ -2266,19 +2495,18 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
 /// user, with no group/other permissions. A failed chmod is fatal: silently
 /// accepting the old mode would expose deleted data and metadata.
 fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
+    let mut meta = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
             match fs::DirBuilder::new().mode(0o700).create(path) {
                 Ok(()) => {}
                 Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
             }
+            fs::symlink_metadata(path)?
         }
         Err(e) => return Err(e),
-    }
-
-    let mut meta = fs::symlink_metadata(path)?;
+    };
     if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2367,19 +2595,18 @@ fn ensure_trusted_ancestors_from(directory: &Path, uid: u32, hops: u32) -> io::R
             }
         }
 
-        match fs::symlink_metadata(&current) {
-            Ok(_) => {}
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match fs::DirBuilder::new().mode(0o700).create(&current) {
                     Ok(()) => {}
                     Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
                 }
+                fs::symlink_metadata(&current)?
             }
             Err(error) => return Err(error),
-        }
-
-        let metadata = fs::symlink_metadata(&current)?;
+        };
         if metadata.file_type().is_symlink() && (metadata.uid() == 0 || metadata.uid() == uid) {
             if hops >= 40 {
                 return Err(io::Error::new(
@@ -2561,29 +2788,29 @@ struct SidecarVersion {
     changed: (i64, i64),
 }
 
+impl SidecarVersion {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
 fn sidecar_version(path: &Path) -> Option<SidecarVersion> {
     let m = fs::symlink_metadata(path).ok()?;
     if !m.is_file() {
         return None;
     }
-    Some(SidecarVersion {
-        device: m.dev(),
-        inode: m.ino(),
-        size: m.len(),
-        modified: (m.mtime(), m.mtime_nsec()),
-        changed: (m.ctime(), m.ctime_nsec()),
-    })
+    Some(SidecarVersion::from_metadata(&m))
 }
 
 fn sidecar_snapshot(path: &Path) -> Option<SidecarVersion> {
     let m = fs::symlink_metadata(path).ok()?;
-    Some(SidecarVersion {
-        device: m.dev(),
-        inode: m.ino(),
-        size: m.len(),
-        modified: (m.mtime(), m.mtime_nsec()),
-        changed: (m.ctime(), m.ctime_nsec()),
-    })
+    Some(SidecarVersion::from_metadata(&m))
 }
 
 /// Hash a file using the configured algorithm.
@@ -4319,6 +4546,65 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_failed_restores_do_not_initialize_the_optional_index() {
+        let (store, _data, work, _) = test_store();
+        let index_path = store.home.join(crate::index::REL_PATH);
+        assert!(!index_path.exists());
+        fs::write(store.home.join("files/existing"), b"data").unwrap();
+        let original = create_file(work.path(), "conflict", "kept");
+        fs::write(
+            store.home.join("info/existing.trashinfo"),
+            TrashInfo::new(original.clone()).to_trashinfo_string(),
+        )
+        .unwrap();
+        assert_eq!(store.list(None).unwrap().len(), 1);
+        assert_eq!(store.status().unwrap(), (4, 1));
+        let mut entry = store.find_entry("existing").unwrap();
+        assert!(matches!(
+            store.restore_entry(&mut entry, None),
+            Err(TrashError::RestoreConflict(_))
+        ));
+        assert!(store.restore_batch(&[], None, false).is_empty());
+        assert!(store.index.get().is_none());
+        assert!(!index_path.exists());
+        let source = create_file(work.path(), "new", "new data");
+        store.trash(&source, None).unwrap();
+        assert!(index_path.is_file());
+        assert_eq!(
+            fs::symlink_metadata(&index_path).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(store.index().unwrap().count().unwrap(), 1);
+    }
+
+    #[test]
+    fn reads_ignore_an_unusable_index_and_do_not_repair_existing_index_permissions() {
+        let (store, _data, work, _) = test_store();
+        let source = create_file(work.path(), "entry", "data");
+        store.trash(&source, None).unwrap();
+        let index_path = store.home.join(crate::index::REL_PATH);
+        drop(store);
+        fs::set_permissions(&index_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let home = index_path.parent().unwrap().parent().unwrap();
+        let reopened = TrashStore::open_isolated(home, Config::default()).unwrap();
+        assert_eq!(reopened.list(None).unwrap().len(), 1);
+        assert_eq!(reopened.status().unwrap(), (4, 1));
+        assert_eq!(
+            fs::symlink_metadata(&index_path).unwrap().mode() & 0o777,
+            0o640
+        );
+        assert!(reopened.index.get().is_none());
+        drop(reopened);
+        for name in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+            let _ = fs::remove_file(index_path.parent().unwrap().join(name));
+        }
+        fs::create_dir(&index_path).unwrap();
+        let reopened = TrashStore::open_isolated(home, Config::default()).unwrap();
+        assert_eq!(reopened.status().unwrap(), (4, 1));
+        assert!(reopened.index.get().is_none());
+    }
+
+    #[test]
     fn listing_special_sidecars_keeps_data_as_orphans_without_blocking() {
         use std::os::unix::fs::symlink;
         let (store, _data, work, _) = test_store();
@@ -4338,6 +4624,176 @@ mod tests {
         let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().all(|entry| entry.orphaned));
+    }
+
+    #[test]
+    fn opened_sidecar_versions_reject_growth_and_path_replacement() {
+        let (store, _data, work, _) = test_store();
+        let path = store.home.join("info/snapshot.trashinfo");
+        fs::write(
+            &path,
+            TrashInfo::new(work.path().join("original")).to_trashinfo_string(),
+        )
+        .unwrap();
+        let (_contents, metadata) = crate::trashinfo::read_sidecar_snapshot(&path).unwrap();
+        let snapshot = Some(SidecarVersion::from_metadata(&metadata));
+        assert_eq!(sidecar_version(&path), snapshot);
+        fs::File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"X-Changed=1\n")
+            .unwrap();
+        assert_ne!(sidecar_version(&path), snapshot);
+
+        let (_contents, metadata) = crate::trashinfo::read_sidecar_snapshot(&path).unwrap();
+        let snapshot = Some(SidecarVersion::from_metadata(&metadata));
+        let _pinned = fs::File::open(&path).unwrap();
+        let replacement = work.path().join("replacement.trashinfo");
+        fs::write(
+            &replacement,
+            TrashInfo::new(work.path().join("replacement")).to_trashinfo_string(),
+        )
+        .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_ne!(sidecar_version(&path), snapshot);
+    }
+
+    #[test]
+    fn streaming_status_matches_list_accounting_for_mixed_home_and_foreign_entries() {
+        use std::os::unix::fs::symlink;
+        let (store, _data, work, _) = test_store();
+        let foreign = work.path().join("mounted/.Trash-test");
+        let empty = work.path().join("empty/.Trash-test");
+        for root in [&foreign, &empty] {
+            fs::create_dir_all(root.join("info")).unwrap();
+            fs::create_dir_all(root.join("files")).unwrap();
+        }
+        let write_info = |root: &Path, id: &OsStr, size: Option<u64>, compressed: bool| {
+            let mut info = TrashInfo::new(work.path().join(id));
+            info.size = size;
+            info.compressed = compressed.then(|| "zstd".into());
+            let mut name = id.to_os_string();
+            name.push(".trashinfo");
+            fs::write(root.join("info").join(name), info.to_trashinfo_string()).unwrap();
+        };
+        fs::write(store.home.join("files/regular"), b"regular").unwrap();
+        write_info(&store.home, OsStr::new("regular"), Some(999), false);
+        fs::write(store.home.join("files/compressed"), b"small").unwrap();
+        write_info(&store.home, OsStr::new("compressed"), Some(999), true);
+        for (id, size) in [("stored-tree", Some(4321)), ("measured-tree", None)] {
+            fs::create_dir(store.home.join("files").join(id)).unwrap();
+            fs::write(
+                store.home.join("files").join(id).join("leaf"),
+                b"tree payload",
+            )
+            .unwrap();
+            write_info(&store.home, OsStr::new(id), size, false);
+        }
+        let target = create_file(work.path(), "external-target", &"x".repeat(8192));
+        for (id, destination) in [
+            ("link", target.clone()),
+            ("dangling", work.path().join("absent")),
+        ] {
+            symlink(destination, store.home.join("files").join(id)).unwrap();
+            write_info(&store.home, OsStr::new(id), Some(u64::MAX), false);
+        }
+        write_info(&store.home, OsStr::new("missing"), Some(12345), false);
+        for id in ["orphan", "corrupt", "nonregular-sidecar"] {
+            fs::write(store.home.join("files").join(id), b"recoverable").unwrap();
+        }
+        fs::write(store.home.join("info/corrupt.trashinfo"), b"invalid").unwrap();
+        symlink(
+            work.path().join("absent"),
+            store.home.join("info/nonregular-sidecar.trashinfo"),
+        )
+        .unwrap();
+        fs::create_dir(store.home.join("files/orphan-tree")).unwrap();
+        fs::write(store.home.join("files/orphan-tree/leaf"), b"orphan data").unwrap();
+        for (id, sidecar) in [
+            (b"raw\xff".as_slice(), true),
+            (b"raw\xfe".as_slice(), false),
+        ] {
+            let id = OsStr::from_bytes(id);
+            fs::write(store.home.join("files").join(id), b"raw data").unwrap();
+            if sidecar {
+                write_info(&store.home, id, None, false);
+            }
+        }
+        for (id, size) in [
+            ("forged-large", Some(u64::MAX)),
+            ("forged-small", Some(1)),
+            ("unsized", None),
+        ] {
+            fs::create_dir(foreign.join("files").join(id)).unwrap();
+            fs::write(foreign.join("files").join(id).join("leaf"), b"foreign tree").unwrap();
+            write_info(&foreign, OsStr::new(id), size, false);
+        }
+
+        let roots = vec![
+            (store.home.clone(), "home".into()),
+            (foreign.clone(), "foreign".into()),
+            (empty, "empty".into()),
+        ];
+        let paths: Vec<PathBuf> = roots.iter().map(|(path, _)| path.clone()).collect();
+        let mut listed = Vec::new();
+        store.list_roots(&paths, None, &mut listed).unwrap();
+        let statuses = store.status_in_roots(&roots).unwrap();
+        assert_eq!(statuses.len(), 3);
+        for status in &statuses {
+            let expected: Vec<&TrashEntry> = listed
+                .iter()
+                .filter(|entry| entry.trash_root == status.trash_dir)
+                .collect();
+            assert_eq!(status.count, expected.len());
+            assert_eq!(
+                status.total_size,
+                expected
+                    .iter()
+                    .map(|entry| store.entry_disk_size(entry))
+                    .fold(0u64, u64::saturating_add)
+            );
+        }
+        let size_of = |id: &str| {
+            let entry = listed.iter().find(|entry| entry.id == id).unwrap();
+            store.entry_disk_size(entry)
+        };
+        assert_eq!(size_of("regular"), 7);
+        assert_eq!(size_of("compressed"), 5);
+        assert_eq!(size_of("stored-tree"), 4321);
+        assert_eq!(size_of("missing"), 0);
+        assert_eq!(size_of("forged-large"), 12);
+        assert_eq!(size_of("forged-small"), 1);
+        assert_eq!(size_of("unsized"), 12);
+        assert!(
+            size_of("link") < 8192,
+            "a symlink's target must not be counted"
+        );
+        assert_eq!(listed.iter().filter(|entry| entry.orphaned).count(), 5);
+        let home = statuses
+            .iter()
+            .find(|status| status.trash_dir == store.home)
+            .unwrap();
+        assert_eq!(store.status().unwrap(), (home.total_size, home.count));
+        assert_eq!(
+            store.status_per_partition().unwrap()[0].total_size,
+            home.total_size
+        );
+    }
+
+    #[test]
+    fn retention_sizing_refreshes_metadata_after_a_status_snapshot() {
+        let (store, _data, work, _) = test_store();
+        let source = create_file(work.path(), "growing", "old");
+        let id = store.trash(&source, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        let snapshot = fs::symlink_metadata(&entry.trashed_path).unwrap();
+        fs::write(&entry.trashed_path, b"new longer data").unwrap();
+        assert_eq!(
+            store.entry_disk_size_from_metadata(&entry, Some(&snapshot)),
+            3
+        );
+        assert_eq!(store.entry_disk_size(&entry), 15);
     }
 
     #[test]
@@ -4377,6 +4833,220 @@ mod tests {
             fs::read(store.home.join("files").join(raw_b)).unwrap(),
             b"recoverable"
         );
+    }
+
+    #[test]
+    fn exact_selector_name_scan_matches_full_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let (store, _data, work, _) = test_store();
+        let foreign = work.path().join("foreign-trash");
+        fs::create_dir_all(foreign.join("info")).unwrap();
+        fs::create_dir(foreign.join("files")).unwrap();
+        let write_entry = |root: &Path, id: &OsStr, original: &str, data: bool| {
+            let mut sidecar = id.to_os_string();
+            sidecar.push(".trashinfo");
+            fs::write(
+                root.join("info").join(sidecar),
+                TrashInfo::new(work.path().join(original)).to_trashinfo_string(),
+            )
+            .unwrap();
+            if data {
+                fs::write(root.join("files").join(id), b"recoverable").unwrap();
+            }
+        };
+        for (id, original, data) in [
+            ("exact", "original", true),
+            ("other", "exact", true), // An exact ID wins over a filename.
+            ("alias-id", "filename-alias", true),
+            ("missing-data", "original-missing", false),
+            ("duplicate", "home-duplicate", true),
+            (".trashinfo", "hidden-leaf", true),
+            ("literal[*]", "literal-original", true),
+        ] {
+            write_entry(&store.home, OsStr::new(id), original, data);
+        }
+        // A pathological metadata name has the same raw file_stem as the
+        // normal hidden leaf above. Absolute selectors must keep the same
+        // ordering and snapshot construction as a complete scan.
+        fs::write(
+            store.home.join("info/.trashinfo"),
+            "[Trash Info]\nPath=/older-hidden\nDeletionDate=2000-01-01T00:00:00\n",
+        )
+        .unwrap();
+        write_entry(&foreign, OsStr::new("foreign"), "foreign-original", true);
+        // Duplicate IDs remain ambiguous even when the foreign copy is orphaned.
+        fs::write(foreign.join("files/duplicate"), b"foreign orphan").unwrap();
+        for id in ["orphan", "corrupt", "linked", "directory-sidecar", "fifo"] {
+            fs::write(store.home.join("files").join(id), b"recoverable").unwrap();
+        }
+        fs::write(store.home.join("info/corrupt.trashinfo"), b"invalid").unwrap();
+        symlink(
+            store.home.join("info/exact.trashinfo"),
+            store.home.join("info/linked.trashinfo"),
+        )
+        .unwrap();
+        fs::create_dir(store.home.join("info/directory-sidecar.trashinfo")).unwrap();
+        let fifo = CString::new(
+            store
+                .home
+                .join("info/fifo.trashinfo")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        for (raw, original) in [
+            (OsStr::from_bytes(b"raw\xff"), "raw-a"),
+            (OsStr::from_bytes(b"raw\xfe"), "raw-b"),
+            (OsStr::new("raw�"), "literal-replacement"),
+        ] {
+            write_entry(&store.home, raw, original, true);
+        }
+        let roots = [store.home.clone(), foreign.clone()];
+        let mut full = Vec::new();
+        store.list_roots(&roots, None, &mut full).unwrap();
+        full.sort_by_key(|entry| std::cmp::Reverse(entry.info.deletion_date));
+        let mut selectors: Vec<String> = [
+            "exact",
+            "other",
+            "filename-alias",
+            "missing-data",
+            "duplicate",
+            ".trashinfo",
+            "literal[*]",
+            "foreign",
+            "orphan",
+            "corrupt",
+            "linked",
+            "directory-sidecar",
+            "fifo",
+            "raw�",
+            "raw-a",
+            "raw-*",
+            "*original",
+            "missing",
+            "",
+            ".",
+            "..",
+            "../exact",
+            "files/exact",
+            "exact/child",
+            "bad\0name",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        selectors.extend(
+            full.iter()
+                .filter_map(|entry| entry.trashed_path.to_str().map(str::to_owned)),
+        );
+        selectors.extend([
+            work.path().join("outside/exact").to_str().unwrap().into(),
+            store.home.join("files/missing").to_str().unwrap().into(),
+            store
+                .home
+                .join("files/exact/child")
+                .to_str()
+                .unwrap()
+                .into(),
+            store
+                .home
+                .join("files/../files/exact")
+                .to_str()
+                .unwrap()
+                .into(),
+        ]);
+        for selector in selectors {
+            let expected = TrashStore::resolve_listed_entry(&full, &selector);
+            let actual = store.find_entry_in_roots(&roots, &selector);
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual.id, expected.id, "{selector:?}");
+                    assert_eq!(actual.trashed_path, expected.trashed_path, "{selector:?}");
+                    assert_eq!(actual.info_path, expected.info_path, "{selector:?}");
+                    assert_eq!(actual.trash_root, expected.trash_root, "{selector:?}");
+                    assert_eq!(actual.orphaned, expected.orphaned, "{selector:?}");
+                    assert_eq!(actual.identity, expected.identity, "{selector:?}");
+                    assert_eq!(
+                        actual.sidecar_version, expected.sidecar_version,
+                        "{selector:?}"
+                    );
+                    assert_eq!(
+                        actual.info.original_path, expected.info.original_path,
+                        "{selector:?}"
+                    );
+                    if !actual.orphaned {
+                        assert_eq!(
+                            actual.info.to_trashinfo_string(),
+                            expected.info.to_trashinfo_string(),
+                            "{selector:?}"
+                        );
+                    }
+                }
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual.to_string(), expected.to_string(), "{selector:?}")
+                }
+                (actual, expected) => {
+                    panic!("{selector:?}: actual {actual:?}, expected {expected:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_selector_reads_only_matching_sidecars_and_keeps_full_fallbacks() {
+        let (store, _data, work, _) = test_store();
+        for i in 0..300 {
+            let id = format!("entry-{i}");
+            fs::write(store.home.join("files").join(&id), b"data").unwrap();
+            fs::write(
+                store.home.join("info").join(format!("{id}.trashinfo")),
+                TrashInfo::new(work.path().join(format!("original-{i}"))).to_trashinfo_string(),
+            )
+            .unwrap();
+        }
+        for selector in [
+            "entry-150".to_owned(),
+            store.home.join("files/entry-150").to_str().unwrap().into(),
+        ] {
+            store.sidecar_reads.set(0);
+            assert_eq!(store.find_entry(&selector).unwrap().id, "entry-150");
+            assert_eq!(store.sidecar_reads.get(), 1);
+        }
+        for selector in ["original-150", "original-15?", "missing", "entry-�"] {
+            store.sidecar_reads.set(0);
+            let _ = store.find_entry(selector);
+            assert_eq!(store.sidecar_reads.get(), 300, "{selector}");
+        }
+    }
+
+    #[test]
+    fn exact_selector_preserves_home_errors_and_skips_broken_foreign_roots() {
+        let (store, _data, work, _) = test_store();
+        fs::write(store.home.join("files/orphan"), b"recoverable").unwrap();
+        let broken = work.path().join("broken");
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join("info"), b"not a directory").unwrap();
+        let roots = [store.home.clone(), broken];
+        assert!(
+            store
+                .find_entry_in_roots(&roots, "orphan")
+                .unwrap()
+                .orphaned
+        );
+        assert!(matches!(
+            store.find_entry_in_roots(&roots, "missing"),
+            Err(TrashError::EntryNotFound(_))
+        ));
+        fs::remove_dir(store.home.join("info")).unwrap();
+        fs::write(store.home.join("info"), b"not a directory").unwrap();
+        for selector in ["orphan", "missing", "*"] {
+            assert!(matches!(
+                store.find_entry_in_roots(&roots, selector),
+                Err(TrashError::Io(_))
+            ));
+        }
     }
 
     #[test]
@@ -5869,6 +6539,235 @@ mod tests {
         }
     }
 
+    fn seed_cached_directory(store: &TrashStore, work: &Path, name: &OsStr) {
+        fs::create_dir(store.home.join("files").join(name)).unwrap();
+        fs::write(store.home.join("files").join(name).join("leaf"), b"tree").unwrap();
+        let mut sidecar = name.to_os_string();
+        sidecar.push(".trashinfo");
+        fs::write(
+            store.home.join("info").join(sidecar),
+            TrashInfo::new(work.join(name)).to_trashinfo_string(),
+        )
+        .unwrap();
+        crate::directorysizes::write_cache(&store.home).unwrap();
+    }
+
+    #[test]
+    fn single_entry_cache_skips_file_and_symlink_removals_among_unrelated_files() {
+        use std::os::unix::fs::symlink;
+
+        for restore in [false, true] {
+            let (store, _data, work, _) = test_store();
+            seed_batch(&store, work.path(), 128);
+            seed_cached_directory(&store, work.path(), OsStr::new("cached-tree"));
+            let cache_path = store.home.join("directorysizes");
+            let cache_before = fs::read(&cache_path).unwrap();
+            let identity_before = file_identity(&cache_path);
+            let target = work.path().join("external-directory");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("KEEP"), b"external").unwrap();
+            symlink(&target, store.home.join("files/link")).unwrap();
+            fs::write(
+                store.home.join("info/link.trashinfo"),
+                TrashInfo::new(work.path().join("link")).to_trashinfo_string(),
+            )
+            .unwrap();
+            for id in ["batch-0", "link"] {
+                if restore {
+                    store.restore(id, None).unwrap();
+                } else {
+                    store.purge(id).unwrap();
+                }
+                assert_eq!(store.cache_refreshes.get(), 0);
+                assert_eq!(fs::read(&cache_path).unwrap(), cache_before);
+                assert_eq!(file_identity(&cache_path), identity_before);
+            }
+            assert_eq!(fs::read(target.join("KEEP")).unwrap(), b"external");
+            assert!(
+                crate::directorysizes::read_cache(&store.home)
+                    .contains_key(b"cached-tree".as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn single_entry_cache_keeps_absent_caches_optional_for_files_and_retired_sidecars() {
+        let (store, _data, work, _) = test_store();
+        seed_batch(&store, work.path(), 3);
+        store.restore("batch-0", None).unwrap();
+        store.purge("batch-1").unwrap();
+        fs::remove_file(store.home.join("files/batch-2")).unwrap();
+        fs::File::open(store.home.join("info/batch-2.trashinfo"))
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(10),
+                ),
+            )
+            .unwrap();
+        store.purge("batch-2").unwrap();
+        assert_eq!(store.cache_refreshes.get(), 0);
+        assert!(!store.home.join("directorysizes").exists());
+    }
+
+    #[test]
+    fn single_entry_cache_refreshes_directories_and_stale_raw_filename_rows() {
+        for restore in [false, true] {
+            let (store, _data, work, _) = test_store();
+            let raw_directory = OsStr::from_bytes(b"raw\xfe");
+            seed_cached_directory(&store, work.path(), raw_directory);
+            seed_cached_directory(&store, work.path(), OsStr::new("removed-tree"));
+            if restore {
+                store.restore("removed-tree", None).unwrap();
+            } else {
+                store.purge("removed-tree").unwrap();
+            }
+            assert_eq!(store.cache_refreshes.get(), 1);
+            let cached = crate::directorysizes::read_cache(&store.home);
+            assert!(cached.contains_key(raw_directory.as_bytes()));
+            assert!(!cached.contains_key(b"removed-tree".as_slice()));
+
+            // These two raw names have the same lossy display ID. A stale
+            // file row must be removed without touching the directory row.
+            let raw_file = OsStr::from_bytes(b"raw\xff");
+            fs::write(store.home.join("files").join(raw_file), b"file").unwrap();
+            let mut info_name = raw_file.to_os_string();
+            info_name.push(".trashinfo");
+            fs::write(
+                store.home.join("info").join(info_name),
+                TrashInfo::new(work.path().join("raw-file-original")).to_trashinfo_string(),
+            )
+            .unwrap();
+            let mut cache = fs::OpenOptions::new()
+                .append(true)
+                .open(store.home.join("directorysizes"))
+                .unwrap();
+            writeln!(cache, "123 456 raw%FF").unwrap();
+            drop(cache);
+            if restore {
+                store.restore("raw-file-original", None).unwrap();
+            } else {
+                store.purge("raw-file-original").unwrap();
+            }
+            assert_eq!(store.cache_refreshes.get(), 2);
+            let cached = crate::directorysizes::read_cache(&store.home);
+            assert!(!cached.contains_key(raw_file.as_bytes()));
+            assert!(cached.contains_key(raw_directory.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn single_entry_cache_uses_the_mutated_root_and_keeps_replacement_checks() {
+        for restore in [false, true] {
+            let (mut store, _data, work, _) = test_store();
+            let (external, _external_data, external_work, _) = test_store();
+            seed_cached_directory(&store, work.path(), OsStr::new("home-tree"));
+            seed_cached_directory(&external, external_work.path(), OsStr::new("foreign-tree"));
+            seed_batch(&external, external_work.path(), 1);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(external.home.join("directorysizes"))
+                .unwrap()
+                .write_all(b"123 456 batch-0\n")
+                .unwrap();
+            let home_before = fs::read(store.home.join("directorysizes")).unwrap();
+            let external_before = fs::read(external.home.join("directorysizes")).unwrap();
+            let mut stale = external.find_entry("batch-0").unwrap();
+            fs::rename(&stale.trashed_path, external_work.path().join("old-inode")).unwrap();
+            fs::write(&stale.trashed_path, b"replacement").unwrap();
+            // Only fixture roots are ever used; permit explicitly resolved
+            // foreign entries as a production store does, without discovery.
+            store.isolated = false;
+            let destination = work.path().join("restored-foreign");
+            let rejected = if restore {
+                store
+                    .restore_entry(&mut stale, Some(&destination))
+                    .map(|_| ())
+            } else {
+                store.purge_resolved_with_maintenance(&stale, true)
+            };
+            assert!(matches!(rejected, Err(TrashError::EntryNotFound(_))));
+            assert_eq!(store.cache_refreshes.get(), 0);
+            assert_eq!(
+                fs::read(external.home.join("directorysizes")).unwrap(),
+                external_before
+            );
+            let mut current = external.find_entry("batch-0").unwrap();
+            if restore {
+                store
+                    .restore_entry(&mut current, Some(&destination))
+                    .unwrap();
+            } else {
+                store
+                    .purge_resolved_with_maintenance(&current, true)
+                    .unwrap();
+            }
+            assert_eq!(store.cache_refreshes.get(), 1);
+            assert_eq!(
+                fs::read(store.home.join("directorysizes")).unwrap(),
+                home_before
+            );
+            let cache = crate::directorysizes::read_cache(&external.home);
+            assert!(!cache.contains_key(b"batch-0".as_slice()));
+            assert!(cache.contains_key(b"foreign-tree".as_slice()));
+        }
+    }
+
+    #[test]
+    fn single_entry_cache_repairs_malformed_and_special_caches_best_effort() {
+        use std::os::unix::fs::symlink;
+
+        for restore in [false, true] {
+            for kind in [
+                "syntax",
+                "name",
+                "percent",
+                "nul",
+                "utf8",
+                "link",
+                "fifo",
+                "directory",
+            ] {
+                let (store, _data, work, _) = test_store();
+                seed_cached_directory(&store, work.path(), OsStr::new("cached-tree"));
+                seed_batch(&store, work.path(), 1);
+                let cache = store.home.join("directorysizes");
+                fs::remove_file(&cache).unwrap();
+                let target = create_file(work.path(), "KEEP", "external cache target");
+                match kind {
+                    "syntax" => fs::write(&cache, b"malformed row\n").unwrap(),
+                    "name" => fs::write(&cache, b"123 456 %2Fescape\n").unwrap(),
+                    "percent" => fs::write(&cache, b"123 456 bad%GG\n").unwrap(),
+                    "nul" => fs::write(&cache, b"123 456 nul%00name\n").unwrap(),
+                    "utf8" => fs::write(&cache, b"invalid\xff").unwrap(),
+                    "link" => symlink(&target, &cache).unwrap(),
+                    "fifo" => {
+                        let name = CString::new(cache.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    }
+                    "directory" => fs::create_dir(&cache).unwrap(),
+                    _ => unreachable!(),
+                }
+                if restore {
+                    store.restore("batch-0", None).unwrap();
+                } else {
+                    store.purge("batch-0").unwrap();
+                }
+                assert_eq!(store.cache_refreshes.get(), 1, "{kind}");
+                assert_eq!(fs::read(&target).unwrap(), b"external cache target");
+                if kind == "directory" {
+                    assert!(cache.is_dir()); // Repair failures remain optional.
+                } else {
+                    assert!(fs::symlink_metadata(&cache).unwrap().is_file());
+                    assert!(
+                        crate::directorysizes::read_cache(&store.home)
+                            .contains_key(b"cached-tree".as_slice())
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn batch_restore_reads_sidecars_once_and_refreshes_cache_once() {
         for count in [32, 64] {
@@ -5967,7 +6866,7 @@ mod tests {
         let (external, _external_data, _, _) = test_store();
         seed_batch(&external, work.path(), 2);
         let entries = external.list(None).unwrap();
-        let index = store.index.as_ref().unwrap();
+        let index = store.index().unwrap();
         index
             .insert(&entries[0].id, &entries[0].info, &external.home)
             .unwrap();
@@ -5983,7 +6882,7 @@ mod tests {
                 store.restore_batch(std::slice::from_ref(entry), Some(&target), false)[0].is_ok()
             );
         }
-        assert_eq!(store.index.as_ref().unwrap().count().unwrap(), 1);
+        assert_eq!(store.index().unwrap().count().unwrap(), 1);
     }
 
     #[test]

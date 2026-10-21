@@ -9,7 +9,10 @@ pub fn run(
     before: Option<&str>,
     json: bool,
 ) {
-    let mut entries = match store.list(pattern) {
+    let progress = ScanProgress::start(!json);
+    let entries = store.list(pattern);
+    drop(progress);
+    let mut entries = match entries {
         Ok(e) => e,
         Err(e) => fatal(e),
     };

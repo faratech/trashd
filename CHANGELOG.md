@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.1.12 (2026-10-21)
+
+This release reduces system calls in trash scans, preload interception,
+seccomp handling, restore, logging and optional-index maintenance. It also
+fixes Rustup cleanup flooding the trash and a restore deadlock involving
+trusted symlinked trash ancestors. Existing trash contents are preserved.
+
+### Fixed
+
+- Rustup and rustup-init now bypass trash like other package/build tools,
+  preventing toolchain cleanup from publishing tens of thousands of rustdoc
+  backup entries. Existing entries are not automatically purged (#282).
+- Preload recognizes the physical home trash when its configured parent
+  contains trusted symlinks. Restore can remove its own metadata without
+  re-interception and waiting on its own root lock. Symlink ownership and
+  target ancestry are authenticated; the final Trash directory must still
+  be a real, private directory (#289).
+
+### Performance
+
+- `trash status` totals entries in one pass, reusing file metadata and
+  discovering trash roots once. It no longer builds or sorts a complete
+  listing or checks every data file a second time (#281).
+- Large trash listings read sidecars through one validated descriptor
+  snapshot, avoiding redundant metadata queries, seeks and EOF probes while
+  retaining replacement and modification checks (#281).
+- Long interactive `trash status` and `trash ls` scans show delayed progress
+  on stderr. Fast commands, redirected output and JSON remain quiet (#281).
+- Listing and fsck reuse exact deletion-date conversions within each scan,
+  avoiding a clock read for every repeated timestamp. The bounded cache
+  retains Chrono's DST, ambiguous-time and historical-offset behavior;
+  standalone parsing is unchanged (#288).
+- Read-only store operations no longer initialize SQLite or create its
+  journal and shared-memory files. The optional index opens on demand for
+  mutations; sidecars remain the authoritative source (#293).
+- Global `never_trash` rules run before local-policy ancestor walks. Preload
+  also skips unnecessary source metadata checks on these excluded paths.
+  Local policies remain fresh for every other operand (#285).
+- Ordinary paths avoid mount-table reads when they cannot be inside a
+  mounted trash root. Authenticated home-trash cleanup checks its current
+  ownership, mode and inode before consulting mounts. Enumeration observes
+  the home device once per scan; removable filesystems are not pinned (#284).
+- Preload reuses its existing time sample for configuration change notices,
+  makes immutable config access free of clock reads, and samples the PID
+  once per eligible hook. Parent changes and forked children are still
+  detected; explicit bypass adds no PID or clock calls (#283, #298).
+- Existing directory preparation reuses its successful metadata lookup.
+  Creation and permission repair still trigger fresh validation, and source
+  replacement is checked before publication (#297).
+- Seccomp skips pathname capture and broker work for bypassed processes,
+  bypassed environments and invalid unlinkat flags. Protected operations
+  retain one captured pathname and the pinned mutation path (#286).
+- Seccomp reads process name and parent from one fresh procfs stat record,
+  stops immediately on an executable match, and avoids redundant executable
+  lookups. Script names and non-leader thread names remain covered (#287).
+- Seccomp opens the target cwd only for operations that use it. The target
+  root remains pinned for policy and recorded-path validation, and the full
+  startup readiness probe remains intact (#296).
+- Forced single-entry restore resolves the trash entry once, retaining its
+  mutable snapshot through conflict handling instead of rescanning every
+  sidecar. Existing destinations and occupied suffixes are preserved (#292).
+- Ordinary exact IDs and absolute trash selectors enumerate directory names
+  but read only matching sidecars. Every root is checked for ambiguity;
+  filename, glob and raw-name collision cases retain full resolution.
+  Home read errors and foreign-root warnings are preserved (#299).
+- Single-file and symlink restores and purges avoid rebuilding the complete
+  directory-size cache when the removed raw name has no cached row. Directory
+  removal, stale rows and malformed or unusable caches retain full refresh;
+  batch maintenance is unchanged (#300).
+- Locked mutations reuse the data and sidecar metadata they just validated.
+  Fresh checks remain after encoding, decompression and lock waits, with
+  final pinned-source identity checks before mutation (#294).
+- Operation-log appends create parent directories and repair permissions
+  only when necessary. Each append still reopens and validates the current
+  regular file. Log tails use positioned reads without EOF or per-chunk
+  seeks, preserving bounded I/O and line semantics (#290, #291).
+- The rebuildable SQLite cache uses `synchronous=NORMAL` only when SQLite
+  confirms WAL mode. Cache commits avoid per-entry syncs; SQLite still syncs
+  checkpoints, and non-WAL fallback retains `FULL`. A system crash or power
+  loss can roll back recent cache rows; files and sidecars remain
+  authoritative, with their durability operations unchanged (#295).
+
+### Measurement and validation
+
+Fixed-workload profiling includes process startup. Timings depend on
+filesystem, cache warmth and system load; syscall counts describe the
+specific fixtures rather than a universal speed guarantee.
+
+- Published 0.1.11 versus the optimized CLI on 6,000 entries reduces
+  `trash status` calls from 72,431 to 36,180 (50% fewer), JSON listing from
+  66,399 to 36,197 (45% fewer), and exact `trash info` lookup from 66,398
+  to 191 (99.7% fewer), with identical command output.
+- A long-lived process performing 50 unlinks and 50 empty-directory removals
+  uses about 35% fewer calls when protected and 67% fewer when excluded.
+  Explicit bypass retains its fast path; native controls are unchanged.
+- Parsing 6,000 identical deletion timestamps reduces clock reads from
+  6,003 to 4. Unique timestamps retain their original clock-read count.
+- Exact lookup on 6,000 entries reads one sidecar instead of 6,000. Combined
+  lookup and cache-maintenance changes reduce a single-file restore in the
+  store harness from about 42,449 calls to 423.
+- A 50-entry store-harness trash or empty workload makes 4 sync calls instead
+  of 54. Read-only startup performs no SQLite page writes or locking.
+- One hundred log appends reduce calls from 1,116 to 819; one hundred log
+  tail reads reduce calls from 708 to 508 and make no seek calls.
+
+Regressions cover mixed home/foreign stores, raw filenames and orphans,
+replacement and permission changes, historical timezones and DST, fresh
+local policies, forked sidecar PIDs, symlinked home paths, restore conflicts,
+SQLite WAL/fallback behavior, and log privacy and malformed-file handling.
+Destructive checks run in disposable filesystems.
+
+`tests/syscall_bench.py` compares current and previous native CLI/preload
+artifacts in the same sandbox, verifies output and recovered payloads, and
+emits JSON call counts after confirming external trash sentinels are intact.
+It reports measurements without imposing machine-dependent timing gates.
+
+Rust 1.99.1 and all dependency versions remain unchanged from 0.1.11, where
+they were updated and verified current.
+
 ## 0.1.11 (2026-10-21)
 
 This release fixes all 14 findings from the bug and performance bash

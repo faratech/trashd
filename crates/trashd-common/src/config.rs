@@ -142,6 +142,8 @@ fn default_bypass_processes() -> Vec<String> {
         "rpm".into(),
         "pip".into(),
         "cargo".into(),
+        "rustup".into(),
+        "rustup-init".into(),
         "npm".into(),
         "make".into(),
         "git".into(),
@@ -308,6 +310,11 @@ impl Config {
     ///   3. If `only_trash` is non-empty and path doesn't match → skip (real-delete)
     ///   4. Otherwise → trash it
     pub fn should_skip(&self, path: &Path) -> bool {
+        // Global never_trash is an unconditional veto. A local policy cannot
+        // change it, so excluded paths need no filesystem policy walk.
+        if pattern_matches_any(&self.never_trash, path) {
+            return true;
+        }
         // Check per-directory .trashd.toml overrides
         if let Some(local) = Self::load_local_config(path) {
             // Local never_trash wins first
@@ -319,16 +326,13 @@ impl Config {
                 if !pattern_matches_any(&local.only_trash, path) {
                     return true; // doesn't match local whitelist → skip
                 }
-                // Matched local whitelist — still check global never_trash below,
-                // but skip the global only_trash check (local overrides it).
-                if pattern_matches_any(&self.never_trash, path) {
-                    return true;
-                }
+                // The global veto already passed. Local only_trash overrides
+                // global only_trash, which must not be re-applied here.
                 return false;
             }
         }
 
-        self.should_skip_configured(path)
+        !self.only_trash.is_empty() && !pattern_matches_any(&self.only_trash, path)
     }
 
     /// Evaluate only this configuration's rules, without reading local files.
@@ -695,6 +699,28 @@ mod tests {
         assert!(cfg.should_skip(Path::new("/home/user/script.py")));
         // But local .trashd.toml with only_trash=["*.py"] should override
         // (tested via integration test since it requires filesystem)
+    }
+
+    #[test]
+    fn global_veto_and_fresh_local_whitelists_keep_precedence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let policy = fixture.path().join(".trashd.toml");
+        let mut config = default_config();
+        config.never_trash = vec!["*.keep".into()];
+        config.only_trash = vec!["*.txt".into()];
+        std::fs::write(&policy, "only_trash = [\"*.py\", \"*.keep\"]\n").unwrap();
+        assert!(config.should_skip(&fixture.path().join("data.keep")));
+        assert!(!config.should_skip(&fixture.path().join("script.py")));
+        assert!(config.should_skip(&fixture.path().join("notes.txt")));
+
+        // A rewrite is observed immediately for operands outside the global
+        // veto: neither positive nor absent local policies are cached.
+        std::fs::write(&policy, "only_trash = [\"*.rs\"]\n").unwrap();
+        assert!(config.should_skip(&fixture.path().join("script.py")));
+        assert!(!config.should_skip(&fixture.path().join("main.rs")));
+        std::fs::remove_file(&policy).unwrap();
+        assert!(!config.should_skip(&fixture.path().join("notes.txt")));
+        assert!(config.should_skip(&fixture.path().join("main.rs")));
     }
 
     #[test]

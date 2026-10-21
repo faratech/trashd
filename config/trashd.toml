@@ -63,6 +63,8 @@ bypass_processes = [
     "rpm",
     "pip",
     "cargo",
+    "rustup",
+    "rustup-init",
     "npm",
     "make",
     "git",

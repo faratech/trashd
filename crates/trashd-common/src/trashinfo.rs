@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local, NaiveDateTime};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -7,17 +8,23 @@ use std::path::{Path, PathBuf};
 /// Read a regular metadata file without following symlinks or waiting for a
 /// FIFO writer. Check the opened descriptor, so a replacement between lookup
 /// and open cannot turn the read into a stream from a special file.
-pub(crate) fn read_regular_text_file(path: &Path) -> io::Result<String> {
-    let mut file = fs::OpenOptions::new()
+fn open_regular_metadata_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "trash metadata is not a regular file",
         ));
     }
+    Ok((file, metadata))
+}
+
+pub(crate) fn read_regular_text_file(path: &Path) -> io::Result<String> {
+    let (mut file, _) = open_regular_metadata_file(path)?;
     let mut text = String::new();
     file.read_to_string(&mut text)?;
     Ok(text)
@@ -27,6 +34,88 @@ pub(crate) fn read_regular_text_file(path: &Path) -> io::Result<String> {
 /// including ones substituted while a listing or integrity check is running.
 pub fn read_sidecar(path: &Path) -> io::Result<String> {
     read_regular_text_file(path)
+}
+
+/// Read exactly the opened sidecar's observed length and return that inode's
+/// metadata with its contents. The caller must compare the path's final
+/// version against this metadata before accepting the snapshot. Truncation
+/// fails the read; growth or replacement is rejected by that version check.
+/// Unlike File::read_to_string, this needs no extra metadata query, seek, or
+/// EOF probe for every small sidecar in a large trash.
+pub(crate) fn read_sidecar_snapshot(path: &Path) -> io::Result<(String, fs::Metadata)> {
+    let (mut file, metadata) = open_regular_metadata_file(path)?;
+    let text = read_text_exact(&mut file, metadata.len())?;
+    Ok((text, metadata))
+}
+
+fn read_text_exact(file: &mut fs::File, len: u64) -> io::Result<String> {
+    let len = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::FileTooLarge, "trash metadata is too large"))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(io::Error::other)?;
+    // Take stops at the observed length without probing the file for EOF.
+    // Let read_to_end initialize only bytes actually read: resizing up front
+    // would touch the entire allocation even if a large file was truncated.
+    file.take(len as u64).read_to_end(&mut bytes)?;
+    if bytes.len() != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "trash metadata was truncated while reading",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Reuse exact second-resolution timestamp conversions within one scan.
+///
+/// Construct with [`Default::default`] for each new scan and call [`Self::parse`]
+/// for its sidecars. At most 256 exact dates are retained, with no process-global
+/// cache. Discard the parser after the scan so later operations resolve their
+/// local timezone independently. Exact keys retain Chrono's historical and DST
+/// fold/gap handling rather than assuming one offset for a whole day or year.
+#[derive(Default)]
+pub struct TrashInfoParser {
+    dates: HashMap<NaiveDateTime, Option<DateTime<Local>>>,
+    #[cfg(test)]
+    resolutions: usize,
+}
+
+const SCAN_DATE_CACHE_LIMIT: usize = 256;
+
+impl TrashInfoParser {
+    /// Parse a sidecar, reusing conversions first resolved during this scan.
+    /// Metadata validation and first-occurrence handling match
+    /// [`TrashInfo::from_trashinfo`]; standalone parsing remains uncached.
+    pub fn parse(&mut self, content: &str) -> Option<TrashInfo> {
+        TrashInfo::parse_with_resolver(content, |naive| {
+            if self.dates.len() == SCAN_DATE_CACHE_LIMIT {
+                if let Some(resolved) = self.dates.get(&naive) {
+                    return *resolved;
+                }
+                self.dates.clear();
+            }
+            *self.dates.entry(naive).or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    self.resolutions += 1;
+                }
+                resolve_local_deletion_date(naive)
+            })
+        })
+    }
+}
+
+fn resolve_local_deletion_date(naive: NaiveDateTime) -> Option<DateTime<Local>> {
+    match naive.and_local_timezone(Local) {
+        chrono::LocalResult::Single(dt) => Some(dt),
+        chrono::LocalResult::Ambiguous(_, latest) => Some(latest),
+        chrono::LocalResult::None => {
+            // Preserve the existing gap recovery, including zones whose
+            // transition is shorter or longer than an hour.
+            let shifted = naive + chrono::Duration::hours(1);
+            shifted.and_local_timezone(Local).earliest()
+        }
+    }
 }
 
 /// Represents a .trashinfo metadata file per FreeDesktop.org Trash spec.
@@ -107,6 +196,13 @@ impl TrashInfo {
     /// - If `Path=` or `DeletionDate=` appears multiple times, first occurrence wins
     /// - Path value is NOT trimmed (percent-encoded spaces are meaningful)
     pub fn from_trashinfo(content: &str) -> Option<Self> {
+        Self::parse_with_resolver(content, resolve_local_deletion_date)
+    }
+
+    fn parse_with_resolver(
+        content: &str,
+        mut resolve_date: impl FnMut(NaiveDateTime) -> Option<DateTime<Local>>,
+    ) -> Option<Self> {
         // Spec: "First line MUST be: [Trash Info]"
         let first_line = content.lines().find(|l| !l.trim().is_empty())?;
         if first_line.trim() != "[Trash Info]" {
@@ -168,15 +264,7 @@ impl TrashInfo {
                         if let Ok(naive) =
                             NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%dT%H:%M:%S")
                         {
-                            date = match naive.and_local_timezone(Local) {
-                                chrono::LocalResult::Single(dt) => Some(dt),
-                                chrono::LocalResult::Ambiguous(_, latest) => Some(latest),
-                                chrono::LocalResult::None => {
-                                    // DST gap — shift forward by an hour
-                                    let shifted = naive + chrono::Duration::hours(1);
-                                    shifted.and_local_timezone(Local).earliest()
-                                }
-                            };
+                            date = resolve_date(naive);
                         }
                     }
                     // First occurrence wins for the extensions too: a later
@@ -276,6 +364,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scan_date_cache_reuses_exact_dates_and_has_bounded_memory() {
+        let base =
+            NaiveDateTime::parse_from_str("2026-10-20T00:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let content = |naive: NaiveDateTime| {
+            format!(
+                "[Trash Info]\nPath=/original\nDeletionDate={}\n",
+                naive.format("%Y-%m-%dT%H:%M:%S")
+            )
+        };
+        let mut parser = TrashInfoParser::default();
+        let repeated = content(base);
+        let expected = TrashInfo::from_trashinfo(&repeated).unwrap().deletion_date;
+        for _ in 0..1000 {
+            assert_eq!(parser.parse(&repeated).unwrap().deletion_date, expected);
+        }
+        assert_eq!(parser.resolutions, 1);
+        for seconds in 1..1000 {
+            let text = content(base + chrono::Duration::seconds(seconds));
+            assert_eq!(
+                parser.parse(&text).unwrap().deletion_date,
+                TrashInfo::from_trashinfo(&text).unwrap().deletion_date
+            );
+            assert!(parser.dates.len() <= SCAN_DATE_CACHE_LIMIT);
+        }
+        let mut next_scan = TrashInfoParser::default();
+        assert_eq!(next_scan.parse(&repeated).unwrap().deletion_date, expected);
+        assert_eq!(
+            next_scan.resolutions, 1,
+            "a new scan must resolve its timezone independently"
+        );
+    }
+
+    #[test]
+    fn scan_date_cache_matches_dst_folds_gaps_and_historical_offsets() {
+        const CHILD: &str = "TRASHD_DATE_CACHE_TZ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for zone in [
+                "UTC0",
+                "America/New_York",
+                "Australia/Lord_Howe",
+                "Pacific/Apia",
+                "Europe/Kyiv",
+            ] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("trashinfo::tests::scan_date_cache_matches_dst_folds_gaps_and_historical_offsets")
+                    .env(CHILD, "1")
+                    .env("TZ", zone)
+                    .env("TRASH_BYPASS", "1")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "timezone child failed for {zone}");
+            }
+            return;
+        }
+        let mut parser = TrashInfoParser::default();
+        for date in [
+            "1883-11-18T12:01:00",
+            "1990-07-01T01:30:00",
+            "2011-12-30T12:30:00",
+            "2019-03-10T02:30:00",
+            "2019-11-03T01:30:00",
+            "2019-04-07T01:45:00",
+            "2019-10-06T02:15:00",
+            "2026-01-01T00:00:00",
+            "2026-07-01T00:00:00",
+        ] {
+            let text = format!("[Trash Info]\nPath=/original\nDeletionDate={date}\n");
+            let expected = TrashInfo::from_trashinfo(&text).map(|info| info.deletion_date);
+            for _ in 0..5 {
+                assert_eq!(
+                    parser.parse(&text).map(|info| info.deletion_date),
+                    expected,
+                    "conversion differs for {date}"
+                );
+            }
+        }
+        let text = "[Trash Info]\nPath=/original\nDeletionDate=2011-12-30T12:30:00\n";
+        if std::env::var("TZ").as_deref() == Ok("Pacific/Apia") {
+            assert!(
+                parser.parse(text).is_none(),
+                "a whole-day gap remains invalid after the existing one-hour recovery"
+            );
+        }
+    }
+
+    #[test]
     fn sidecar_reader_accepts_only_regular_files() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
@@ -286,6 +461,9 @@ mod tests {
         let regular = fixture.path().join("regular.trashinfo");
         fs::write(&regular, "metadata").unwrap();
         assert_eq!(read_sidecar(&regular).unwrap(), "metadata");
+        let (content, metadata) = read_sidecar_snapshot(&regular).unwrap();
+        assert_eq!(content, "metadata");
+        assert_eq!(metadata.len(), 8);
 
         let fifo = fixture.path().join("fifo.trashinfo");
         let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
@@ -296,6 +474,10 @@ mod tests {
         symlink(&regular, &link).unwrap();
         for invalid in [&fifo, &socket, &link, fixture.path()] {
             assert!(read_sidecar(invalid).is_err(), "accepted {invalid:?}");
+            assert!(
+                read_sidecar_snapshot(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
         }
         // Arbitrary regular files keep the ordinary UTF-8 read contract.
         fs::write(&regular, b"\xff").unwrap();
@@ -303,6 +485,40 @@ mod tests {
             read_sidecar(&regular).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(
+            read_sidecar_snapshot(&regular).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn sidecar_snapshot_reads_observed_length_and_rejects_truncation() {
+        use std::io::Write;
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("growing.trashinfo");
+        fs::write(&path, "métadata").unwrap();
+        let (mut input, metadata) = open_regular_metadata_file(&path).unwrap();
+        let mut writer = fs::File::options().append(true).open(&path).unwrap();
+        writer.write_all(b" appended").unwrap();
+        assert_eq!(
+            read_text_exact(&mut input, metadata.len()).unwrap(),
+            "métadata"
+        );
+        assert_ne!(metadata.len(), writer.metadata().unwrap().len());
+        // Other callers retain a full regular-file read. Only the snapshot
+        // API stops at the captured length and requires version validation.
+        assert_eq!(read_sidecar(&path).unwrap(), "métadata appended");
+
+        let (mut input, metadata) = open_regular_metadata_file(&path).unwrap();
+        writer.set_len(3).unwrap();
+        assert_eq!(
+            read_text_exact(&mut input, metadata.len())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+        fs::write(&path, b"").unwrap();
+        assert_eq!(read_sidecar_snapshot(&path).unwrap().0, "");
     }
 
     // Regression (#223): from_str_radix accepts a sign ("%+F" decoded as

@@ -27,31 +27,83 @@ pub struct DirSizeEntry {
 /// Read the directorysizes cache for a trash directory.
 pub fn read_cache(trash_dir: &Path) -> HashMap<Vec<u8>, DirSizeEntry> {
     let cache_path = trash_dir.join("directorysizes");
-    let mut entries = HashMap::new();
-
     let content = match crate::trashinfo::read_regular_text_file(&cache_path) {
         Ok(c) => c,
-        Err(_) => return entries,
+        Err(_) => return HashMap::new(),
     };
+    parse_cache(&content).0
+}
+
+/// Check a removed raw name without traversing the trash. A malformed or
+/// unreadable cache needs the same best-effort rebuild as before; callers may
+/// skip maintenance only after a successful parse (or an absent cache).
+pub(crate) fn cache_contains_name(trash_dir: &Path, name: &OsStr) -> io::Result<bool> {
+    let content = crate::trashinfo::read_regular_text_file(&trash_dir.join("directorysizes"))?;
+    let (entries, malformed) = parse_cache(&content);
+    if malformed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed directorysizes cache",
+        ));
+    }
+    Ok(entries.contains_key(name.as_bytes()))
+}
+
+fn parse_cache(content: &str) -> (HashMap<Vec<u8>, DirSizeEntry>, bool) {
+    let mut entries = HashMap::new();
+    let mut malformed = false;
 
     for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() != 3 {
+            malformed = true;
             continue;
         }
         let size: u64 = match parts[0].parse() {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                malformed = true;
+                continue;
+            }
         };
         let mtime: i64 = match parts[1].parse() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                malformed = true;
+                continue;
+            }
         };
+        // Keep the public reader's permissive decoding, but a checked read
+        // must request repair for invalid/incomplete escapes instead of
+        // treating the resulting literal percent bytes as a valid cache.
+        let mut encoded = parts[2].bytes();
+        while let Some(byte) = encoded.next() {
+            if byte == b'%'
+                && !matches!(
+                    (encoded.next(), encoded.next()),
+                    (Some(hi), Some(lo)) if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit()
+                )
+            {
+                malformed = true;
+                break;
+            }
+        }
         let name = decode_name(parts[2]);
+        if name.is_empty()
+            || name.contains(&b'/')
+            || name.contains(&0)
+            || name == b"."
+            || name == b".."
+        {
+            malformed = true;
+        }
         entries.insert(name.clone(), DirSizeEntry { size, mtime, name });
     }
 
-    entries
+    (entries, malformed)
 }
 
 /// Write/update the directorysizes cache for a trash directory.
@@ -207,6 +259,54 @@ fn decode_name(s: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn checked_cache_names_reject_malformed_encoding_without_changing_public_reads() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cases: &[(&str, &[u8], bool)] = &[
+            ("bad%GG", b"bad%GG", false),
+            ("bad%G0", b"bad%G0", false),
+            ("bad%0G", b"bad%0G", false),
+            ("trailing%", b"trailing%", false),
+            ("short%A", b"short%A", false),
+            ("nul%00name", b"nul\0name", false),
+            ("", b"", false),
+            ("%2F", b"/", false),
+            ("%2f", b"/", false),
+            (".", b".", false),
+            ("%2e%2E", b"..", false),
+            ("plain", b"plain", true),
+            ("literal%25GG", b"literal%GG", true),
+            ("literal%252F", b"literal%2F", true),
+            ("raw%FF", b"raw\xff", true),
+            ("encoded%20space", b"encoded space", true),
+        ];
+        for &(encoded, decoded, valid) in cases {
+            fs::write(
+                fixture.path().join("directorysizes"),
+                format!("7 9 kept\n123 456 {encoded}\n"),
+            )
+            .unwrap();
+            // The legacy public map retains even permissively decoded bad
+            // names. Only the checked helper uses the malformed flag.
+            let public = read_cache(fixture.path());
+            assert_eq!(public.len(), 2, "{encoded}");
+            let entry = public.get(decoded).unwrap();
+            assert_eq!((entry.size, entry.mtime), (123, 456), "{encoded}");
+            assert_eq!(entry.name, decoded, "{encoded}");
+            let checked = cache_contains_name(fixture.path(), OsStr::from_bytes(decoded));
+            if valid {
+                assert!(checked.unwrap(), "{encoded}");
+                assert!(!cache_contains_name(fixture.path(), OsStr::new("absent")).unwrap());
+            } else {
+                assert_eq!(
+                    checked.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                    "{encoded}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fifo_cache_is_ignored_and_replaced_without_blocking() {

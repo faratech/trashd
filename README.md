@@ -359,7 +359,7 @@ only_trash = []
 bypass_processes = [
     "apt", "apt-get", "dpkg",
     "yum", "dnf", "pacman", "rpm",
-    "pip", "cargo", "npm", "make",
+    "pip", "cargo", "rustup", "rustup-init", "npm", "make",
     "git",
     "journald",
     "containerd", "dockerd",
