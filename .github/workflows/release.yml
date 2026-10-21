@@ -36,7 +36,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -93,10 +93,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
@@ -113,7 +113,7 @@ jobs:
       - name: Install zig cross linker
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
-          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.16.0 cargo-zigbuild==0.23.4
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.17.0 cargo-zigbuild==0.23.4
           echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
 
       - name: Install aarch64 strip
@@ -173,7 +173,7 @@ jobs:
           fi
 
           # Docs
-          cp README.md "${STAGING}/"
+          cp README.md CHANGELOG.md "${STAGING}/"
           cp LICENSE* "${STAGING}/" 2>/dev/null || true
 
           # Create tarball + checksum
@@ -204,7 +204,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -274,6 +274,74 @@ jobs:
           grep -q '^VERSION="'"${RELEASE_VERSION}"'"$' artifacts/install-trashd.sh
           chmod +x artifacts/install-trashd.sh
 
+      - name: Generate comprehensive release notes
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'NOTES_PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          lines = Path("CHANGELOG.md").read_text().splitlines()
+          changes = []
+          collecting = False
+          for line in lines:
+              if line.startswith("## "):
+                  if collecting:
+                      break
+                  collecting = line.startswith(f"## {version} (") or line == f"## {version}"
+                  continue
+              if collecting:
+                  changes.append(line)
+          changes = "\n".join(changes).strip()
+          checksums = "".join(
+              path.read_text()
+              for path in sorted(Path("artifacts").glob("trashd-linux-*/*.sha256"))
+          ).strip()
+          notes = f"""## trashd {version}
+
+          Linux recycle bin with four interception and audit layers.
+
+          {changes}
+
+          ### Quick install (no Rust required)
+          ```bash
+          curl -fsSL https://github.com/faratech/trashd/releases/download/v{version}/install-trashd.sh | sudo bash
+          ```
+
+          ### Manual install from tarball
+          ```bash
+          tar xzf trashd-{version}-linux-x86_64.tar.gz
+          cd trashd-{version}-linux-x86_64
+          sudo ./install.sh
+          ```
+          Use the aarch64 archive on ARM64 hosts.
+
+          ### Build from source
+          ```bash
+          git clone --branch v{version} https://github.com/faratech/trashd.git
+          cd trashd
+          sudo ./install.sh
+          ```
+          Source builds require Rust 1.99.1 or newer and run compilation as the invoking non-root user.
+
+          ### Checksums
+          ```
+          {checksums}
+          ```
+          Download the matching `.sha256` file and run `sha256sum -c` before extracting.
+
+          ### Verification
+          Release tarballs and checksum files have GitHub build attestations:
+          ```bash
+          gh attestation verify trashd-{version}-linux-x86_64.tar.gz --repo faratech/trashd
+          gh attestation verify trashd-{version}-linux-aarch64.tar.gz --repo faratech/trashd
+          ```
+          """
+          Path("release-notes.md").write_text(notes)
+          NOTES_PY
+
       - name: Create GitHub Release (also creates the tag)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -293,52 +361,18 @@ jobs:
           done
           ASSETS="${ASSETS} artifacts/install-trashd.sh"
 
-          # Build checksums section
-          CHECKSUMS=$(cat artifacts/trashd-linux-*/trashd-*.sha256 2>/dev/null || echo "see .sha256 files")
-
           # Retryable: re-running after a partial release must upload to
           # the existing release instead of failing at create (#264).
           if gh release view "v${VERSION}" >/dev/null 2>&1; then
             gh release upload "v${VERSION}" --clobber ${ASSETS}
+            gh release edit "v${VERSION}" --notes-file release-notes.md
           else
           # Tag the commit that was built, not whatever main points at by
           # the time this job runs (#238).
           gh release create "v${VERSION}" \
             --target "${GITHUB_SHA}" \
             --title "trashd ${VERSION}" \
-            --notes "## trashd ${VERSION}
-
-          Linux recycle bin with 4-layer interception (PATH shim, LD_PRELOAD, seccomp, fanotify).
-
-          ### Quick install (no Rust required)
-          \`\`\`bash
-          curl -fsSL https://github.com/faratech/trashd/releases/download/v${VERSION}/install-trashd.sh | sudo bash
-          \`\`\`
-
-          ### Manual install from tarball
-          \`\`\`bash
-          tar xzf trashd-${VERSION}-linux-x86_64.tar.gz
-          cd trashd-${VERSION}-linux-x86_64
-          sudo ./install.sh
-          \`\`\`
-
-          ### Build from source
-          \`\`\`bash
-          git clone https://github.com/faratech/trashd.git && cd trashd
-          sudo ./install.sh
-          \`\`\`
-
-          ### Checksums
-          \`\`\`
-          ${CHECKSUMS}
-          \`\`\`
-
-          ### Verification
-          All release tarballs are verified with GitHub artifact attestation:
-          \`\`\`bash
-          gh attestation verify trashd-${VERSION}-linux-x86_64.tar.gz --owner faratech
-          gh attestation verify trashd-${VERSION}-linux-aarch64.tar.gz --owner faratech
-          \`\`\`" \
+            --notes-file release-notes.md \
             ${PRERELEASE} \
             ${ASSETS}
           fi

@@ -1,5 +1,131 @@
 # Changelog
 
+## 0.1.11 (2026-10-21)
+
+This release fixes all 14 findings from the bug and performance bash
+(#266–#279). It prevents malformed metadata from hanging commands, preserves
+distinct Unix filenames during listing and repair, restores rm flag
+compatibility, and reduces memory use and filesystem work in common paths.
+
+### Data preservation and repair
+
+- **Distinct non-UTF-8 filenames remain visible.** Trash listing tracks raw
+  filename bytes, so names that produce the same replacement characters on
+  screen no longer hide each other's orphaned data. A display ID matching
+  multiple entries is rejected as ambiguous even within one trash root;
+  unique original names still select individual entries (#267).
+- **Repair confirmations apply to the exact file shown.** `trash fsck --fix`
+  matches snapshots by raw filesystem path and constructs sidecar names
+  without lossy conversion. Previously, confirming one orphan and declining
+  another with a colliding display name could delete the declined file.
+  Valid non-UTF-8 sidecars are no longer falsely reported as missing (#271).
+
+### Commands stay responsive with malformed metadata
+
+- **Trashinfo and directory-size metadata:** listing, repair and index
+  rebuilding open `.trashinfo` without following symlinks or waiting for
+  FIFO writers, then require a regular file before reading. Payloads with
+  unusable sidecars remain discoverable as orphans. A FIFO `directorysizes`
+  cache is ignored and can be replaced normally (#266).
+- **Operation log:** a FIFO or other nonregular `operations.log` cannot hang
+  `trash log` or a trash, restore or purge that has already changed the data.
+  Log writes fail promptly, and a symlink log cannot redirect writes or
+  permission changes to an unrelated file (#275).
+- **Retention state:** `auto_purge.lock` and `last_purge` are opened without
+  blocking on special files. Marker timestamps are updated through a
+  validated descriptor; a symlink marker can no longer truncate its target.
+  Existing contention handling and purge throttling remain in effect (#277).
+- **Global and user configuration:** FIFO configuration files cannot hang
+  CLI startup, configuration editing or the first preloaded deletion.
+  Descriptor type checks preserve support for symlinked dotfiles; an
+  unreadable configuration is refused by the editor instead of overwritten
+  (#278).
+- **Update-check cache:** a FIFO `last-update-check` record is ignored
+  promptly, allowing `trash self-update --check` to proceed to its normal
+  update check (#279).
+
+### rm compatibility
+
+- `rm -d` accepts regular files and symlinks as well as empty directories.
+  Nonempty directories still require recursive removal. The same behavior
+  applies to protected operands and paths excluded from trash (#268).
+- Accepted abbreviations of the shim's custom bypass flags, such as
+  `--perm` and `--no-t`, are removed before invoking the real rm (#272).
+- Custom bypass flags also work when `TRASH_BYPASS=1` is set. Unknown or
+  ambiguous options continue to reach the real rm on that bypass path, and
+  arguments after `--`, including raw-byte filenames resembling options,
+  remain literal operands (#276).
+
+### Performance
+
+- **Bounded log tails:** `trash log -n N` reads backward in chunks until it
+  has the requested records. `-n 0` avoids reading the log. Chronological
+  output, CRLF, unterminated final records and UTF-8 across chunk boundaries
+  are preserved. Large histories no longer cause false empty results when
+  whole-file allocation fails (#269).
+- **One successful verification pass:** restore selects XXH3-128 or SHA-256
+  from the stored digest format, avoiding an unnecessary second full-file
+  scan. Existing digests remain valid after changing the configured
+  algorithm, and corruption and unreadable-file warnings are retained
+  (#274).
+- **Less per-deletion procfs work:** preload obtains its current parent with
+  `getppid()` instead of opening and parsing `/proc/self/stat` on every
+  hook. Reparenting detection and periodic ancestry refresh remain intact
+  (#270).
+- **One pathname capture per seccomp notification:** display-path resolution
+  reuses the captured bytes, removing a redundant broker round trip and
+  remote-memory read while keeping display and mutation based on the same
+  pathname capture (#273).
+- **Less repair and retention work:** report-only fsck and clean repair
+  checks skip unnecessary store snapshots; orphan repair uses direct path
+  lookups instead of repeated linear searches (#271). A recent regular
+  retention marker skips opening and locking the retention state file;
+  due runs still acquire the lock and recheck the marker (#277).
+
+Measured with isolated fixtures on the development host:
+
+| Probe | Before | After |
+| --- | --- | --- |
+| One-record tail of a 179,200,062-byte log, debug peak RSS | 458,456 KiB | 6,568 KiB |
+| Same tail under a 128 MiB address-space limit | Incorrect empty result | Correct latest record |
+| Successful verification of an 8 MiB hashed file | 16 MiB read | 8 MiB read |
+| `/proc/*/stat` opens for 100 preload unlinks | 102 | 2 |
+| Report-only fsck of 500 valid entries | Repeated store enumeration | 500 sidecar reads, one per entry |
+
+These fixtures measure specific memory and I/O costs. Runtime gains depend
+on workload, storage and build profile. Corruption diagnostics can still
+compute an additional digest, and requesting all log records requires
+reading the full history.
+
+### Toolchain, dependencies and release artifacts
+
+- Rust is pinned to **1.99.1** for local builds, CI, dependency updates and
+  releases. Source requirements and packaging metadata now agree.
+- Refreshed all Cargo dependencies, including libc 0.2.191, zstd 0.14.3,
+  zstd-safe 8.2.0, zstd-sys 2.1.2, rustls 0.23.46, rustls-webpki 0.103.16,
+  webpki-roots 1.0.10, ureq-proto 0.6.5, cc 1.9.0, crc32fast 1.5.3,
+  deranged 0.5.9, equivalent 1.0.3 and find-msvc-tools 0.1.15.
+- Updated workflow dependencies to checkout v7, upload-artifact v7,
+  download-artifact v8 and create-pull-request v8. Cross-builds use Zig
+  0.17.0 with cargo-zigbuild 0.23.4.
+- Linux x86_64 and aarch64 tarballs retain the **glibc 2.28** compatibility
+  floor, SHA-256 checksum files and GitHub build attestations. Archives now
+  include this changelog, and GitHub Actions publishes the version's full
+  release notes alongside installation and verification instructions.
+
+### Validation and upgrading
+
+Regression coverage includes special metadata files, raw-name collisions,
+repair consent, configuration symlinks, rm option forwarding, log line and
+chunk boundaries, bounded log I/O, both digest formats, and retention
+locking and throttling. Validation covers workspace tests, formatting,
+Clippy with warnings denied, release builds, installer and CLI/preload
+sandboxes, and protected seccomp interception under Yama restrictions in CI.
+
+Existing trash entries and metadata formats remain supported; no store
+migration is required. Upgrade all components together. Restart long-lived
+processes to load the updated preload library.
+
 ## 0.1.10 (2026-10-12)
 
 ### Fixed

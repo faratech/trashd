@@ -1117,7 +1117,7 @@ impl TrashStore {
         // orphan detection must know every real entry in this directory, or a
         // filtered-out entry's own files/<id> would be re-synthesized as a
         // fake "orphaned" copy of itself (#144).
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_ids = std::collections::HashSet::new();
 
         for entry in fs::read_dir(&info_dir)? {
             let entry = entry?;
@@ -1141,7 +1141,7 @@ impl TrashStore {
             #[cfg(test)]
             self.sidecar_reads.set(self.sidecar_reads.get() + 1);
             let sidecar_version = sidecar_version(&entry.path());
-            let content = match fs::read_to_string(entry.path()) {
+            let content = match crate::trashinfo::read_sidecar(&entry.path()) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1154,7 +1154,7 @@ impl TrashStore {
                 Some(i) => i,
                 None => continue,
             };
-            seen_ids.insert(id.clone());
+            seen_ids.insert(raw_stem.clone());
 
             // Spec: topdir trash may store relative paths. Resolve to absolute
             // using the topdir (parent of the trash directory).
@@ -1195,13 +1195,13 @@ impl TrashStore {
         // this is emergency case and MUST be presented as such."
         // Scan files/ for entries without matching .trashinfo.
         if files_dir.exists() {
-            let known_ids: std::collections::HashSet<String> = seen_ids;
+            let known_ids = seen_ids;
             let mut orphans = Vec::new();
             if let Ok(file_entries) = fs::read_dir(&files_dir) {
                 for fe in file_entries.flatten() {
                     let raw_name = fe.file_name();
-                    let name = raw_name.to_string_lossy().into_owned();
-                    if !known_ids.contains(&name) {
+                    if !known_ids.contains(&raw_name) {
+                        let name = raw_name.to_string_lossy().into_owned();
                         // Apply pattern filter to orphans too
                         if let Some(pat) = pattern
                             && !simple_glob_match(pat, &name)
@@ -1479,19 +1479,12 @@ impl TrashStore {
         // reported as a warning, not a rollback (the user can decide what to do).
         let hash_warning = if let Some(ref expected_hash) = entry.info.sha256 {
             if source_is_regular {
-                // Try both algorithms — we don't know which was used originally
-                let xxhash =
-                    hash_file_at(destination.parent.as_raw_fd(), &destination.name, "xxhash").ok();
-                let sha256 =
-                    hash_file_at(destination.parent.as_raw_fd(), &destination.name, "sha256").ok();
-                if xxhash.as_deref() == Some(expected_hash.as_str())
-                    || sha256.as_deref() == Some(expected_hash.as_str())
-                {
-                    None // match
-                } else {
-                    let actual = xxhash.or(sha256).unwrap_or_else(|| "(unreadable)".into());
-                    Some((expected_hash.clone(), actual))
-                }
+                restore_hash_mismatch_at(
+                    destination.parent.as_raw_fd(),
+                    &destination.name,
+                    expected_hash,
+                )
+                .map(|actual| (expected_hash.clone(), actual))
             } else {
                 None // directories/symlinks don't get hashed
             }
@@ -1613,32 +1606,64 @@ impl TrashStore {
     /// Run auto_purge only if enough time has passed since the last run.
     /// Uses a timestamp file to avoid scanning the entire trash on every deletion.
     fn maybe_auto_purge(&self) -> Result<(), TrashError> {
+        let interval = self.config.auto_purge_interval_secs;
+        let marker = self.home.join(".trashd/last_purge");
+        let recent = |meta: fs::Metadata| {
+            meta.is_file()
+                && meta
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed.as_secs() < interval)
+        };
+        // Most deletions are throttled. A recent regular marker lets them
+        // avoid opening/flocking a retention lock at all; never follow a
+        // symlink that could suppress retention using another file's mtime.
+        if interval > 0 && fs::symlink_metadata(&marker).is_ok_and(recent) {
+            return Ok(());
+        }
         // One purge at a time per home: concurrent runs each trimmed the full
         // excess, deleting far more than the limits required (#220). A held
         // lock means a purge is already running, so this one is skipped.
         let Some(_running) = self.try_lock_auto_purge() else {
             return Ok(());
         };
-        let interval = self.config.auto_purge_interval_secs;
         if interval == 0 {
             return self.auto_purge();
         }
 
-        let marker = self.home.join(".trashd/last_purge");
-        if let Ok(meta) = fs::metadata(&marker)
-            && let Ok(modified) = meta.modified()
-            && let Ok(elapsed) = modified.elapsed()
-            && elapsed.as_secs() < interval
-        {
-            return Ok(()); // too soon, skip
-        }
-
-        // Touch the marker before purging (so concurrent callers also skip)
-        let _ = fs::OpenOptions::new()
-            .create(true)
+        // Recheck under the retention lock: another purge may have completed
+        // between the fast-path check and our lock acquisition. Open without
+        // truncating or following symlinks and validate before touching its
+        // timestamp, so a FIFO cannot block and a link cannot damage a target.
+        let mut options = fs::OpenOptions::new();
+        options
             .write(true)
-            .truncate(true)
-            .open(&marker);
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let opened = options
+            .create_new(true)
+            .open(&marker)
+            .map(|file| (file, true))
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    options
+                        .create_new(false)
+                        .open(&marker)
+                        .map(|file| (file, false))
+                } else {
+                    Err(error)
+                }
+            });
+        if let Ok((marker, created)) = opened
+            && let Ok(meta) = marker.metadata()
+            && meta.is_file()
+        {
+            if !created && recent(meta) {
+                return Ok(());
+            }
+            let _ = marker.set_modified(std::time::SystemTime::now());
+        }
 
         self.auto_purge()
     }
@@ -1652,9 +1677,12 @@ impl TrashStore {
             .truncate(false)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(self.home.join(".trashd/auto_purge.lock"))
             .ok()?;
+        if !lock.metadata().ok()?.is_file() {
+            return None;
+        }
         (unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
             .then_some(lock)
     }
@@ -2090,15 +2118,13 @@ impl TrashStore {
             return Ok(exact[0].clone());
         }
         if exact.len() > 1 {
-            let roots: std::collections::HashSet<&PathBuf> =
-                exact.iter().map(|e| &e.trash_root).collect();
-            if roots.len() > 1 {
-                return Err(TrashError::AmbiguousMatch {
-                    pattern: id_or_pattern.into(),
-                    count: exact.len(),
-                });
-            }
-            return Ok(exact[0].clone());
+            // Distinct raw names can share a lossy display ID even inside
+            // one root. An ID must select exactly one entry before a restore
+            // or purge is allowed to act on it.
+            return Err(TrashError::AmbiguousMatch {
+                pattern: id_or_pattern.into(),
+                count: exact.len(),
+            });
         }
 
         // Filename match — check for ambiguity
@@ -4034,6 +4060,30 @@ fn hash_file_at(parent: RawFd, name: &CStr, algorithm: &str) -> io::Result<Strin
     hash_reader(file, algorithm)
 }
 
+/// Both supported digests have a fixed encoded length: XXH3-128 is 32 hex
+/// characters and SHA-256 is 64. The stored digest therefore determines the
+/// algorithm even when configuration changed after trashing. Successful
+/// restores need only one scan, avoiding SHA-256 work for default XXH3 files.
+fn restore_hash_mismatch_at(parent: RawFd, name: &CStr, expected: &str) -> Option<String> {
+    let algorithm = if expected.len() == 64 {
+        "sha256"
+    } else {
+        "xxhash"
+    };
+    let digest = hash_file_at(parent, name, algorithm).ok();
+    if digest.as_deref() == Some(expected) {
+        return None;
+    }
+    // Preserve the existing warning's preference for the XXH3 actual digest
+    // on corruption, with the SHA-256 digest as fallback if XXH3 cannot read.
+    let actual = if algorithm == "sha256" {
+        hash_file_at(parent, name, "xxhash").ok().or(digest)
+    } else {
+        digest.or_else(|| hash_file_at(parent, name, "sha256").ok())
+    };
+    Some(actual.unwrap_or_else(|| "(unreadable)".into()))
+}
+
 /// Normalize a path: canonicalize the parent (resolving symlinks in directory
 /// components) but preserve the final component as-is (so symlinks are not
 /// followed for the target file itself).
@@ -4266,6 +4316,122 @@ mod tests {
         config.retention.disk_pressure_percent = 0;
         let store = TrashStore::open_isolated(&data_dir.path().join("Trash"), config).unwrap();
         (store, data_dir, workdir, ())
+    }
+
+    #[test]
+    fn listing_special_sidecars_keeps_data_as_orphans_without_blocking() {
+        use std::os::unix::fs::symlink;
+        let (store, _data, work, _) = test_store();
+        let regular = work.path().join("metadata");
+        fs::write(
+            &regular,
+            TrashInfo::new(work.path().join("original")).to_trashinfo_string(),
+        )
+        .unwrap();
+        let fifo = store.home.join("info/fifo.trashinfo");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        symlink(&regular, store.home.join("info/link.trashinfo")).unwrap();
+        for id in ["fifo", "link"] {
+            fs::write(store.home.join("files").join(id), b"recoverable").unwrap();
+        }
+        let listed = store.list(None).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|entry| entry.orphaned));
+    }
+
+    #[test]
+    fn lossy_id_collisions_keep_orphans_visible_and_refuse_ambiguous_selection() {
+        let (store, _data, work, _) = test_store();
+        let raw_a = OsStr::from_bytes(b"entry\xff");
+        let raw_b = OsStr::from_bytes(b"entry\xfe");
+        for name in [raw_a, raw_b] {
+            fs::write(store.home.join("files").join(name), b"recoverable").unwrap();
+        }
+        let write_sidecar = |name: &OsStr, original: &str| {
+            let mut sidecar = name.to_os_string();
+            sidecar.push(".trashinfo");
+            fs::write(
+                store.home.join("info").join(sidecar),
+                TrashInfo::new(work.path().join(original)).to_trashinfo_string(),
+            )
+            .unwrap();
+        };
+        write_sidecar(raw_a, "original-a");
+        let listed = store.list(None).unwrap();
+        assert_eq!(listed.len(), 2);
+        let orphan = listed.iter().find(|entry| entry.orphaned).unwrap();
+        assert_eq!(orphan.trashed_path.file_name(), Some(raw_b));
+        assert_eq!(store.list(Some("*entry*")).unwrap().len(), 1);
+
+        write_sidecar(raw_b, "original-b");
+        assert!(matches!(
+            store.find_entry("entry�"),
+            Err(TrashError::AmbiguousMatch { count: 2, .. })
+        ));
+        // Selection by the unique original name still resolves and acts on
+        // exactly one raw on-disk entry.
+        store.purge("original-a").unwrap();
+        assert!(!store.home.join("files").join(raw_a).exists());
+        assert_eq!(
+            fs::read(store.home.join("files").join(raw_b)).unwrap(),
+            b"recoverable"
+        );
+    }
+
+    #[test]
+    fn restore_verifies_both_stored_hashes_after_configuration_changes() {
+        let (mut store, _data, work, _) = test_store();
+        for (algorithm, changed_algorithm) in [("xxhash", "sha256"), ("sha256", "xxhash")] {
+            store.config.hash_algorithm = algorithm.into();
+            let source = work.path().join(algorithm);
+            fs::write(&source, b"original data").unwrap();
+            let id = store.trash(&source, None).unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            let expected = entry.info.sha256.as_deref().unwrap();
+            assert_eq!(expected.len(), if algorithm == "sha256" { 64 } else { 32 });
+            store.config.hash_algorithm = changed_algorithm.into();
+            assert_eq!(store.restore(&id, None).unwrap(), source);
+            assert_eq!(fs::read(&source).unwrap(), b"original data");
+            let source_name = CString::new(source.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                restore_hash_mismatch_at(libc::AT_FDCWD, &source_name, expected),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn restore_hash_mismatch_keeps_corruption_and_unreadable_warnings() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("payload");
+        fs::write(&source, b"original data").unwrap();
+        let hashes = [
+            hash_file(&source, "xxhash").unwrap(),
+            hash_file(&source, "sha256").unwrap(),
+        ];
+        fs::write(&source, b"corrupted data").unwrap();
+        let actual = hash_file(&source, "xxhash").unwrap();
+        let source_name = CString::new(source.as_os_str().as_bytes()).unwrap();
+        for expected in &hashes {
+            assert_eq!(
+                restore_hash_mismatch_at(libc::AT_FDCWD, &source_name, expected),
+                Some(actual.clone()),
+            );
+        }
+        // Malformed metadata still produces a warning instead of silently
+        // disabling verification, and missing data retains its diagnostic.
+        assert_eq!(
+            restore_hash_mismatch_at(libc::AT_FDCWD, &source_name, "invalid digest"),
+            Some(actual),
+        );
+        fs::remove_file(&source).unwrap();
+        for expected in &hashes {
+            assert_eq!(
+                restore_hash_mismatch_at(libc::AT_FDCWD, &source_name, expected),
+                Some("(unreadable)".into()),
+            );
+        }
     }
 
     #[test]
@@ -6408,6 +6574,119 @@ mod tests {
         assert!(
             store.find_entry(&id).is_err(),
             "expired entry survived an unlocked purge"
+        );
+    }
+
+    #[test]
+    fn retention_state_fifos_do_not_block_and_marker_links_do_not_truncate() {
+        use std::os::unix::fs::symlink;
+        for state in ["auto_purge.lock", "last_purge"] {
+            let (store, _data, work, _) = test_store();
+            let path = store.home.join(".trashd").join(state);
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            // An aged marker forces the touch path instead of the throttle
+            // fast path. Linux permits opening a FIFO read/write without a
+            // peer; close that descriptor before exercising the writer.
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+            let source = create_file(work.path(), "payload", "recoverable");
+            let id = store.trash(&source, None).unwrap();
+            assert_eq!(
+                fs::read(store.home.join("files").join(id)).unwrap(),
+                b"recoverable"
+            );
+        }
+        let (store, _data, work, _) = test_store();
+        let victim = create_file(work.path(), "unrelated", "must survive");
+        let file = fs::File::options().write(true).open(&victim).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        symlink(&victim, store.home.join(".trashd/last_purge")).unwrap();
+        store
+            .trash(&create_file(work.path(), "payload", "recoverable"), None)
+            .unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive");
+        assert_eq!(
+            file.metadata().unwrap().modified().unwrap(),
+            std::time::SystemTime::UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn retention_marker_runs_due_purges_and_throttles_without_opening_lock() {
+        let (mut store, _data, work, _) = test_store();
+        store.config.retention.max_age_days = 1;
+        let marker_path = store.home.join(".trashd/last_purge");
+        let lock_path = store.home.join(".trashd/auto_purge.lock");
+        let add_expired = |name: &str| {
+            let data = store.home.join("files").join(name);
+            fs::write(&data, b"expired").unwrap();
+            let mut info = TrashInfo::new(work.path().join(name));
+            info.deletion_date = chrono::Local::now() - chrono::Duration::days(2);
+            fs::write(
+                store.home.join("info").join(format!("{name}.trashinfo")),
+                info.to_trashinfo_string(),
+            )
+            .unwrap();
+            data
+        };
+        let first = add_expired("first");
+        store.maybe_auto_purge().unwrap();
+        assert!(
+            !first.exists(),
+            "creating a fresh marker must still run the first purge"
+        );
+        let marker = fs::File::options().write(true).open(&marker_path).unwrap();
+        marker
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let second = add_expired("second");
+        let lock = fs::File::options().write(true).open(&lock_path).unwrap();
+        lock.lock().unwrap();
+        store.maybe_auto_purge().unwrap();
+        assert!(
+            second.exists(),
+            "a due purge must still honor an active lock"
+        );
+        drop(lock);
+        store.maybe_auto_purge().unwrap();
+        assert!(!second.exists());
+        assert!(
+            marker
+                .metadata()
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .unwrap()
+                .as_secs()
+                < store.config.auto_purge_interval_secs
+        );
+
+        let third = add_expired("third");
+        fs::remove_file(&lock_path).unwrap();
+        store.maybe_auto_purge().unwrap();
+        assert!(
+            third.exists(),
+            "a fresh marker must throttle the next purge"
+        );
+        assert!(
+            !lock_path.exists(),
+            "throttled deletions must not open/create the lock"
+        );
+        marker
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        store.maybe_auto_purge().unwrap();
+        assert!(
+            !third.exists(),
+            "an existing aged marker must permit another purge"
         );
     }
 

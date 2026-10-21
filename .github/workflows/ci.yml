@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # No dtolnay/rust-toolchain step on purpose: rustup honors rust-toolchain.toml
       # (channel + clippy/rustfmt components), so the workflow can't drift from the pin.
       # First cargo/clippy/fmt invocation below installs the pinned toolchain.
@@ -35,7 +35,7 @@ jobs:
       - name: Release artifacts honor the glibc floor
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
-          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.16.0 cargo-zigbuild==0.23.4
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.17.0 cargo-zigbuild==0.23.4
           PATH="$RUNNER_TEMP/zig/bin:$PATH" cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.28
           R=target/x86_64-unknown-linux-gnu/release
           tests/glibc_floor.sh 2.28 "$R/libtrashd_preload.so" "$R/trashd-exec" "$R/trash" "$R/trashd-rm" "$R/trashd"

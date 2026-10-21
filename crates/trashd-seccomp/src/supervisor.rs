@@ -256,7 +256,8 @@ fn handle_notification(
     // (#6), nor for never_trash: a spelling such as `/proc/self/cwd/x` says
     // nothing about where the file lives, so the store judges the path
     // derived from the pinned parent instead (#226).
-    let display = match mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args) {
+    let display = match mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args, &raw)
+    {
         Ok(p) => p,
         Err(_) => {
             respond_continue(fd, notif.id);

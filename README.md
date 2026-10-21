@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/faratech/trashd/actions/workflows/ci.yml/badge.svg)](https://github.com/faratech/trashd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.99.1%2B-orange.svg)](https://www.rust-lang.org/)
 
 A Linux recycle bin that actually works — in scripts, cron jobs, and at the desktop.
 
@@ -649,7 +649,7 @@ Covers: Layer 1 shim, Layer 2 LD_PRELOAD, `--permanent` bypass, `TRASH_BYPASS=1`
 
 ## Requirements
 
-- **Rust 1.97+** (for building from source)
+- **Rust 1.99.1+** (for building from source)
 - **Linux 5.6+** (for seccomp notification and pinned `openat2` resolution — Layer 4)
 - **Linux 5.9+** (for fanotify FID reporting — Layer 3)
 - **CAP_SYS_ADMIN** or root (for fanotify daemon)

@@ -15,7 +15,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Read a NUL-terminated string from the target process's address space.
 pub fn read_path_from_process(pid: u32, addr: u64) -> io::Result<PathBuf> {
@@ -82,29 +82,33 @@ pub fn read_arg_path(pid: u32, syscall_nr: i32, args: &[u64; 6]) -> io::Result<P
     read_path_from_process(pid, path_addr)
 }
 
-/// Resolve the path for a given syscall notification.
+/// Resolve the already captured pathname for a syscall notification.
+/// Never read the target's memory again: display and pinned operations must
+/// use the same capture, and a second read also adds broker IPC (#273).
 ///
 /// - unlink(pathname):        args[0] = pathname pointer
 /// - rmdir(pathname):         args[0] = pathname pointer
 /// - unlinkat(dirfd, path, flags): args[0] = dirfd, args[1] = pathname pointer
-pub fn resolve_syscall_path(pid: u32, syscall_nr: i32, args: &[u64; 6]) -> io::Result<PathBuf> {
+pub fn resolve_syscall_path(
+    pid: u32,
+    syscall_nr: i32,
+    args: &[u64; 6],
+    path: &Path,
+) -> io::Result<PathBuf> {
     #[cfg(target_arch = "x86_64")]
     const NR_UNLINKAT: i32 = 263;
     #[cfg(target_arch = "aarch64")]
     const NR_UNLINKAT: i32 = 35;
 
-    let (dirfd, path_addr) = if syscall_nr == NR_UNLINKAT {
-        (Some(args[0] as i32), args[1])
+    let dirfd = if syscall_nr == NR_UNLINKAT {
+        Some(args[0] as i32)
     } else {
-        // unlink or rmdir: pathname is args[0]
-        (None, args[0])
+        None
     };
-
-    let path = read_path_from_process(pid, path_addr)?;
 
     // If the path is absolute, return it directly
     if path.is_absolute() {
-        return Ok(path);
+        return Ok(path.to_path_buf());
     }
 
     // Relative path — resolve against dirfd or cwd
@@ -123,7 +127,7 @@ pub fn resolve_syscall_path(pid: u32, syscall_nr: i32, args: &[u64; 6]) -> io::R
         }
     };
 
-    Ok(base.join(&path))
+    Ok(base.join(path))
 }
 
 /// Read a /proc/{pid}/{name} symlink.
@@ -134,4 +138,48 @@ fn read_proc_link(pid: u32, name: &str) -> io::Result<PathBuf> {
 /// Read /proc/{pid}/fd/{fd} symlink to get the path a file descriptor points to.
 fn read_proc_fd(pid: u32, fd: i32) -> io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn absolute_display_uses_capture_without_process_access() {
+        let captured = PathBuf::from(OsString::from_vec(b"/captured/raw-\xff".to_vec()));
+        // Neither this pid nor the null pathname address may be consulted.
+        let display =
+            resolve_syscall_path(0, libc::SYS_unlinkat as i32, &[0; 6], &captured).unwrap();
+        assert_eq!(display, captured);
+    }
+
+    #[test]
+    fn relative_display_uses_capture_and_original_directory_base() {
+        let pid = std::process::id();
+        let captured = Path::new("captured/../victim");
+        let changed = std::ffi::CString::new("changed-after-capture").unwrap();
+        let mut args = [0; 6];
+        args[0] = libc::AT_FDCWD as u64;
+        args[1] = changed.as_ptr() as u64;
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+        assert_eq!(
+            resolve_syscall_path(pid, libc::SYS_unlinkat as i32, &args, captured).unwrap(),
+            cwd.join(captured)
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let fd = std::fs::File::open(directory.path()).unwrap();
+        args[0] = fd.as_raw_fd() as u64;
+        assert_eq!(
+            resolve_syscall_path(pid, libc::SYS_unlinkat as i32, &args, captured).unwrap(),
+            directory.path().join(captured)
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            resolve_syscall_path(pid, libc::SYS_unlink as i32, &args, captured).unwrap(),
+            cwd.join(captured)
+        );
+    }
 }

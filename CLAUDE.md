@@ -84,7 +84,7 @@ Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+) and watches `FAN_DELET
 - **Atomic IDs**: `O_CREAT|O_EXCL` on `.trashinfo`. Filename truncated to 223 chars for filesystem limits
 - **Symlink-safe**: `normalize_path()` canonicalizes parent only. Symlinks re-created in cross-device copies
 - **Process bypass**: walks `/proc/{pid}/stat` up the tree. Also checks `bypass_paths` against `/proc/self/exe`
-- **Hash verification**: XXH3-128 (default) or SHA-256, computed on trash, verified on restore (tries both algorithms)
+- **Hash verification**: XXH3-128 (default) or SHA-256, computed on trash; restore selects the stored digest's algorithm for one successful verification pass
 - **Auto-purge throttling**: `maybe_auto_purge()` skips if < `auto_purge_interval_secs` since last run
 - **Config precedence**: `never_trash` always wins → `only_trash` narrows → `.trashd.toml` applies locally
 - **Shim sets `TRASH_BYPASS=1`** when passing through to real rm (prevents LD_PRELOAD re-interception)

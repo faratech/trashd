@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the built rm shim in a disposable sandbox: shim_regression.py PATH."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -103,6 +104,54 @@ def main():
         assert result.returncode == 1 and "trashd" not in result.stderr, result.stderr
         print("PASS: --permanent with ignored SIGCHLD reports the real rm's status")
 
+        # Accepted custom long-option abbreviations must be stripped before
+        # real rm, while identical operands after -- are kept (#272).
+        for flag in ["--perm", "--no-t"]:
+            operand = root / f"abbreviated-{flag[2:]}"
+            operand.write_bytes(b"permanently removed")
+            named_like_option = root / flag
+            named_like_option.write_bytes(b"also permanently removed")
+            result = run([flag, operand, "--", flag])
+            assert result.returncode == 0, (flag, result.stderr)
+            assert not operand.exists() and not named_like_option.exists(), flag
+            assert not list((root / "data/Trash/info").glob(operand.name + "*.trashinfo")), flag
+        print("PASS: abbreviated bypass flags preserve post-separator operands")
+
+        for flag in ["--permanent", "--no-trash", "--perm", "--no-t"]:
+            operand = root / f"env-bypassed-{flag[2:]}"
+            operand.write_bytes(b"permanently removed")
+            named_like_option = root / flag
+            named_like_option.write_bytes(b"also permanently removed")
+            result = subprocess.run([str(binary), flag, str(operand), "--", flag],
+                                    env=dict(env, TRASH_BYPASS="1"), cwd=root,
+                                    capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, (flag, result.stderr)
+            assert not operand.exists() and not named_like_option.exists(), flag
+        print("PASS: environment bypass accepts custom flags and preserves post-separator operands")
+
+        # A stashed real-rm fixture records arguments that the shim parser
+        # would reject. Environment bypass must still pass those through,
+        # including ambiguous prefixes that are not custom options (#276).
+        import shutil
+        prefix = root / "passthrough-prefix"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "real").mkdir()
+        fixture_shim = prefix / "bin/rm"
+        shutil.copy2(binary, fixture_shim)
+        fixture_rm = prefix / "real/rm"
+        fixture_rm.write_text("#!/usr/bin/python3\nimport json,sys\n"
+                              "print('rm fixture' if sys.argv[1:] == ['--version'] "
+                              "else json.dumps(sys.argv[1:]))\n")
+        fixture_rm.chmod(0o755)
+        raw_name = os.fsdecode(b"raw-\xff")
+        forwarded = ["--real-only-option", "--p", "--no", "--no-preserve-root",
+                     "--", "--permanent", raw_name]
+        result = subprocess.run([str(fixture_shim), "--perm", "--no-trash", *forwarded],
+                                env=dict(env, TRASH_BYPASS="1"), cwd=root,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0 and json.loads(result.stdout) == forwarded, result
+        print("PASS: environment bypass forwards real-rm-only options, ambiguous prefixes and raw names")
+
         for name, flags, directory in [
             ("repeated-force", ["-ff"], False),
             ("repeated-recursive", ["-r", "--recursive"], True),
@@ -122,6 +171,49 @@ def main():
             stored = matches[0] / "keep" if directory else matches[0]
             assert stored.read_bytes() == b"recoverable"
         print("PASS: repeated force/recursive flags retain actual recoverable trash data")
+
+        # -d permits empty directories in addition to ordinary files and
+        # symlinks; it is not a directory-only operation (#268). Compare the
+        # system rm for protected paths and never_trash fallback paths.
+        link_target = root / "dir-flag-link-target"
+        link_target.write_bytes(b"target survives")
+        dir_target = root / "dir-flag-dir-target"
+        dir_target.mkdir()
+        (dir_target / "keep").write_bytes(b"target directory survives")
+        for excluded in [False, True]:
+            for kind in ["file", "file-link", "dir-link", "dangling", "empty-dir", "full-dir"]:
+                suffix = ".tmp" if excluded else ""
+                operands = [root / f"{tool}-dir-flag-{kind}{suffix}" for tool in ["system", "shim"]]
+                for operand in operands:
+                    if kind == "file":
+                        operand.write_bytes(b"recoverable")
+                    elif kind in ["empty-dir", "full-dir"]:
+                        operand.mkdir()
+                        if kind == "full-dir":
+                            (operand / "keep").write_bytes(b"must remain")
+                    else:
+                        target = {"file-link": link_target, "dir-link": dir_target,
+                                  "dangling": root / "missing-link-target"}[kind]
+                        operand.symlink_to(target)
+                system_rm = subprocess.run(["/usr/bin/rm", "-d", str(operands[0])],
+                                           env=dict(env, TRASH_BYPASS="1"), capture_output=True)
+                result = run(["-d", operands[1]])
+                assert result.returncode == system_rm.returncode, (kind, excluded, result.stderr, system_rm.stderr)
+                assert os.path.lexists(operands[1]) == os.path.lexists(operands[0]), (kind, excluded)
+                if kind == "full-dir":
+                    assert (operands[1] / "keep").read_bytes() == b"must remain"
+                stored = list((root / "data/Trash/files").glob(operands[1].name + "*"))
+                assert len(stored) == int(not excluded and kind != "full-dir"), (kind, excluded, stored)
+                if stored:
+                    if kind == "file":
+                        assert stored[0].read_bytes() == b"recoverable"
+                    elif kind == "empty-dir":
+                        assert stored[0].is_dir() and not list(stored[0].iterdir())
+                    else:
+                        assert stored[0].is_symlink() and os.readlink(stored[0]) == str(target)
+        assert link_target.read_bytes() == b"target survives"
+        assert (dir_target / "keep").read_bytes() == b"target directory survives"
+        print("PASS: -d matches system rm for files, links and directories, including excluded paths")
 
         # A trailing slash makes rm operate on a symlink's TARGET. Policy must
         # be evaluated on that target too: a link in never-trash /tmp used to

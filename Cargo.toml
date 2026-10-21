@@ -10,9 +10,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.99.1"
 license = "MIT"
 repository = "https://github.com/faratech/trashd"
 homepage = "https://github.com/faratech/trashd"

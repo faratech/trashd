@@ -208,7 +208,7 @@ impl Config {
     }
 
     fn load_partial(path: &Path) -> Option<PartialConfig> {
-        let contents = match std::fs::read_to_string(path) {
+        let contents = match crate::config_file::read(path) {
             Ok(c) => c,
             Err(_) => return None,
         };
@@ -586,6 +586,25 @@ mod tests {
         config.merge(Config::load_partial(&path).expect("legacy config must load"));
         assert_eq!(config.only_trash, ["*.txt"]);
         assert_eq!(config.max_file_size_mb, 9);
+    }
+
+    #[test]
+    fn loader_accepts_symlinked_config_and_ignores_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("dotfiles.toml");
+        std::fs::write(&target, "max_file_size_mb = 17\n").unwrap();
+        let path = directory.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            Config::load_partial(&path).unwrap().max_file_size_mb,
+            Some(17)
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(Config::load_partial(&path).is_none());
     }
 
     #[test]

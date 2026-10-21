@@ -155,21 +155,7 @@ fn main() -> ExitCode {
     // the filter intact and reach the real rm.
     if args.permanent {
         let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        let bypass_flag = |a: &std::ffi::OsString| {
-            a.as_os_str() != "--permanent" && a.as_os_str() != "--no-trash"
-        };
-        let filtered: Vec<std::ffi::OsString> = match raw.iter().position(|a| a == "--") {
-            // Strip the bypass flags only BEFORE `--`; the tail (including the
-            // separator) is operand territory and must pass through verbatim.
-            Some(i) => raw[..i]
-                .iter()
-                .filter(|a| bypass_flag(a))
-                .cloned()
-                .chain(raw[i..].iter().cloned())
-                .collect(),
-            None => raw.iter().filter(|a| bypass_flag(a)).cloned().collect(),
-        };
-        return passthrough_with_args(&filtered);
+        return passthrough_with_args(&strip_bypass_flags(raw));
     }
 
     if args.files.is_empty() {
@@ -266,14 +252,6 @@ fn main() -> ExitCode {
         // Check if it's a directory without -r
         if is_dir && !args.recursive && !args.dir {
             eprintln!("rm: cannot remove '{}': Is a directory", file.display());
-            exit_code = ExitCode::FAILURE;
-            continue;
-        }
-
-        // rm -d has rmdir semantics: a non-directory operand is an error, like
-        // GNU rm's "Not a directory" — not a silent trash of the file (#149).
-        if args.dir && !args.recursive && !is_dir {
-            eprintln!("rm: cannot remove '{}': Not a directory", file.display());
             exit_code = ExitCode::FAILURE;
             continue;
         }
@@ -774,7 +752,48 @@ fn stash_is_shim(path: &PathBuf) -> bool {
 fn passthrough() -> ExitCode {
     // args_os: never panic on non-UTF-8 argv (#14)
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    passthrough_with_args(&args)
+    passthrough_with_args(&strip_bypass_flags(args))
+}
+
+/// Remove shim-only options even when TRASH_BYPASS skips argument parsing.
+/// Validate prefixes against option metadata without parsing the full argv:
+/// bypass callers can use options supported only by their real rm (#276).
+fn strip_bypass_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let command = std::sync::OnceLock::new();
+    let mut operands = false;
+    args.into_iter()
+        .filter(|arg| {
+            if operands {
+                return true;
+            }
+            if arg == "--" {
+                operands = true;
+                return true;
+            }
+            let Some(prefix) = arg.to_str().and_then(|s| s.strip_prefix("--")) else {
+                return true;
+            };
+            if prefix == "permanent" || prefix == "no-trash" {
+                return false;
+            }
+            if prefix.is_empty()
+                || !("permanent".starts_with(prefix) || "no-trash".starts_with(prefix))
+            {
+                return true;
+            }
+            // Construct the parser only for abbreviated custom options.
+            // Ambiguous prefixes such as --p or --no remain real-rm input.
+            let command = command.get_or_init(Rm::command);
+            command.get_arguments().any(|option| {
+                option.get_id() != "permanent"
+                    && option
+                        .get_long()
+                        .into_iter()
+                        .chain(option.get_all_aliases().into_iter().flatten())
+                        .any(|name| name.starts_with(prefix))
+            })
+        })
+        .collect()
 }
 
 fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
@@ -812,39 +831,34 @@ fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
 
 /// Remove a file/dir/symlink correctly using symlink_metadata.
 /// `recursive` must be true for directories to be removed (matches rm -r semantics);
-/// `dir_only` (rm -d) allows removing an EMPTY directory via rmdir semantics.
-fn real_rm(path: &PathBuf, recursive: bool, dir_only: bool) -> std::io::Result<()> {
+/// `allow_empty_dir` (rm -d) additionally permits removing an EMPTY directory.
+fn real_rm(path: &PathBuf, recursive: bool, allow_empty_dir: bool) -> std::io::Result<()> {
     // Set TRASH_BYPASS so the LD_PRELOAD layer doesn't re-intercept
     // our unlink/rmdir calls when we genuinely want a real delete.
     // Safety: the shim is single-threaded (no other threads to race with).
     unsafe {
         std::env::set_var("TRASH_BYPASS", "1");
     }
-    let result = real_rm_inner(path, recursive, dir_only);
+    let result = real_rm_inner(path, recursive, allow_empty_dir);
     unsafe {
         std::env::remove_var("TRASH_BYPASS");
     }
     result
 }
 
-fn real_rm_inner(path: &PathBuf, recursive: bool, dir_only: bool) -> std::io::Result<()> {
+fn real_rm_inner(path: &PathBuf, recursive: bool, allow_empty_dir: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
 
     if meta.file_type().is_symlink() {
-        if dir_only && !recursive {
-            return Err(std::io::Error::other("Not a directory"));
-        }
         std::fs::remove_file(path)
     } else if meta.is_dir() {
         if recursive {
             std::fs::remove_dir_all(path)
-        } else if dir_only {
+        } else if allow_empty_dir {
             std::fs::remove_dir(path)
         } else {
             Err(std::io::Error::other("Is a directory"))
         }
-    } else if dir_only && !recursive {
-        Err(std::io::Error::other("Not a directory"))
     } else {
         std::fs::remove_file(path)
     }
@@ -1056,22 +1070,11 @@ mod tests {
     // filenames and must reach the real rm verbatim.
     #[test]
     fn permanent_filter_keeps_post_separator_operands() {
-        // Reimplemented here against the same rule main() applies, so a
-        // regression in either copy is caught.
         let filter = |raw: &[&str]| -> Vec<String> {
-            match raw.iter().position(|a| *a == "--") {
-                Some(i) => raw[..i]
-                    .iter()
-                    .filter(|a| !matches!(**a, "--permanent" | "--no-trash"))
-                    .map(|a| a.to_string())
-                    .chain(raw[i..].iter().map(|a| a.to_string()))
-                    .collect(),
-                None => raw
-                    .iter()
-                    .filter(|a| !matches!(**a, "--permanent" | "--no-trash"))
-                    .map(|a| a.to_string())
-                    .collect(),
-            }
+            strip_bypass_flags(raw.iter().map(std::ffi::OsString::from).collect())
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
         };
 
         assert_eq!(
