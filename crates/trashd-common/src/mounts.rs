@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -325,26 +325,26 @@ fn trusted_topdir(topdir: &Path, uid: u32) -> bool {
 /// current-user-owned directory with no group/other access. This invariant is
 /// what makes subsequent entry names safe to enumerate and permanently purge.
 pub(crate) fn validate_private_dir(path: &Path, uid: u32, repair_mode: bool) -> bool {
-    let mut meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
+    private_dir_metadata(path, uid, repair_mode).is_some()
+}
+
+/// Keep the validated identity and permissions in the same metadata snapshot.
+fn private_dir_metadata(path: &Path, uid: u32, repair_mode: bool) -> Option<fs::Metadata> {
+    let mut meta = fs::symlink_metadata(path).ok()?;
     if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
-        return false;
+        return None;
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
         if !repair_mode || fs::set_permissions(path, fs::Permissions::from_mode(0o700)).is_err() {
-            return false;
+            return None;
         }
-        meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(_) => return false,
-        };
+        meta = fs::symlink_metadata(path).ok()?;
     }
-    meta.is_dir()
+    (meta.is_dir()
         && !meta.file_type().is_symlink()
         && meta.uid() == uid
-        && meta.permissions().mode() & 0o777 == 0o700
+        && meta.permissions().mode() & 0o777 == 0o700)
+        .then_some(meta)
 }
 
 /// Validate an existing trash root for read/destructive enumeration. Unlike
@@ -367,12 +367,52 @@ pub(crate) fn is_safe_trash_root(path: &Path, uid: u32) -> bool {
 #[allow(dead_code)]
 pub(crate) fn is_trash_internal(path: &Path, home: &Path, trusted_home: bool) -> bool {
     use std::sync::{Mutex, OnceLock};
+    let home_candidate = trusted_home && path.starts_with(home);
+    // A mounted trash root must have one of these complete path components.
+    // This is only a negative filter: candidates still undergo every trust
+    // check below. Ordinary paths need no mount discovery or UID lookup.
+    if !home_candidate
+        && !path.components().any(|component| {
+            let name = component.as_os_str().as_bytes();
+            name == b".Trash" || name.starts_with(b".Trash-")
+        })
+    {
+        return false;
+    }
     static ROOTS: OnceLock<Mutex<HashMap<PathBuf, (u64, u64)>>> = OnceLock::new();
     let roots = ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
     let uid = unsafe { libc::geteuid() };
-    let mut candidates = Vec::new();
-    if trusted_home && path.starts_with(home) {
-        candidates.push(home.to_path_buf());
+    let forget = |root: &Path| {
+        if let Ok(mut map) = roots.try_lock() {
+            map.remove(root);
+        }
+    };
+    let authenticated = |root: &Path| {
+        let Some(meta) = private_dir_metadata(root, uid, false) else {
+            forget(root);
+            return false;
+        };
+        let identity = (meta.dev(), meta.ino());
+        // Never hold this lock over filesystem calls or retain descriptors.
+        let remembered = roots.try_lock().ok().and_then(|map| map.get(root).copied());
+        if let Some(remembered) = remembered {
+            if remembered == identity {
+                return true;
+            }
+            forget(root);
+        }
+        if !is_safe_trash_root(root, uid) {
+            return false;
+        }
+        if let Ok(mut map) = roots.try_lock() {
+            map.insert(root.to_path_buf(), identity);
+        }
+        true
+    };
+    // Home is already the first candidate. Authenticate it before consulting
+    // the mount table, including cached cleanup after files/info are removed.
+    if home_candidate && authenticated(home) {
+        return true;
     }
     for mount in list_mounts() {
         if !path.starts_with(&mount.path) {
@@ -385,43 +425,10 @@ pub(crate) fn is_trash_internal(path: &Path, home: &Path, trusted_home: bool) ->
         .into_iter()
         .flatten()
         {
-            if path.starts_with(&root) {
-                candidates.push(root);
-            }
-        }
-    }
-    // Snapshot under a briefly held lock; contention means "no cache".
-    let known: HashMap<PathBuf, (u64, u64)> = match roots.try_lock() {
-        Ok(map) => map.clone(),
-        Err(_) => HashMap::new(),
-    };
-    let forget = |root: &PathBuf| {
-        if let Ok(mut map) = roots.try_lock() {
-            map.remove(root);
-        }
-    };
-    for root in candidates {
-        if !validate_private_dir(&root, uid, false) {
-            forget(&root);
-            continue;
-        }
-        let Ok(meta) = root.symlink_metadata() else {
-            continue;
-        };
-        let identity = (meta.dev(), meta.ino());
-        if let Some(remembered) = known.get(&root) {
-            if *remembered == identity {
+            if path.starts_with(&root) && authenticated(&root) {
                 return true;
             }
-            forget(&root);
         }
-        if !is_safe_trash_root(&root, uid) {
-            continue;
-        }
-        if let Ok(mut map) = roots.try_lock() {
-            map.insert(root, identity);
-        }
-        return true;
     }
     false
 }
@@ -443,10 +450,13 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
         dirs.insert(home_trash.to_path_buf(), "home".into());
     }
 
+    // One enumeration uses one observed home device instead of re-statting
+    // the same path for each mount. Every discovered root is still validated.
+    let home_device = device_id_or_parent(home_trash);
     // Scan all mount points for trash directories
     for mount in list_mounts() {
         // Skip if same filesystem as home
-        if same_filesystem(home_trash, &mount.path) {
+        if home_device.is_some() && home_device == device_id_or_parent(&mount.path) {
             continue;
         }
 
@@ -554,6 +564,47 @@ mod tests {
         let lookalike = fixture.path().join("project/.Trash");
         assert!(!is_trash_internal(&lookalike.join("item"), &home, true));
         assert!(!lookalike.exists());
+    }
+
+    #[test]
+    fn home_authentication_keeps_raw_paths_and_rejects_replacement_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture
+            .path()
+            .join(OsString::from_vec(b"custom-\xff-home".to_vec()));
+        let prepare = || {
+            fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        };
+        prepare();
+        for child in ["files", "info"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(home.join(child))
+                .unwrap();
+        }
+        let item = home.join("files/item");
+        assert!(is_trash_internal(&item, &home, true));
+        assert!(!is_trash_internal(&item, &home, false));
+
+        // A private directory at the same path cannot inherit the old inode's
+        // cleanup authorization without its own authenticated files/info.
+        fs::rename(&home, fixture.path().join("retired")).unwrap();
+        prepare();
+        assert!(!is_trash_internal(&item, &home, true));
+        assert!(!home.join("files").exists());
+        assert!(!home.join("info").exists());
+        for child in ["files", "info"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(home.join(child))
+                .unwrap();
+        }
+        assert!(is_trash_internal(&item, &home, true));
+        fs::remove_dir(home.join("files")).unwrap();
+        fs::remove_dir(home.join("info")).unwrap();
+        assert!(is_trash_internal(&home, &home, true));
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!is_trash_internal(&home, &home, true));
     }
 
     #[test]

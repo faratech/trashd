@@ -1,5 +1,55 @@
 use colored::Colorize;
 
+/// Delayed feedback for a long interactive scan. The worker owns the progress
+/// line and clears it before the guard's drop returns to the command.
+pub struct ScanProgress(Option<(std::sync::mpsc::SyncSender<()>, std::thread::JoinHandle<()>)>);
+
+impl ScanProgress {
+    pub fn start(enabled: bool) -> Self {
+        use std::io::{IsTerminal, Write};
+        use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+        use std::time::{Duration, Instant};
+
+        if !enabled || !std::io::stderr().is_terminal() {
+            return Self(None);
+        }
+        let (stop, receiver) = sync_channel(1);
+        let started = Instant::now();
+        let worker = std::thread::Builder::new().spawn(move || {
+            if receiver.recv_timeout(Duration::from_millis(300)) != Err(RecvTimeoutError::Timeout) {
+                return;
+            }
+            let mut stderr = std::io::stderr();
+            loop {
+                let _ = write!(
+                    stderr,
+                    "\rScanning trash... {}s",
+                    started.elapsed().as_secs()
+                );
+                let _ = stderr.flush();
+                if receiver.recv_timeout(Duration::from_secs(1)) != Err(RecvTimeoutError::Timeout) {
+                    break;
+                }
+            }
+            let _ = write!(stderr, "\r\x1b[2K");
+            let _ = stderr.flush();
+        });
+        match worker {
+            Ok(worker) => Self(Some((stop, worker))),
+            Err(_) => Self(None),
+        }
+    }
+}
+
+impl Drop for ScanProgress {
+    fn drop(&mut self) {
+        if let Some((stop, worker)) = self.0.take() {
+            let _ = stop.try_send(());
+            let _ = worker.join();
+        }
+    }
+}
+
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;

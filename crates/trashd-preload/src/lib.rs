@@ -138,6 +138,8 @@ impl Default for PreloadConfig {
                 "rpm".into(),
                 "pip".into(),
                 "cargo".into(),
+                "rustup".into(),
+                "rustup-init".into(),
                 "npm".into(),
                 "make".into(),
                 "git".into(),
@@ -194,26 +196,27 @@ impl PreloadConfig {
     }
 }
 
-/// Config with periodic reload. Checks config file mtime every 60 seconds
-/// so long-lived processes pick up config changes without restart.
+/// Immutable config; the hook's existing time sample drives change notices.
 fn config() -> &'static PreloadConfig {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     static CFG: OnceLock<PreloadConfig> = OnceLock::new();
+    CFG.get_or_init(load_config)
+}
+
+/// Check file mtimes every 60 seconds and report restart-required changes.
+/// Reuse the bypass cache's time sample rather than reading the clock on
+/// every config lookup within the same deletion (#283).
+fn check_config_changed(now: i64) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
     static LAST_CHECK: AtomicI64 = AtomicI64::new(0);
     static GLOBAL_MTIME: AtomicI64 = AtomicI64::new(0);
 
-    let cfg = CFG.get_or_init(load_config);
-
-    // Periodically check if config files changed (every 60 seconds)
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let last = LAST_CHECK.load(Ordering::Relaxed);
-    if now - last >= 60 {
-        LAST_CHECK.store(now, Ordering::Relaxed);
+    if now - last >= 60
+        && LAST_CHECK
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
         let current_mtime = config_mtime();
         let cached_mtime = GLOBAL_MTIME.load(Ordering::Relaxed);
         if current_mtime != cached_mtime {
@@ -226,16 +229,9 @@ fn config() -> &'static PreloadConfig {
             }
         }
     }
-
-    cfg
 }
 
 fn load_config() -> PreloadConfig {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    // Store initial mtime
-    static INIT_MTIME: AtomicI64 = AtomicI64::new(0);
-    INIT_MTIME.store(config_mtime(), Ordering::Relaxed);
-
     let mut cfg = PreloadConfig::default();
 
     // Layer 1: global config
@@ -411,11 +407,10 @@ fn bypass_cache_hit(cached: u64, pid: u32, ppid: u32) -> Option<bool> {
 /// Caching by PID alone kept the verdict for the process's whole lifetime,
 /// so a long-lived worker spawned by git/make/cargo deleted permanently
 /// forever after that ancestor exited (#249).
-fn is_process_bypassed() -> bool {
+fn is_process_bypassed(pid: u32) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CACHED: AtomicU64 = AtomicU64::new(0);
     static CACHED_AT: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
     // This runs on every hook, even while the verdict is cached. A direct
     // getppid preserves reparenting detection without opening, reading and
     // parsing /proc/self/stat for each deletion.
@@ -426,6 +421,7 @@ fn is_process_bypassed() -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    check_config_changed(now as i64);
     let fresh = now.saturating_sub(CACHED_AT.load(Ordering::Relaxed)) <= 5;
     if fresh && let Some(hit) = bypass_cache_hit(CACHED.load(Ordering::Relaxed), pid, ppid) {
         return hit;
@@ -502,9 +498,30 @@ fn process_names(pid: u32) -> Vec<String> {
 /// misclassified as trash-internal (which would make the hook permanently
 /// `rm` it instead of trashing it).
 fn is_inside_trash(path: &Path) -> bool {
-    let home = home_trash_dir();
+    let mut home = home_trash_dir();
+    // A physical home trash still ends in Trash: the root itself may not
+    // be a symlink. Other paths cannot need home-ancestor authentication.
+    if !path.starts_with(&home)
+        && !path
+            .components()
+            .any(|component| component.as_os_str() == "Trash")
+    {
+        return mounts::is_trash_internal(path, &home, false);
+    }
     let uid = unsafe { libc::geteuid() };
-    let trusted_home = ensure_trusted_parent(&home, uid).is_ok();
+    let mut trusted_home = ensure_trusted_parent(&home, uid).is_ok();
+    if !trusted_home
+        && let Some(parent) = home.parent()
+        && ensure_trusted_ancestors_with(parent, uid, false).is_ok()
+        && let Ok(physical_parent) = fs::canonicalize(parent)
+        && let Some(name) = home.file_name()
+    {
+        // Resolve only after authenticating logical symlinks and their
+        // targets. Keep the final root unresolved so the classifier still
+        // rejects a Trash symlink and validates UID/mode/inode (#289).
+        home = physical_parent.join(name);
+        trusted_home = true;
+    }
     mounts::is_trash_internal(path, &home, trusted_home)
 }
 
@@ -736,10 +753,16 @@ fn load_local_config(path: &Path) -> Option<LocalConfig> {
     }
 }
 
-/// Check if path should skip trash (real-delete instead).
-/// Uses the same matching logic and precedence as trashd-common's
-/// Config::should_skip: per-directory .trashd.toml first, then never_trash
-/// wins, then only_trash narrows.
+/// Global exclusions always win, even over local whitelists. Check them
+/// before inode metadata, trash-root or local-policy walks (#285).
+fn globally_excluded(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    config().never_trash.iter().any(|p| pattern_matches(p, &s))
+}
+
+/// Check remaining policy after the hook has ruled out global exclusions.
+/// Keep the nearest local policy fresh on every call, including local
+/// whitelist precedence over the global whitelist.
 fn should_skip_path(path: &Path) -> bool {
     // Never intercept operations inside trash directories themselves
     if is_inside_trash(path) {
@@ -748,7 +771,6 @@ fn should_skip_path(path: &Path) -> bool {
 
     let s = path.to_string_lossy();
     let cfg = config();
-
     // Per-directory .trashd.toml overrides (same precedence as trashd-common).
     if let Some(local) = load_local_config(path) {
         if !local.never_trash.is_empty() && local.never_trash.iter().any(|p| pattern_matches(p, &s))
@@ -759,17 +781,8 @@ fn should_skip_path(path: &Path) -> bool {
             if !local.only_trash.iter().any(|p| pattern_matches(p, &s)) {
                 return true; // doesn't match local whitelist → real-delete
             }
-            // Matched local whitelist — global never_trash can still veto.
-            if cfg.never_trash.iter().any(|p| pattern_matches(p, &s)) {
-                return true;
-            }
             return false;
         }
-    }
-
-    // never_trash always wins
-    if cfg.never_trash.iter().any(|p| pattern_matches(p, &s)) {
-        return true;
     }
 
     // only_trash whitelist: if set and the path doesn't match, skip it so the
@@ -845,19 +858,12 @@ fn existing_device(path: &Path) -> Option<u64> {
         .map(|meta| meta.dev())
 }
 
-fn trash_dir_for(path: &Path) -> Result<PathBuf, StoreError> {
+fn trash_dir_for(path: &Path, file_dev: u64) -> Result<PathBuf, StoreError> {
     let home_trash = home_trash_dir();
 
-    let file_dev = fs::symlink_metadata(path)
-        .or_else(|_| {
-            path.parent()
-                .map(fs::metadata)
-                .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "")))
-        })
-        .ok()
-        .map(|m| m.dev());
-
-    if file_dev.is_some() && file_dev == existing_device(&home_trash) {
+    // try_trash just verified this inode; its device cannot change. The
+    // pre-move identity recheck still detects replacement (#297).
+    if Some(file_dev) == existing_device(&home_trash) {
         return prepared_home_trash(home_trash);
     }
 
@@ -921,18 +927,18 @@ fn prepare_home_trash(home: &Path) -> Result<(), StoreError> {
 }
 
 fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
+    let mut meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
             match fs::DirBuilder::new().mode(0o700).create(path) {
                 Ok(()) => {}
                 Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
             }
+            fs::symlink_metadata(path)?
         }
         Err(e) => return Err(e),
-    }
-    let mut meta = fs::symlink_metadata(path)?;
+    };
     if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -982,18 +988,27 @@ fn ensure_trusted_parent(path: &Path, uid: u32) -> io::Result<()> {
 }
 
 fn ensure_trusted_ancestors(directory: &Path, uid: u32) -> io::Result<()> {
+    ensure_trusted_ancestors_with(directory, uid, true)
+}
+
+fn ensure_trusted_ancestors_with(directory: &Path, uid: u32, create: bool) -> io::Result<()> {
     let directory = if directory.is_absolute() {
         directory.to_path_buf()
     } else {
         std::env::current_dir()?.join(directory)
     };
-    ensure_trusted_ancestors_from(&directory, uid, 0)
+    ensure_trusted_ancestors_from(&directory, uid, 0, create)
 }
 
 /// Same rule as trashd-common: a symlinked ancestor owned by root or this
 /// user (ostree's /home, a stowed ~/.local) is followed and its target
 /// validated from the root; anyone else's link is refused (#222).
-fn ensure_trusted_ancestors_from(directory: &Path, uid: u32, hops: u32) -> io::Result<()> {
+fn ensure_trusted_ancestors_from(
+    directory: &Path,
+    uid: u32,
+    hops: u32,
+    create: bool,
+) -> io::Result<()> {
     use std::path::Component;
 
     let components: Vec<Component> = directory.components().collect();
@@ -1010,18 +1025,18 @@ fn ensure_trusted_ancestors_from(directory: &Path, uid: u32, hops: u32) -> io::R
             }
         }
 
-        match fs::symlink_metadata(&current) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                 match fs::DirBuilder::new().mode(0o700).create(&current) {
                     Ok(()) => {}
                     Err(raced) if raced.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
                 }
+                fs::symlink_metadata(&current)?
             }
             Err(error) => return Err(error),
-        }
-        let metadata = fs::symlink_metadata(&current)?;
+        };
         if metadata.file_type().is_symlink() && (metadata.uid() == 0 || metadata.uid() == uid) {
             if hops >= 40 {
                 return Err(io::Error::new(
@@ -1034,7 +1049,7 @@ fn ensure_trusted_ancestors_from(directory: &Path, uid: u32, hops: u32) -> io::R
             for rest in &components[index + 1..] {
                 resolved.push(rest.as_os_str());
             }
-            return ensure_trusted_ancestors_from(&resolved, uid, hops + 1);
+            return ensure_trusted_ancestors_from(&resolved, uid, hops + 1, create);
         }
         let mode = metadata.permissions().mode();
         if !metadata.is_dir()
@@ -1208,7 +1223,7 @@ enum TrashAttempt {
 /// Fresh ids to claim when another writer takes `files/<id>` first.
 const MAX_CLAIM_ATTEMPTS: u32 = 8;
 
-fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
+fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64, pid: u32) -> TrashAttempt {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return TrashAttempt::NotTrashed;
     };
@@ -1230,7 +1245,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
             }
         }
     }
-    let trash_dir = match trash_dir_for(path) {
+    let trash_dir = match trash_dir_for(path, meta.dev()) {
         Ok(path) => path,
         Err(StoreError::Unavailable) => return TrashAttempt::NotTrashed,
         Err(StoreError::Unsafe) => return TrashAttempt::UnsafeStore,
@@ -1303,7 +1318,7 @@ fn try_trash(path: &Path, expect_dev: u64, expect_ino: u64) -> TrashAttempt {
         "[Trash Info]\nPath={}\nDeletionDate={}\nX-Trashd-Command=preload\nX-Trashd-PID={}\nX-Trashd-Size={size}\n",
         encode_path(&trashinfo_path),
         now.format("%Y-%m-%dT%H:%M:%S"),
-        std::process::id(),
+        pid,
     );
 
     let source = match CString::new(path.as_os_str().as_bytes()) {
@@ -1681,8 +1696,14 @@ fn finish_attempt(attempt: TrashAttempt, saved_errno: libc::c_int) -> Option<lib
     }
 }
 
-fn should_intercept() -> bool {
-    !is_bypass_active() && !is_seccomp_active() && !is_process_bypassed()
+fn intercepted_pid() -> Option<u32> {
+    if is_bypass_active() || is_seccomp_active() {
+        return None;
+    }
+    // One fresh PID per hook preserves fork detection and also identifies
+    // any sidecar this operation publishes, without a second syscall (#298).
+    let pid = std::process::id();
+    (!is_process_bypassed(pid)).then_some(pid)
 }
 
 // ---------------------------------------------------------------------------
@@ -1702,7 +1723,7 @@ fn should_intercept() -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
     unsafe {
-        // Capture the caller's errno FIRST — before the guard, should_intercept()
+        // Capture the caller's errno FIRST — before the guard, intercepted_pid()
         // (/proc walks), or path resolution can perturb it — so the success path
         // restores the caller's true pre-call errno.
         let saved_errno = *libc::__errno_location();
@@ -1713,18 +1734,18 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
                 None => return None,
             };
 
-            if !should_intercept() {
-                return None;
-            }
+            let pid = intercepted_pid()?;
 
-            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname) {
+            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname)
+                && !globally_excluded(&abs)
+            {
                 // Use symlink_metadata to not follow symlinks — dangling symlinks
                 // should be trashed, not permanently deleted via the fallthrough.
                 if let Ok(meta) = fs::symlink_metadata(&abs)
                     && !should_skip_path(&abs)
                     && !meta.is_dir()
                     && let Some(result) =
-                        finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                        finish_attempt(try_trash(&abs, meta.dev(), meta.ino(), pid), saved_errno)
                 {
                     return Some(result);
                 }
@@ -1757,16 +1778,16 @@ pub unsafe extern "C" fn unlinkat(
                 None => return None,
             };
 
-            if !should_intercept() {
-                return None;
-            }
+            let pid = intercepted_pid()?;
 
             if flags & !libc::AT_REMOVEDIR != 0 {
                 return None;
             }
             let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
-            if let Some(abs) = resolve_at_path(dirfd, pathname) {
+            if let Some(abs) = resolve_at_path(dirfd, pathname)
+                && !globally_excluded(&abs)
+            {
                 // Use symlink_metadata to not follow symlinks
                 if let Ok(meta) = fs::symlink_metadata(&abs)
                     && !should_skip_path(&abs)
@@ -1780,14 +1801,18 @@ pub unsafe extern "C" fn unlinkat(
                         if is_real_dir
                             && let Ok(mut rd) = fs::read_dir(&abs)
                             && rd.next().is_none()
-                            && let Some(result) =
-                                finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                            && let Some(result) = finish_attempt(
+                                try_trash(&abs, meta.dev(), meta.ino(), pid),
+                                saved_errno,
+                            )
                         {
                             return Some(result);
                         }
                     } else if !is_real_dir
-                        && let Some(result) =
-                            finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                        && let Some(result) = finish_attempt(
+                            try_trash(&abs, meta.dev(), meta.ino(), pid),
+                            saved_errno,
+                        )
                     {
                         return Some(result);
                     }
@@ -1817,11 +1842,11 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                 None => return None,
             };
 
-            if !should_intercept() {
-                return None;
-            }
+            let pid = intercepted_pid()?;
 
-            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname) {
+            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname)
+                && !globally_excluded(&abs)
+            {
                 // Use symlink_metadata — rmdir only applies to real directories, not symlinks
                 if let Ok(meta) = fs::symlink_metadata(&abs)
                     && meta.is_dir()
@@ -1830,7 +1855,7 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                     && let Ok(mut rd) = fs::read_dir(&abs)
                     && rd.next().is_none()
                     && let Some(result) =
-                        finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                        finish_attempt(try_trash(&abs, meta.dev(), meta.ino(), pid), saved_errno)
                 {
                     return Some(result);
                 }
@@ -1859,11 +1884,11 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
                 None => return None,
             };
 
-            if !should_intercept() {
-                return None;
-            }
+            let pid = intercepted_pid()?;
 
-            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname) {
+            if let Some(abs) = resolve_at_path(libc::AT_FDCWD, pathname)
+                && !globally_excluded(&abs)
+            {
                 // remove() == unlink() for non-directories and rmdir() for
                 // (empty) directories; symlink_metadata never follows links.
                 if let Ok(meta) = fs::symlink_metadata(&abs)
@@ -1878,8 +1903,10 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
                         true
                     };
                     if eligible
-                        && let Some(result) =
-                            finish_attempt(try_trash(&abs, meta.dev(), meta.ino()), saved_errno)
+                        && let Some(result) = finish_attempt(
+                            try_trash(&abs, meta.dev(), meta.ino(), pid),
+                            saved_errno,
+                        )
                     {
                         return Some(result);
                     }
@@ -2105,10 +2132,16 @@ mod tests {
         std::os::unix::fs::symlink(&private, &link).unwrap();
         // The trash directory itself is never a symlink.
         assert!(ensure_private_dir(&link, uid, true).is_err());
+        // Classification accepts trusted existing ancestry but must never
+        // prepare missing directories while deciding whether to bypass.
+        assert!(ensure_trusted_ancestors_with(&link, uid, false).is_ok());
+        assert!(ensure_trusted_ancestors_with(&link.join("new"), uid, false).is_err());
+        assert!(!private.join("new").exists());
         // Ancestors may be links the user or root owns (#222); a link owned
         // by anyone else is refused and nothing is created through it.
         if uid == 0 {
             std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
+            assert!(ensure_trusted_ancestors_with(&link, uid, false).is_err());
             assert!(ensure_trusted_ancestors(&link.join("new"), uid).is_err());
             assert!(!private.join("new").exists());
         }

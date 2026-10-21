@@ -79,6 +79,7 @@ fn check_trash_dir(
     let mut orphaned_info = 0usize;
     let mut orphaned_files = 0usize;
     let mut corrupt_info = 0usize;
+    let mut parser = trashd_common::trashinfo::TrashInfoParser::default();
 
     // Check for .trashinfo files without matching files
     if let Ok(entries) = std::fs::read_dir(&info_dir) {
@@ -121,7 +122,7 @@ fn check_trash_dir(
             // Check if trashinfo is parseable
             let usable = trashd_common::trashinfo::read_sidecar(&entry.path())
                 .ok()
-                .and_then(|content| trashd_common::trashinfo::TrashInfo::from_trashinfo(&content))
+                .and_then(|content| parser.parse(&content))
                 .is_some();
             if !usable {
                 corrupt_info += 1;
@@ -237,6 +238,7 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
     let index = trashd_common::index::TrashIndex::open(&index_path)?;
 
     let mut entries = Vec::new();
+    let mut parser = trashd_common::trashinfo::TrashInfoParser::default();
     if let Ok(dir_entries) = std::fs::read_dir(&info_dir) {
         for entry in dir_entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -245,7 +247,7 @@ fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::erro
             }
             let id = name.strip_suffix(".trashinfo").unwrap_or(&name).to_string();
             if let Ok(content) = trashd_common::trashinfo::read_sidecar(&entry.path())
-                && let Some(info) = trashd_common::trashinfo::TrashInfo::from_trashinfo(&content)
+                && let Some(info) = parser.parse(&content)
             {
                 entries.push((id, info, trash_dir.to_path_buf()));
             }

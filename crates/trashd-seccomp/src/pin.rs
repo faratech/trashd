@@ -83,9 +83,29 @@ impl Drop for TargetFs {
 impl TargetFs {
     /// Pin the exact triggering task, including non-leader threads.
     pub fn open(pid: u32) -> io::Result<Self> {
+        Self::open_selected(pid, true)
+    }
+
+    /// Pin only bases this operation will use. Every operation needs the
+    /// root for shares_our_view's policy/record guard; only cwd-relative paths
+    /// need cwd. The startup probe continues to validate both backends.
+    pub(crate) fn open_for_operation(
+        pid: u32,
+        absolute: bool,
+        dirfd: Option<i32>,
+    ) -> io::Result<Self> {
+        Self::open_selected(
+            pid,
+            !absolute && matches!(dirfd, None | Some(libc::AT_FDCWD)),
+        )
+    }
+
+    fn open_selected(pid: u32, need_cwd: bool) -> io::Result<Self> {
         let procfd = open_proc_dir(&format!("/proc/{pid}")).ok_or_else(io::Error::last_os_error)?;
         let root_fd = open_task_directory(procfd, c"root");
-        let cwd_fd = open_task_directory(procfd, c"cwd");
+        let cwd_fd = need_cwd
+            .then(|| open_task_directory(procfd, c"cwd"))
+            .flatten();
         Ok(Self {
             pid,
             procfd,
@@ -394,16 +414,6 @@ pub fn try_pinned(
     // trash the file (review finding).
     let had_trailing_slash = raw.as_bytes().last() == Some(&b'/');
 
-    let tfs = TargetFs::open(pid)?;
-
-    // Task-reuse guard: the target may have died after receiving the event.
-    // Re-check validity after pinning its proc directory — a still-valid
-    // id proves this pid is still the blocked target.
-    // notify_fd < 0 skips this check — unit tests have no seccomp fd.
-    if notify_fd >= 0 && !crate::supervisor::notif_id_valid(notify_fd, notify_id) {
-        return Ok(Decision::Continue);
-    }
-
     // Split off the FINAL component; strip trailing slashes. An all-slash
     // path names the root itself — nothing meaningful to delete.
     let bytes = raw.as_bytes();
@@ -422,6 +432,14 @@ pub fn try_pinned(
     let name = OsStr::from_bytes(final_comp);
     if name.is_empty() || name == "." || name == ".." {
         // The kernel produces the right errno for these pathological forms.
+        return Ok(Decision::Continue);
+    }
+
+    let tfs = TargetFs::open_for_operation(pid, bytes.first() == Some(&b'/'), dirfd)?;
+
+    // Task-reuse guard: a still-valid id proves these newly pinned task
+    // descriptors belong to the blocked target. Unit tests have no listener.
+    if notify_fd >= 0 && !crate::supervisor::notif_id_valid(notify_fd, notify_id) {
         return Ok(Decision::Continue);
     }
 
@@ -549,6 +567,43 @@ pub fn try_pinned(
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn operation_context_pins_only_required_bases() {
+        use std::os::unix::fs::MetadataExt;
+        let pid = std::process::id();
+        let cases = [
+            (true, None, false),
+            (true, Some(37), false),
+            (false, None, true),
+            (false, Some(libc::AT_FDCWD), true),
+            (false, Some(37), false),
+        ];
+        for (absolute, dirfd, cwd) in cases {
+            let context = TargetFs::open_for_operation(pid, absolute, dirfd).unwrap();
+            assert!(context.root().is_some());
+            assert_eq!(context.cwd().is_some(), cwd);
+            for (fd, path) in [
+                (context.root(), Path::new("/")),
+                (context.cwd(), Path::new(".")),
+            ] {
+                if let Some(fd) = fd {
+                    let mut actual: libc::stat = unsafe { std::mem::zeroed() };
+                    assert_eq!(unsafe { libc::fstat(fd, &mut actual) }, 0);
+                    let expected = std::fs::metadata(path).unwrap();
+                    assert_eq!(
+                        (actual.st_dev, actual.st_ino),
+                        (expected.dev(), expected.ino())
+                    );
+                }
+            }
+        }
+        // Readiness continues to pin both mandatory directory backends.
+        let startup = TargetFs::open(pid).unwrap();
+        assert!(startup.root().is_some());
+        assert!(startup.cwd().is_some());
+    }
+
     /// No ambient configuration, environment mutation or mount discovery.
     fn setup(dir_name: &str) -> (TrashStore, PathBuf, tempfile::TempDir) {
         let fixture = tempfile::Builder::new().prefix(dir_name).tempdir().unwrap();

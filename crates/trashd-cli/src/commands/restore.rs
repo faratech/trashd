@@ -87,7 +87,11 @@ fn restore_entry(
     to: Option<&Path>,
     force: bool,
 ) -> Result<PathBuf, TrashError> {
-    match store.restore(target, to) {
+    // Keep the same resolved snapshot through conflict handling instead of
+    // enumerating every sidecar a second time for one --force restore.
+    let mut entry = store.find_entry(target)?;
+    let mut restore = |destination: Option<&Path>| store.restore_entry(&mut entry, destination);
+    match restore(to) {
         Ok(path) => Ok(path),
         Err(TrashError::RestoreConflict(path)) if force => {
             // Auto-rename: try .1, .2, .3, ... off a NORMALIZED base so a
@@ -99,11 +103,61 @@ fn restore_entry(
                 name.push(format!(".{i}"));
                 let renamed = PathBuf::from(name);
                 if std::fs::symlink_metadata(&renamed).is_err() {
-                    return store.restore(target, Some(&renamed));
+                    return restore(Some(&renamed));
                 }
             }
             Err(TrashError::RestoreConflict(path))
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn force_restore_keeps_existing_paths_and_uses_the_next_free_suffix() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut config = trashd_common::Config::default();
+        config.never_trash.clear();
+        let store = TrashStore::open_isolated(&fixture.path().join("Trash"), config).unwrap();
+        let original = fixture.path().join("document");
+        fs::write(&original, b"recover me").unwrap();
+        let id = store.trash(&original, None).unwrap();
+        fs::write(&original, b"keep original").unwrap();
+        fs::write(fixture.path().join("document.1"), b"keep suffix").unwrap();
+        assert!(matches!(
+            restore_entry(&store, &id, None, false),
+            Err(TrashError::RestoreConflict(_))
+        ));
+        let restored = restore_entry(&store, &id, None, true).unwrap();
+        assert_eq!(restored, fixture.path().join("document.2"));
+        assert_eq!(fs::read(restored).unwrap(), b"recover me");
+        assert_eq!(fs::read(original).unwrap(), b"keep original");
+        assert_eq!(
+            fs::read(fixture.path().join("document.1")).unwrap(),
+            b"keep suffix"
+        );
+        assert!(store.list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn force_restore_normalizes_a_trailing_slash_destination() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut config = trashd_common::Config::default();
+        config.never_trash.clear();
+        let store = TrashStore::open_isolated(&fixture.path().join("Trash"), config).unwrap();
+        let original = fixture.path().join("document");
+        fs::write(&original, b"recover me").unwrap();
+        let id = store.trash(&original, None).unwrap();
+        let destination = fixture.path().join("backup/");
+        fs::create_dir(&destination).unwrap();
+        let restored = restore_entry(&store, &id, Some(&destination), true).unwrap();
+        assert_eq!(restored, fixture.path().join("backup.1"));
+        assert_eq!(fs::read(restored).unwrap(), b"recover me");
+        assert!(destination.is_dir());
+        assert!(fs::read_dir(destination).unwrap().next().is_none());
     }
 }

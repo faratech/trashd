@@ -3,7 +3,10 @@ use colored::Colorize;
 use trashd_common::TrashStore;
 
 pub fn run(store: &TrashStore) {
-    match store.status_per_partition() {
+    let progress = ScanProgress::start(true);
+    let partitions = store.status_per_partition();
+    drop(progress);
+    match partitions {
         Ok(partitions) => {
             let total_size: u64 = partitions.iter().map(|p| p.total_size).sum();
             let total_count: usize = partitions.iter().map(|p| p.count).sum();

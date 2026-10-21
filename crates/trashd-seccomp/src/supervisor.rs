@@ -232,34 +232,17 @@ fn handle_notification(
         return;
     }
 
-    // trashd's own binaries remove only what their store logic decided to
-    // remove; re-trashing that deadlocked or duplicated data (#195, #196).
-    if is_own_component(notif.pid, own) {
-        respond_continue(fd, notif.id);
-        return;
-    }
-
-    // Raw pathname argument from the target's memory. The target is frozen in
-    // its syscall, so this memory is stable against the TARGET; a sibling
-    // sharing its memory could mutate it (documented residual micro-race —
-    // every ptrace/seccomp supervisor has it).
-    let raw = match mem::read_arg_path(notif.pid, notif.data.nr, &notif.data.args) {
-        Ok(p) => p,
-        Err(_) => {
-            // Can't read path → let the real syscall run
-            respond_continue(fd, notif.id);
-            return;
-        }
-    };
-    // Best-effort full path for logging and the .trashinfo Path= field when
-    // the pinned parent cannot name itself. Never used to touch the inode
-    // (#6), nor for never_trash: a spelling such as `/proc/self/cwd/x` says
-    // nothing about where the file lives, so the store judges the path
-    // derived from the pinned parent instead (#226).
-    let display = match mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args, &raw)
-    {
-        Ok(p) => p,
-        Err(_) => {
+    // Capture only after CONTINUE-only gates. Protected operations retain
+    // one pathname capture and the same pinned mutation path (#286).
+    let capture = capture_protected_path(notif, config, own, || {
+        let raw = mem::read_arg_path(notif.pid, notif.data.nr, &notif.data.args)?;
+        // Display only: mutation and policy use the pinned parent (#6, #226).
+        let display = mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args, &raw)?;
+        Ok((raw, display))
+    });
+    let (raw, display) = match capture {
+        Ok(Some(captured)) => captured,
+        _ => {
             respond_continue(fd, notif.id);
             return;
         }
@@ -267,42 +250,6 @@ fn handle_notification(
 
     // From this point, ALL code paths MUST send a response.
     // Failure to respond will hang the supervised process.
-
-    if notif.data.nr == libc::SYS_unlinkat as i32
-        && (notif.data.args[2] as i32 & !libc::AT_REMOVEDIR) != 0
-    {
-        respond_continue(fd, notif.id);
-        return;
-    }
-
-    // Honor bypass_processes: if the deleting process (or an ancestor) is in
-    // the bypass list (git, cargo, apt, …), let the real delete happen — same
-    // as the shim/preload layers do.
-    if process_bypassed(notif.pid, &config.bypass_processes) {
-        respond_continue(fd, notif.id);
-        return;
-    }
-
-    // Honor TRASH_BYPASS=1 in the target's environment (#18).
-    if target_bypassed(notif.pid) {
-        respond_continue(fd, notif.id);
-        return;
-    }
-
-    // Honor bypass_paths against the TRAPPING process's executable (#21).
-    if !config.bypass_paths.is_empty()
-        && let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid))
-    {
-        let exe_str = exe.to_string_lossy();
-        if config
-            .bypass_paths
-            .iter()
-            .any(|p| exe_str.starts_with(p.as_str()))
-        {
-            respond_continue(fd, notif.id);
-            return;
-        }
-    }
 
     #[cfg(target_arch = "x86_64")]
     let is_rmdir = notif.data.nr == 84; // SYS_rmdir
@@ -344,6 +291,26 @@ fn handle_notification(
     }
 }
 
+/// CONTINUE-only gates need no target pathname. In particular, package-tool
+/// deletes must not pay a broker round trip before their bypass is known.
+fn capture_protected_path(
+    notif: &SeccompNotif,
+    config: &Config,
+    own: &[(u64, u64)],
+    capture: impl FnOnce() -> io::Result<(std::path::PathBuf, std::path::PathBuf)>,
+) -> io::Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
+    if (notif.data.nr == libc::SYS_unlinkat as i32
+        && (notif.data.args[2] as i32 & !libc::AT_REMOVEDIR) != 0)
+        // Store-internal deletes must never be intercepted (#195, #196).
+        || is_own_component(notif.pid, own)
+        || process_bypassed(notif.pid, &config.bypass_processes, &config.bypass_paths)
+        || target_bypassed(notif.pid)
+    {
+        return Ok(None);
+    }
+    capture().map(Some)
+}
+
 /// (device, inode) of trashd's own binaries installed beside this
 /// supervisor: the `trash` CLI and the rm shim (a release prefix keeps the
 /// shim in lib/trashd/bin; a build directory has both side by side).
@@ -365,8 +332,9 @@ pub(crate) fn own_component_ids(supervisor_exe: &std::path::Path) -> Vec<(u64, u
 
 fn is_own_component(pid: u32, own: &[(u64, u64)]) -> bool {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(format!("/proc/{pid}/exe"))
-        .is_ok_and(|meta| own.contains(&(meta.dev(), meta.ino())))
+    !own.is_empty()
+        && std::fs::metadata(format!("/proc/{pid}/exe"))
+            .is_ok_and(|meta| own.contains(&(meta.dev(), meta.ino())))
 }
 
 /// True when the TARGET process has TRASH_BYPASS=1 in its environment.
@@ -388,49 +356,64 @@ fn target_bypassed(pid: u32) -> bool {
 /// process name is in the bypass list. Mirrors the preload layer's logic so a
 /// given process makes the same trash/skip decision regardless of which
 /// interception layer is active.
-fn process_bypassed(pid: u32, bypass: &[String]) -> bool {
-    if bypass.is_empty() {
+fn process_bypassed(pid: u32, bypass: &[String], bypass_paths: &[String]) -> bool {
+    if bypass.is_empty() && bypass_paths.is_empty() {
         return false;
     }
     let mut cur = pid;
-    for _ in 0..16 {
-        if process_names(cur).iter().any(|name| bypass.contains(name)) {
+    for depth in 0..16 {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{cur}/exe")) {
+            if depth == 0
+                && bypass_paths
+                    .iter()
+                    .any(|prefix| exe.to_string_lossy().starts_with(prefix.as_str()))
+            {
+                return true;
+            }
+            if let Some(name) = exe.file_name()
+                && bypass
+                    .iter()
+                    .any(|candidate| candidate == name.to_string_lossy().as_ref())
+            {
+                return true;
+            }
+        }
+        if bypass.is_empty() {
+            break;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{cur}/stat")).ok();
+        if let Some((comm, parent)) = stat.as_deref().and_then(parse_process_stat) {
+            if bypass.iter().any(|candidate| candidate == comm) {
+                return true;
+            }
+            if parent > 1 && parent != cur {
+                cur = parent;
+                continue;
+            }
+        } else if std::fs::read_to_string(format!("/proc/{cur}/comm"))
+            .is_ok_and(|comm| bypass.iter().any(|candidate| candidate == comm.trim()))
+        {
+            // Preserve name matching if stat is unreadable or malformed.
             return true;
         }
-        match parent_pid(cur) {
-            Some(p) if p > 1 && p != cur => cur = p,
-            _ => break,
-        }
+        break;
     }
     false
 }
 
-/// Parse the parent PID (field 4) from /proc/{pid}/stat, accounting for a comm
-/// field that may itself contain spaces/parens.
-fn parent_pid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rfind(')')? + 2;
-    let fields: Vec<&str> = stat.get(after_comm..)?.split_whitespace().collect();
-    fields.get(1)?.parse().ok()
-}
-
-fn process_names(pid: u32) -> Vec<String> {
-    // Both the executable's basename and the kernel's comm: for a script,
-    // comm is the script's own name (pip, npm) while the executable is its
-    // interpreter, so bypass entries for script tools never matched (#224).
-    let mut names = Vec::with_capacity(2);
-    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-        && let Some(name) = exe.file_name()
-    {
-        names.push(name.to_string_lossy().into_owned());
-    }
-    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        let comm = comm.trim().to_string();
-        if !names.contains(&comm) {
-            names.push(comm);
-        }
-    }
-    names
+/// stat carries both the script's kernel comm and its parent. Use the last
+/// closing parenthesis because comm may itself contain parentheses/newlines.
+fn parse_process_stat(stat: &str) -> Option<(&str, u32)> {
+    let start = stat.find('(')? + 1;
+    let end = stat.rfind(')')?;
+    let comm = stat.get(start..end)?.trim();
+    let parent = stat
+        .get(end + 1..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((comm, parent))
 }
 
 /// Passthrough mode: respond CONTINUE to every notification.
@@ -449,6 +432,101 @@ fn run_passthrough(fd: i32) -> io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn stat_names_and_parents_preserve_parentheses_and_whitespace() {
+        assert_eq!(parse_process_stat("12 (pip) S 34 5 6"), Some(("pip", 34)));
+        assert_eq!(
+            parse_process_stat("12 ( \nodd ) ( name\n ) S 34 5 6"),
+            Some(("odd ) ( name", 34))
+        );
+        for malformed in ["12 pip S 34", "12 (pip", "12 (pip) S", "12 (pip) S bad"] {
+            assert_eq!(parse_process_stat(malformed), None);
+        }
+    }
+
+    #[test]
+    fn bypass_gates_do_not_capture_path_and_protected_capture_runs_once() {
+        use std::path::PathBuf;
+        let mut config = Config::default();
+        config.bypass_processes.clear();
+        config.bypass_paths.clear();
+        let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
+        notif.pid = u32::MAX;
+        notif.data.nr = libc::SYS_unlinkat as i32;
+        notif.data.args[2] = 0x4000;
+        assert!(
+            capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+                .unwrap()
+                .is_none()
+        );
+        notif.data.args[2] = 0;
+        let captures = std::cell::Cell::new(0);
+        let result = capture_protected_path(&notif, &config, &[], || {
+            captures.set(captures.get() + 1);
+            Ok((PathBuf::from("raw"), PathBuf::from("/display/raw")))
+        })
+        .unwrap();
+        assert_eq!(captures.get(), 1);
+        assert_eq!(result.unwrap().0, PathBuf::from("raw"));
+
+        notif.pid = std::process::id();
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        config.bypass_processes = vec![exe.file_name().unwrap().to_string_lossy().into_owned()];
+        assert!(
+            capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+                .unwrap()
+                .is_none()
+        );
+        config.bypass_processes.clear();
+        config.bypass_paths = vec![exe.to_string_lossy().into_owned()];
+        assert!(
+            capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn process_policy_observes_comm_changes_without_caching() {
+        if std::env::var_os("TRASHD_PROCESS_POLICY_CHILD").is_some() {
+            // The test harness runs on a non-leader thread, like a seccomp
+            // notification's triggering task. PR_SET_NAME changes this TID.
+            let pid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NAME, c"before ) (".as_ptr()) },
+                0
+            );
+            assert!(process_bypassed(pid, &["before ) (".into()], &[]));
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NAME, c"after".as_ptr()) },
+                0
+            );
+            assert!(!process_bypassed(pid, &["before ) (".into()], &[]));
+            assert!(process_bypassed(pid, &["after".into()], &[]));
+            let mut config = Config::default();
+            config.bypass_processes.clear();
+            let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
+            notif.pid = pid;
+            notif.data.nr = libc::SYS_unlinkat as i32;
+            assert!(
+                capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+                    .unwrap()
+                    .is_none()
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::process_policy_observes_comm_changes_without_caching",
+            ])
+            .env("TRASHD_PROCESS_POLICY_CHILD", "1")
+            .env("TRASH_BYPASS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     /// Once every filtered task has exited, RECV fails at once (ENOENT on
     /// current kernels) and poll reports POLLHUP. A pipe without a writer
@@ -511,7 +589,7 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "pip")
         });
-        let bypassed = process_bypassed(pid, &["pip".to_string()]);
+        let bypassed = process_bypassed(pid, &["pip".to_string()], &[]);
         let _ = child.kill();
         let _ = child.wait();
         assert!(comm_ready, "script never started");

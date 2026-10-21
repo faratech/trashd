@@ -6,9 +6,9 @@
 //! Format: `TIMESTAMP OP [details]`
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Log a trash operation.
@@ -98,26 +98,29 @@ fn read_log_file(path: &Path, max_lines: usize) -> Vec<String> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
-        .and_then(require_regular_log)
-        .and_then(|mut file| read_log_tail(&mut file, max_lines))
+        .and_then(|file| {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "operation log is not a regular file",
+                ));
+            }
+            read_log_tail(metadata.len(), max_lines, |position, chunk| {
+                file.read_exact_at(chunk, position)
+            })
+        })
         .unwrap_or_default()
 }
 
-fn require_regular_log(file: fs::File) -> io::Result<fs::File> {
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "operation log is not a regular file",
-        ));
-    }
-    Ok(file)
-}
-
-fn read_log_tail(reader: &mut (impl Read + Seek), max_lines: usize) -> io::Result<Vec<String>> {
+fn read_log_tail(
+    end: u64,
+    max_lines: usize,
+    mut read_chunk: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
     if max_lines == 0 {
         return Ok(Vec::new());
     }
-    let end = reader.seek(SeekFrom::End(0))?;
     let mut position = end;
     let mut remaining = max_lines;
     let mut reversed = Vec::new();
@@ -125,8 +128,7 @@ fn read_log_tail(reader: &mut (impl Read + Seek), max_lines: usize) -> io::Resul
     'chunks: while position > 0 {
         let length = position.min(chunk.len() as u64) as usize;
         position -= length as u64;
-        reader.seek(SeekFrom::Start(position))?;
-        reader.read_exact(&mut chunk[..length])?;
+        read_chunk(position, &mut chunk[..length])?;
         for index in (0..length).rev() {
             let byte = chunk[index];
             // A terminating newline belongs to the last record; every
@@ -213,29 +215,46 @@ fn escape_field_bytes(value: &[u8]) -> String {
 fn write_log(home: &Path, message: &str) {
     let path = home.join(".trashd/operations.log");
 
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
     let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
     let pid = std::process::id();
     let line = format!("{timestamp} pid={pid} {message}\n");
 
-    let result = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(&path)
-        .and_then(require_regular_log)
-        .and_then(|mut f| {
+    let result = open_log_for_append(&path).and_then(|mut f| {
+        let metadata = f.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation log is not a regular file",
+            ));
+        }
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
             f.set_permissions(fs::Permissions::from_mode(0o600))?;
-            f.write_all(line.as_bytes())
-        });
+        }
+        f.write_all(line.as_bytes())
+    });
 
     if let Err(e) = result {
         eprintln!("trashd: failed to write operation log: {e}");
+    }
+}
+
+fn open_log_for_append(path: &Path) -> io::Result<fs::File> {
+    let open = || {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+    };
+    match open() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            open()
+        }
+        result => result,
     }
 }
 
@@ -245,7 +264,30 @@ mod tests {
         escape_field_bytes, log_purge_in, log_restore_in, log_trash_in, read_log_file,
         read_log_tail, spawn_reaped,
     };
-    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn append_creates_repairs_and_reopens_the_current_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(".trashd/operations.log");
+        log_purge_in(home.path(), "first");
+        assert_eq!(log.metadata().unwrap().permissions().mode() & 0o7777, 0o600);
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o640)).unwrap();
+        log_purge_in(home.path(), "second");
+        assert_eq!(log.metadata().unwrap().permissions().mode() & 0o7777, 0o600);
+        let retired = home.path().join("retired.log");
+        std::fs::rename(&log, &retired).unwrap();
+        log_purge_in(home.path(), "third");
+        let original = std::fs::read_to_string(retired).unwrap();
+        assert!(original.contains("id=first\n"));
+        assert!(original.contains("id=second\n"));
+        assert!(!original.contains("id=third\n"));
+        let current = std::fs::read_to_string(&log).unwrap();
+        assert!(current.contains("id=third\n"));
+        assert!(!current.contains("id=first\n"));
+    }
 
     #[test]
     fn special_logs_cannot_block_or_modify_an_external_target() {
@@ -276,6 +318,8 @@ mod tests {
 
     #[test]
     fn log_tail_preserves_line_semantics_and_chunk_boundaries() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("operations.log");
         // The first backwards chunk starts inside the two-byte character.
         let boundary = format!("old\né{}\n", "x".repeat(8190));
         for content in [
@@ -291,11 +335,11 @@ mod tests {
             "a\r\nb\nc\r\n",
             &boundary,
         ] {
+            std::fs::write(&path, content).unwrap();
             let lines: Vec<_> = content.lines().map(str::to_owned).collect();
             for count in [0, 1, 2, 3, usize::MAX] {
                 let expected = &lines[lines.len().saturating_sub(count)..];
-                let actual =
-                    read_log_tail(&mut io::Cursor::new(content.as_bytes()), count).unwrap();
+                let actual = read_log_file(&path, count);
                 assert_eq!(
                     actual,
                     expected,
@@ -304,43 +348,37 @@ mod tests {
                 );
             }
         }
+        std::fs::write(&path, b"invalid\xff\n").unwrap();
+        assert!(read_log_file(&path, 1).is_empty());
     }
 
     #[test]
     fn log_tail_reads_only_requested_history() {
-        struct Counted {
-            file: std::fs::File,
-            bytes_read: usize,
-        }
-        impl Read for Counted {
-            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-                let count = self.file.read(buffer)?;
-                self.bytes_read += count;
-                Ok(count)
-            }
-        }
-        impl Seek for Counted {
-            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-                self.file.seek(position)
-            }
-        }
         // A sparse historical prefix proves the amount of I/O is bounded
         // without creating a large fixture or relying on timing/RSS.
         let mut file = tempfile::tempfile().unwrap();
         file.set_len(1024 * 1024 * 1024).unwrap();
         file.seek(SeekFrom::End(0)).unwrap();
         file.write_all(b"\nold\nlatest\n").unwrap();
-        let mut reader = Counted {
-            file,
-            bytes_read: 0,
+        let bytes_read = std::cell::Cell::new(0);
+        let mut read_chunk = |position, chunk: &mut [u8]| {
+            file.read_exact_at(chunk, position)?;
+            bytes_read.set(bytes_read.get() + chunk.len());
+            Ok(())
         };
-        assert!(read_log_tail(&mut reader, 0).unwrap().is_empty());
-        assert_eq!(reader.bytes_read, 0);
-        assert_eq!(read_log_tail(&mut reader, 1).unwrap(), ["latest"]);
+        let end = file.metadata().unwrap().len();
+        assert!(read_log_tail(end, 0, &mut read_chunk).unwrap().is_empty());
+        assert_eq!(bytes_read.get(), 0);
+        assert_eq!(read_log_tail(end, 1, &mut read_chunk).unwrap(), ["latest"]);
         assert!(
-            reader.bytes_read <= 8192,
+            bytes_read.get() <= 8192,
             "read {} historical bytes",
-            reader.bytes_read
+            bytes_read.get()
+        );
+        file.set_len(1).unwrap();
+        assert_eq!(
+            read_log_tail(end, 1, &mut read_chunk).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
         );
     }
 
