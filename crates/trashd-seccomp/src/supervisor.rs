@@ -181,11 +181,14 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         None => CredentialGate::Unknown,
     };
     let session = SessionAncestry::discover();
-    // Domains restricted before a previous supervisor died are relearned
-    // from the stable ancestor; local records cover this generation (#390).
-    let mut landlock = LandlockGate::new(crate::broker::landlock_records().unwrap_or_default());
     store.defer_maintenance();
     signal_ready(ready_fd, true);
+    // Domains restricted before a previous supervisor died are relearned
+    // from the stable ancestor; local records cover this generation (#390).
+    // This fetch must follow the ready signal: the orchestrator does not
+    // serve broker requests until startup completes, so asking earlier
+    // deadlocks the supervisor against its own readiness.
+    let mut landlock = LandlockGate::new(crate::broker::landlock_records().unwrap_or_default());
 
     loop {
         // Block until a notification arrives
