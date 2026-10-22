@@ -363,7 +363,12 @@ def main():
         oracle = subprocess.run(["/usr/bin/rm", "-d", str(unlistable)], env=dict(nobody_env, TRASH_BYPASS="1"), cwd=nobody, capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
         unlistable.chmod(0o700)
         assert ours.returncode == oracle.returncode == 1, (ours.stderr, oracle.stderr)
-        assert "not empty" in ours.stderr and "not empty" in oracle.stderr, (ours.stderr, oracle.stderr)
+        # The refusal is the contract: rmdir knows the directory is not
+        # empty, but newer GNU rm reports its failed listing attempt
+        # (Permission denied) instead of the rmdir diagnosis.
+        assert "not empty" in ours.stderr, (ours.stderr, oracle.stderr)
+        assert "not empty" in oracle.stderr or "Permission denied" in oracle.stderr, (
+            ours.stderr, oracle.stderr)
         assert (unlistable / "secret").read_bytes() == b"keep"
         assert not list((nobody / "data/Trash/info").glob("*.trashinfo")) if (nobody / "data/Trash/info").exists() else True
         print("PASS: -d on an unlistable non-empty directory refuses like rm")
