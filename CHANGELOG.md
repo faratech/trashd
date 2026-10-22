@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.13 (2026-10-22)
 
 This round fixes a privilege boundary in the root seccomp supervisor,
 several ways trashd-exec could end a login or lose protection mid-command,
