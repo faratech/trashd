@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.14 (2026-10-22)
+
+Stabilization release for deletion security boundaries, syscall compatibility,
+no-clobber publication, and interrupted cleanup. Install the wrapper and preload
+from the same release and restart existing wrapped sessions.
 
 ### Fixed
 

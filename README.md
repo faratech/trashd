@@ -8,7 +8,7 @@ A Linux recycle bin that actually works — in scripts, cron jobs, and at the de
 
 Unlike `safe-rm` (which only blocks deletes) or `trash-cli` (which requires calling `trash-put` instead of `rm`), trashd intercepts destructive commands transparently across four independent layers. Scripts that call `rm` get trash protection without any code changes. Programs that call `unlink()` directly get caught too. Even statically-linked binaries making raw syscalls are intercepted at the kernel boundary.
 
-Every layer is fail-safe: if trashing fails for any reason, the real delete executes normally. trashd never blocks or hangs a deletion.
+Interception preserves the caller's kernel permissions. Some operational failures fall back to real deletion; storage and identity checks can also refuse an operation. See [Safety](#safety) for each layer's fallback behavior.
 
 ## How it works
 
@@ -54,6 +54,8 @@ A drop-in `rm` replacement installed at `/usr/local/lib/trashd/bin/rm`, prepende
 
 Supports all standard GNU `rm` flags: `-r`/`-R`/`--recursive`, `-f`/`--force`, `-i` (prompt per file), `-I` (prompt once for 3+ files), `-d`/`--dir` (empty directories), `-v`/`--verbose`. Adds `--permanent` and `--no-trash` to bypass trash when needed.
 
+Recursive confirmation plans pin directory identities until their answers are applied. Each operand has a 32 MiB planning budget, a depth limit of 128, and at most 256 retained directory descriptors (reduced under a low file descriptor limit). Exceeding a budget refuses that operand before mutation; wide-directory verification uses binary search over planned names.
+
 Discovers the real `rm` binary via a stashed copy at `/usr/local/lib/trashd/real/rm`, falling back to PATH search (skipping trashd directories), then `/usr/bin/rm`. When passing through to real `rm`, sets `TRASH_BYPASS=1` in the child environment so the LD_PRELOAD layer doesn't re-intercept the delete.
 
 In GUI sessions (when `$DISPLAY` or `$WAYLAND_DISPLAY` is set), sends a desktop notification via `notify-send` when files are trashed.
@@ -67,7 +69,7 @@ Enabled system-wide via `/etc/ld.so.preload`, which `install.sh` and a native `m
 Key safety mechanisms:
 - **Re-entrancy guard** — A thread-local `Cell<bool>` prevents internal `rename()`/`mkdir()` calls during trash operations from re-entering the hooked `unlink()`.
 - **Trash directory skip** — Paths inside `~/.local/share/Trash/`, `.Trash-$UID/`, and `.Trash/` are never intercepted. This prevents the preload from intercepting trash cleanup operations.
-- **Seccomp deference** — Preload defers after checking ACTIVE and a cookie-specific filter proof. Unrelated filters or stale markers retain preload protection.
+- **Seccomp deference** — Preload defers after checking ACTIVE and a cookie-specific, versioned filter proof. Unrelated filters, stale markers, and incompatible wrapper versions retain in-process preload protection. On x86-64, marked handoffs preserve `unlink`, `rmdir`, or `unlinkat` as appropriate; `remove()` tries `unlink` and then `rmdir` for a directory, preserving the syscall families an application's seccomp profile permits.
 - **Config change detection** — Checks config file mtime every 60 seconds and logs when changes are detected. Full reload requires process restart (intentional — mutating global state in a preload `.so` is unsafe).
 
 ### Layer 3 — fanotify daemon (`trashd`)
@@ -90,19 +92,19 @@ Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the kernel syscall boundary 
 
 2. **Supervisor** — Receives notifications via `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`, asks the ancestor broker to read path arguments and duplicate target directory descriptors, resolves paths through pinned descriptors, applies config filters, and either trashes the file (responding with success) or lets the real syscall execute (responding with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Absolute paths are confined to the target's pinned root. Relative walks that escape a pinned cwd/dirfd (`..`, symlinks) resolve normally when the target shares the supervisor's root mount and mount namespace; for chrooted or namespaced targets they are handed back to the target kernel, and the supervisor never retries them through a host-namespace display path. A trash on another filesystem (or one without `RENAME_NOREPLACE`, such as NFS) is filled by copying from the pinned parent, as `trash()` does. trashd's own `trash` CLI and rm shim are never intercepted: their deletes are store-internal. Validates notification IDs to mitigate TOCTOU races.
 
-3. **Watchdog** — Holds a `dup()`'d copy of the notification fd. Monitors the supervisor via `waitpid()`. On supervisor death: immediately drains all pending notifications with `CONTINUE` (fail-safe — blocked processes resume with real deletes), then forks a new supervisor. If fork fails, enters emergency passthrough mode (responds `CONTINUE` until no filtered task remains). Once every filtered task has exited, the listener reports hangup and the supervisor and watchdog exit instead of retrying.
+3. **Watchdog** — Holds a `dup()`'d copy of the notification fd. Monitors the supervisor via `waitpid()`. On supervisor death: immediately drains pending notifications through the shared decline handler, then forks a new supervisor. Marked preload handoffs return `ENOSYS` for in-process handling; unmarked deletes continue in the target kernel, and Landlock attempts are recorded before continuing. If fork fails, the same handler serves notifications until no filtered task remains. Once every filtered task has exited, the listener reports hangup and the supervisor and watchdog exit instead of retrying.
 
 4. **Orchestrator** — Remains an ancestor and subreaper for the command and its descendants. It brokers `process_vm_readv()` and `pidfd_getfd()` over a private socket, preserving access under Yama `ptrace_scope=1` across child forks and supervisor restarts. It forwards `SIGHUP`, `SIGINT`, and `SIGTERM` through pidfds and reaps exited children. Protection remains available until all descendants finish; the wrapper then returns the original command's exit status. Background descendants therefore keep the wrapper running after their parent exits. The wrapper waits with the default `SIGCHLD` disposition even when it inherits `SIG_IGN` (WSL's `login` passes one to every shell); the command gets the inherited disposition back.
 
-The BPF filter is architecture-specific: x86_64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84). aarch64 traps only `SYS_unlinkat` (35) since the other two syscalls don't exist on that architecture. Both also trap `SYS_landlock_restrict_self` (446) so the supervisor learns about Landlock domains targets add later.
+The BPF filter is architecture-specific: x86_64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84). aarch64 traps only `SYS_unlinkat` (35) since the other two syscalls don't exist on that architecture. Both also trap `SYS_landlock_restrict_self` (446) to record restriction setup attempts before the kernel executes them.
 
-Update `trashd-exec` and `libtrashd_preload.so` together, then restart sessions already wrapped by `trashd-exec`. Their inherited seccomp filters remain in place until those sessions exit; replacing the files does not update a running session's filter.
+Install `trashd-exec` and `libtrashd_preload.so` from the same release, then restart sessions already wrapped by `trashd-exec` and long-running processes using preload. Their inherited seccomp filters and loaded libraries remain in place until those processes exit; replacing the files does not update them. A mismatched filter proof prevents new preload code from deferring to an incompatible wrapper, but a complete upgrade requires restarting the session.
 
 Automatic nonroot login shells use preload and the PATH shim, preserving normal `sudo` behavior. Interactive root shells try `trashd-exec --preserve-privileges` without changing privilege state. Set `TRASHD_SECCOMP_AUTO=0` to disable automatic wrapping. `TRASHD_SECCOMP_ATTEMPTED` prevents profile recursion.
 
 Explicit `trashd-exec <command>` provides kernel interception but sets irreversible, inherited `NoNewPrivs`, preventing setuid/file-capability elevation. ACTIVE and a random cookie are published only after memory access, root/cwd and directory-descriptor pinning, `openat2`, and supervisor readiness succeed. Setup failure reaps the filtered child and execs the command in place of the unfiltered wrapper, with both markers cleared and the inherited signal state restored. No wrapper process stays resident in fallback mode. Supervisor startup failure aborts.
 
-Landlock rules a target installs after wrapper startup are honored: the filter also traps `landlock_restrict_self`, so the supervisor records each new domain (kept by the orchestrator across supervisor restarts) and declines those threads' deletes to their own credentials instead of renaming with its unrestricted ones. A removal the target's policy forbids is therefore refused natively; a deferring preload still trashes in-process under the same domain. Domains inherited at startup are shared with the supervisor, whose renames the kernel already checks against them. This resolves [#390](https://github.com/faratech/trashd/issues/390).
+Any `landlock_restrict_self` attempt after wrapper startup sets a session-wide flag before the syscall continues, even if the kernel later rejects the attempt. The watchdog and every supervisor share this flag; it survives supervisor replacement and the exit of a restricting parent, with no per-task record limit. Once set, all subsequent deletions in that wrapped session stay in the target's own security context. A deferring preload handles trashing in-process under that context; static binaries and direct syscalls proceed to the kernel and may permanently delete permitted paths rather than trash them. The kernel refuses removals forbidden by the target's policy. Domains inherited at startup are shared with the supervisor, whose renames the kernel already checks against them. If restriction tracking is unavailable, the supervisor declines mutations and refuses untracked restriction setup. This resolves [#390](https://github.com/faratech/trashd/issues/390).
 
 `Device or resource busy (os error 16)` means an earlier inherited notification filter already owns a listener. Another listener cannot be installed, and namespaces cannot remove the inherited filter. The wrapper reports the downgrade and retains preload/shim fallback where available; it cannot undo privilege restrictions imposed upstream.
 
@@ -144,7 +146,7 @@ The install script:
 6. Installs `/etc/profile.d/trashd.sh` (PATH shim + seccomp wrapper)
 7. Installs and starts the `trashd` systemd service
    and a per-user `trashd-cleanup.timer` (disabled; enable it with
-   `systemctl --user enable --now trashd-cleanup.timer` to purge items older than 30 days weekly)
+   `systemctl --user enable --now trashd-cleanup.timer` to purge items older than 30 days and retry unfinished cleanup weekly)
 8. Installs man pages to `/usr/local/share/man/man1/`
 9. Installs shell completions for bash, zsh, and fish
 10. Creates global config at `/etc/trashd/config.toml`
@@ -231,6 +233,8 @@ trash --version          # show version
 
 `restore`, `purge` and `info` also accept an entry's trashed path (the `trashed_path` field of `trash ls --json`). It stays unique when the same name was trashed on two partitions, where the ID alone is ambiguous. Non-UTF-8 names are matched byte for byte.
 
+`trash empty` also retries detached deletion jobs and reclaims a bounded batch of abandoned copy and encoding stages, even when no ordinary entries match `--older` or the trash is otherwise empty. It leaves active stages alone and never adds ordinary entries beyond the confirmed selection. `trash status` reports pending detached deletion jobs separately from the ordinary item count and size; `trash empty --dry-run` previews selected entries and pending detached-job retries without mutation. Cleanup failures return an error so explicit and scheduled runs can report unfinished work.
+
 `trash self-update` verifies the release's build attestation with the GitHub CLI (`gh attestation verify`) before running the installer as root; without `gh`, pass `--allow-unverified` to install anyway. It only updates installations in a root-owned prefix and leaves package-managed `/usr` installs to the package manager. `trash config edit` starts from a fully commented template, so nothing is overridden until you uncomment it.
 
 ### Bypass trash when needed
@@ -305,6 +309,8 @@ The copy works through pinned descriptors and never re-resolves the path:
 3. **Retire** — Only nodes that still match the snapshot (or, for a single file, the exact copied version) are removed from the source. Files created or changed during the move stay where they are, and the call reports the move as incomplete while keeping the complete trash entry.
 
 If the copy fails, the orphaned `.trashinfo` and any partial copy are cleaned up before returning the error.
+
+Directory restores that require a staged copy publish with atomic no-replace semantics. If the destination filesystem cannot provide them, trashd refuses publication and retains the trashed source rather than risk replacing a competing empty directory. Regular files can use exclusive hard-link publication where supported.
 
 ## Configuration
 
@@ -474,8 +480,8 @@ Changing `hash_algorithm` in the config does **not** require rehashing existing 
 Interception failures can fall back to permanent deletion:
 - **Shim** — Uses real deletion only for explicit bypasses and configured excluded paths. Unsafe or unavailable trash storage returns an error without deleting.
 - **Preload** — Rejects an unsafe trash directory (one another user could control) with `EACCES`. A trash that simply cannot be created — a service account whose home is `/nonexistent` or root-owned — lets the real `unlink()`/`rmdir()` run, and root running with another user's `HOME` uses its own home trash. Other operational failures return the result of the real call.
-- **Seccomp** — Responds with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` when pinned resolution or storage is unavailable, so the target kernel executes the syscall in the target's own namespace.
-- **Watchdog** — On supervisor crash, drains all pending notifications with `CONTINUE`
+- **Seccomp** — When it declines a marked preload handoff, returns `ENOSYS` so preload handles trashing in-process. Unmarked deletes continue in the target kernel with its own permissions and namespace.
+- **Watchdog** — On supervisor crash, uses the same decline handler, including recording Landlock attempts before allowing setup to continue.
 
 These fallback paths preserve the calling program's ability to delete, but the files may be unrecoverable. The seccomp wrapper aborts if it installs a filter but cannot establish a supervisor, preventing the command from running with a stranded listener.
 
@@ -613,6 +619,7 @@ trashd/
 │   ├── trashd-common/      # shared core library
 │   │   ├── config.rs        # layered TOML config with pattern matching
 │   │   ├── store.rs         # TrashStore: trash, restore, purge, empty, auto-purge
+│   │   ├── store/           # listing and unfinished-cleanup helpers
 │   │   ├── trashinfo.rs     # .trashinfo parser/serializer (FreeDesktop spec)
 │   │   ├── mounts.rs        # multi-partition trash directory discovery
 │   │   ├── directorysizes.rs # $trash/directorysizes cache (spec v1.0)
@@ -625,7 +632,7 @@ trashd/
 ├── config/
 │   └── trashd.toml          # default config template
 ├── tests/
-│   └── integration.sh       # 12 end-to-end integration tests
+│   └── integration.sh       # sandboxed end-to-end integration tests
 └── install/
     ├── profile.d/           # PATH shim + seccomp activation
     └── systemd/             # trashd.service
@@ -646,7 +653,7 @@ trashd/
 ### Unit tests
 
 ```bash
-TRASH_BYPASS=1 cargo test    # 32 unit tests (store, trashinfo, globs)
+TRASH_BYPASS=1 cargo test --workspace
 ```
 
 `TRASH_BYPASS=1` is required when LD_PRELOAD is system-wide to prevent the preload from intercepting test operations.
@@ -654,10 +661,15 @@ TRASH_BYPASS=1 cargo test    # 32 unit tests (store, trashinfo, globs)
 ### Integration tests
 
 ```bash
-sudo ./tests/integration.sh  # 12 end-to-end tests (requires install)
+cargo build --release --locked
+sudo ./tests/integration.sh target/release
+sudo ./tests/install_regression.sh target/release
+sudo python3 tests/shim_regression.py target/release/trashd-rm
+sudo env TRASH_BYPASS=1 REQUIRE_SECCOMP=1 python3 tests/sandbox.py --build-dir target/release -- \
+  /usr/bin/python3 /tests/seccomp_regression.py
 ```
 
-Covers: Layer 1 shim, Layer 2 LD_PRELOAD, `--permanent` bypass, `TRASH_BYPASS=1` bypass, `trash undo`, `trash restore --to`, `trash purge`, `trash empty -y`, `*/.git/*` pattern skip, restore conflict detection, duplicate filename unique IDs, and `trash fsck` orphan detection.
+Subprocess suites use `tests/sandbox.py` to isolate the locally built artifacts in private mount and PID namespaces with disposable trash roots; they require Linux mount privileges and fail if isolation cannot be established. No installation or host-trash cleanup is needed. Coverage includes interception layers, bypasses, restore conflicts, interrupted cleanup, confirmation budgets, and seccomp/Landlock lifecycle behavior. `REQUIRE_SECCOMP=1` requires a working notification listener; without it, unsupported hosts may skip live seccomp checks. The opt-in self-update network check uses `TRASHD_TEST_NETWORK=1`.
 
 ## Requirements
 
