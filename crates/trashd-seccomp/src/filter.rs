@@ -56,6 +56,12 @@ const SYS_RETIRE: u32 = SYS_UNLINK;
 #[cfg(target_arch = "aarch64")]
 const SYS_RETIRE: u32 = SYS_UNLINKAT;
 
+// landlock_restrict_self (446 on both architectures): trapping it lets
+// the supervisor learn that a thread entered a Landlock domain it does not
+// share, instead of lending that thread its own unrestricted credentials
+// (#390). Sandbox setup itself is always continued.
+const SYS_LANDLOCK_RESTRICT_SELF: u32 = 446;
+
 // io_uring (same generic numbers on both arches). io_uring can execute
 // IORING_OP_UNLINKAT/UNLINK/RMDIR from kernel workers WITHOUT a syscall
 // entry, so allowing io_uring_setup/enter/register would let a supervised
@@ -112,33 +118,35 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 #[cfg(target_arch = "x86_64")]
 fn build_base_filter() -> Vec<SockFilter> {
     //  [0] LD arch
-    //  [1] JEQ native -> [2], else ERRNO[12]
+    //  [1] JEQ native -> [2], else ERRNO[13]
     //  [2] LD nr
-    //  [3] JGE x32-bit           -> ERRNO[12]
-    //  [4] JEQ unlink        -> NOTIF[11]
-    //  [5] JEQ unlinkat      -> NOTIF[11]
-    //  [6] JEQ rmdir         -> NOTIF[11]
-    //  [7] JEQ io_uring_setup    -> ERRNO[12]
-    //  [8] JEQ io_uring_enter    -> ERRNO[12]
-    //  [9] JEQ io_uring_register -> ERRNO[12]
-    // [10] RET ALLOW   [11] RET USER_NOTIF   [12] RET ERRNO|ENOSYS
+    //  [3] JGE x32-bit           -> ERRNO[13]
+    //  [4] JEQ unlink        -> NOTIF[12]
+    //  [5] JEQ unlinkat      -> NOTIF[12]
+    //  [6] JEQ rmdir         -> NOTIF[12]
+    //  [7] JEQ landlock_restrict_self -> NOTIF[12]
+    //  [8] JEQ io_uring_setup    -> ERRNO[13]
+    //  [9] JEQ io_uring_enter    -> ERRNO[13]
+    // [10] JEQ io_uring_register -> ERRNO[13]
+    // [11] RET ALLOW   [12] RET USER_NOTIF   [13] RET ERRNO|ENOSYS
     vec![
         // [0] Load architecture
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
         // [1] Native arch → continue; anything else → ERRNO|ENOSYS (a 32-bit
         // process under the 64-bit supervisor used to get silent ALLOWs)
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 10),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 11),
         // [2] Load syscall number
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
         // [3] x32 syscalls carry this bit and reuse the native arch token, so
         // the arch check cannot catch them; without this they would silently
         // ALLOW every delete (#123). Reject them like a foreign architecture.
-        bpf_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 8, 0),
-        // [4..6] unlink/unlinkat/rmdir → USER_NOTIF [11]
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINK, 6, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 5, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_RMDIR, 4, 0),
-        // [7..9] io_uring → ERRNO|ENOSYS [12]
+        bpf_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 9, 0),
+        // [4..7] unlink/unlinkat/rmdir and landlock_restrict_self → NOTIF [12]
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINK, 7, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 6, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_RMDIR, 5, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_LANDLOCK_RESTRICT_SELF, 4, 0),
+        // [8..10] io_uring → ERRNO|ENOSYS [13]
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_SETUP, 4, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_ENTER, 3, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_REGISTER, 2, 0),
@@ -154,15 +162,17 @@ fn build_base_filter() -> Vec<SockFilter> {
 /// Build the BPF filter for aarch64 (only unlinkat exists).
 #[cfg(target_arch = "aarch64")]
 fn build_base_filter() -> Vec<SockFilter> {
-    //  [0] LD arch    [3] JEQ unlinkat -> NOTIF[8]
-    //  [1] JEQ native -> [2], else ERRNO[9]
-    //  [2] LD nr      [4..6] JEQ io_uring_* -> ERRNO[9]
-    //                 [7] RET ALLOW  [8] RET USER_NOTIF  [9] RET ERRNO|ENOSYS
+    //  [0] LD arch    [3] JEQ unlinkat -> NOTIF[9]
+    //  [1] JEQ native -> [2], else ERRNO[10]
+    //  [2] LD nr      [4] JEQ landlock_restrict_self -> NOTIF[9]
+    //                 [5..7] JEQ io_uring_* -> ERRNO[10]
+    //                 [8] RET ALLOW  [9] RET USER_NOTIF  [10] RET ERRNO|ENOSYS
     vec![
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 7),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 8),
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 4, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 5, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_LANDLOCK_RESTRICT_SELF, 4, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_SETUP, 4, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_ENTER, 3, 0),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_REGISTER, 2, 0),
@@ -382,6 +392,16 @@ mod tests {
         for nr in [425, 426, 427] {
             assert_eq!(decide(NATIVE_ARCH, nr, args, ip), SECCOMP_RET_ERRNO_ENOSYS);
         }
+        // Sandbox setup is observed, never blocked: the supervisor records
+        // the new Landlock domain, then continues the call (#390).
+        assert_eq!(
+            decide(NATIVE_ARCH, SYS_LANDLOCK_RESTRICT_SELF, args, ip),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            decide(0, SYS_LANDLOCK_RESTRICT_SELF, args, ip),
+            SECCOMP_RET_ERRNO_ENOSYS
+        );
         #[cfg(target_arch = "x86_64")]
         {
             for nr in [SYS_UNLINKAT, SYS_RMDIR] {

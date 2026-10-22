@@ -72,6 +72,41 @@ pub fn duplicate_fd(pid: u32, fd: i32) -> io::Result<RawFd> {
         .ok_or_else(|| io::Error::other("broker did not return a descriptor"))
 }
 
+/// Record a thread that entered a Landlock domain, kept by the stable
+/// ancestor so a replacement supervisor relearns it (#390).
+pub fn record_landlock(tid: u32, tgid: u32) -> io::Result<()> {
+    request(3, tid, u64::from(tgid)).map(|_| ())
+}
+
+/// Every Landlock record the ancestor holds, as `(tid, tgid)` pairs.
+pub fn landlock_records() -> io::Result<Vec<(u32, u32)>> {
+    let (data, _) = request(4, 0, 0)?;
+    if data.len() % 8 != 0 {
+        return Err(io::Error::other("invalid landlock record list"));
+    }
+    Ok(data
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|pair| {
+            (
+                u32::from_ne_bytes(pair[..4].try_into().unwrap()),
+                u32::from_ne_bytes(pair[4..].try_into().unwrap()),
+            )
+        })
+        .collect())
+}
+
+/// Landlock domains recorded by any supervisor generation. This state
+/// lives only in the serving (orchestrator) process; supervisors are
+/// replaced, the ancestor is not.
+fn landlock_store() -> &'static std::sync::Mutex<Vec<(u32, u32)>> {
+    static STORE: OnceLock<std::sync::Mutex<Vec<(u32, u32)>>> = OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+const MAX_LANDLOCK_RECORDS: usize = 512;
+
 /// Handle one datagram. A dead supervisor's reply socket is harmless: its
 /// replacement has a different socket and never consumes the old response.
 pub fn serve(fd: RawFd) -> io::Result<()> {
@@ -97,6 +132,22 @@ pub fn serve(fd: RawFd) -> io::Result<()> {
         1 => crate::mem::read_path_locally(pid, value)
             .map(|p| (p.as_os_str().as_bytes().to_vec(), None)),
         2 => duplicate_locally(pid, value as i32).map(|fd| (Vec::new(), Some(fd))),
+        3 => {
+            let mut store = landlock_store().lock().unwrap();
+            if store.len() < MAX_LANDLOCK_RECORDS && !store.contains(&(pid, value as u32)) {
+                store.push((pid, value as u32));
+            }
+            Ok((Vec::new(), None))
+        }
+        4 => {
+            let store = landlock_store().lock().unwrap();
+            let mut data = Vec::with_capacity(store.len() * 8);
+            for (tid, tgid) in store.iter().take(MAX_LANDLOCK_RECORDS) {
+                data.extend_from_slice(&tid.to_ne_bytes());
+                data.extend_from_slice(&tgid.to_ne_bytes());
+            }
+            Ok((data, None))
+        }
         _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
     };
     let (bytes, descriptor) = match result {
@@ -242,6 +293,31 @@ fn recv_packet(sock: RawFd) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #390: records written by one supervisor generation are fetched by
+    // its replacement through the stable ancestor.
+    #[test]
+    fn landlock_records_survive_through_the_broker() {
+        let (server, client) = UnixDatagram::pair().unwrap();
+        let (reply, destination) = UnixDatagram::pair().unwrap();
+        let packet = |kind: u32, pid: u32, value: u64| {
+            let mut data = Vec::new();
+            data.extend_from_slice(&kind.to_ne_bytes());
+            data.extend_from_slice(&pid.to_ne_bytes());
+            data.extend_from_slice(&value.to_ne_bytes());
+            send_packet(client.as_raw_fd(), &data, Some(destination.as_raw_fd())).unwrap();
+            serve(server.as_raw_fd()).unwrap();
+            recv_packet(reply.as_raw_fd()).unwrap().0
+        };
+        assert_eq!(packet(3, 111, 222), 0i32.to_ne_bytes());
+        assert_eq!(packet(3, 111, 222), 0i32.to_ne_bytes(), "no duplicates");
+        let fetched = packet(4, 0, 0);
+        assert_eq!(&fetched[..4], 0i32.to_ne_bytes());
+        assert_eq!(
+            &fetched[4..],
+            [111u32.to_ne_bytes(), 222u32.to_ne_bytes()].concat()
+        );
+    }
 
     /// Isolate forks, credential changes and the per-process broker client
     /// from the test harness. No permission changes escape this subprocess.

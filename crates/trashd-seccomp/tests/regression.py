@@ -159,6 +159,39 @@ for row in sys.stdin:
         # wrapper readiness. The completed copy publishes between pinned fds
         # on one filesystem; supervisor rename remains available too (#392).
         subprocess.run(command, env=child_env, preexec_fn=force_copy_error(), check=True, timeout=8)
+    elif mode in ["landlock", "landlock-attempt", "landlock-child"]:
+        # A domain handling REMOVE_FILE with no allow rule: the deletion
+        # must be refused natively, never completed by the supervisor
+        # with credentials outside the domain (#390).
+        import ctypes as _ctypes
+        _libc = _ctypes.CDLL(None, use_errno=True)
+        class _Attr(_ctypes.Structure):
+            _fields_ = [("handled_access_fs", _ctypes.c_uint64),
+                        ("handled_access_net", _ctypes.c_uint64),
+                        ("scoped", _ctypes.c_uint64)]
+        if mode == "landlock":
+            _attr = _Attr()
+            _attr.handled_access_fs = 1 << 5  # LANDLOCK_ACCESS_FS_REMOVE_FILE
+            _rs = _libc.syscall(444, _ctypes.byref(_attr), _ctypes.sizeof(_attr), 0)
+            assert _rs >= 0, "landlock_create_ruleset failed"
+            _libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
+            assert _libc.syscall(446, _rs, 0) == 0, "landlock_restrict_self failed"
+        if mode == "landlock-child":
+            _child = os.fork()
+            if _child == 0:
+                try: os.unlink(path)
+                except PermissionError: os._exit(13)
+                except BaseException: os._exit(14)
+                os._exit(0)
+            _, _status = os.waitpid(_child, 0)
+            print(json.dumps("denied" if os.WEXITSTATUS(_status) == 13 else "removed"), flush=True)
+            continue
+        try:
+            os.unlink(path)
+            print(json.dumps("removed"), flush=True)
+        except PermissionError:
+            print(json.dumps("denied"), flush=True)
+        continue
     elif mode.startswith("thread"):
         errors = []
         def worker():
@@ -420,6 +453,43 @@ def run():
             finally:
                 stop(process)
         print("PASS: protected deletes, forked children, dirfds, FIFO, restart, signals", flush=True)
+
+        # A target that sandboxes itself with Landlock after startup keeps
+        # its native refusals: the supervisor must decline rather than
+        # rename with credentials outside the domain, for the restricted
+        # thread, its forked children, and after a supervisor restart
+        # (records are relearned from the stable ancestor) (#390).
+        with (fixture / "landlock.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                target, active = line(process)
+                assert active == "1", "landlock case lost listener"
+                victim = work / "landlock.txt"
+                victim.write_bytes(b"refused data survives\n")
+                process.stdin.write(json.dumps(["landlock", str(victim)]) + "\n"); process.stdin.flush()
+                assert line(process) == "denied"
+                assert victim.read_bytes() == b"refused data survives\n"
+                assert not recovery_records(data, victim), "supervisor bypassed the Landlock refusal"
+                child_victim = work / "landlock-child.txt"
+                child_victim.write_bytes(b"child refused\n")
+                process.stdin.write(json.dumps(["landlock-child", str(child_victim)]) + "\n"); process.stdin.flush()
+                assert line(process) == "denied"
+                assert child_victim.read_bytes() == b"child refused\n"
+                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
+                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                os.kill(supervisor, signal.SIGKILL)
+                wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
+                again = work / "landlock-after-restart.txt"
+                again.write_bytes(b"still refused\n")
+                process.stdin.write(json.dumps(["landlock-attempt", str(again)]) + "\n"); process.stdin.flush()
+                assert line(process) == "denied"
+                assert again.read_bytes() == b"still refused\n"
+                assert not recovery_records(data, again), "replacement supervisor bypassed the Landlock refusal"
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: Landlock refusals survive supervisor credentials, fork and restart", flush=True)
 
         with (fixture / "descriptor-backend.log").open("w") as log:
             process = launch(protected_env, log, errno.ENOSYS, SYSCALL_PIDFD_GETFD)

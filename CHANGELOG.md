@@ -11,6 +11,11 @@ preserved.
 
 ### Fixed
 
+- The seccomp supervisor honors Landlock domains a target installs after
+  startup: it records each `landlock_restrict_self` and declines those
+  threads' deletes to their own credentials, so a policy-forbidden removal
+  is refused natively instead of renamed with supervisor credentials.
+  Records persist with the orchestrator across supervisor restarts (#390).
 - `trash fsck` reports directory entries it could not read and fails the
   check instead of discarding the error and claiming clean trash (#398).
 - Trash naming no longer exhausts a fixed same-second counter range: after

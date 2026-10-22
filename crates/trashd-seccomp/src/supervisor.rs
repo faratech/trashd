@@ -181,6 +181,9 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         None => CredentialGate::Unknown,
     };
     let session = SessionAncestry::discover();
+    // Domains restricted before a previous supervisor died are relearned
+    // from the stable ancestor; local records cover this generation (#390).
+    let mut landlock = LandlockGate::new(crate::broker::landlock_records().unwrap_or_default());
     store.defer_maintenance();
     signal_ready(ready_fd, true);
 
@@ -218,6 +221,7 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
                 own.ids(),
                 &credentials,
                 session.as_ref(),
+                &mut landlock,
             )
         }));
         if handled.is_err() {
@@ -240,6 +244,7 @@ pub(crate) fn signal_ready(fd: i32, ready: bool) {
 }
 
 /// Handle a single notification.
+#[allow(clippy::too_many_arguments)]
 fn handle_notification(
     fd: i32,
     notif: &SeccompNotif,
@@ -248,6 +253,7 @@ fn handle_notification(
     own: &[(u64, u64)],
     credentials: &CredentialGate,
     session: Option<&SessionAncestry>,
+    landlock: &mut LandlockGate,
 ) {
     // Check if the notification is still valid BEFORE touching the target's
     // /proc state: if the target died and its PID was recycled, the reads
@@ -261,10 +267,21 @@ fn handle_notification(
         return;
     }
 
+    // Sandbox setup is never blocked: record the domain the calling
+    // thread is about to enter, then let the kernel apply it (#390).
+    if notif.data.nr == SYS_LANDLOCK_RESTRICT_SELF {
+        landlock.note(notif.pid);
+        respond_continue(fd, notif.id);
+        return;
+    }
+
     // A target we will not lend our credentials to deletes with its own:
     // a deferring preload trashes the entry itself, anything else is left to
-    // the kernel (#311, #349).
-    if !invalid_flags(notif) && !credentials.lends_to(notif.pid) {
+    // the kernel (#311, #349). A Landlock domain the supervisor does not
+    // share is the same refusal: our rename would bypass the target's own
+    // policy, so the deletion stays with the target's credentials (#390).
+    if !invalid_flags(notif) && (!credentials.lends_to(notif.pid) || landlock.restricts(notif.pid))
+    {
         decline(fd, notif);
         return;
     }
@@ -467,6 +484,96 @@ impl CredentialGate {
             CredentialGate::Unknown => false,
         }
     }
+}
+
+/// landlock_restrict_self on x86_64 and aarch64.
+const SYS_LANDLOCK_RESTRICT_SELF: i32 = 446;
+
+/// Threads that entered a Landlock domain the supervisor does not share.
+///
+/// Landlock gives a supervisor no way to list another thread's domains,
+/// so the filter traps landlock_restrict_self itself: every domain a
+/// target adds after startup is recorded here (and with the stable
+/// ancestor, for replacement supervisors) before the kernel applies it.
+/// Domains inherited at session start are shared with the supervisor,
+/// whose renames the kernel checks against them already. A recorded
+/// restriction declines the delete to the target's own credentials —
+/// the preload then trashes in-process under the same domain, and any
+/// other caller's kernel check (including its refusal) runs natively.
+pub(crate) struct LandlockGate {
+    /// (tid, tgid) pairs that restricted themselves.
+    recorded: Vec<(u32, u32)>,
+}
+
+impl LandlockGate {
+    fn new(recorded: Vec<(u32, u32)>) -> Self {
+        Self { recorded }
+    }
+
+    fn note(&mut self, tid: u32) {
+        let tgid = thread_group(tid).unwrap_or(tid);
+        if !self.recorded.contains(&(tid, tgid)) {
+            self.recorded.push((tid, tgid));
+        }
+        let _ = crate::broker::record_landlock(tid, tgid);
+    }
+
+    fn restricts(&self, tid: u32) -> bool {
+        // Sessions that never sandbox pay no /proc reads for this gate.
+        if self.recorded.is_empty() {
+            return false;
+        }
+        if self.recorded.iter().any(|&(recorded, _)| recorded == tid) {
+            return true;
+        }
+        // Kernels exposing a thread's domain answer directly; this also
+        // covers domains inherited from an ancestor that has since exited.
+        if attr_restricted(tid) {
+            return true;
+        }
+        let restricted_groups: Vec<u32> = self.recorded.iter().map(|&(_, tgid)| tgid).collect();
+        if let Some(tgid) = thread_group(tid)
+            && restricted_groups.contains(&tgid)
+        {
+            return true;
+        }
+        // A process forked by a restricted thread inherits its domain.
+        // Walk parents while they live; the attr check above covers the
+        // orphaned case on kernels that expose it.
+        let mut current = tid;
+        for _ in 0..BYPASS_DEPTH {
+            let Some((_, parent)) = trashd_common::proc_stat::comm_and_parent(current) else {
+                return false;
+            };
+            if parent <= 1 {
+                return false;
+            }
+            if restricted_groups.contains(&parent) {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+}
+
+/// Thread group of a task from `/proc/<tid>/status`.
+fn thread_group(tid: u32) -> Option<u32> {
+    read_proc_text(&format!("/proc/{tid}/status"))?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok())
+}
+
+/// Whether `/proc/<tid>/attr/landlock/domain` reports a domain. Absent
+/// files and the explicit `none` both mean no domain is visible.
+fn attr_restricted(tid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{tid}/attr/landlock/domain"))
+        .is_ok_and(|content| domain_attr_restricted(&content))
+}
+
+fn domain_attr_restricted(content: &str) -> bool {
+    let content = content.trim();
+    !content.is_empty() && content != "none"
 }
 
 /// A small /proc text file, decoded lossily: status prints `Name:` as raw
@@ -727,6 +834,28 @@ fn run_passthrough(fd: i32) -> io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // #390: only threads recorded at restrict time (or reporting a
+    // domain through the kernel attr) lose supervisor credentials.
+    #[test]
+    fn landlock_gate_records_restricted_threads() {
+        assert!(!domain_attr_restricted(""));
+        assert!(!domain_attr_restricted("  none\n"));
+        assert!(domain_attr_restricted("17179869184\n"));
+
+        let gate = LandlockGate::new(vec![]);
+        assert!(!gate.restricts(std::process::id()));
+
+        let gate = LandlockGate::new(vec![(424_242, 424_242)]);
+        assert!(gate.restricts(424_242), "the restricting thread itself");
+        assert!(!gate.restricts(u32::MAX - 1), "a task that does not exist");
+
+        // This test process is in nobody's recorded group, and reading
+        // its thread group must agree with getpid for the main thread.
+        let gate = LandlockGate::new(vec![(424_242, 424_242)]);
+        assert!(!gate.restricts(std::process::id()));
+        assert_eq!(thread_group(std::process::id()), Some(std::process::id()));
+    }
 
     #[test]
     fn credentials_parse_filesystem_ids_groups_and_capabilities() {
