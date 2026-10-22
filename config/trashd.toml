@@ -1,12 +1,17 @@
 # trashd configuration
 #
+# Prefer `trash config set/add/edit` for changes — it validates values and
+# writes atomically. See `trash config show` for the effective merged result
+# and the README's Configuration section for the full guide.
+#
 # Layered config:
 #   /etc/trashd/config.toml        — global (admin-managed)
 #   ~/.config/trashd/config.toml   — per-user override
 #
 # Scalars: user overrides global overrides defaults.
-# Lists (never_trash, bypass_processes): user extends global — admin-set
-# patterns cannot be removed by individual users.
+# Lists (never_trash, bypass_processes, bypass_paths): user extends global —
+# admin-set patterns cannot be removed by individual users.
+# only_trash is the exception: user replaces global (it is a whitelist).
 
 # Paths that should never be trashed (use real delete instead).
 # Supports *, **, ?, and [...] wildcards; relative patterns match path components.
@@ -91,8 +96,9 @@ max_dir_size_mb = 0
 # SHA-256 is better if you need cryptographic verification.
 hash_algorithm = "xxhash"
 
-# Files smaller than this (in MB) get a hash on trash for integrity checking.
-# Set to 0 to disable hashing entirely. Default is 1 MB.
+# Files up to this size (in MB) get an integrity hash on trash, checked on
+# restore. (The name is historical: it applies to whichever hash_algorithm
+# is selected, not only SHA-256.) Set to 0 to disable hashing. Default: 1 MB.
 sha256_max_size_mb = 1
 
 # Minimum seconds between auto-purge scans. Auto-purge checks retention

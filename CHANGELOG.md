@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- Rewrote `README.md` to be reader-first: a 30-second demo and quick start
+  precede the internals, every `trash` subcommand and flag is now in a
+  complete reference table, and configuration, environment variables,
+  retention, safety limits, troubleshooting, and advanced wrapping each
+  have a dedicated section. Deep implementation detail moved into collapsed
+  deep dives so the main flow stays scannable on GitHub. Corrected the
+  cron coverage description (Layer 2, not the PATH shim) and the install
+  verification example (`/tmp` is never-trashed by default).
+- Expanded `CONTRIBUTING.md` with layered architecture notes, tiered test
+  instructions, and testing rules; fixed the "adding a CLI subcommand"
+  steps (the `Commands` enum lives in `src/cli.rs`, handlers in
+  `src/commands/`). Clarified merge semantics in `config/trashd.toml`.
+
 ## 0.1.14 (2026-10-22)
 
 Stabilization release for deletion security boundaries, syscall compatibility,
