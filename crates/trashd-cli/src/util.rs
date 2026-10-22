@@ -50,6 +50,25 @@ impl Drop for ScanProgress {
     }
 }
 
+/// Buffer display rows while preserving write and final-flush failures.
+/// Release the stdout lock before reporting an error on stderr.
+pub fn with_buffered_stdout(render: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>) {
+    let result = buffered_output(std::io::stdout().lock(), render);
+    if let Err(error) = result {
+        fatal(error);
+    }
+}
+
+fn buffered_output(
+    writer: impl std::io::Write,
+    render: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut output = std::io::BufWriter::new(writer);
+    render(&mut output)?;
+    output.flush()
+}
+
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -182,27 +201,56 @@ pub fn printable_path(path: &std::path::Path) -> String {
     printable(&path.to_string_lossy())
 }
 
+/// Serialize rows directly instead of duplicating all entries as Values and
+/// a complete JSON String. Keep the historical pretty format and key order.
 pub fn print_json_entries(entries: &[trashd_common::store::TrashEntry]) {
-    let items: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id,
-                // Unique even when two trash roots hold the same id; accepted
-                // as a selector by restore, purge and info (#210).
-                "trashed_path": e.trashed_path.to_string_lossy(),
-                "original_path": e.info.original_path.to_string_lossy(),
-                "deletion_date": e.info.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                "size": e.info.size,
-                "command": e.info.command,
-                "trash_dir": e.trash_root.to_string_lossy(),
-            })
-        })
-        .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into())
-    );
+    with_buffered_stdout(|out| write_json_entries(out, entries));
+}
+
+fn write_json_entries(
+    out: &mut dyn std::io::Write,
+    entries: &[trashd_common::store::TrashEntry],
+) -> std::io::Result<()> {
+    use serde::ser::{SerializeSeq, Serializer};
+    let mut serializer = serde_json::Serializer::pretty(&mut *out);
+    let mut sequence = serializer
+        .serialize_seq(Some(entries.len()))
+        .map_err(std::io::Error::other)?;
+    for entry in entries {
+        sequence
+            .serialize_element(&JsonEntry(entry))
+            .map_err(std::io::Error::other)?;
+    }
+    sequence.end().map_err(std::io::Error::other)?;
+    writeln!(out)
+}
+
+struct JsonEntry<'a>(&'a trashd_common::store::TrashEntry);
+
+impl serde::Serialize for JsonEntry<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let entry = self.0;
+        // serde_json::Value sorted these keys alphabetically. Preserve that
+        // byte ordering for callers which compare or consume the old output.
+        let mut row = serializer.serialize_struct("TrashEntry", 7)?;
+        row.serialize_field("command", &entry.info.command)?;
+        row.serialize_field(
+            "deletion_date",
+            &entry
+                .info
+                .deletion_date
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+        )?;
+        row.serialize_field("id", &entry.id)?;
+        row.serialize_field("original_path", &entry.info.original_path.to_string_lossy())?;
+        row.serialize_field("size", &entry.info.size)?;
+        row.serialize_field("trash_dir", &entry.trash_root.to_string_lossy())?;
+        // Unique across roots; restore, purge and info accept this selector.
+        row.serialize_field("trashed_path", &entry.trashed_path.to_string_lossy())?;
+        row.end()
+    }
 }
 
 /// Truncate a path string for display, respecting UTF-8 char boundaries.
@@ -227,18 +275,6 @@ pub fn confirm(msg: &str) -> bool {
 }
 
 /// Print a fatal error and exit.
-/// The selector for an entry named on the command line: UTF-8 targets as
-/// typed, anything else by its raw bytes. A lossy conversion matched another
-/// entry's ID exactly, so purge deleted the wrong file (#209).
-pub fn target_selector(store: &trashd_common::TrashStore, target: &std::ffi::OsStr) -> String {
-    match target.to_str() {
-        Some(target) => target.to_owned(),
-        None => store
-            .selector_for_raw_name(target)
-            .unwrap_or_else(|e| fatal(e)),
-    }
-}
-
 pub fn fatal(msg: impl std::fmt::Display) -> ! {
     eprintln!("{} {msg}", "trash: error:".red().bold());
     std::process::exit(1);
@@ -257,6 +293,70 @@ pub use std::path::PathBuf;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #380: streaming must keep the complete historical wire format,
+    // including nulls, escaping, raw Unix names and sequence order.
+    #[test]
+    fn streamed_json_preserves_pretty_output() {
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let mut config = trashd_common::Config::default();
+        config.never_trash.clear();
+        let store = trashd_common::TrashStore::open_isolated(&fixture.path().join("Trash"), config)
+            .unwrap();
+        for name in [
+            std::ffi::OsStr::new("plain"),
+            std::ffi::OsStr::from_bytes(b"raw-\xff\n"),
+        ] {
+            let source = fixture.path().join(name);
+            std::fs::write(&source, b"data").unwrap();
+            store.trash(&source, None).unwrap();
+        }
+        let mut entries = store.list(None).unwrap();
+        entries[0].info.command = Some("command \"quoted\"\n\\".into());
+        entries[0].info.size = None;
+        for slice in [&entries[..], &entries[..0]] {
+            let values: Vec<_> = slice.iter().map(|entry| serde_json::json!({
+                "id": entry.id,
+                "trashed_path": entry.trashed_path.to_string_lossy(),
+                "original_path": entry.info.original_path.to_string_lossy(),
+                "deletion_date": entry.info.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                "size": entry.info.size,
+                "command": entry.info.command,
+                "trash_dir": entry.trash_root.to_string_lossy(),
+            })).collect();
+            let expected = serde_json::to_string_pretty(&values).unwrap() + "\n";
+            let mut actual = Vec::new();
+            write_json_entries(&mut actual, slice).unwrap();
+            assert_eq!(actual, expected.as_bytes());
+        }
+        let error = write_json_entries(&mut FailingOutput, &entries).unwrap_err();
+        assert!(error.to_string().contains("No space left"));
+    }
+
+    struct FailingOutput;
+    impl std::io::Write for FailingOutput {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_output_propagates_final_flush_and_render_failures() {
+        let error = super::buffered_output(FailingOutput, |output| {
+            writeln!(output, "small buffered row")
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let error = super::buffered_output(Vec::new(), |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
 
     // Regression (#255): two u64::MAX sidecar sizes panicked `trash du`.
     #[test]

@@ -16,6 +16,9 @@ const BPF_JEQ: u16 = 0x10;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const BPF_JGE: u16 = 0x40;
 const BPF_K: u16 = 0x00;
+const BPF_X: u16 = 0x08;
+const BPF_MISC: u16 = 0x07;
+const BPF_TAX: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 // x32 processes report arch == AUDIT_ARCH_X86_64 but OR 0x40000000 into every
@@ -28,6 +31,7 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 // seccomp_data offsets
 const OFFSET_NR: u32 = 0; // offsetof(seccomp_data, nr)
 const OFFSET_ARCH: u32 = 4; // offsetof(seccomp_data, arch)
+const OFFSET_IP: u32 = 8; // offsetof(seccomp_data, instruction_pointer)
 
 // Architecture
 #[cfg(target_arch = "x86_64")]
@@ -46,6 +50,11 @@ const SYS_UNLINKAT: u32 = 263;
 // aarch64 syscall numbers (no unlink/rmdir — only unlinkat)
 #[cfg(target_arch = "aarch64")]
 const SYS_UNLINKAT: u32 = 35;
+
+#[cfg(target_arch = "x86_64")]
+const SYS_RETIRE: u32 = SYS_UNLINK;
+#[cfg(target_arch = "aarch64")]
+const SYS_RETIRE: u32 = SYS_UNLINKAT;
 
 // io_uring (same generic numbers on both arches). io_uring can execute
 // IORING_OP_UNLINKAT/UNLINK/RMDIR from kernel workers WITHOUT a syscall
@@ -184,8 +193,45 @@ pub fn build_filter(cookie: [u32; 4]) -> Vec<SockFilter> {
         BPF_RET | BPF_K,
         SECCOMP_RET_ERRNO | crate::seccomp_identity::PROOF_ERRNO as u32,
     ));
+    proof.extend(build_retirement_filter());
     proof.extend(build_base_filter());
     proof
+}
+
+/// Explicit source retirement stays in the caller's kernel context while
+/// it holds the copy's publication lock. Bind both tags to this syscall's
+/// site, so stale argument registers cannot exempt later calls (#393).
+fn build_retirement_filter() -> Vec<SockFilter> {
+    let mut program = Vec::new();
+    for (offset, value) in [
+        (OFFSET_ARCH, native_arch()),
+        (OFFSET_NR, SYS_RETIRE),
+        (32, 0), // unlinkat flags on ARM; explicitly zero unused arg on x86
+        (40, crate::seccomp_identity::RETIRE_MARK as u32),
+        (44, (crate::seccomp_identity::RETIRE_MARK >> 32) as u32),
+        (48, crate::seccomp_identity::RETIRE_GUARD as u32),
+        (52, (crate::seccomp_identity::RETIRE_GUARD >> 32) as u32),
+    ] {
+        program.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, offset));
+        program.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, value, 0, 0));
+    }
+    for (ip, argument) in [(OFFSET_IP, 56), (OFFSET_IP + 4, 60)] {
+        program.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, ip));
+        program.push(bpf_stmt(BPF_MISC | BPF_TAX, 0));
+        program.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, argument));
+        program.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_X, 0, 0, 0));
+    }
+    program.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    let end = program.len();
+    for (index, instruction) in program.iter_mut().enumerate() {
+        if instruction.code == BPF_JMP | BPF_JEQ | BPF_K
+            || instruction.code == BPF_JMP | BPF_JEQ | BPF_X
+        {
+            // Any mismatch continues at the original complete filter.
+            instruction.jf = (end - index - 1) as u8;
+        }
+    }
+    program
 }
 
 fn native_arch() -> u32 {
@@ -236,16 +282,27 @@ mod tests {
     }
 
     fn run_filter_args(prog: &[SockFilter], arch: u32, nr: u32, args: [u32; 4]) -> u32 {
+        let mut full = [0; 6];
+        for (destination, word) in full.iter_mut().zip(args) {
+            *destination = u64::from(word);
+        }
+        run_filter_context(prog, arch, nr, full, 0)
+    }
+
+    fn run_filter_context(prog: &[SockFilter], arch: u32, nr: u32, args: [u64; 6], ip: u64) -> u32 {
         let mut pc = 0usize;
         let mut acc: u32 = 0;
+        let mut index: u32 = 0;
         loop {
             let ins = &prog[pc];
             if ins.code == BPF_LD | BPF_W | BPF_ABS {
                 acc = match ins.k {
                     OFFSET_NR => nr,
                     OFFSET_ARCH => arch,
-                    offset if (16..48).contains(&offset) && (offset - 16) % 8 == 0 => {
-                        args[((offset - 16) / 8) as usize]
+                    OFFSET_IP => ip as u32,
+                    offset if offset == OFFSET_IP + 4 => (ip >> 32) as u32,
+                    offset if (16..64).contains(&offset) && offset % 4 == 0 => {
+                        (args[((offset - 16) / 8) as usize] >> ((offset % 8) * 8)) as u32
                     }
                     _ => panic!("unexpected absolute load offset {}", ins.k),
                 };
@@ -258,6 +315,15 @@ mod tests {
                 };
             } else if ins.code == BPF_JMP | BPF_JGE | BPF_K {
                 pc += 1 + if acc >= ins.k {
+                    ins.jt as usize
+                } else {
+                    ins.jf as usize
+                };
+            } else if ins.code == BPF_MISC | BPF_TAX {
+                index = acc;
+                pc += 1;
+            } else if ins.code == BPF_JMP | BPF_JEQ | BPF_X {
+                pc += 1 + if acc == index {
                     ins.jt as usize
                 } else {
                     ins.jf as usize
@@ -275,6 +341,176 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     const NATIVE_ARCH: u32 = AUDIT_ARCH_AARCH64;
+
+    #[test]
+    fn retirement_tags_are_bound_to_the_native_syscall_site() {
+        let program = build_filter([1, 2, 3, 4]);
+        let ip = 0x1234_5678_abcd_ef00;
+        let args = [
+            libc::AT_FDCWD as u64,
+            0,
+            0,
+            crate::seccomp_identity::RETIRE_MARK,
+            crate::seccomp_identity::RETIRE_GUARD,
+            ip,
+        ];
+        let decide = |arch, nr, args, ip| run_filter_context(&program, arch, nr, args, ip);
+        assert_eq!(decide(NATIVE_ARCH, SYS_RETIRE, args, ip), SECCOMP_RET_ALLOW);
+        for argument in [3, 4, 5] {
+            for bit in [0, 31, 32, 63] {
+                let mut changed = args;
+                changed[argument] ^= 1 << bit;
+                assert_eq!(
+                    decide(NATIVE_ARCH, SYS_RETIRE, changed, ip),
+                    SECCOMP_RET_USER_NOTIF
+                );
+            }
+        }
+        for bit in [0, 32] {
+            assert_eq!(
+                decide(NATIVE_ARCH, SYS_RETIRE, args, ip ^ (1 << bit)),
+                SECCOMP_RET_USER_NOTIF
+            );
+        }
+        let mut directory = args;
+        directory[2] = libc::AT_REMOVEDIR as u64;
+        assert_eq!(
+            decide(NATIVE_ARCH, SYS_RETIRE, directory, ip),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(decide(0, SYS_RETIRE, args, ip), SECCOMP_RET_ERRNO_ENOSYS);
+        for nr in [425, 426, 427] {
+            assert_eq!(decide(NATIVE_ARCH, nr, args, ip), SECCOMP_RET_ERRNO_ENOSYS);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            for nr in [SYS_UNLINKAT, SYS_RMDIR] {
+                assert_eq!(decide(NATIVE_ARCH, nr, args, ip), SECCOMP_RET_USER_NOTIF);
+            }
+            assert_eq!(
+                decide(NATIVE_ARCH, SYS_RETIRE | X32_SYSCALL_BIT, args, ip),
+                SECCOMP_RET_ERRNO_ENOSYS
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_retirement_preserves_native_results_and_traps_other_sites() {
+        use std::os::unix::ffi::OsStrExt;
+        const CHILD: &str = "TRASHD_TEST_NATIVE_RETIRE_ROOT";
+        const TEST: &str =
+            "filter::tests::kernel_retirement_preserves_native_results_and_traps_other_sites";
+        let Some(root) = std::env::var_os(CHILD) else {
+            let root = tempfile::tempdir().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD, root.path())
+                .env("TRASH_BYPASS", "1")
+                .output()
+                .unwrap();
+            assert!(child.status.success(), "{child:?}");
+            return;
+        };
+        let root = std::path::Path::new(&root);
+        let file = root.join("file");
+        let link = root.join("link");
+        let directory = root.join("directory");
+        std::fs::write(&file, b"native retirement").unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let name =
+            |path: &std::path::Path| std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // No listener is needed: every ordinary delete is refused instead.
+        // Only a correctly bound retirement can reach the native kernel.
+        let mut instructions = build_filter([1, 2, 3, 4]);
+        for instruction in &mut instructions {
+            if instruction.code == BPF_RET | BPF_K && instruction.k == SECCOMP_RET_USER_NOTIF {
+                instruction.k = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // An existing sandbox can permit libc unlink (87), while
+            // denying unlinkat (263). Retirement must keep that surface.
+            let deny_unlinkat = [
+                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 0, 1),
+                bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+                bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            ];
+            let program = SockFprog {
+                len: deny_unlinkat.len() as u16,
+                filter: deny_unlinkat.as_ptr(),
+            };
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) },
+                0
+            );
+        }
+        let program = SockFprog {
+            len: instructions.len() as u16,
+            filter: instructions.as_ptr(),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) },
+            0
+        );
+        let file_name = name(&file);
+        assert_eq!(
+            unsafe { libc::unlinkat(libc::AT_FDCWD, file_name.as_ptr(), 0) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(unsafe { libc::unlink(file_name.as_ptr()) }, -1);
+        #[cfg(target_arch = "x86_64")]
+        let (first, second) = (file_name.as_ptr() as libc::c_long, 0 as libc::c_long);
+        #[cfg(target_arch = "aarch64")]
+        let (first, second) = (
+            libc::AT_FDCWD as libc::c_long,
+            file_name.as_ptr() as libc::c_long,
+        );
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    SYS_RETIRE as libc::c_long,
+                    first,
+                    second,
+                    0 as libc::c_long,
+                    crate::seccomp_identity::RETIRE_MARK,
+                    crate::seccomp_identity::RETIRE_GUARD,
+                    0usize,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        unsafe { crate::seccomp_identity::retire_unlink(name(&link).as_ptr()) }.unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"native retirement");
+        let directory_error =
+            unsafe { crate::seccomp_identity::retire_unlink(name(&directory).as_ptr()) }
+                .unwrap_err();
+        assert_eq!(directory_error.raw_os_error(), Some(libc::EISDIR));
+        unsafe { crate::seccomp_identity::retire_unlink(file_name.as_ptr()) }.unwrap();
+        assert!(!file.exists());
+        let missing =
+            unsafe { crate::seccomp_identity::retire_unlink(file_name.as_ptr()) }.unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+    }
 
     #[test]
     fn kernel_cookie_proof_is_nonblocking_and_preserves_errno() {

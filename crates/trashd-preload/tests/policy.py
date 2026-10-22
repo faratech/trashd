@@ -135,6 +135,45 @@ def run():
         )
         case("live-local-policy", "",
              command=lambda victim: ["/usr/bin/python3", "-c", live_policy, victim])
+        # The advancing collision IDs remain unique after fork: children
+        # inherit the counter but have a distinct PID. Every payload and
+        # sidecar must survive; naming collisions never justify real unlink.
+        collision_root = root / "collision-fork"
+        collision_root.mkdir()
+        collision_config = collision_root / "config/trashd"
+        collision_config.mkdir(parents=True)
+        (collision_config / "config.toml").write_text("")
+        collision_env = dict(os.environ, LD_PRELOAD=library, HOME=str(collision_root),
+                             XDG_CONFIG_HOME=str(collision_config.parent),
+                             XDG_DATA_HOME=str(collision_root / "data"))
+        collision_env.pop("TRASH_BYPASS", None)
+        collision_env.pop("TRASHD_SECCOMP_ACTIVE", None)
+        collision_script = (
+            "import os,sys\nfrom pathlib import Path\n"
+            "root=Path(sys.argv[1]); seed=root/'seed'; seed.mkdir()\n"
+            "for i in range(3):\n"
+            " p=seed/'victim'; p.write_bytes(('seed-'+str(i)).encode()); os.unlink(p)\n"
+            "child=os.fork(); role='child' if child==0 else 'parent'\n"
+            "directory=root/role; directory.mkdir()\n"
+            "for i in range(20):\n"
+            " p=directory/'victim'; p.write_bytes((role+'-'+str(i)).encode()); os.unlink(p)\n"
+            "if child==0: os._exit(0)\n"
+            "assert os.waitpid(child,0)[1]==0\n"
+        )
+        collision_result = subprocess.run(
+            ["/usr/bin/python3", "-c", collision_script, str(collision_root)],
+            env=collision_env, capture_output=True, timeout=10)
+        assert collision_result.returncode == 0, collision_result.stderr
+        collision_store = collision_root / "data/Trash"
+        collision_files = list((collision_store / "files").iterdir())
+        collision_records = list((collision_store / "info").glob("*.trashinfo"))
+        expected = {f"seed-{i}".encode() for i in range(3)} | {
+            f"{role}-{i}".encode() for role in ["parent", "child"] for i in range(20)}
+        assert len(collision_files) == len(collision_records) == len(expected)
+        assert {path.read_bytes() for path in collision_files} == expected
+        assert {path.name for path in collision_files} == {
+            path.name.removesuffix(".trashinfo") for path in collision_records}
+        print("PASS: collision IDs preserve every parent and forked-child payload")
         # A policy key nested under [retention] (legacy layout) is still
         # applied — but loudly, not silently (#150).
         case("legacy-retention-promoted", '[retention]\nonly_trash = ["*.txt"]\n',
@@ -305,13 +344,60 @@ def run():
         assert not list((data / "Trash/info").glob("*.trashinfo"))
         print("PASS: unsupported unlinkat flags leave data and metadata untouched")
 
-        # Exercise published-copy cleanup failure even without a usable
-        # listener. Both filters affect only a sandbox child; errno denial
-        # takes precedence over any inherited notification filter.
         import errno
         from seccomp_regression import force_install_error
         renameat2 = {"x86_64": 316, "aarch64": 276}[os.uname().machine]
         unlink_nr = {"x86_64": 87, "aarch64": 35}[os.uname().machine]
+
+        # Standalone preload must retain libc unlink's x86 syscall surface:
+        # an application may allow unlink(87), but deny unlinkat(263). Force
+        # the copy branch without a verified trashd notification filter.
+        if os.uname().machine == "x86_64":
+            def copy_with_unlinkat_denied():
+                force_install_error(errno.EXDEV, renameat2)()
+                force_install_error(errno.EACCES, 263)()
+            code = (
+                "import ctypes,errno,os,sys\n"
+                "c=ctypes.CDLL(None,use_errno=True); c.syscall.restype=ctypes.c_long\n"
+                "path=ctypes.c_char_p(os.fsencode(sys.argv[1]))\n"
+                "assert c.syscall(316,-100,path,-100,path,1)==-1 and ctypes.get_errno()==errno.EXDEV\n"
+                "assert c.syscall(263,-100,path,0)==-1 and ctypes.get_errno()==errno.EACCES\n"
+                "ctypes.set_errno(errno.EDOM)\n"
+                "assert c.unlink(path)==0, ctypes.get_errno()\n"
+                "assert ctypes.get_errno()==errno.EDOM\n"
+            )
+            for is_link in [False, True]:
+                fixture, data, environment = focused_fixture("unlink-only-copy-" + str(is_link))
+                environment.pop("TRASHD_SECCOMP_ACTIVE", None)
+                environment.pop("TRASHD_SECCOMP_COOKIE", None)
+                victim = fixture / "victim"
+                payload = b"complete recovery under unlink-only sandbox"
+                if is_link:
+                    target = fixture / "target"; target.write_bytes(payload)
+                    victim.symlink_to(target)
+                else:
+                    victim.write_bytes(payload)
+                result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
+                    capture_output=True, preexec_fn=copy_with_unlinkat_denied, timeout=10)
+                assert result.returncode == 0 and not os.path.lexists(victim), result.stderr
+                records = list((data / "Trash/info").glob("*.trashinfo"))
+                assert len(records) == 1, records
+                stored = data / "Trash/files" / records[0].stem
+                assert stored.read_bytes() == payload and stored.is_symlink() == is_link
+                if is_link:
+                    assert os.readlink(stored) == str(target) and target.read_bytes() == payload
+                restored = subprocess.run([cli, "restore", records[0].stem],
+                    env=dict(environment, TRASH_BYPASS="1"), capture_output=True)
+                assert restored.returncode == 0, restored.stderr
+                assert victim.read_bytes() == payload and victim.is_symlink() == is_link
+                if is_link:
+                    assert os.readlink(victim) == str(target) and target.read_bytes() == payload
+                assert not records[0].exists() and not os.path.lexists(stored)
+            print("PASS: standalone x86 copied-source retirement preserves unlink-only sandbox profiles")
+
+        # Exercise published-copy cleanup failure even without a usable
+        # listener. Both filters affect only a sandbox child; errno denial
+        # takes precedence over any inherited notification filter.
         def deny_move_and_cleanup():
             # EXDEV is the cross-device case that takes the copy path.
             force_install_error(errno.EXDEV, renameat2)()
@@ -337,6 +423,78 @@ def run():
                 assert stored.read_bytes() == b"complete recovery"
                 assert stored.is_symlink() == is_link
         print("PASS: failed source cleanup returns errno and never leaves a partial entry")
+
+        # A supervisor declining a deferred deletion (a target it will not
+        # lend its credentials to, or a listener gone) answers ENOSYS; the
+        # preload then trashes in-process instead of leaving the kernel to
+        # delete (#349). A plain filter stands in for the supervisor: it
+        # proves the cookie and answers marked unlinkat calls.
+        import ctypes
+        from seccomp_regression import Instruction, Program, LIBC, SYSCALL_SECCOMP
+        cookie = [0x01234567, 0x89abcdef, 0x0badf00d, 0x5eedcafe]
+        mark = 0x7472_6173_6864_6d6b  # seccomp_identity::DEFER_MARK
+        unlinkat_nr = {"x86_64": 263, "aarch64": 35}[os.uname().machine]
+        getpid_nr = {"x86_64": 39, "aarch64": 172}[os.uname().machine]
+        def supervisor_answering(error):
+            def install():
+                allow, answer = 0x7FFF0000, 0x00050000 | error
+                program = [Instruction(0x20, 0, 0, 0)]  # nr
+                proof = [Instruction(0x20, 0, 0, 16 + 8 * i) for i in range(4)]
+                # getpid(cookie...) -> PROOF_ERRNO (4093)
+                program += [Instruction(0x15, 0, 9, getpid_nr)]
+                for i, word in enumerate(cookie):
+                    program += [proof[i], Instruction(0x15, 0, 7 - 2 * i, word)]
+                program += [Instruction(0x06, 0, 0, 0x00050000 | 4093)]
+                # unlinkat(.., .., .., DEFER_MARK) -> error
+                program += [Instruction(0x20, 0, 0, 0), Instruction(0x15, 0, 5, unlinkat_nr),
+                            Instruction(0x20, 0, 0, 40), Instruction(0x15, 0, 3, mark & 0xFFFFFFFF),
+                            Instruction(0x20, 0, 0, 44), Instruction(0x15, 0, 1, mark >> 32),
+                            Instruction(0x06, 0, 0, answer), Instruction(0x06, 0, 0, allow)]
+                instructions = (Instruction * len(program))(*program)
+                filt = Program(len(program), instructions)
+                if LIBC.prctl(38, 1, 0, 0, 0) or LIBC.syscall(SYSCALL_SECCOMP, 1, 0, ctypes.byref(filt)):
+                    raise RuntimeError("cannot install the stand-in supervisor filter")
+            return install
+        for error, trashed in [(errno.ENOSYS, True), (errno.EACCES, False)]:
+            fixture, data, environment = focused_fixture(f"declined-{error}")
+            environment["TRASHD_SECCOMP_ACTIVE"] = "1"
+            environment["TRASHD_SECCOMP_COOKIE"] = "".join(f"{w:08x}" for w in cookie)
+            for mode in ["unlink", "remove", "rmdir"]:
+                victim = fixture / f"victim-{mode}"
+                if mode == "rmdir": victim.mkdir()
+                else: victim.write_bytes(b"recoverable")
+                code = ("import ctypes,os,sys\nc=ctypes.CDLL(None,use_errno=True)\n"
+                        f"r=c.{mode}(ctypes.c_char_p(os.fsencode(sys.argv[1])))\n"
+                        "print(r, ctypes.get_errno())")
+                result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
+                    capture_output=True, text=True, preexec_fn=supervisor_answering(error), timeout=10)
+                assert result.returncode == 0, result.stderr
+                records = [r for r in (data / "Trash/info").glob("*.trashinfo") if r.stem.startswith(victim.name)]
+                if trashed:
+                    assert result.stdout.split()[0] == "0" and not os.path.lexists(victim), (mode, result.stdout)
+                    assert len(records) == 1, (mode, records)
+                else:
+                    assert result.stdout.split() == ["-1", str(errno.EACCES)], (mode, result.stdout)
+                    assert os.path.lexists(victim) and not records, mode
+        print("PASS: a declined deferral is trashed in-process; a supervisor's error is returned")
+
+        # The preload runs inside every process, including those under
+        # seccomp allowlists that kill syscalls newer than they know: it must
+        # trash without openat2 (#357).
+        def kill_on_openat2():
+            program = (Instruction * 4)(
+                Instruction(0x20, 0, 0, 0), Instruction(0x15, 0, 1, 437),
+                Instruction(0x06, 0, 0, 0x80000000), Instruction(0x06, 0, 0, 0x7FFF0000))
+            filt = Program(4, program)
+            if LIBC.prctl(38, 1, 0, 0, 0) or LIBC.syscall(SYSCALL_SECCOMP, 1, 0, ctypes.byref(filt)):
+                raise RuntimeError("cannot install the openat2 filter")
+        fixture, data, environment = focused_fixture("allowlist-without-openat2")
+        victim = fixture / "victim"; victim.write_bytes(b"recoverable")
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment,
+            capture_output=True, preexec_fn=kill_on_openat2, timeout=10)
+        assert result.returncode == 0 and not victim.exists(), (result.returncode, result.stderr)
+        assert len(list((data / "Trash/info").glob("*.trashinfo"))) == 1
+        print("PASS: trashing needs no syscall an older seccomp allowlist lacks (openat2)")
 
         for dirname in [".Trash", f".Trash-{os.geteuid()}"]:
             fixture, data, environment = focused_fixture("lookalike-" + dirname)
@@ -399,6 +557,20 @@ def run():
             subprocess.run(["/usr/bin/umount", str(readonly)], check=True)
         print("PASS: failed source removal leaves no duplicate in the trash")
 
+        # rmdir of a mount point fails busy, and nothing is prepared inside
+        # the mounted filesystem first (#368).
+        fixture, data, environment = focused_fixture("mount-root")
+        mounted = fixture / "mounted"
+        mounted.mkdir()
+        subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "none", str(mounted)], check=True)
+        try:
+            result = subprocess.run(["/usr/bin/rmdir", str(mounted)], env=environment, capture_output=True, text=True)
+            assert result.returncode != 0 and "busy" in result.stderr, result.stderr
+            assert not list(mounted.iterdir()), list(mounted.iterdir())
+        finally:
+            subprocess.run(["/usr/bin/umount", str(mounted)], check=True)
+        print("PASS: rmdir of a mount point prepares no trash inside it")
+
         # Preload diagnostics run inside arbitrary programs. With stderr on a
         # closed pipe they must neither raise SIGPIPE in the host nor abort it
         # (eprintln! panics on EPIPE inside an extern "C" hook) (#208).
@@ -423,9 +595,11 @@ def run():
         print("PASS: diagnostics never kill or abort the host on a closed stderr")
 
         # A FreeDesktop tool that ignores trashd's lock can take files/<id>
-        # between our id claim and the rename. A fanotify permission event
-        # holds the sidecar write while the racer takes that name; unlink must
-        # then trash under a fresh id, never fail with EEXIST (#225).
+        # while we claim that id. A fanotify permission event holds the
+        # O_EXCL sidecar claim while the racer takes the name; unlink must
+        # then trash under a fresh id, never fail with EEXIST (#225). The
+        # record is written through the claiming descriptor (#305), so the
+        # claim is the last open before the rename that can be held.
         import ctypes, select, struct, threading
         def race_for_name(info_dir, files_dir, name, stop, raced):
             libc = ctypes.CDLL(None, use_errno=True)
@@ -445,8 +619,8 @@ def run():
                         offset += length
                         if os.readlink(f"/proc/self/fd/{fd}").endswith(f"/{name}.trashinfo"):
                             opens += 1
-                            # Open 1 is the O_EXCL claim; open 2 writes the claimed record.
-                            if opens == 2:
+                            # Open 1 is the O_EXCL claim of the original name.
+                            if opens == 1:
                                 (files_dir / name).write_bytes(b"racer")
                                 raced.set()
                         os.write(fan, struct.pack("iI", fd, 0x01))  # FAN_ALLOW
@@ -470,7 +644,7 @@ def run():
                                     capture_output=True, text=True, timeout=10)
         finally:
             stop.set(); racer.join()
-        assert raced.is_set(), "the racer never saw the claimed sidecar being written"
+        assert raced.is_set(), "the racer never saw the sidecar being claimed"
         assert result.stdout.strip() == "unlinked" and not victim.exists(), (result.stdout, result.stderr)
         assert (data / "Trash/files/victim").read_bytes() == b"racer"
         records = list((data / "Trash/info").glob("*.trashinfo"))

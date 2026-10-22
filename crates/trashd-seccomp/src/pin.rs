@@ -64,6 +64,8 @@ pub struct TargetFs {
     procfd: RawFd,
     root_fd: Option<RawFd>,
     cwd_fd: Option<RawFd>,
+    /// `shares_our_view`, once computed for this operation.
+    view: std::cell::Cell<Option<bool>>,
 }
 
 impl Drop for TargetFs {
@@ -111,6 +113,7 @@ impl TargetFs {
             procfd,
             root_fd,
             cwd_fd,
+            view: std::cell::Cell::new(None),
         })
     }
 
@@ -124,28 +127,27 @@ impl TargetFs {
     /// so `..` and absolute symlinks reach the same inodes either way (#195).
     /// Anything else (a chroot, even one into a bind mount of `/`, or another
     /// namespace) keeps RESOLVE_BENEATH and #62's protection.
+    ///
+    /// Asked twice per operation, it is computed once; our own side never
+    /// changes and is computed once per supervisor (#320).
     pub fn shares_our_view(&self) -> bool {
+        if let Some(shared) = self.view.get() {
+            return shared;
+        }
+        let shared = self.compute_shares_our_view();
+        self.view.set(Some(shared));
+        shared
+    }
+
+    fn compute_shares_our_view(&self) -> bool {
         let Some(root) = self.root_fd else {
             return false;
         };
-        let (Some(theirs), Some(ours)) = (
-            mount_identity(root, c"", libc::AT_EMPTY_PATH),
-            mount_identity(libc::AT_FDCWD, c"/", 0),
-        ) else {
+        let Some((our_root, our_ns)) = our_view() else {
             return false;
         };
-        let namespace = |dir: RawFd, name: &CStr| {
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            (unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, 0) } == 0)
-                .then_some((stat.st_dev, stat.st_ino))
-        };
-        let (Some(their_ns), Some(our_ns)) = (
-            namespace(self.procfd, c"ns/mnt"),
-            namespace(libc::AT_FDCWD, c"/proc/self/ns/mnt"),
-        ) else {
-            return false;
-        };
-        theirs == ours && their_ns == our_ns
+        mount_identity(root, c"", libc::AT_EMPTY_PATH) == Some(our_root)
+            && namespace_identity(self.procfd, c"ns/mnt") == Some(our_ns)
     }
 
     /// O_PATH fd on the target's cwd (for `AT_FDCWD`-relative paths).
@@ -168,14 +170,38 @@ impl TargetFs {
 
 /// (mount id, device, inode) of a directory, or None when the kernel cannot
 /// report a mount id (statx STATX_MNT_ID, Linux 5.8+).
-fn mount_identity(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<(u64, u32, u32, u64)> {
+/// Mount id, device major/minor and inode of a directory.
+type MountIdentity = (u64, u32, u32, u64);
+/// Device and inode of a namespace file.
+type NamespaceIdentity = (u64, u64);
+
+/// This supervisor's root mount identity and mount namespace: a process's
+/// root and namespace only change through calls the supervisor never makes.
+fn our_view() -> Option<(MountIdentity, NamespaceIdentity)> {
+    static VIEW: std::sync::OnceLock<Option<(MountIdentity, NamespaceIdentity)>> =
+        std::sync::OnceLock::new();
+    *VIEW.get_or_init(|| {
+        Some((
+            mount_identity(libc::AT_FDCWD, c"/", 0)?,
+            namespace_identity(libc::AT_FDCWD, c"/proc/self/ns/mnt")?,
+        ))
+    })
+}
+
+fn namespace_identity(dir: RawFd, name: &CStr) -> Option<NamespaceIdentity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, 0) } == 0)
+        .then_some((stat.st_dev, stat.st_ino))
+}
+
+fn mount_identity(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<MountIdentity> {
     let mut stx: libc::statx = unsafe { std::mem::zeroed() };
     let mask = libc::STATX_INO | libc::STATX_MNT_ID;
     if unsafe {
         libc::statx(
             dir,
             name.as_ptr(),
-            flags | libc::AT_SYMLINK_NOFOLLOW,
+            flags | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
             mask,
             &mut stx,
         )
@@ -261,15 +287,140 @@ pub fn resolve_parent(base_fd: RawFd, prefix: &OsStr, absolute: bool) -> io::Res
     )
 }
 
-/// `resolve_parent` with an explicit containment mode: RESOLVE_IN_ROOT,
-/// RESOLVE_BENEATH, or 0 for a target that shares this process's view.
-/// Absolute path of a pinned directory as this process sees it, or None for
-/// an unlinked or unreachable directory.
+/// Candidate absolute path of a pinned directory as this process sees it.
+/// The kernel's " (deleted)" suffix is ambiguous with a literal filename;
+/// physical_path verifies that case instead of treating it as authoritative.
 fn pinned_directory_path(directory: RawFd) -> Option<std::path::PathBuf> {
     let path = std::fs::read_link(format!("/proc/self/fd/{directory}")).ok()?;
-    (path.is_absolute() && !path.as_os_str().as_bytes().ends_with(b" (deleted)")).then_some(path)
+    path.is_absolute().then_some(path)
 }
 
+fn stat_at(directory: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
+fn same_inode(first: &libc::stat, second: &libc::stat) -> bool {
+    first.st_dev == second.st_dev
+        && first.st_ino == second.st_ino
+        && first.st_mode == second.st_mode
+        && first.st_uid == second.st_uid
+        && first.st_gid == second.st_gid
+}
+
+fn same_entry(first: &libc::stat, second: &libc::stat) -> bool {
+    same_inode(first, second)
+        && first.st_size == second.st_size
+        && first.st_mtime == second.st_mtime
+        && first.st_mtime_nsec == second.st_mtime_nsec
+        && first.st_ctime == second.st_ctime
+        && first.st_ctime_nsec == second.st_ctime_nsec
+}
+
+fn same_directory(first: RawFd, second: RawFd) -> bool {
+    let mut a: libc::stat = unsafe { std::mem::zeroed() };
+    let mut b: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(first, &mut a) == 0 && libc::fstat(second, &mut b) == 0 })
+        && a.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && same_inode(&a, &b)
+}
+
+/// A foreign mount namespace can hide a policy file without changing its
+/// parent inode. Verify every policy lookup and ancestor, not just the first
+/// directory. Namespace clones may have different mount IDs for the same
+/// underlying directories; device/inode identity is what makes the recorded
+/// physical path restore into the directory we actually removed from.
+fn same_policy_ancestors(source: RawFd, mapped: RawFd, path: &std::path::Path) -> bool {
+    let duplicate = |fd| {
+        let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        (fd >= 0).then(|| FdGuard(fd))
+    };
+    let (Some(mut source), Some(mut mapped)) = (duplicate(source), duplicate(mapped)) else {
+        return false;
+    };
+    let mut ancestors = path.ancestors().peekable();
+    while ancestors.next().is_some() {
+        if !same_directory(source.0, mapped.0) {
+            return false;
+        }
+        match (
+            stat_at(source.0, c".trashd.toml"),
+            stat_at(mapped.0, c".trashd.toml"),
+        ) {
+            (Ok(a), Ok(b)) if same_entry(&a, &b) => {}
+            (Err(a), Err(b))
+                if a.raw_os_error() == Some(libc::ENOENT)
+                    && b.raw_os_error() == Some(libc::ENOENT) => {}
+            _ => return false,
+        }
+        if ancestors.peek().is_some() {
+            let (Some(a), Some(b)) = (
+                open_task_directory(source.0, c"..").map(FdGuard),
+                open_task_directory(mapped.0, c"..").map(FdGuard),
+            ) else {
+                return false;
+            };
+            source = a;
+            mapped = b;
+        }
+    }
+    true
+}
+
+/// Path policy and Path= use the supervisor's physical view. A chroot's
+/// absolute spelling cannot be used there (#387). A /proc fd link from a
+/// foreign namespace is only a candidate: reopen it and prove both parent
+/// and leaf still identify the pinned objects. Also prove policy visibility
+/// when mount namespaces differ. Unreachable/overmounted paths are declined,
+/// never retried through an unverified display spelling.
+fn physical_path(fs: &TargetFs, parent: RawFd, name: &OsStr) -> Option<std::path::PathBuf> {
+    let candidate = pinned_directory_path(parent)?;
+    if fs.shares_our_view() && !candidate.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return Some(candidate.join(name));
+    }
+    let candidate = CString::new(candidate.as_os_str().as_bytes()).ok()?;
+    let mapped = unsafe {
+        libc::open(
+            candidate.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if mapped < 0 {
+        return None;
+    }
+    let mapped = FdGuard(mapped);
+    let name_c = CString::new(name.as_bytes()).ok()?;
+    if !same_directory(parent, mapped.0)
+        || !same_entry(
+            &stat_at(parent, &name_c).ok()?,
+            &stat_at(mapped.0, &name_c).ok()?,
+        )
+    {
+        return None;
+    }
+    let path = pinned_directory_path(mapped.0)?;
+    let ours = namespace_identity(libc::AT_FDCWD, c"/proc/self/ns/mnt")?;
+    if namespace_identity(fs.procfd, c"ns/mnt")? != ours
+        && !same_policy_ancestors(parent, mapped.0, &path)
+    {
+        return None;
+    }
+    Some(path.join(name))
+}
+
+/// `resolve_parent` with an explicit containment mode: RESOLVE_IN_ROOT,
+/// RESOLVE_BENEATH, or 0 for a target that shares this process's view.
 fn resolve_parent_with(base_fd: RawFd, prefix: &OsStr, containment: u64) -> io::Result<RawFd> {
     #[repr(C)]
     struct OpenHow {
@@ -370,6 +521,10 @@ pub enum Decision {
     /// Let the kernel execute the real syscall (bypass lists, refusals, and
     /// cases where the kernel produces the exact errno better than we can).
     Continue,
+    /// The entry could not be trashed here (unresolvable in our view, a
+    /// cross-device target, a store failure): a deferring preload trashes
+    /// it in-process; anything else the kernel runs (#355).
+    Decline,
     /// Fail the syscall with this errno WITHOUT executing it.
     Errno(i32),
 }
@@ -388,7 +543,7 @@ pub fn try_pinned(
     syscall_nr: i32,
     args: &[u64; 6],
     raw: &OsStr,
-    display: &std::path::Path,
+    _display: &std::path::Path,
     remove_dir: bool,
     notify_fd: i32,
     notify_id: u64,
@@ -450,7 +605,7 @@ pub fn try_pinned(
     // pathname is absolute — the pinned target-root fd would be silently
     // bypassed and "/a/b" resolved against the SUPERVISOR'S root. The prefix
     // below is therefore rewritten RELATIVE to that root.
-    let _dup_base: Option<FdGuard>;
+    let mut dup_base: Option<FdGuard> = None;
     let base: RawFd = if bytes.first() == Some(&b'/') {
         while prefix.first() == Some(&b'/') {
             prefix = &prefix[1..]; // "///a/" -> "a/"
@@ -465,7 +620,7 @@ pub fn try_pinned(
             Some(fd) => {
                 let g = FdGuard(tfs.dup_dirfd(fd)?);
                 let raw_fd = g.0;
-                _dup_base = Some(g);
+                dup_base = Some(g);
                 raw_fd
             }
         }
@@ -473,8 +628,12 @@ pub fn try_pinned(
 
     // The ancestor broker obtains its own pidfd when duplicating an explicit
     // dirfd. Revalidate after that round trip so PID reuse cannot select a
-    // descriptor belonging to a different process (#6).
-    if notify_fd >= 0 && !crate::supervisor::notif_id_valid(notify_fd, notify_id) {
+    // descriptor belonging to a different process (#6). Without one, the
+    // check after pinning already covers every descriptor in use (#320).
+    if dup_base.is_some()
+        && notify_fd >= 0
+        && !crate::supervisor::notif_id_valid(notify_fd, notify_id)
+    {
         return Ok(Decision::Continue);
     }
 
@@ -505,9 +664,9 @@ pub fn try_pinned(
                 raw_fd
             }
             // Component vanished, resolution escaped the pinned base, or the
-            // kernel lacks openat2: execute the original syscall in the
-            // target's namespace rather than re-resolving this path here.
-            Err(_) => return Ok(Decision::Continue),
+            // kernel lacks openat2: leave the original syscall to the target's
+            // namespace rather than re-resolving this path here.
+            Err(_) => return Ok(Decision::Decline),
         }
     };
 
@@ -528,7 +687,7 @@ pub fn try_pinned(
         match dir_is_empty(parent, name) {
             Ok(true) => {}
             Ok(false) => return Ok(Decision::Errno(libc::ENOTEMPTY)),
-            Err(_) => return Ok(Decision::Continue),
+            Err(_) => return Ok(Decision::Decline),
         }
     } else if fmt == libc::S_IFDIR {
         return Ok(Decision::Errno(libc::EISDIR));
@@ -540,26 +699,28 @@ pub fn try_pinned(
     // Policy and the recorded Path= follow where the pinned parent really is,
     // not how the target spelled it (`/proc/self/cwd/x`, `/dev/fd/N/x`, `..`):
     // re-resolving a spelling here reads the SUPERVISOR's view (#226). Our
-    // /proc path names the parent only when the target shares that view.
-    let physical = tfs
-        .shares_our_view()
-        .then(|| pinned_directory_path(parent))
-        .flatten()
-        .map(|directory| directory.join(name));
-    let display = physical.as_deref().unwrap_or(display);
+    // /proc path needs an identity proof when the target has another view.
+    let Some(physical) = physical_path(&tfs, parent, name) else {
+        return Ok(Decision::Decline);
+    };
 
     // The move itself: renameat(pinned_parent, name -> trash/files/<id>)
     // inside TrashStore::trash_at, which applies config eligibility to that
-    // path for parity with the other layers.
-    match store.trash_at_checked(parent, name, display, Some("seccomp"), || {
-        notify_fd < 0 || crate::supervisor::notif_id_valid(notify_fd, notify_id)
-    }) {
+    // path for parity with the other layers. A physical path is canonical
+    // already and needs no second resolution (#320).
+    let still_valid = || notify_fd < 0 || crate::supervisor::notif_id_valid(notify_fd, notify_id);
+    let trashed = store.trash_at_canonical(parent, name, &physical, Some("seccomp"), still_valid);
+    match trashed {
         Ok(_id) => Ok(Decision::Trashed),
-        Err(TrashError::Excluded(_)) | Err(TrashError::Refused(_)) => Ok(Decision::Continue),
+        // Policy: the preload would decide the same, so declining only
+        // cost a second round trip (#357).
+        Err(TrashError::Excluded(_) | TrashError::Refused(_) | TrashError::TooLarge { .. }) => {
+            Ok(Decision::Continue)
+        }
         // EXDEV (namespaced/cross-device target), hash/store hiccups, and
-        // unsafe stores all defer to the original target syscall. Re-resolving
+        // unsafe stores all defer to the target's own layer. Re-resolving
         // `display` in the supervisor could mutate an unrelated host path.
-        Err(_) => Ok(Decision::Continue),
+        Err(_) => Ok(Decision::Decline),
     }
 }
 
@@ -567,6 +728,242 @@ pub fn try_pinned(
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    struct ForeignTarget(std::process::Child);
+
+    impl Drop for ForeignTarget {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Change only a helper process's root/mount namespace. No fork inside
+    /// the harness, no host mount or permission changes, and Drop reaps it.
+    fn foreign_target(directory: &Path, mode: &str) -> Option<ForeignTarget> {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let script = r#"
+import ctypes, errno, os, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+directory, mode = sys.argv[1:]
+def checked(result):
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+            print('SKIP: filesystem namespace privileges unavailable', flush=True)
+            sys.exit(77)
+        raise OSError(error, os.strerror(error))
+if mode == 'chroot':
+    checked(libc.chroot(os.fsencode(directory)))
+    os.chdir('/')
+else:
+    checked(libc.unshare(0x00020000))
+    checked(libc.mount(None, b'/', None, 0x4000 | 0x40000, None))
+    if mode == 'parent':
+        checked(libc.mount(b'tmpfs', os.fsencode(directory), b'tmpfs', 0, None))
+        with open(os.path.join(directory, 'victim.txt'), 'wb') as file:
+            file.write(b'target namespace')
+    elif mode in ('leaf', 'policy', 'ancestor-policy'):
+        source, target = ('replacement', 'victim.txt') if mode == 'leaf' else ('replacement.toml', '.trashd.toml')
+        target_directory = os.path.dirname(directory) if mode == 'ancestor-policy' else directory
+        checked(libc.mount(os.fsencode(os.path.join(directory, source)), os.fsencode(os.path.join(target_directory, target)), None, 4096, None))
+    os.chdir(directory)
+print('ready', flush=True)
+time.sleep(60)
+"#;
+        let child = Command::new("/usr/bin/python3")
+            .args(["-u", "-c", script])
+            .arg(directory)
+            .arg(mode)
+            .env("TRASH_BYPASS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated filesystem helper");
+        let mut child = ForeignTarget(child);
+        let mut line = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        if line.starts_with("SKIP:") {
+            eprintln!("{}", line.trim());
+            return None;
+        }
+        assert_eq!(line.trim(), "ready", "filesystem helper failed to start");
+        Some(child)
+    }
+
+    #[test]
+    fn physical_mapping_distinguishes_literal_deleted_suffix() {
+        let fixture = tempfile::tempdir().unwrap();
+        let literal = fixture.path().join("literal (deleted)");
+        std::fs::create_dir(&literal).unwrap();
+        std::fs::write(literal.join("victim.txt"), b"still reachable").unwrap();
+        let filesystem = TargetFs::open(std::process::id()).unwrap();
+        let parent = FdGuard(open_proc_dir(literal.to_str().unwrap()).unwrap());
+        assert_eq!(
+            physical_path(&filesystem, parent.0, OsStr::new("victim.txt")),
+            Some(literal.join("victim.txt"))
+        );
+
+        let removed = fixture.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        let parent = FdGuard(open_proc_dir(removed.to_str().unwrap()).unwrap());
+        std::fs::remove_dir(&removed).unwrap();
+        // Even when the deleted marker happens to name a real directory,
+        // its inode cannot stand in for the removed pinned parent.
+        let shadow = fixture.path().join("removed (deleted)");
+        std::fs::create_dir(&shadow).unwrap();
+        std::fs::write(shadow.join("victim.txt"), b"unrelated").unwrap();
+        assert_eq!(
+            physical_path(&filesystem, parent.0, OsStr::new("victim.txt")),
+            None
+        );
+    }
+
+    #[test]
+    fn chrooted_absolute_paths_use_physical_policy_and_restore_location() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: changing the helper's root requires root");
+            return;
+        }
+        let (unused_store, jail, fixture) = setup("chroot-physical");
+        drop(unused_store);
+        let Some(target) = foreign_target(&jail, "chroot") else {
+            return;
+        };
+        assert!(!TargetFs::open(target.0.id()).unwrap().shares_our_view());
+        let victim = jail.join("victim.txt");
+        std::fs::write(&victim, b"restore inside the jail").unwrap();
+        let config = trashd_common::Config {
+            never_trash: Vec::new(),
+            only_trash: vec![victim.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let store = TrashStore::open_isolated(&fixture.path().join("allowed"), config).unwrap();
+        let attempt = |store: &TrashStore, raw: &OsStr| {
+            try_pinned(
+                target.0.id(),
+                libc::SYS_unlinkat as i32,
+                &[libc::AT_FDCWD as u64, 0, 0, 0, 0, 0],
+                raw,
+                Path::new("/victim.txt"),
+                false,
+                -1,
+                0,
+                store,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            attempt(&store, OsStr::new("/victim.txt")),
+            Decision::Trashed
+        ));
+        let entries = store.list(None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].info.original_path, victim);
+        assert_eq!(store.restore(&entries[0].id, None).unwrap(), victim);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"restore inside the jail");
+
+        let config = trashd_common::Config {
+            never_trash: vec![victim.to_string_lossy().into_owned()],
+            only_trash: Vec::new(),
+            ..Default::default()
+        };
+        let store = TrashStore::open_isolated(&fixture.path().join("excluded"), config).unwrap();
+        assert!(matches!(
+            attempt(&store, OsStr::new("/victim.txt")),
+            Decision::Continue
+        ));
+        assert!(victim.exists());
+        assert!(store.list(None).unwrap().is_empty());
+
+        // Path= also preserves raw names through the verified mapping.
+        let raw = OsStr::from_bytes(b"raw-\xff");
+        let victim = jail.join(raw);
+        std::fs::write(&victim, b"raw name").unwrap();
+        let config = trashd_common::Config {
+            never_trash: Vec::new(),
+            ..Default::default()
+        };
+        let store = TrashStore::open_isolated(&fixture.path().join("raw"), config).unwrap();
+        assert!(matches!(
+            attempt(&store, OsStr::from_bytes(b"/raw-\xff")),
+            Decision::Trashed
+        ));
+        let entries = store.list(None).unwrap();
+        assert_eq!(entries[0].info.original_path, victim);
+    }
+
+    #[test]
+    fn foreign_namespace_mapping_proves_leaf_and_policy_visibility() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: changing the helper's mount namespace requires root");
+            return;
+        }
+        for mode in ["clone", "parent", "leaf", "policy", "ancestor-policy"] {
+            let (store, work, _fixture) = setup("namespace-physical");
+            let victim = work.join("victim.txt");
+            std::fs::write(&victim, b"host namespace").unwrap();
+            std::fs::write(work.join("replacement"), b"target namespace").unwrap();
+            std::fs::write(work.join(".trashd.toml"), b"never_trash = []\n").unwrap();
+            std::fs::write(
+                work.parent().unwrap().join(".trashd.toml"),
+                b"never_trash = []\n",
+            )
+            .unwrap();
+            std::fs::write(work.join("replacement.toml"), b"only_trash = ['*.keep']\n").unwrap();
+            let Some(target) = foreign_target(&work, mode) else {
+                return;
+            };
+            let filesystem = TargetFs::open(target.0.id()).unwrap();
+            assert!(!filesystem.shares_our_view());
+            let mapped = physical_path(
+                &filesystem,
+                filesystem.cwd().unwrap(),
+                OsStr::new("victim.txt"),
+            );
+            assert_eq!(mapped, (mode == "clone").then(|| victim.clone()), "{mode}");
+            let decision = try_pinned(
+                target.0.id(),
+                libc::SYS_unlinkat as i32,
+                &[libc::AT_FDCWD as u64, 0, 0, 0, 0, 0],
+                OsStr::new("victim.txt"),
+                &victim,
+                false,
+                -1,
+                0,
+                &store,
+            )
+            .unwrap();
+            if mode == "clone" {
+                assert!(
+                    matches!(decision, Decision::Trashed),
+                    "{mode}: {decision:?}"
+                );
+                let entries = store.list(None).unwrap();
+                assert_eq!(entries[0].info.original_path, victim);
+                assert_eq!(store.restore(&entries[0].id, None).unwrap(), victim);
+            } else {
+                assert!(
+                    matches!(decision, Decision::Decline),
+                    "{mode}: {decision:?}"
+                );
+                assert_eq!(std::fs::read(&victim).unwrap(), b"host namespace");
+                assert!(store.list(None).unwrap().is_empty());
+                let target_view = format!("/proc/{}/cwd/victim.txt", target.0.id());
+                assert_eq!(
+                    std::fs::read(target_view).unwrap(),
+                    if mode.ends_with("policy") {
+                        b"host namespace".as_slice()
+                    } else {
+                        b"target namespace".as_slice()
+                    }
+                );
+            }
+        }
+    }
 
     #[test]
     fn operation_context_pins_only_required_bases() {
@@ -845,10 +1242,8 @@ mod tests {
                 &store,
             )
             .expect("pinned attempt");
-            assert!(
-                matches!(decision, Decision::Continue),
-                "{raw}: {decision:?}"
-            );
+            // Left to the target's own layer (#355).
+            assert!(matches!(decision, Decision::Decline), "{raw}: {decision:?}");
             assert!(display.exists(), "supervisor must not mutate {display:?}");
         }
         assert!(store.list(None).unwrap().is_empty());
@@ -931,7 +1326,8 @@ mod tests {
         )
         .expect("pinned attempt");
 
-        assert!(matches!(decision, Decision::Continue));
+        // A store failure leaves it to the target's own layer (#355).
+        assert!(matches!(decision, Decision::Decline));
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
         child.kill().unwrap();
         let _ = child.wait();
@@ -1302,7 +1698,7 @@ mod tests {
             .expect("pinned attempt");
             match d {
                 Decision::Trashed => trashed += 1,
-                Decision::Continue => {}
+                Decision::Continue | Decision::Decline => {}
                 Decision::Errno(e) => panic!("round {i}: unexpected errno {e}"),
             }
 

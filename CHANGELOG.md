@@ -1,5 +1,304 @@
 # Changelog
 
+## Unreleased
+
+This round fixes a privilege boundary in the root seccomp supervisor,
+several ways trashd-exec could end a login or lose protection mid-command,
+rm parity gaps, unsafe compression, and misleading daemon audit paths. It
+also removes most of the per-deletion system calls and fsyncs that remained
+in the preload, the shim and the supervisor. Existing trash contents are
+preserved.
+
+### Fixed
+
+- `trash fsck` reports directory entries it could not read and fails the
+  check instead of discarding the error and claiming clean trash (#398).
+- Trash naming no longer exhausts a fixed same-second counter range: after
+  the first timestamped ID, preload and store claims advance to PID- and
+  sequence-unique IDs, so collisions never turn a delete permanent (#399).
+- Directory-size cache maintenance scans rows one at a time instead of
+  building a full entry map to test membership or validate the cache,
+  while checked reads still validate every row (#400).
+- Text and JSON `ls` output reports write and final-flush failures with a
+  normal error exit, including empty listings (#380).
+- The fanotify daemon passes raw Unix mount paths to `statfs` and
+  `fanotify_mark`, so a non-UTF-8 mount point is monitored (#381).
+- Preload cross-device copies keep the publication lock through source
+  retirement and refuse changed sources instead of deleting newer data.
+  Copying is bounded to the verified source size, and rollback removes only
+  the copy this operation created (#382).
+- Copied-source retirement under preload and seccomp no longer deadlocks
+  against its own publication lock. The caller performs the native unlink,
+  preserving kernel permission checks and existing syscall allowlists
+  (#393). Update the wrapper and preload together and restart wrapped
+  sessions so they receive the new filter.
+- Cross-device restore preserves source edits made after copying and rolls
+  back only the destination it created. Files changed before opening are
+  rejected before any copy is created, using the existing metadata checks
+  (#396).
+- Maintenance reclaims unpublished copies left by killed cross-device
+  operations, compression and decompression. Locked stage announcements
+  preserve active writers and unrelated state, and cleanup never traverses
+  a mount in a partial copy (#383, #388, #389).
+- Status and size retention count foreign directory trees beyond 10,000
+  entries. Forged recorded sizes remain capped by measured data (#384).
+- Out-of-range local deletion dates are rejected instead of panicking an
+  entire listing or retention scan (#385).
+- Compression and decompression recheck the opened data's content and
+  metadata version before publication, preserving same-inode edits made
+  during encoding or a lock wait. Input reads remain bounded if a writer
+  keeps growing the file (#386).
+- Seccomp records and applies policy to a verified physical path for
+  chrooted processes. Hidden parents, overmounted files and differing
+  policy visibility defer to in-process protection; ordinary namespace
+  clones with the same visible paths remain protected (#387).
+- A privileged supervisor no longer performs trapped deletes for targets
+  whose filesystem UID/GID, groups or effective capabilities differ from
+  its own (users reached via su/sudo inside a wrapped root session,
+  processes that dropped capabilities); the kernel judges their syscall
+  instead (#311).
+- trashd-exec execs commands with SIGPIPE at its default (#312), runs the
+  command unprotected instead of exiting 1 when protection cannot start
+  (unreadable cwd, broken trash, supervisor timeout) (#313), accepts
+  non-UTF-8 arguments (#314), keeps its workers alive through Ctrl-C and
+  other job signals, no longer forwards a terminal signal twice, forwards
+  QUIT/USR1/USR2 instead of dying of them, and ends by re-raising the
+  command's terminating signal (#321).
+- trashd-exec workers can no longer kill the command through a panic or a
+  failed stderr write, release the launch directory, and re-identify
+  trashd's own binaries after an update (#323); the orchestrator survives
+  descriptor exhaustion from many adopted descendants (#325).
+- The shim passes bypassed callers through before opening the store
+  (#315), ignores ENOTDIR operands under `-f`, refuses `-d` on an
+  unlistable non-empty directory like rm, prompts for every entry under
+  `-ri` (#316), and sends one desktop notification per invocation (#317).
+  An unusable `.trashd.toml` is reported once per file (#318). Under
+  `-ri`, each fully confirmed subtree is one trash entry that undo
+  restores whole, prompts show the operand's own paths, and `-di` confirms
+  an unlistable empty directory (#342). Answers are carried out only on
+  the entries confirmed: anything that appears meanwhile stays, and the
+  prompts, file-kind names, `-I` wording and yes rule follow GNU rm
+  (#351, #355).
+- Trash roots on mounts listed past the first 4 KB of /proc/mounts are
+  found again (#354).
+- The preload no longer uses openat2, which killed processes under
+  seccomp allowlists that predate it; a reader holding the SQLite cache
+  open no longer stalls deletions; `-ri --one-file-system` asks about
+  other filesystems as GNU rm does (#357).
+- `rm --one-file-system` holds mount points as busy, as GNU rm does: a
+  bind-mounted file no longer lets its directory be moved into the trash
+  with the live mount inside, and overlayfs files that report their
+  layer's device are removed like any other (#358), including bind mounts
+  from the same filesystem and on kernels before 5.8 (#359, #360). An
+  accepted empty btrfs subvolume is removed if still empty, and a seccomp
+  profile that refuses statx no longer stops `-ri` (#360, #361). Mounted
+  directories still honor the size limit and trash refusals, and a bind
+  made over a confirmed entry during the prompts never travels into the
+  trash (#361).
+- Plain `rm -r` of a directory holding a mount no longer carries the live
+  mount into the trash: the tree moves whole or not at all, so it is
+  refused and nothing moves; a mounted operand is emptied into its own
+  trash instead of refused (#366). No walk empties a mount nobody named
+  (only `-i` asks), nothing configured out of the trash under a trashed
+  operand is deleted for good, and files on a read-only filesystem or in
+  an unwritable directory are no longer copied into the trash only to
+  stay where they are (#368). A mount too deep or behind an unreadable
+  directory for the walk is found in the mount table, and no tree is
+  copied across filesystems when a directory inside it that holds entries
+  is unwritable, immutable or sticky against the user, or when anything in
+  it is immutable or append-only (#370, #371, #372). No stat of trashd's
+  triggers an automount (#372).
+- Cross-device trash and restore retire every hard link in a copied tree.
+  Removing one link no longer makes the remaining links appear changed;
+  content and version checks still preserve files edited during retirement
+  (#373).
+- Immutable and append-only entries are also refused before a cross-device
+  copy when a container blocks statx or its attributes are unavailable.
+  If inode flags cannot be examined, the copy fails before publishing data
+  (#374).
+- A mount point operand (`rm -d`, asked about first under `-i`;
+  `rmdir(2)` under the preload; a bind-mounted file from any filesystem)
+  is reported busy like GNU rm: no `.Trash-$UID` is left on the mounted
+  filesystem and no copy is stranded in the trash (#368, #369).
+- Real `rm -r` of an excluded tree walks it by descriptor, so a directory
+  swapped for a symlink is never followed out of the tree. Like rm, it
+  removes everything it can instead of stopping at the first failure, and
+  reports each entry that stays once, without Rust's "(os error N)". A
+  mount inside stays as it is, busy (GNU rm empties it) (#368, #369). It
+  needs no read access to the tree's parent, removes empty directories it
+  cannot list and has no depth cap, as rm, and reads huge directories in
+  batches instead of listing them whole (#370, #371).
+- Purging never deletes through a mount point that travelled into the
+  trash with its directory (nor changes its mode, nor leaves its siblings
+  behind), and a bind alias of the trash, its directories or an ancestor
+  of it is refused like the trash itself (#362, #363).
+- A real-rm probe that could not start or was killed is no longer
+  remembered (one made every later passthrough refuse to run), and the
+  probe cache never creates root-owned directories in a user's home under
+  `sudo -E` (#339).
+- The supervisor lets the kernel judge deletes by targets in another user
+  namespace, whose mapped root looks like real root (#341). Deletes it
+  will not perform with its own credentials (a user switched with su,
+  runuser or setpriv, dropped capabilities) are trashed by the preload
+  in-process instead of being deleted, as are deletes while the
+  supervisor is being replaced (#349) or cannot trash them itself (no
+  store, a cross-device or namespaced target) (#355).
+- trashd-exec answers a notification even when handling it panics, reads
+  status files with non-UTF-8 command names, survives a full descriptor
+  table without killing the command, and forwards ALRM, timer,
+  resource-limit and real-time signals instead of dying of them (#350).
+- `self-update` unpacks only under directories no other user can modify
+  (#343).
+- `rm -r --one-file-system <dir>` records an absolute `Path=` (#310).
+- Preload hooks no longer consult NSS when `HOME` is unset, except for
+  users `/etc/passwd` does not list, who now get the same home trash as
+  the CLI (#303, #346). A
+  dirfd-relative delete is trashed only when the resolved path names the
+  caller's inode (#304). The passwd-home fallback trash records absolute
+  paths (#305).
+- The trash-root authentication cache no longer drops roots under lock
+  contention (#309).
+- `trash compress` leaves hard-linked data, files with extended attributes
+  and other tools' entries alone, and stages attempts outside `files/` so
+  an interrupted run strands nothing there (#327).
+- Ambiguous selectors list exactly the matching entries, and
+  `restore --all` no longer treats exact names with brackets as globs
+  (#328); `restore --all <name>` restores every copy trashed under that
+  name again (#340). `trash undo` restores the latest of same-second
+  deletions, also after compression and on coarse filesystem clocks: new
+  sidecars record a nanosecond deletion stamp (`X-Trashd-DeletedNs`)
+  (#329, #345).
+- `trash config add/remove/set` edit legacy `[retention]` settings where
+  they apply (#330). `self-update` works with a noexec `TMPDIR` (#331).
+- `trash fsck` exits 1 when it finds problems, when `--fix` leaves any, or
+  when a root cannot be checked or read (#332, #347). `ls` handles a symlinked home,
+  rejects bad time filters before scanning, and more output is escaped;
+  `status` totals cannot wrap (#333).
+- The daemon logs paths through real mounts rather than bind mounts, keeps
+  directory paths for `rm -rf` records even when it reads behind (with
+  `FAN_REPORT_TARGET_FID`, Linux 5.17+), and no longer stalls every second
+  on a hung network mount (#326, #344).
+- A concurrent `trash compress` no longer sweeps another run's staged
+  file (#348). Retention compression keeps the original atime, the daemon
+  log stays in event order, and the real-rm probe cache works through a
+  symlinked cache directory (#352).
+- An interrupted cross-device trash or restore no longer leaves truncated
+  data under the final name: copies are staged under a hidden name and
+  published without replacing anything; interrupted decompression no
+  longer leaves an orphaned entry (#334).
+- Purge, `empty` and retention remove trees containing read-only
+  directories (Go module caches, Bazel/Nix outputs) and entries whose data
+  the owner cannot read; oversized sidecars and caches are rejected instead
+  of being read into memory (#335).
+- Trashed directories record their full size beyond 10,000 files, so the
+  size limit and `trash status` count large trees (#336).
+- Patterns treat an unterminated `[` as a literal and accept `\` escapes,
+  like fnmatch(3) (#337).
+- Cross-device copies keep sparse files sparse and hard links linked (#338).
+
+### Performance
+
+- Common cross-device copies stop at the captured source size, including
+  sparse extents and filesystems without extent queries. Appends cannot
+  prolong copy work past that bound while the publication lock is held,
+  and empty copies skip extent queries entirely (#395).
+- Purge and unpublished-stage cleanup read directory entries in batches.
+  Purge shares one read buffer across its iterative walk; wide directories
+  and deep trees no longer require whole-directory name lists or a buffer
+  at every ancestor (#391). On a warm tmpfs with 100,000 filenames of 220
+  bytes, peak purge memory falls from about 29.5 to 3.5 MiB and median time
+  from 856 to 810 ms against 1c76f33 (four alternating pairs).
+- JSON listings stream directly to a buffered writer instead of holding a
+  second representation of every entry and the complete output string.
+  A 20,000-entry sandbox listing keeps identical output while reducing peak
+  memory from about 55 to 21 MiB (median of four alternating pairs, #380).
+- Foreign-tree accounting uses batched descriptor-relative walks, stops
+  at a recorded-size ceiling, and reuses each measurement within a retention
+  pass instead of walking selected victims twice (#384).
+- Manual compression rejects entries younger than its age filter before
+  inspecting their data or extended attributes (#386). Against 96d8a97,
+  a 6,000-entry no-eligible-entry scan drops from 48,174 to 36,171 syscalls
+  and from 120.3 to 92.1 ms median (40 alternating samples per build).
+- Selector commands retain their resolved matches instead of rescanning
+  them for `restore --all` or ambiguity output (#376). In a 6,000-entry
+  sandbox, no-match `restore --all` drops from 66,207 to 36,155 syscalls;
+  ambiguous selectors drop from about 72,300 to 36,200.
+- Directory-size cache rebuilds skip unrelated regular files using
+  directory-entry types, with metadata fallback when needed and fresh
+  checks for candidate directories (#377). Purging an empty directory
+  among 6,000 regular files takes 220 instead of 6,211 syscalls.
+- `find` and `du` keep sidecar freshness checks but skip unused data inode
+  stats; find queries and ls date filters retain and sort only matching
+  results after orphan bookkeeping (#378). A 6,000-entry find/du scan
+  saves about 6,000 syscalls. Buffered find/du output still reports write
+  and flush failures.
+- Cross-device trash collects retirement snapshots during its permission
+  preflight instead of walking the tree again (#379). A 6,000-file copy
+  takes 174,319 instead of 180,328 syscalls; mount surveys, copy-time
+  validation and source-retirement guards stay in place. Partial statx
+  results fall back to complete metadata, and inode-flag checks also work
+  when statx is blocked after the process has already used it.
+- Untraced paired checks on the 6,000-entry sandbox (40 alternating samples
+  per build) reduce median no-match find from 98.7 to 76.7 ms, no-match
+  `restore --all` from 166.8 to 97.1 ms, and directory purge from 28.8 to
+  13.4 ms. Ordinary and cross-device trash show no reproducible slowdown.
+  These measurements depend on the fixture and host.
+- Removed the unused SQLite index and its dependency, including cache writes
+  on trash, restore and purge, and the `fsck --fix` rebuild. All lookups still
+  use `.trashinfo` files; existing cache files are left untouched (#375).
+  Against 431c859, a warm single-file shim `rm` takes 139 instead of 222
+  syscalls (40 alternating samples: median 2.22 instead of 3.06 ms).
+- Passthroughs reuse real-rm probe verdicts (~7.6 ms -> ~4.7 ms on the dev
+  host) (#324).
+- Bypass ancestry walks read comm and parent from one bounded stat read:
+  4 syscalls per ancestor instead of 15 (#302).
+- A steady-state preload deletion costs ~40 syscalls instead of ~65: path
+  resolution keeps canonical prefixes (#304), the store lock is taken
+  optimistically, the sidecar is written through its claim, a validated
+  home ancestry is reused for five seconds and the deletion date comes from
+  the hook's single clock sample (#305). Config reads drop a redundant
+  fstat and seek (#308). The preload no longer links chrono or dirs.
+- Store mutations reuse a validated root path chain, lock before repairing,
+  canonicalize only relative components and write sidecars through their
+  claim (~94 -> ~62 syscalls per extra shim operand) (#307). Trashing a
+  directory updates one directorysizes row instead of rebuilding the cache
+  (#322).
+- The supervisor answers before running retention (#319), stops its bypass
+  walk at the orchestrator's cached ancestry, and drops repeated
+  view-identity, revalidation, realpath and environ work per delete (#320).
+- Preload hooks rule out excluded, missing and trash-internal paths before
+  walking the process tree (an excluded unlink: 53 -> 10 syscalls). `ls`
+  and `undo` skip unused data stats and mount points are stat'ed once
+  (300 entries: `ls` 2,384 -> 1,719, `undo` 2,261 -> 1,892 syscalls); the
+  store lock, retention throttle and passthroughs
+  (exec in place) do less (#353).
+- Bypassed processes check their cached verdict before any path work
+  (3,000-file `rm -rf` under make: 21,179 -> 12,181 syscalls); display
+  listings skip a per-entry re-stat and the mount scan skips kernel
+  pseudo-filesystems (`ls` with 300 entries: 2,382 -> 1,417) (#354).
+- Where statx cannot tell mount roots (before Linux 5.8), purging asks
+  only directories, once per level, instead of every entry (#364); one
+  path's statx failure no longer disables statx for the process (#365),
+  and mount IDs come from file handles before devices are compared, with
+  no /proc needed (#367).
+- Measuring a trashed tree looks entries up relative to their directory
+  instead of by absolute path, and directory listings read getdents64
+  straight from the descriptor (a 50-deep tree of 5,000 files:
+  38.2 -> 21.3 ms; 50 directories of 100 files: 5,873 -> 5,588 syscalls),
+  which also speeds up purging trees (#368).
+- The daemon refreshes mounts only when the mount table changes (#326),
+  and decodes each directory handle, names each deleting process and
+  writes its log once per batch (a 1,011-entry `rm -rf`: ~8,300 -> ~770
+  daemon syscalls) (#344).
+- Purges use raw syscalls instead of hooked libc wrappers (emptying 5,000
+  files: ~76,600 -> ~5,800 syscalls) and delete detached directory trees
+  after releasing the trash-root lock, so a large purge no longer stalls
+  every delete (#335).
+- Retention no longer re-reads and re-encodes incompressible data on every
+  run, sizes entries only when a size limit is set, and refreshes
+  directorysizes only where a removal changed it; snapshot retirement is
+  no longer quadratic; trashing a directory walks it once (#336).
+
 ## 0.1.12 (2026-10-21)
 
 This release reduces system calls in trash scans, preload interception,
@@ -108,10 +407,10 @@ specific fixtures rather than a universal speed guarantee.
 Regressions cover mixed home/foreign stores, raw filenames and orphans,
 replacement and permission changes, historical timezones and DST, fresh
 local policies, forked sidecar PIDs, symlinked home paths, restore conflicts,
-SQLite WAL/fallback behavior, and log privacy and malformed-file handling.
+legacy cache preservation, and log privacy and malformed-file handling.
 Destructive checks run in disposable filesystems.
 
-`tests/syscall_bench.py` compares current and previous native CLI/preload
+`tests/syscall_bench.py` compares current and previous native CLI/shim/preload
 artifacts in the same sandbox, verifies output and recovered payloads, and
 emits JSON call counts after confirming external trash sentinels are intact.
 It reports measurements without imposing machine-dependent timing gates.

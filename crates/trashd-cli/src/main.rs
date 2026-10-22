@@ -24,7 +24,7 @@ fn main() {
     let cli = Cli::parse();
 
     // config/log/self-update never touch the store; opening it unconditionally
-    // made them fail (and create the trash tree + index) as a side effect —
+    // made them fail (and create the trash tree) as a side effect —
     // including `trash self-update`, the recovery path for a broken install.
     match cli.command {
         Commands::Log { lines } => commands::log::run(lines),
@@ -52,25 +52,15 @@ fn main() {
                     json,
                 ),
                 Commands::Find { query } => commands::find::run(&store, &query.to_string_lossy()),
-                Commands::Info { target } => {
-                    commands::info::run(&store, &util::target_selector(&store, &target))
-                }
+                Commands::Info { target } => commands::info::run(&store, &target),
                 Commands::Restore {
                     target,
                     to,
                     force,
                     all,
-                } => commands::restore::run(
-                    &store,
-                    &util::target_selector(&store, &target),
-                    to.as_deref(),
-                    force,
-                    all,
-                ),
+                } => commands::restore::run(&store, &target, to.as_deref(), force, all),
                 Commands::Undo => commands::undo::run(&store),
-                Commands::Purge { target } => {
-                    commands::purge::run(&store, &util::target_selector(&store, &target))
-                }
+                Commands::Purge { target } => commands::purge::run(&store, &target),
                 Commands::Empty {
                     older,
                     dry_run,

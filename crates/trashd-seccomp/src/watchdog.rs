@@ -75,11 +75,14 @@ pub fn run_watchdog(
         }
         std::process::exit(1);
     }
+    // Workers never use the launch directory; holding it as their cwd kept
+    // its filesystem busy for the whole session (#323).
+    unsafe { libc::chdir(c"/".as_ptr()) };
+    // Teardown only: the orchestrator sends TERM once the command exits.
+    // Terminal and job signals are ignored (SignalWait::reset_for_worker):
+    // Ctrl-C used to end both workers while the command kept running, so
+    // its cleanup deletes then failed with ENOSYS.
     unsafe {
-        libc::signal(
-            libc::SIGINT,
-            forward_term_and_exit as *const () as libc::sighandler_t,
-        );
         libc::signal(
             libc::SIGTERM,
             forward_term_and_exit as *const () as libc::sighandler_t,
@@ -91,7 +94,7 @@ pub fn run_watchdog(
     match pid {
         -1 => {
             supervisor::signal_ready(ready_fd, false);
-            eprintln!(
+            report!(
                 "trashd-exec: watchdog: initial supervisor fork failed: {}",
                 io::Error::last_os_error()
             );
@@ -101,16 +104,19 @@ pub fn run_watchdog(
             passthrough_loop(notif_fd)
         }
         0 => {
-            // Supervisor child
-            if let Err(e) = supervisor::run_supervisor(notif_fd, broker_fd, ready_fd) {
-                eprintln!("trashd-exec: supervisor error: {e}");
-            }
+            // Supervisor child. A panic must not unwind into the frames this
+            // fork shares with the watchdog and orchestrator (#323).
+            let _ = std::panic::catch_unwind(|| {
+                if let Err(e) = supervisor::run_supervisor(notif_fd, broker_fd, ready_fd) {
+                    report!("trashd-exec: supervisor error: {e}");
+                }
+            });
             unsafe { libc::_exit(1) }
         }
         supervisor_pid => {
             unsafe { libc::close(ready_fd) };
             SUPERVISOR_PID.store(supervisor_pid, Ordering::Relaxed);
-            eprintln!("trashd-exec: watchdog: supervisor spawned (pid {supervisor_pid})");
+            report!("trashd-exec: watchdog: supervisor spawned (pid {supervisor_pid})");
             supervise_loop(supervisor_pid, notif_fd, broker_fd)
         }
     }
@@ -144,14 +150,14 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
             unsafe { libc::_exit(0) };
         }
 
-        eprintln!(
+        report!(
             "trashd-exec: watchdog: supervisor died ({}), failing over",
             exit_info
         );
 
         // Phase 1: Drain pending notifications with CONTINUE.
         set_nonblocking(notif_fd, true);
-        drain_with_continue(notif_fd);
+        drain_declining(notif_fd);
 
         // Bounded backoff (#121): a persistent startup error (e.g. socketpair
         // failure under fd pressure) would otherwise produce a tight
@@ -163,7 +169,7 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
         let pid = unsafe { libc::fork() };
         match pid {
             -1 => {
-                eprintln!(
+                report!(
                     "trashd-exec: watchdog: fork failed: {}",
                     io::Error::last_os_error()
                 );
@@ -174,13 +180,15 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
             0 => {
                 // New supervisor child process
                 set_nonblocking(notif_fd, false);
-                eprintln!(
+                report!(
                     "trashd-exec: watchdog: new supervisor started (pid {})",
                     unsafe { libc::getpid() }
                 );
-                if let Err(e) = supervisor::run_supervisor(notif_fd, broker_fd, -1) {
-                    eprintln!("trashd-exec: supervisor error: {e}");
-                }
+                let _ = std::panic::catch_unwind(|| {
+                    if let Err(e) = supervisor::run_supervisor(notif_fd, broker_fd, -1) {
+                        report!("trashd-exec: supervisor error: {e}");
+                    }
+                });
                 unsafe { libc::_exit(1) };
             }
             child_pid => {
@@ -188,7 +196,7 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
                 set_nonblocking(notif_fd, false);
                 SUPERVISOR_PID.store(child_pid, Ordering::Relaxed);
                 supervisor_pid = child_pid;
-                eprintln!(
+                report!(
                     "trashd-exec: watchdog: new supervisor spawned (pid {})",
                     child_pid
                 );
@@ -205,7 +213,7 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
 /// process deliberately holds one open to stay useful. Such a delete would
 /// hang until the target dies. Accepted: requires a supervisor crash mid-
 /// handle, which is exactly the failure this watchdog exists to bound.
-fn drain_with_continue(fd: i32) {
+fn drain_declining(fd: i32) {
     loop {
         // Older notification ioctls ignore O_NONBLOCK. Check readiness before
         // RECV so an idle listener cannot prevent supervisor replacement.
@@ -218,9 +226,8 @@ fn drain_with_continue(fd: i32) {
             break;
         }
         match supervisor::notif_recv(fd) {
-            Ok(notif) => {
-                supervisor::respond_continue(fd, notif.id);
-            }
+            // A deferring preload still trashes in-process (#349).
+            Ok(notif) => supervisor::decline(fd, &notif),
             Err(e)
                 if e.raw_os_error() == Some(libc::EAGAIN)
                     || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
@@ -233,12 +240,13 @@ fn drain_with_continue(fd: i32) {
     }
 }
 
-/// Emergency passthrough: respond CONTINUE to everything forever.
+/// Emergency passthrough: decline everything forever (CONTINUE, or ENOSYS
+/// for a deferring preload).
 fn passthrough_loop(fd: i32) -> ! {
-    eprintln!("trashd-exec: watchdog: entering emergency passthrough mode");
+    report!("trashd-exec: watchdog: entering emergency passthrough mode");
     loop {
         match supervisor::notif_recv(fd) {
-            Ok(notif) => supervisor::respond_continue(fd, notif.id),
+            Ok(notif) => supervisor::decline(fd, &notif),
             Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
                 // fd closed — we're done
                 unsafe { libc::_exit(0) };

@@ -1,7 +1,19 @@
+use crate::util::{printable, printable_path};
 use colored::Colorize;
 use trashd_common::TrashStore;
 
 pub fn run(store: &TrashStore, fix: bool) {
+    // Problems found by a check, or left behind by --fix, fail the command
+    // so scripts can act on it (#156).
+    if !check(store, fix) {
+        std::process::exit(1);
+    }
+}
+
+/// Check (and with `fix`, repair) every trash root. False when problems were
+/// found, or --fix left any behind (a failed removal, a kept corrupt sidecar
+/// or orphan, an unchecked root).
+fn check(store: &TrashStore, fix: bool) -> bool {
     println!("{}", "Checking trash integrity...".bold());
 
     let roots = store.all_trash_dirs();
@@ -9,65 +21,89 @@ pub fn run(store: &TrashStore, fix: bool) {
     // case keeps its historical output.
     let multi = roots.len() > 1;
 
-    let mut orphaned_info = 0usize;
-    let mut orphaned_files = 0usize;
-    let mut corrupt_info = 0usize;
+    let mut found = Findings::default();
 
     for (trash_dir, label) in &roots {
         if multi {
-            println!("\n{} ({})", trash_dir.display(), label);
+            println!("\n{} ({})", printable_path(trash_dir), printable(label));
         }
-        let (oi, of, ci) = check_trash_dir(store, trash_dir, fix);
-        orphaned_info += oi;
-        orphaned_files += of;
-        corrupt_info += ci;
+        found.add(check_trash_dir(store, trash_dir, fix));
     }
 
-    let total = orphaned_info + orphaned_files + corrupt_info;
-    if total == 0 {
+    let total = found.orphaned_info + found.orphaned_files + found.corrupt_info;
+    if total == 0 && found.unchecked == 0 {
         println!("{}", "No problems found.".green().bold());
     } else {
-        println!(
-            "\n{} problems: {} orphaned trashinfo, {} orphaned files, {} corrupt",
-            total, orphaned_info, orphaned_files, corrupt_info,
-        );
-        if !fix {
+        if total > 0 {
+            println!(
+                "\n{} problems: {} orphaned trashinfo, {} orphaned files, {} corrupt",
+                total, found.orphaned_info, found.orphaned_files, found.corrupt_info,
+            );
+        }
+        // An unlockable root (read-only media) was not checked at all; it
+        // used to be reported as one corrupt sidecar.
+        if found.unchecked > 0 {
+            println!("{} trash root(s) could not be checked", found.unchecked);
+        }
+        if !fix && total > 0 {
             println!("Run {} to fix.", "trash fsck --fix".bold());
         }
     }
 
-    // Rebuild only the HOME index when fixing: the store serves exactly one
-    // SQLite index (at the home root); per-mount roots have none, so writing
-    // there would just drop unused files (and fail on read-only media).
-    // The per-root CHECKS above are what makes fsck multi-partition (#157).
     if fix {
-        let home = store.home_dir();
-        if roots.iter().any(|(p, _)| p == home) {
-            print!("\nRebuilding index in {}... ", home.display());
-            match store
-                .lock_trash_root(home)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-                .and_then(|_guard| rebuild_index(home))
-            {
-                Ok(count) => println!("{} ({count} entries)", "done".green()),
-                Err(e) => println!("{} {e}", "failed".red()),
-            }
-        }
+        found.unresolved == 0 && found.unchecked == 0
+    } else {
+        total == 0 && found.unchecked == 0
     }
 }
 
-/// Check one trash root; returns (orphaned_info, orphaned_files, corrupt_info).
-fn check_trash_dir(
+/// What checking the trash roots found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Findings {
+    orphaned_info: usize,
+    orphaned_files: usize,
+    corrupt_info: usize,
+    /// Problems --fix did not resolve.
+    unresolved: usize,
+    /// Roots that could not be locked for checking.
+    unchecked: usize,
+}
+
+impl Findings {
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        (self.orphaned_info, self.orphaned_files, self.corrupt_info)
+    }
+
+    fn add(&mut self, other: Findings) {
+        self.orphaned_info += other.orphaned_info;
+        self.orphaned_files += other.orphaned_files;
+        self.corrupt_info += other.corrupt_info;
+        self.unresolved += other.unresolved;
+        self.unchecked += other.unchecked;
+    }
+}
+
+/// Check one trash root.
+fn check_trash_dir(store: &TrashStore, trash_dir: &std::path::Path, fix: bool) -> Findings {
+    check_trash_dir_with_listing(store, trash_dir, fix, listing)
+}
+
+fn check_trash_dir_with_listing<I: Iterator<Item = std::io::Result<std::fs::DirEntry>>>(
     store: &TrashStore,
     trash_dir: &std::path::Path,
     fix: bool,
-) -> (usize, usize, usize) {
+    mut listing: impl FnMut(&std::path::Path, &mut usize) -> Option<I>,
+) -> Findings {
     let guard = if fix {
         match store.lock_trash_root(trash_dir) {
             Ok(g) => Some(g),
             Err(e) => {
-                eprintln!("Could not lock {}: {e}", trash_dir.display());
-                return (0, 0, 1);
+                eprintln!("Could not lock {}: {e}", printable_path(trash_dir));
+                return Findings {
+                    unchecked: 1,
+                    ..Findings::default()
+                };
             }
         }
     } else {
@@ -79,11 +115,13 @@ fn check_trash_dir(
     let mut orphaned_info = 0usize;
     let mut orphaned_files = 0usize;
     let mut corrupt_info = 0usize;
+    let mut unresolved = 0usize;
+    let mut unchecked = 0usize;
     let mut parser = trashd_common::trashinfo::TrashInfoParser::default();
 
     // Check for .trashinfo files without matching files
-    if let Ok(entries) = std::fs::read_dir(&info_dir) {
-        for entry in entries.flatten() {
+    if let Some(entries) = listing(&info_dir, &mut unchecked) {
+        for entry in checked_entries(entries, &info_dir, &mut unchecked) {
             // Raw bytes: a lossy name pointed at a different (missing) data
             // file, so --fix deleted valid sidecars of non-UTF-8 entries (#212).
             use std::os::unix::ffi::OsStrExt;
@@ -93,7 +131,8 @@ fn check_trash_dir(
             };
             let id = std::ffi::OsStr::from_bytes(stem);
             let file_path = files_dir.join(id);
-            let id = id.to_string_lossy();
+            // Names are attacker-chosen: never echo control characters.
+            let id = printable(&id.to_string_lossy());
             // symlink_metadata (not exists()): a DANGLING symlink in files/
             // is still an entry we must not silently discard by declaring its
             // trashinfo orphaned.
@@ -113,7 +152,10 @@ fn check_trash_dir(
                     // exit 0 with the file still present (#156).
                     match std::fs::remove_file(entry.path()) {
                         Ok(()) => println!("    {}", "removed".green()),
-                        Err(e) => println!("    {} {e}", "failed:".red()),
+                        Err(e) => {
+                            println!("    {} {e}", "failed:".red());
+                            unresolved += 1;
+                        }
                     }
                 }
                 continue; // already reported — don't also count as corrupt
@@ -137,8 +179,9 @@ fn check_trash_dir(
                     println!(
                         "    {} data preserved at {} (metadata unreadable; recover manually)",
                         "kept".green(),
-                        file_path.display(),
+                        printable_path(&file_path),
                     );
+                    unresolved += 1;
                 }
             }
         }
@@ -147,8 +190,8 @@ fn check_trash_dir(
     // Capture candidates while publication is excluded. Use the raw name
     // for sidecar lookup: different Unix names can have the same lossy ID.
     let mut candidates = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&files_dir) {
-        for entry in entries.flatten() {
+    if let Some(entries) = listing(&files_dir, &mut unchecked) {
+        for entry in checked_entries(entries, &files_dir, &mut unchecked) {
             let mut info_name = entry.file_name();
             info_name.push(".trashinfo");
             let info_path = info_dir.join(info_name);
@@ -162,12 +205,14 @@ fn check_trash_dir(
     // orphan. Avoid rereading all roots for report-only or clean checks.
     // Index by the actual path both to keep colliding lossy IDs distinct
     // and to avoid a linear search through the trash for every orphan.
+    // Only this root is listed: listing every root once per root made a
+    // repair quadratic in the number of roots.
     let snapshots: std::collections::HashMap<_, _> = if fix && !candidates.is_empty() {
         store
-            .list(None)
+            .list_root(trash_dir)
             .unwrap_or_default()
             .into_iter()
-            .filter(|entry| entry.trash_root == trash_dir && entry.orphaned)
+            .filter(|entry| entry.orphaned)
             .map(|entry| (entry.trashed_path.clone(), entry))
             .collect()
     } else {
@@ -182,34 +227,77 @@ fn check_trash_dir(
         println!(
             "  {} orphaned file (no trashinfo): {}",
             "WARN".yellow(),
-            name.to_string_lossy()
+            printable(&name.to_string_lossy())
         );
         if fix {
             // Orphaned data can be recoverable user data. Require explicit
             // per-item confirmation before permanently deleting it.
             let Some(snapshot) = snapshots.get(&entry.path()) else {
+                unresolved += 1;
                 continue;
             };
             if crate::util::confirm(&format!(
                 "    permanently delete orphaned '{}'? This cannot be undone [y/N] ",
-                entry.path().display()
+                printable_path(&entry.path())
             )) {
                 let res = store.purge_resolved(snapshot);
                 match res {
                     Ok(()) => println!("    {}", "removed".green()),
-                    Err(e) => println!("    {} {e}", "failed:".red()),
+                    Err(e) => {
+                        println!("    {} {e}", "failed:".red());
+                        unresolved += 1;
+                    }
                 }
             } else {
                 println!(
                     "    {} data preserved at {} (recover manually)",
                     "kept".green(),
-                    entry.path().display()
+                    printable_path(&entry.path())
                 );
+                unresolved += 1;
             }
         }
     }
 
-    (orphaned_info, orphaned_files, corrupt_info)
+    Findings {
+        orphaned_info,
+        orphaned_files,
+        corrupt_info,
+        unresolved,
+        unchecked: unchecked.min(1),
+    }
+}
+
+/// A root's `info/` or `files/` listing. One that exists but cannot be read
+/// leaves the root unchecked: skipping it printed "No problems found" and
+/// exited 0 (#347).
+fn listing(dir: &std::path::Path, unchecked: &mut usize) -> Option<std::fs::ReadDir> {
+    match std::fs::read_dir(dir) {
+        Ok(listing) => Some(listing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("Could not read {}: {e}", printable_path(dir));
+            *unchecked += 1;
+            None
+        }
+    }
+}
+
+/// Opening a directory can succeed even when reading its entries fails.
+/// Keep useful entries, but never report an incomplete root as clean (#398).
+fn checked_entries(
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+    dir: &std::path::Path,
+    unchecked: &mut usize,
+) -> impl Iterator<Item = std::fs::DirEntry> {
+    entries.filter_map(move |entry| match entry {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            eprintln!("Could not read {}: {error}", printable_path(dir));
+            *unchecked += 1;
+            None
+        }
+    })
 }
 
 /// Whether `files/<id>` has a usable sidecar, matching the store's own
@@ -223,45 +311,132 @@ fn sidecar_is_usable(info_path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Scan all .trashinfo files and rebuild the SQLite index from scratch.
-fn rebuild_index(trash_dir: &std::path::Path) -> Result<usize, Box<dyn std::error::Error>> {
-    let info_dir = trash_dir.join("info");
-    // Must match the path the store actually reads/writes (store.rs uses the
-    // same shared constant), otherwise --fix rebuilds a throwaway file.
-    let index_path = trash_dir.join(trashd_common::index::REL_PATH);
-
-    // Ensure parent dir exists
-    if let Some(parent) = index_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let index = trashd_common::index::TrashIndex::open(&index_path)?;
-
-    let mut entries = Vec::new();
-    let mut parser = trashd_common::trashinfo::TrashInfoParser::default();
-    if let Ok(dir_entries) = std::fs::read_dir(&info_dir) {
-        for entry in dir_entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".trashinfo") {
-                continue;
-            }
-            let id = name.strip_suffix(".trashinfo").unwrap_or(&name).to_string();
-            if let Ok(content) = trashd_common::trashinfo::read_sidecar(&entry.path())
-                && let Some(info) = parser.parse(&content)
-            {
-                entries.push((id, info, trash_dir.to_path_buf()));
-            }
-        }
-    }
-
-    let count = index.rebuild(&entries)?;
-    Ok(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn each_directory_read_failure_preserves_other_findings() {
+        for failed_dir in ["info", "files"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("Trash");
+            let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+            aged_sidecar(
+                &root,
+                std::ffi::OsStr::new("missing"),
+                &fixture.path().join("missing"),
+            );
+            fs::write(root.join("info/corrupt.trashinfo"), b"invalid metadata").unwrap();
+            fs::write(root.join("files/corrupt"), b"recoverable").unwrap();
+            fs::write(root.join("files/orphan"), b"recoverable orphan").unwrap();
+
+            let found = check_trash_dir_with_listing(&store, &root, false, |dir, unchecked| {
+                listing(dir, unchecked).map(|entries| {
+                    let mut entries = entries.collect::<Vec<_>>();
+                    if dir.file_name() == Some(std::ffi::OsStr::new(failed_dir)) {
+                        // Insert a fault among real directory entries. A
+                        // failure of either pass must not hide useful work
+                        // before/after it or in the other pass.
+                        entries.insert(1, Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                    }
+                    entries.into_iter()
+                })
+            });
+            assert_eq!(found.counts(), (1, 1, 1), "failed {failed_dir} scan");
+            assert_eq!(found.unchecked, 1, "failed {failed_dir} scan");
+            assert_eq!(
+                fs::read(root.join("files/corrupt")).unwrap(),
+                b"recoverable"
+            );
+            assert_eq!(
+                fs::read(root.join("files/orphan")).unwrap(),
+                b"recoverable orphan"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_iteration_errors_fail_both_fsck_modes() {
+        const TEST: &str = "commands::fsck::tests::directory_iteration_errors_fail_both_fsck_modes";
+        const CHILD: &str = "TRASHD_FSCK_READDIR_EIO_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The unfiltered parent owns cleanup: the child deliberately
+            // cannot enumerate directories after installing its filter.
+            let fixture = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD, fixture.path())
+                .env("TRASH_BYPASS", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "fsck iteration-error child failed");
+            return;
+        }
+
+        let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap()).join("Trash");
+        let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        assert!(check(&store, false));
+        assert!(check(&store, true));
+        let orphan = root.join("files/recoverable");
+        fs::write(&orphan, b"preserve this data").unwrap();
+        assert!(!check(&store, false));
+
+        // A real kernel fault after opendir succeeds, rather than a failed
+        // open or a mocked result. Re-exec confines the irreversible filter.
+        let mut filters = [
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_getdents64 as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0x0005_0000 | libc::EIO as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0x7fff_0000,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filters.len() as u16,
+            filter: filters.as_mut_ptr(),
+        };
+        let installed = unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                && libc::prctl(libc::PR_SET_SECCOMP, 2, &program, 0, 0) == 0
+        };
+        if !installed {
+            eprintln!(
+                "SKIP: seccomp fault injection unavailable: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        let mut listing = fs::read_dir(root.join("info")).unwrap();
+        assert_eq!(
+            listing.next().unwrap().unwrap_err().raw_os_error(),
+            Some(libc::EIO),
+            "the opened directory must fail during iteration",
+        );
+        drop(listing);
+        assert!(!check(&store, false), "an incomplete check must fail");
+        assert!(!check(&store, true), "an incomplete repair must fail");
+        assert_eq!(fs::read(&orphan).unwrap(), b"preserve this data");
+    }
 
     #[test]
     fn special_sidecars_are_reported_without_reading_or_deleting_them() {
@@ -280,8 +455,8 @@ mod tests {
             fs::write(root.join("files").join(name), b"recoverable").unwrap();
         }
 
-        assert_eq!(check_trash_dir(&store, &root, false), (0, 3, 3));
-        assert_eq!(rebuild_index(&root).unwrap(), 0);
+        assert_eq!(check_trash_dir(&store, &root, false).counts(), (0, 3, 3));
+        assert!(!check(&store, false), "special sidecars must fail fsck");
         assert!(fifo.symlink_metadata().unwrap().file_type().is_fifo());
         for name in ["fifo", "link", "directory"] {
             assert_eq!(
@@ -307,7 +482,7 @@ mod tests {
             let store =
                 TrashStore::open_isolated(&worker_root, trashd_common::Config::default()).unwrap();
             started_tx.send(()).unwrap();
-            let result = check_trash_dir(&store, &worker_root, true);
+            let result = check_trash_dir(&store, &worker_root, true).counts();
             done_tx.send(result).unwrap();
         });
         started_rx.recv().unwrap();
@@ -362,7 +537,7 @@ mod tests {
         let id = std::ffi::OsStr::from_bytes(b"report-\xff");
         fs::write(root.join("files").join(id), b"data").unwrap();
         let sidecar = aged_sidecar(&root, id, &dir.path().join(id));
-        assert_eq!(check_trash_dir(&store, &root, true), (0, 0, 0));
+        assert_eq!(check_trash_dir(&store, &root, true).counts(), (0, 0, 0));
         assert!(
             sidecar.exists(),
             "valid sidecar of a non-UTF-8 entry was deleted"
@@ -378,7 +553,7 @@ mod tests {
         if let Some(root) = std::env::var_os("TRASHD_FSCK_CHILD_ROOT") {
             let root = std::path::PathBuf::from(root);
             let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
-            assert_eq!(check_trash_dir(&store, &root, true), (0, 2, 0));
+            assert_eq!(check_trash_dir(&store, &root, true).counts(), (0, 2, 0));
             return;
         }
 
@@ -437,6 +612,34 @@ mod tests {
         assert!(!aged.exists());
     }
 
+    #[test]
+    fn clean_and_problem_checks_report_their_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&trash, trashd_common::Config::default()).unwrap();
+        assert!(check(&store, false), "a clean trash passes");
+        fs::write(trash.join("files/orphan"), b"x").unwrap();
+        assert!(!check(&store, false), "a found problem fails the check");
+    }
+
+    // #347: a root whose listing cannot be read was not checked, so it must
+    // not pass as clean.
+    #[test]
+    fn unreadable_roots_fail_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join("Trash");
+        let store = TrashStore::open_isolated(&trash, trashd_common::Config::default()).unwrap();
+        fs::remove_dir(trash.join("info")).unwrap();
+        assert!(
+            check(&store, false),
+            "a missing info/ holds nothing to check"
+        );
+        fs::write(trash.join("info"), b"not a directory").unwrap();
+        let found = check_trash_dir(&store, &trash, false);
+        assert_eq!(found.unchecked, 1);
+        assert!(!check(&store, false));
+    }
+
     // C1: `fsck --fix` must NEVER delete the data file just because its
     // .trashinfo is unparseable — the file in files/<id> is intact and is
     // exactly what the trash bin exists to protect.
@@ -451,7 +654,8 @@ mod tests {
         fs::write(trash.join("info/keep.trashinfo"), "GARBAGE not a header\n").unwrap();
         fs::write(trash.join("files/keep"), b"precious").unwrap();
 
-        run(&store, true); // fsck --fix
+        // The kept corrupt sidecar is a problem --fix left behind (#156).
+        assert!(!check(&store, true), "fsck --fix must report failure");
 
         assert!(
             trash.join("files/keep").exists(),

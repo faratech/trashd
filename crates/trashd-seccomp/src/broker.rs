@@ -120,8 +120,20 @@ pub fn serve(fd: RawFd) -> io::Result<()> {
 }
 
 pub(crate) fn duplicate_locally(pid: u32, fd: i32) -> io::Result<OwnedFd> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Kernels before 6.9 reject PIDFD_THREAD with EINVAL; remember that
+    // instead of failing one syscall per duplication (#320).
+    static THREAD_PIDFDS_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
     // PIDFD_THREAD (O_EXCL) addresses the task's own descriptor table.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, libc::O_EXCL) };
+    let pidfd = if THREAD_PIDFDS_UNSUPPORTED.load(Ordering::Relaxed) {
+        -1
+    } else {
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, libc::O_EXCL) };
+        if pidfd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+            THREAD_PIDFDS_UNSUPPORTED.store(true, Ordering::Relaxed);
+        }
+        pidfd
+    };
     if pidfd >= 0 {
         let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
         let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };

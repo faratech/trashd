@@ -35,14 +35,14 @@ Use `target/release` instead of `target/debug` after `cargo build --workspace --
 
 | Crate | What it is |
 |-------|-----------|
-| `trashd-common` | Core library: store, config, index, mounts, trashinfo, oplog |
+| `trashd-common` | Core library: store, config, mounts, trashinfo, oplog |
 | `trashd-cli` | `trash` CLI binary |
 | `trashd-shim` | `trashd-rm` binary (drop-in `rm` replacement) |
 | `trashd-preload` | `libtrashd_preload.so` (LD_PRELOAD hooks) |
 | `trashd-seccomp` | `trashd-exec` binary (seccomp supervisor + watchdog) |
 | `trashd` | `trashd` binary (fanotify monitor) |
 
-`trashd-preload` is standalone (no `trashd-common` dependency) to keep the `.so` small and avoid SQLite. It duplicates some logic from `trashd-common` — if you change config parsing or trash directory selection, update both.
+`trashd-preload` is standalone (no `trashd-common` dependency) to keep the `.so` small. It duplicates some logic from `trashd-common` — if you change config parsing or trash directory selection, update both.
 
 ## Pull requests
 

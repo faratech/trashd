@@ -1,6 +1,7 @@
 use crate::util::*;
 use colored::Colorize;
 use trashd_common::TrashStore;
+use trashd_common::store::compression_source_matches;
 
 pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
     let days = match parse_duration_days(older) {
@@ -16,24 +17,26 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
     let now = chrono::Local::now();
     let mut compressed = 0usize;
     let mut saved = 0u64;
+    if !dry_run {
+        sweep_interrupted_attempts(&entries);
+    }
 
     for entry in &entries {
-        if entry.orphaned {
+        // Most entries are recent; their data and xattrs need no inspection.
+        let age = now.signed_duration_since(entry.info.deletion_date);
+        if age.num_days() < days as i64 {
             continue;
         }
         // symlink_metadata: a trashed SYMLINK must never be compressed —
         // reading through it would slurp its target and renaming the
         // compressed data over it would replace the link with a regular
-        // file (#45).
+        // file (#45). Hard links, extended attributes and other tools'
+        // entries are left alone as well (#327).
         let stored_meta = match std::fs::symlink_metadata(&entry.trashed_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if !stored_meta.is_file() {
-            continue;
-        }
-        let age = now.signed_duration_since(entry.info.deletion_date);
-        if age.num_days() < days as i64 {
+        if !trashd_common::store::compression_candidate(entry, &stored_meta) {
             continue;
         }
         let size_before = stored_meta.len();
@@ -53,15 +56,15 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
         if size_before > restore_limit {
             continue;
         }
-        // Check zstd magic — skip already compressed
-        if is_zstd(&entry.trashed_path) {
-            continue;
-        }
-
         if dry_run {
+            // Unmarked zstd data (a trashed .zst) is skipped by the real run,
+            // which checks the magic itself under the entry lock.
+            if is_zstd(&entry.trashed_path) {
+                continue;
+            }
             println!(
                 "  {} {} ({})",
-                entry.trashed_path.display(),
+                printable_path(&entry.trashed_path),
                 entry.id.dimmed(),
                 format_size(size_before),
             );
@@ -79,7 +82,7 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
                 eprintln!(
                     "  {} {}: {e}",
                     "warn:".yellow(),
-                    entry.trashed_path.display(),
+                    printable_path(&entry.trashed_path),
                 );
             }
         }
@@ -104,6 +107,63 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
             compressed,
             format_size(saved),
         );
+    }
+}
+
+const COMPRESS_PREFIX: &str = ".trashd-compress-";
+
+/// Remove attempts a killed run left behind: in the state directory, and in
+/// files/ from versions that staged there (only names without a sidecar).
+/// An hour's grace keeps a concurrent run's attempt in place.
+fn sweep_interrupted_attempts(entries: &[trashd_common::store::TrashEntry]) {
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    sweep_attempts_changed_before(entries, stale);
+}
+
+/// Staleness is judged by the status-change time: a live attempt is given
+/// the original's old mtime just before it is published, and a concurrent
+/// sweep judging by mtime removed it (#348). ctime cannot be set back.
+fn sweep_attempts_changed_before(
+    entries: &[trashd_common::store::TrashEntry],
+    stale: std::time::SystemTime,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let mut roots: Vec<&std::path::Path> = entries.iter().map(|e| e.trash_root.as_path()).collect();
+    roots.sort();
+    roots.dedup();
+    let uid = unsafe { libc::geteuid() };
+    for root in roots {
+        for dir in [root.join(".trashd"), root.join("files")] {
+            let Ok(listing) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for item in listing.flatten() {
+                let name = item.file_name();
+                if !name
+                    .as_encoded_bytes()
+                    .starts_with(COMPRESS_PREFIX.as_bytes())
+                {
+                    continue;
+                }
+                let mut sidecar = name.clone();
+                sidecar.push(".trashinfo");
+                if root.join("info").join(sidecar).exists() {
+                    continue;
+                }
+                if let Ok(meta) = std::fs::symlink_metadata(item.path())
+                    && meta.is_file()
+                    && meta.uid() == uid
+                    && std::time::UNIX_EPOCH
+                        .checked_add(std::time::Duration::new(
+                            meta.ctime().max(0) as u64,
+                            meta.ctime_nsec().clamp(0, 999_999_999) as u32,
+                        ))
+                        .is_some_and(|changed| changed < stale)
+                {
+                    let _ = std::fs::remove_file(item.path());
+                }
+            }
+        }
     }
 }
 
@@ -137,6 +197,25 @@ fn compress_file_zstd(
     entry: &trashd_common::store::TrashEntry,
     size_before: u64,
 ) -> std::io::Result<Option<u64>> {
+    compress_before_commit(store, entry, size_before, || {})
+}
+
+fn compress_before_commit(
+    store: &TrashStore,
+    entry: &trashd_common::store::TrashEntry,
+    size_before: u64,
+    before_commit: impl FnOnce(),
+) -> std::io::Result<Option<u64>> {
+    compress_before_publish(store, entry, size_before, before_commit, || {})
+}
+
+fn compress_before_publish(
+    store: &TrashStore,
+    entry: &trashd_common::store::TrashEntry,
+    size_before: u64,
+    before_commit: impl FnOnce(),
+    before_persist: impl FnOnce(),
+) -> std::io::Result<Option<u64>> {
     use trashd_common::store::set_compression_marker;
 
     use std::io::{Read, Seek};
@@ -152,14 +231,14 @@ fn compress_file_zstd(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = input.metadata()?;
-    if !metadata.is_file() {
+    if !metadata.is_file() || metadata.len() != size_before {
         return Ok(None);
     }
     // Serialize compressors that opened the same inode. The second one may
     // have waited on a file that has since been replaced; don't swap it back.
     input.lock()?;
     let current = std::fs::symlink_metadata(path)?;
-    if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+    if !compression_source_matches(&metadata, &current) {
         return Ok(None);
     }
     let mut magic = [0u8; 4];
@@ -168,17 +247,23 @@ fn compress_file_zstd(
     }
     input.rewind()?;
 
-    // Exclusive, unpredictable sibling names cannot overwrite another trash
-    // entry or follow a planted symlink. RAII removes abandoned attempts.
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry has no parent")
-    })?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".trashd-compress-")
-        .tempfile_in(parent)?;
+    // Exclusive, unpredictable names cannot overwrite another trash entry or
+    // follow a planted symlink. RAII removes abandoned attempts; a run killed
+    // by a signal skips RAII, so attempts are staged in the root's private
+    // state directory (same filesystem) rather than files/, where a leftover
+    // listed as an orphaned entry forever (#327).
+    let mut tmp = trashd_common::store::create_data_stage(&entry.trash_root)?;
     {
         let mut enc = zstd::stream::Encoder::new(tmp.as_file_mut(), 3)?;
-        std::io::copy(&mut input, &mut enc)?;
+        // A writer with an existing descriptor need not honor our flock.
+        // Bound work even if it keeps extending the same inode (#386).
+        let copied = std::io::copy(
+            &mut Read::by_ref(&mut input).take(size_before.saturating_add(1)),
+            &mut enc,
+        )?;
+        if copied != size_before {
+            return Ok(None);
+        }
         enc.finish()?;
     }
     let compressed_len = tmp.as_file().metadata()?.len();
@@ -199,12 +284,16 @@ fn compress_file_zstd(
     tmp.as_file().set_permissions(metadata.permissions())?;
     tmp.as_file().sync_all()?;
 
+    before_commit();
     let guard = store
         .lock_trash_root(&entry.trash_root)
         .map_err(std::io::Error::other)?;
     store
         .validate_entry_locked(entry, &guard)
         .map_err(std::io::Error::other)?;
+    if !compression_source_matches(&metadata, &input.metadata()?) {
+        return Ok(None);
+    }
     // The replacement keeps the original timestamps (#202).
     tmp.as_file().set_times(
         std::fs::FileTimes::new()
@@ -215,13 +304,28 @@ fn compress_file_zstd(
     // 1) Marker first, touching only that line of the on-disk sidecar (#218).
     set_compression_marker(info_path, Some("zstd"))?;
 
-    // 2) Then the atomic data swap.
-    if let Err(e) = tmp.persist(path) {
-        // Revert the marker: data is still plaintext.
-        let _ = set_compression_marker(info_path, None);
-        return Err(e.error);
+    before_persist();
+    // The marker write syncs its temporary file, so a writer can change the
+    // source while it blocks. Recheck immediately before the data swap.
+    let result = (|| -> std::io::Result<bool> {
+        if !compression_source_matches(&metadata, &input.metadata()?) {
+            return Ok(false);
+        }
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => Ok(Some(compressed_len)),
+        Ok(false) => {
+            set_compression_marker(info_path, None)?;
+            Ok(None)
+        }
+        Err(error) => {
+            // Revert the marker: data is still plaintext.
+            let _ = set_compression_marker(info_path, None);
+            Err(error)
+        }
     }
-    Ok(Some(compressed_len))
 }
 
 #[cfg(test)]
@@ -248,6 +352,248 @@ mod tests {
         .unwrap();
         let entry = store.find_entry(name).unwrap();
         (store, entry)
+    }
+
+    // #386: an open writer can edit the trashed inode without taking its
+    // flock. Neither its inode identity nor the sidecar version changes.
+    #[test]
+    fn compression_preserves_newer_same_inode_data_and_metadata() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        for action in ["append", "rewrite", "mode", "link"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, entry) = fixture(dir.path(), "data");
+            let sidecar = fs::read(&entry.info_path).unwrap();
+            let inode = fs::metadata(&entry.trashed_path).unwrap().ino();
+            let result = compress_before_commit(&store, &entry, 8192, || match action {
+                "append" => fs::OpenOptions::new()
+                    .append(true)
+                    .open(&entry.trashed_path)
+                    .unwrap()
+                    .write_all(b"newer content")
+                    .unwrap(),
+                "rewrite" => fs::write(&entry.trashed_path, b"updated data").unwrap(),
+                "mode" => fs::set_permissions(
+                    &entry.trashed_path,
+                    fs::Permissions::from_mode(
+                        fs::metadata(&entry.trashed_path).unwrap().mode() ^ 0o100,
+                    ),
+                )
+                .unwrap(),
+                "link" => {
+                    fs::hard_link(&entry.trashed_path, dir.path().join("another-link")).unwrap()
+                }
+                _ => unreachable!(),
+            })
+            .unwrap();
+            assert!(result.is_none(), "{action}: changed source was published");
+            assert_eq!(fs::metadata(&entry.trashed_path).unwrap().ino(), inode);
+            assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+            let data = fs::read(&entry.trashed_path).unwrap();
+            if action == "append" {
+                assert!(data.ends_with(b"newer content"));
+            }
+            if action == "rewrite" {
+                assert_eq!(data, b"updated data");
+            }
+            assert!(!is_zstd(&entry.trashed_path));
+            assert!(
+                !fs::read_dir(store.home_dir().join(".trashd"))
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(COMPRESS_PREFIX.as_bytes()))
+            );
+        }
+    }
+
+    #[test]
+    fn compression_preserves_edits_after_staging_and_marker_write() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        for phase in ["staging", "marker"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (store, entry) = fixture(directory.path(), "data");
+            let sidecar = fs::read(&entry.info_path).unwrap();
+            let inode = fs::metadata(&entry.trashed_path).unwrap().ino();
+            let assert_live_stage = || {
+                let stages = fs::read_dir(store.home_dir().join(".trashd"))
+                    .unwrap()
+                    .flatten()
+                    .filter(|item| {
+                        item.file_name()
+                            .as_encoded_bytes()
+                            .starts_with(trashd_common::store::DATA_STAGE_PREFIX.as_bytes())
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(stages.len(), 1);
+                let stage = fs::File::open(stages[0].path()).unwrap();
+                assert_eq!(
+                    unsafe { libc::flock(stage.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+                    -1
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            };
+            let append = || {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&entry.trashed_path)
+                    .unwrap()
+                    .write_all(b"newer bytes")
+                    .unwrap();
+            };
+            let result = compress_before_publish(
+                &store,
+                &entry,
+                8192,
+                || {
+                    assert_live_stage();
+                    if phase == "staging" {
+                        append();
+                    }
+                },
+                || {
+                    assert_live_stage();
+                    assert!(
+                        fs::read_to_string(&entry.info_path)
+                            .unwrap()
+                            .contains("X-Trashd-Compressed=zstd"),
+                        "the edit must follow the real marker write"
+                    );
+                    if phase == "marker" {
+                        append();
+                    }
+                },
+            )
+            .unwrap();
+            assert!(result.is_none(), "{phase}: changed source was published");
+            assert_eq!(fs::metadata(&entry.trashed_path).unwrap().ino(), inode);
+            assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+            let mut current = vec![b'x'; 8192];
+            current.extend_from_slice(b"newer bytes");
+            assert_eq!(fs::read(&entry.trashed_path).unwrap(), current);
+            assert!(
+                !fs::read_dir(store.home_dir().join(".trashd"))
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(COMPRESS_PREFIX.as_bytes()))
+            );
+        }
+    }
+
+    // #327: compression replaces the data inode, so it must skip hard-linked
+    // data, extended attributes and entries other trash tools wrote.
+    #[test]
+    fn only_plain_trashd_entries_are_compressed() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        let store =
+            TrashStore::open_isolated(&dir.path().join("Trash"), trashd_common::Config::default())
+                .unwrap();
+        let add = |name: &str, trashd: bool| {
+            let data = store.home_dir().join("files").join(name);
+            fs::write(&data, vec![b'x'; 8192]).unwrap();
+            let mut info = TrashInfo::new(dir.path().join(name));
+            if trashd {
+                info.pid = Some(1);
+            }
+            fs::write(
+                store
+                    .home_dir()
+                    .join("info")
+                    .join(format!("{name}.trashinfo")),
+                info.to_trashinfo_string(),
+            )
+            .unwrap();
+            data
+        };
+        let plain = add("plain", true);
+        let linked = add("linked", true);
+        fs::hard_link(&linked, dir.path().join("elsewhere")).unwrap();
+        let foreign = add("foreign", false);
+        let labelled = add("labelled", true);
+        let name = std::ffi::CString::new(labelled.as_os_str().as_bytes()).unwrap();
+        let xattrs = unsafe {
+            libc::setxattr(
+                name.as_ptr(),
+                c"user.origin".as_ptr(),
+                b"x".as_ptr().cast(),
+                1,
+                0,
+            )
+        } == 0;
+        run(&store, "0", false);
+        let compressed = |path: &Path| is_zstd(path);
+        assert!(compressed(&plain));
+        assert!(
+            !compressed(&linked),
+            "a hard link would keep the original data"
+        );
+        assert!(
+            !compressed(&foreign),
+            "another tool would restore zstd bytes"
+        );
+        if xattrs {
+            assert!(!compressed(&labelled), "extended attributes would be lost");
+        }
+    }
+
+    // #327: attempts are staged outside files/, and leftovers of killed runs
+    // are swept once stale, never a concurrent run's or a real entry.
+    #[test]
+    fn interrupted_attempts_are_swept_and_never_left_in_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            TrashStore::open_isolated(&dir.path().join("Trash"), trashd_common::Config::default())
+                .unwrap();
+        let root = store.home_dir().to_path_buf();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        // Every attempt carries an old mtime, as a live one does just before
+        // it is published (#348); only the status-change time tells them apart.
+        let leftover = |path: &Path| {
+            fs::write(path, b"partial").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        };
+        let old_in_files = root.join("files/.trashd-compress-old");
+        let old_in_state = root.join(".trashd/.trashd-compress-old");
+        let fresh = root.join(".trashd/.trashd-compress-fresh");
+        let real = root.join("files/.trashd-compress-real");
+        leftover(&old_in_files);
+        leftover(&old_in_state);
+        leftover(&real);
+        // Filesystem timestamps come from a coarse clock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let stale = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        leftover(&fresh);
+        fs::write(
+            root.join("info/.trashd-compress-real.trashinfo"),
+            TrashInfo::new(dir.path().join("x")).to_trashinfo_string(),
+        )
+        .unwrap();
+        let entry = store.find_entry(".trashd-compress-real").unwrap();
+        sweep_attempts_changed_before(std::slice::from_ref(&entry), stale);
+        assert!(!old_in_files.exists() && !old_in_state.exists());
+        assert!(fresh.exists(), "a concurrent run's attempt stays");
+        assert!(real.exists(), "an entry with a sidecar is not an attempt");
+        sweep_interrupted_attempts(std::slice::from_ref(&entry));
+        assert!(fresh.exists(), "an hour has not passed");
     }
 
     fn compress_fixture(dir: &Path, name: &str, mode: u32) {

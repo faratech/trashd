@@ -41,7 +41,7 @@ trashd-cli      → trashd-common + zstd (native compression)
 trashd-shim     → trashd-common
 trashd-seccomp  → trashd-common
 trashd   → trashd-common
-trashd-preload  → (standalone — no trashd-common to avoid pulling in SQLite)
+trashd-preload  → (standalone — no trashd-common dependency)
 ```
 
 ### trashd-common — shared core
@@ -49,18 +49,17 @@ trashd-preload  → (standalone — no trashd-common to avoid pulling in SQLite)
 - **`store.rs`** — `TrashStore` is the main API. `trash()` moves files (with dir size limit check, bypass_paths check), `restore()` brings them back (with hash verification), `list()` scans all trash dirs (detects orphaned files per spec). Auto-purge is throttled via `maybe_auto_purge()` timestamp marker. Cross-device moves use depth-limited `copy_tree()` (max 100 levels). `dir_size()` capped at 10,000 files. Topdir trash stores relative paths per FreeDesktop spec.
 - **`config.rs`** — Layered TOML config: defaults → `/etc/trashd/config.toml` → `~/.config/trashd/config.toml` → per-directory `.trashd.toml`. Supports `never_trash`, `only_trash`, `bypass_processes`, `bypass_paths`, `max_dir_size_mb`. Pattern matching in `pattern_matches_any()` handles prefix, suffix, infix (`*/.git/*`), and exact patterns.
 - **`mounts.rs`** — Multi-partition logic. `trash_dir_for_path()` picks same-device trash or topdir `.Trash-$UID/`. Checks `$topdir/.Trash/$UID/` with sticky-bit + symlink validation (FreeDesktop spec §1.2.2a).
-- **`index.rs`** — SQLite index. Written on trash/restore/purge but `list()` scans `.trashinfo` files as the authoritative source.
 - **`trashinfo.rs`** — FreeDesktop.org `.trashinfo` parser/serializer. Validates `[Trash Info]` header is first line. First-occurrence wins for duplicate keys. Path value not trimmed (percent-encoded spaces preserved). Extended `X-Trashd-*` fields. Writes `X-Trashd-Hash` (reads both `X-Trashd-Hash` and `X-Trashd-SHA256` for backward compat).
 - **`directorysizes.rs`** — `$trash/directorysizes` cache per FreeDesktop spec v1.0. Atomic write via temp file + rename.
 - **`oplog.rs`** — Append-only operation log. Desktop notification via `notify-send` (GUI sessions only).
 
 ### trashd-preload — standalone by design
 
-Does NOT depend on `trashd-common` to keep the `.so` small and avoid SQLite. Duplicates config parsing, trash directory selection, and trashinfo writing. Uses `OnceLock` for config with periodic mtime-based change detection (logs when config changes).
+Does NOT depend on `trashd-common` to keep the `.so` small. Duplicates config parsing, trash directory selection, and trashinfo writing. Uses `OnceLock` for config with periodic mtime-based change detection (logs when config changes).
 
 Key safety mechanisms:
 - Thread-local `Cell<bool>` re-entrancy guard prevents internal `rename()`/`mkdir()` from re-entering hooked `unlink()`
-- Skips paths inside trash directories (prevents intercepting SQLite journal deletions)
+- Skips paths inside trash directories (prevents intercepting trash cleanup operations)
 - Defers to seccomp when `TRASHD_SECCOMP_ACTIVE=1` is set
 - Sets `TRASH_BYPASS=1` checked on every call
 

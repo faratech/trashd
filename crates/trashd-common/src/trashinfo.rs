@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// Read a regular metadata file without following symlinks or waiting for a
 /// FIFO writer. Check the opened descriptor, so a replacement between lookup
 /// and open cannot turn the read into a stream from a special file.
-fn open_regular_metadata_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+fn open_regular_metadata_file(path: &Path, limit: u64) -> io::Result<(fs::File, fs::Metadata)> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -20,20 +20,53 @@ fn open_regular_metadata_file(path: &Path) -> io::Result<(fs::File, fs::Metadata
             "trash metadata is not a regular file",
         ));
     }
+    // Metadata files are small; a huge one (crafted on removable media,
+    // whose trash a user may own) is not metadata, and reading it whole made
+    // every listing allocate its size (#335).
+    if metadata.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is too large",
+        ));
+    }
     Ok((file, metadata))
 }
 
-pub(crate) fn read_regular_text_file(path: &Path) -> io::Result<String> {
-    let (mut file, _) = open_regular_metadata_file(path)?;
+/// Largest .trashinfo sidecar accepted as metadata.
+pub(crate) const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+
+/// Read a regular metadata file of at most `limit` bytes.
+pub(crate) fn read_regular_text_file(path: &Path, limit: u64) -> io::Result<String> {
+    let (file, _) = open_regular_metadata_file(path, limit)?;
     let mut text = String::new();
-    file.read_to_string(&mut text)?;
+    // Growth after the size check is bounded too.
+    if file.take(limit + 1).read_to_string(&mut text)? as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is too large",
+        ));
+    }
     Ok(text)
+}
+
+/// A sidecar's raw bytes (bounded like `read_sidecar`, no UTF-8 check), for
+/// edits that must preserve every other byte.
+pub(crate) fn read_sidecar_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let (file, _) = open_regular_metadata_file(path, MAX_SIDECAR_BYTES)?;
+    let mut bytes = Vec::new();
+    if file.take(MAX_SIDECAR_BYTES + 1).read_to_end(&mut bytes)? as u64 > MAX_SIDECAR_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is too large",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Read a .trashinfo sidecar. Special files and symlinks are invalid metadata,
 /// including ones substituted while a listing or integrity check is running.
 pub fn read_sidecar(path: &Path) -> io::Result<String> {
-    read_regular_text_file(path)
+    read_regular_text_file(path, MAX_SIDECAR_BYTES)
 }
 
 /// Read exactly the opened sidecar's observed length and return that inode's
@@ -43,7 +76,7 @@ pub fn read_sidecar(path: &Path) -> io::Result<String> {
 /// Unlike File::read_to_string, this needs no extra metadata query, seek, or
 /// EOF probe for every small sidecar in a large trash.
 pub(crate) fn read_sidecar_snapshot(path: &Path) -> io::Result<(String, fs::Metadata)> {
-    let (mut file, metadata) = open_regular_metadata_file(path)?;
+    let (mut file, metadata) = open_regular_metadata_file(path, MAX_SIDECAR_BYTES)?;
     let text = read_text_exact(&mut file, metadata.len())?;
     Ok((text, metadata))
 }
@@ -112,7 +145,7 @@ fn resolve_local_deletion_date(naive: NaiveDateTime) -> Option<DateTime<Local>> 
         chrono::LocalResult::None => {
             // Preserve the existing gap recovery, including zones whose
             // transition is shorter or longer than an hour.
-            let shifted = naive + chrono::Duration::hours(1);
+            let shifted = naive.checked_add_signed(chrono::Duration::hours(1))?;
             shifted.and_local_timezone(Local).earliest()
         }
     }
@@ -136,6 +169,11 @@ pub struct TrashInfo {
     /// this is set — never by sniffing magic bytes, which would corrupt a
     /// user's genuine compressed file.
     pub compressed: Option<String>,
+    /// trashd extension: the deletion instant in nanoseconds since the
+    /// epoch. DeletionDate has one-second precision and sidecar mtimes come
+    /// from the filesystem's coarse clock, so entries trashed together
+    /// (`rm a b`) tied, and undo picked either (#345).
+    pub deletion_ns: Option<u64>,
 }
 
 impl TrashInfo {
@@ -147,14 +185,18 @@ impl TrashInfo {
     }
 
     pub fn new(original_path: PathBuf) -> Self {
+        let now = Local::now();
         Self {
             original_path,
-            deletion_date: Local::now(),
+            deletion_date: now,
             command: None,
             pid: None,
             size: None,
             sha256: None,
             compressed: None,
+            deletion_ns: now
+                .timestamp_nanos_opt()
+                .and_then(|ns| u64::try_from(ns).ok()),
         }
     }
 
@@ -184,6 +226,9 @@ impl TrashInfo {
         }
         if let Some(ref algo) = self.compressed {
             s.push_str(&format!("X-Trashd-Compressed={algo}\n"));
+        }
+        if let Some(ns) = self.deletion_ns {
+            s.push_str(&format!("X-Trashd-DeletedNs={ns}\n"));
         }
 
         s
@@ -216,6 +261,7 @@ impl TrashInfo {
         let mut size = None;
         let mut sha256 = None;
         let mut compressed = None;
+        let mut deletion_ns = None;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -281,6 +327,9 @@ impl TrashInfo {
                     "X-Trashd-Compressed" if compressed.is_none() => {
                         compressed = Some(value.trim().to_string())
                     }
+                    "X-Trashd-DeletedNs" if deletion_ns.is_none() => {
+                        deletion_ns = value.trim().parse().ok()
+                    }
                     _ => {}
                 }
             }
@@ -294,6 +343,7 @@ impl TrashInfo {
             size,
             sha256,
             compressed,
+            deletion_ns,
         })
     }
 }
@@ -362,6 +412,50 @@ fn decode_path(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #385: a local timestamp near Chrono's limit can map outside its UTC
+    // range. The gap-recovery hour must reject overflow instead of letting
+    // one untrusted sidecar panic an entire scan. Re-exec for each timezone
+    // so Local's cache and TZ never affect another harness test.
+    #[test]
+    fn extreme_dates_in_offset_zones_never_overflow() {
+        const TEST: &str = "trashinfo::tests::extreme_dates_in_offset_zones_never_overflow";
+        const CHILD: &str = "TRASHD_EXTREME_DATE_TZ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for zone in ["Etc/GMT+12", "Etc/GMT-14", "UTC0"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, "1")
+                    .env("TZ", zone)
+                    .env("TRASH_BYPASS", "1")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "extreme date child failed for {zone}");
+            }
+            return;
+        }
+        let zone = std::env::var("TZ").unwrap();
+        let mut parser = TrashInfoParser::default();
+        for (date, valid) in [
+            ("+262142-12-31T23:30:00", zone != "Etc/GMT+12"),
+            ("-262143-01-01T00:30:00", zone != "Etc/GMT-14"),
+            ("2026-10-22T12:30:00", true),
+        ] {
+            let sidecar = format!("[Trash Info]\nPath=/original\nDeletionDate={date}\n");
+            assert_eq!(
+                TrashInfo::from_trashinfo(&sidecar).is_some(),
+                valid,
+                "standalone conversion for {date} in {zone}"
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    parser.parse(&sidecar).is_some(),
+                    valid,
+                    "cached conversion for {date} in {zone}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn scan_date_cache_reuses_exact_dates_and_has_bounded_memory() {
@@ -497,7 +591,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("growing.trashinfo");
         fs::write(&path, "métadata").unwrap();
-        let (mut input, metadata) = open_regular_metadata_file(&path).unwrap();
+        let (mut input, metadata) = open_regular_metadata_file(&path, MAX_SIDECAR_BYTES).unwrap();
         let mut writer = fs::File::options().append(true).open(&path).unwrap();
         writer.write_all(b" appended").unwrap();
         assert_eq!(
@@ -509,7 +603,7 @@ mod tests {
         // API stops at the captured length and requires version validation.
         assert_eq!(read_sidecar(&path).unwrap(), "métadata appended");
 
-        let (mut input, metadata) = open_regular_metadata_file(&path).unwrap();
+        let (mut input, metadata) = open_regular_metadata_file(&path, MAX_SIDECAR_BYTES).unwrap();
         writer.set_len(3).unwrap();
         assert_eq!(
             read_text_exact(&mut input, metadata.len())
@@ -518,7 +612,14 @@ mod tests {
             io::ErrorKind::UnexpectedEof,
         );
         fs::write(&path, b"").unwrap();
-        assert_eq!(read_sidecar_snapshot(&path).unwrap().0, "");
+        assert_eq!(read_sidecar_snapshot(&path).unwrap().0, ""); // An oversized "sidecar" is not metadata (#335).
+        fs::write(&path, vec![b'x'; MAX_SIDECAR_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            read_sidecar(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(read_sidecar_snapshot(&path).is_err());
+        assert!(read_sidecar_bytes(&path).is_err());
     }
 
     // Regression (#223): from_str_radix accepts a sign ("%+F" decoded as
@@ -557,6 +658,7 @@ mod tests {
             size: Some(4096),
             sha256: Some("abcdef1234567890".into()),
             compressed: None,
+            deletion_ns: Some(1_792_642_099_123_456_789),
         };
 
         let serialized = info.to_trashinfo_string();

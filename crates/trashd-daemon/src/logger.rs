@@ -13,9 +13,11 @@ pub struct DeletionEvent {
 }
 
 impl DeletionEvent {
-    /// Format as a structured log line.
-    pub fn log(&self, skipped: bool) {
-        eprintln!("{}", self.format(skipped));
+    /// Append the structured log line to `out`, which a batch writes once:
+    /// eprintln! made two unbuffered writes per deletion (#344).
+    pub fn log_to(&self, out: &mut String, skipped: bool) {
+        out.push_str(&self.format(skipped));
+        out.push('\n');
     }
 
     fn format(&self, skipped: bool) -> String {

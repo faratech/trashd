@@ -375,7 +375,7 @@ pub fn run(check_only: bool, allow_unverified: bool) {
     // the mode at creation and fails if the path already exists).
     use std::os::unix::fs::DirBuilderExt;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let tmp_base = std::env::temp_dir();
+    let tmp_base = exec_capable_temp_base().unwrap_or_else(|reason| fatal(reason));
     let tmp_dir = {
         let mut chosen = None;
         for attempt in 0..128u32 {
@@ -816,9 +816,127 @@ fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<
     Ok(())
 }
 
+/// The release is unpacked and install.sh load-tests its binaries from the
+/// unpacked tree, so it needs a directory that may execute files: with a
+/// noexec TMPDIR (common on hardened hosts) the load test failed with a
+/// misleading glibc message (#331). The private, exclusively created
+/// directory inside keeps the same protections in each candidate.
+fn exec_capable_temp_base() -> Result<std::path::PathBuf, &'static str> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
+        });
+    let mut unsafe_found = false;
+    // Judged and used by their resolved paths, so a symlinked base (OSTree's
+    // /root) qualifies by what it points to and is not re-traversed (#352).
+    for dir in [Some(std::env::temp_dir()), Some("/var/tmp".into()), cache]
+        .into_iter()
+        .flatten()
+        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .filter(|dir| allows_exec(dir))
+    {
+        if safe_temp_base(&dir) {
+            return Ok(dir);
+        }
+        unsafe_found = true;
+    }
+    Err(if unsafe_found {
+        "no executable temporary directory is safe from other users (each component must be \
+         owned by root or you, and writable by others only when sticky); set TMPDIR to one \
+         that is and retry"
+    } else {
+        "no temporary directory allows executing files (noexec mounts); \
+         set TMPDIR to one that does and retry"
+    })
+}
+
+/// The unpacked installer runs with our privileges, so nobody else may be
+/// able to swap our update directory out of its base: every component must
+/// be a real directory owned by root or us, writable by others only when
+/// sticky. Under `sudo -E` the cache fallback (or TMPDIR) can be a user's
+/// own tree, where they could rename root's directory and plant an
+/// install.sh (#343).
+fn safe_temp_base(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    dir.is_absolute()
+        && dir.ancestors().all(|component| {
+            fs::symlink_metadata(component).is_ok_and(|meta| {
+                meta.file_type().is_dir()
+                    && (meta.uid() == 0 || meta.uid() == uid)
+                    && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0)
+            })
+        })
+}
+
+fn allows_exec(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let measured = unsafe { libc::statvfs(name.as_ptr(), &mut stat) } == 0;
+    measured
+        && stat.f_flag & libc::ST_NOEXEC == 0
+        && std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #331: the unpacked release must be executable where it is unpacked.
+    #[test]
+    fn temp_base_must_allow_executing_files() {
+        assert!(allows_exec(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        ))));
+        assert!(!allows_exec(std::path::Path::new(
+            "/nonexistent-trashd-dir"
+        )));
+        let proc_noexec = std::fs::read_to_string("/proc/self/mounts").is_ok_and(|mounts| {
+            mounts.lines().any(|line| {
+                let fields: Vec<&str> = line.split(' ').collect();
+                fields.get(1) == Some(&"/proc")
+                    && fields
+                        .get(3)
+                        .is_some_and(|options| options.split(',').any(|o| o == "noexec"))
+            })
+        });
+        if proc_noexec {
+            assert!(!allows_exec(std::path::Path::new("/proc")));
+        }
+        assert!(exec_capable_temp_base().is_ok_and(|dir| allows_exec(&dir)));
+    }
+
+    // #343: root never unpacks an installer where another user could swap
+    // the update directory.
+    #[test]
+    fn temp_base_must_be_safe_from_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(safe_temp_base(&base));
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!safe_temp_base(&base), "writable by others without sticky");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(safe_temp_base(&base));
+        let link = temp.path().join("link");
+        symlink(&base, &link).unwrap();
+        assert!(!safe_temp_base(&link));
+        assert!(!safe_temp_base(std::path::Path::new("relative")));
+        if unsafe { libc::geteuid() } == 0 {
+            let foreign = temp.path().join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            std::os::unix::fs::chown(&foreign, Some(65534), Some(65534)).unwrap();
+            assert!(!safe_temp_base(&foreign), "owned by another user");
+            assert!(!safe_temp_base(&foreign.join("missing")));
+        }
+    }
     use std::os::unix::fs::symlink;
 
     #[test]

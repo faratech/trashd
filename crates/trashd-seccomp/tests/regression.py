@@ -41,19 +41,51 @@ class Program(ctypes.Structure):
     _fields_ = [("length", ctypes.c_ushort), ("instructions", ctypes.POINTER(Instruction))]
 
 
-def force_install_error(error, syscall=SYSCALL_SECCOMP):
-    """A real inherited kernel filter that rejects only one syscall."""
+def force_install_error(error, syscall=SYSCALL_SECCOMP, first_arg=None):
+    """A real inherited filter, optionally matching one int argument too."""
     def install():
-        instructions = (Instruction * 4)(
-            Instruction(0x20, 0, 0, 0),
-            Instruction(0x15, 0, 1, syscall),
-            Instruction(0x06, 0, 0, 0x00050000 | error),
-            Instruction(0x06, 0, 0, 0x7FFF0000),
-        )
+        if first_arg is None:
+            instructions = (Instruction * 4)(
+                Instruction(0x20, 0, 0, 0),
+                Instruction(0x15, 0, 1, syscall),
+                Instruction(0x06, 0, 0, 0x00050000 | error),
+                Instruction(0x06, 0, 0, 0x7FFF0000),
+            )
+        else:
+            instructions = (Instruction * 6)(
+                Instruction(0x20, 0, 0, 0),
+                Instruction(0x15, 0, 3, syscall),
+                # seccomp_data.args[0]: the kernel consumes an int dirfd,
+                # so upper argument bits do not affect its value (#392).
+                Instruction(0x20, 0, 0, 16),
+                Instruction(0x15, 0, 1, first_arg & 0xFFFFFFFF),
+                Instruction(0x06, 0, 0, 0x00050000 | error),
+                Instruction(0x06, 0, 0, 0x7FFF0000),
+            )
         program = Program(len(instructions), instructions)
         if LIBC.prctl(38, 1, 0, 0, 0) or LIBC.syscall(SYSCALL_SECCOMP, 1, 0, ctypes.byref(program)):
             raise RuntimeError("cannot install failure-injection filter")
     return install
+
+
+def force_copy_error():
+    """Fail the initial path rename, allowing pinned stage publication."""
+    renameat2 = {"x86_64": 316, "aarch64": 276}[os.uname().machine]
+    install = force_install_error(errno.EXDEV, renameat2, first_arg=-100)
+
+    def install_and_probe():
+        install()
+        # Verify the real filter, not just its assembled instructions. An
+        # accidental ALLOW would silently stop exercising the copy fallback;
+        # a blanket failure would also reject same-filesystem publication.
+        for directory, expected in [(-100, (errno.EXDEV,)),
+                                    (-1, (errno.ENOENT, errno.EBADF))]:
+            ctypes.set_errno(0)
+            result = LIBC.syscall(renameat2, directory, ctypes.c_char_p(b""),
+                                  -1, ctypes.c_char_p(b""), 1)
+            if result != -1 or ctypes.get_errno() not in expected:
+                raise RuntimeError("copy failure-injection filter matched the wrong operation")
+    return install_and_probe
 
 
 def wait_until(predicate, description, timeout=8):
@@ -114,8 +146,7 @@ for row in sys.stdin:
         assert result == -1 and ctypes.get_errno() == 22
     elif mode in ["common-copy", "preload-copy"]:
         sys.path.insert(0, "/tests")
-        from seccomp_regression import force_install_error
-        renameat2 = {"x86_64": 316, "aarch64": 276}[os.uname().machine]
+        from seccomp_regression import force_copy_error
         child_env = dict(os.environ)
         if mode == "common-copy":
             command = ["/opt/trashd/bin/trashd-rm", path]
@@ -124,11 +155,10 @@ for row in sys.stdin:
             child_env.pop("TRASHD_SECCOMP_COOKIE", None)
             child_env["LD_PRELOAD"] = "/opt/trashd/lib/libtrashd_preload.so"
             command = [sys.executable, "-c", "import os,sys; os.unlink(sys.argv[1])", path]
-        # Fail rename with EXDEV only in the deleting descendant after wrapper
-        # readiness: the cross-device case is the one that takes the copy path
-        # (other errors fail the delete since #204/#205). Supervisor rename
-        # remains available, exposing nested lock cycles.
-        subprocess.run(command, env=child_env, preexec_fn=force_install_error(18, renameat2), check=True, timeout=8)
+        # Fail the initial path rename only in the deleting descendant after
+        # wrapper readiness. The completed copy publishes between pinned fds
+        # on one filesystem; supervisor rename remains available too (#392).
+        subprocess.run(command, env=child_env, preexec_fn=force_copy_error(), check=True, timeout=8)
     elif mode.startswith("thread"):
         errors = []
         def worker():
@@ -384,7 +414,8 @@ def run():
                 for mode in ["unlink", "child", "dirfd", "thread", "thread-dirfd", "thread-private"]:
                     delete(process, work, data, mode, f"after-{mode}.txt")
                 os.kill(process.pid, signal.SIGTERM)
-                assert process.wait(timeout=5) == 128 + signal.SIGTERM
+                status = process.wait(timeout=5)
+                assert status == -signal.SIGTERM, f"protected SIGTERM returned {status}, expected {-signal.SIGTERM}"
                 assert not Path(f"/proc/{target}").exists()
             finally:
                 stop(process)
@@ -408,7 +439,8 @@ def run():
                     target, active = line(process)
                     assert active == "1", "protected signal case lost listener"
                     os.kill(process.pid, sig)
-                    assert process.wait(timeout=5) == 128 + sig
+                    status = process.wait(timeout=5)
+                    assert status == -sig, f"protected {sig.name} returned {status}, expected {-sig}"
                     assert not Path(f"/proc/{target}").exists()
                 finally:
                     stop(process)

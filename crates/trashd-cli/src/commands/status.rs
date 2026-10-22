@@ -8,7 +8,10 @@ pub fn run(store: &TrashStore) {
     drop(progress);
     match partitions {
         Ok(partitions) => {
-            let total_size: u64 = partitions.iter().map(|p| p.total_size).sum();
+            // Sizes come from sidecars, which anyone can write: never wrap.
+            let total_size = partitions
+                .iter()
+                .fold(0u64, |total, p| total.saturating_add(p.total_size));
             let total_count: usize = partitions.iter().map(|p| p.count).sum();
 
             println!("{}", "Trash Status".bold().underline());
@@ -21,14 +24,14 @@ pub fn run(store: &TrashStore) {
                 for ps in &partitions {
                     println!(
                         "    {} — {} items, {}",
-                        ps.label,
+                        printable(&ps.label),
                         ps.count,
                         format_size(ps.total_size),
                     );
-                    println!("      {}", ps.trash_dir.display().to_string().dimmed());
+                    println!("      {}", printable_path(&ps.trash_dir).dimmed());
                 }
             } else if let Some(ps) = partitions.first() {
-                println!("  Location: {}", ps.trash_dir.display());
+                println!("  Location: {}", printable_path(&ps.trash_dir));
             }
         }
         Err(e) => fatal(e),

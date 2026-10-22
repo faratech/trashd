@@ -24,6 +24,11 @@ ARTIFACTS = {
     "trashd-exec": "bin/trashd-exec",
     "libtrashd_preload.so": "lib/libtrashd_preload.so",
     "trashd": "bin/trashd",
+    # Optional benchmark-only artifacts; keep real daemon/supervisor slots
+    # available when comparing all interception layers in one sandbox.
+    "bench-baseline-cli": "bin/bench-baseline-cli",
+    "bench-baseline-shim": "bin/bench-baseline-shim",
+    "bench-baseline-preload.so": "lib/bench-baseline-preload.so",
 }
 
 
@@ -150,7 +155,7 @@ def run(args, command):
         # Hide installed trashd binaries/stashes as well as global config.
         if (root / "usr/local").is_dir():
             mount("-t", "tmpfs", "-o", "mode=755", "trashd-test-local", root / "usr/local")
-        for name in ("null", "zero", "random", "urandom"):
+        for name in ("null", "zero", "full", "random", "urandom"):
             (root / "dev" / name).touch()
             mount("--bind", Path("/dev") / name, root / "dev" / name)
         (root / "dev/fd").symlink_to("/proc/self/fd")

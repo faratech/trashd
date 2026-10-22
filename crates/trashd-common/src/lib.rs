@@ -1,16 +1,16 @@
 pub mod config;
 pub mod config_file;
 pub mod directorysizes;
-pub mod index;
 pub(crate) mod local_trust;
 pub mod mounts;
 pub mod oplog;
+pub mod proc_stat;
 pub mod store;
 pub mod store_lock;
+pub(crate) mod trash_id;
 pub mod trashinfo;
 
 pub use config::Config;
-pub use index::TrashIndex;
 pub use mounts::trash_dir_for_path;
 pub use store::TrashStore;
 

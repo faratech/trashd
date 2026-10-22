@@ -62,11 +62,11 @@ In GUI sessions (when `$DISPLAY` or `$WAYLAND_DISPLAY` is set), sends a desktop 
 
 A shared library that hooks `unlink()`, `unlinkat()`, `rmdir()`, and `remove()` at the libc level using `dlsym(RTLD_NEXT, ...)`. (glibc's `remove()` calls hidden internal aliases that hooking `unlink`/`rmdir` cannot reach, so it is interposed directly.) Catches deletions from any dynamically-linked program — Python's `os.remove()`, Perl's `unlink`, Go's `os.Remove()`, compiled C programs, anything that calls libc.
 
-Enabled system-wide via `/etc/ld.so.preload`, which `install.sh` and a native `make install` register. Distribution packages built from `packaging/` install the library without registering it: add its path to `/etc/ld.so.preload` to enable the layer. The library is intentionally standalone — no dependency on `trashd-common` or SQLite — to keep the `.so` small (~870 KB) and avoid pulling heavy dependencies into every process on the system.
+Enabled system-wide via `/etc/ld.so.preload`, which `install.sh` and a native `make install` register. Distribution packages built from `packaging/` install the library without registering it: add its path to `/etc/ld.so.preload` to enable the layer. The library is intentionally standalone — no dependency on `trashd-common` — to keep the `.so` small (~870 KB) and avoid pulling heavy dependencies into every process on the system.
 
 Key safety mechanisms:
 - **Re-entrancy guard** — A thread-local `Cell<bool>` prevents internal `rename()`/`mkdir()` calls during trash operations from re-entering the hooked `unlink()`.
-- **Trash directory skip** — Paths inside `~/.local/share/Trash/`, `.Trash-$UID/`, and `.Trash/` are never intercepted. This prevents the preload from trashing SQLite journal files and `.trashinfo` cleanup operations.
+- **Trash directory skip** — Paths inside `~/.local/share/Trash/`, `.Trash-$UID/`, and `.Trash/` are never intercepted. This prevents the preload from intercepting trash cleanup operations.
 - **Seccomp deference** — Preload defers after checking ACTIVE and a cookie-specific filter proof. Unrelated filters or stale markers retain preload protection.
 - **Config change detection** — Checks config file mtime every 60 seconds and logs when changes are detected. Full reload requires process restart (intentional — mutating global state in a preload `.so` is unsafe).
 
@@ -82,7 +82,7 @@ Trash publication, compression and retirement share a persistent private `.trash
 
 ### Layer 4 — seccomp supervisor (`trashd-exec`)
 
-The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the kernel syscall boundary using a BPF seccomp filter with `SECCOMP_RET_USER_NOTIF`. Catches everything — statically-linked binaries, setuid programs, programs that clear `LD_PRELOAD`, and raw syscalls.
+Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the kernel syscall boundary using a BPF seccomp filter with `SECCOMP_RET_USER_NOTIF`. This includes statically-linked binaries, programs that clear `LD_PRELOAD`, and raw syscalls. The supervisor declines operations when it cannot safely pin the target's filesystem view or when a privileged supervisor's ordinary credentials differ from the target's; those operations use the target's own protection layers and kernel permissions.
 
 **Process architecture:**
 
@@ -96,9 +96,13 @@ The most robust layer. Traps `unlink(2)`, `unlinkat(2)`, and `rmdir(2)` at the k
 
 The BPF filter is architecture-specific: x86_64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84). aarch64 traps only `SYS_unlinkat` (35) since the other two syscalls don't exist on that architecture.
 
+Update `trashd-exec` and `libtrashd_preload.so` together, then restart sessions already wrapped by `trashd-exec`. Their inherited seccomp filters remain in place until those sessions exit; replacing the files does not update a running session's filter.
+
 Automatic nonroot login shells use preload and the PATH shim, preserving normal `sudo` behavior. Interactive root shells try `trashd-exec --preserve-privileges` without changing privilege state. Set `TRASHD_SECCOMP_AUTO=0` to disable automatic wrapping. `TRASHD_SECCOMP_ATTEMPTED` prevents profile recursion.
 
 Explicit `trashd-exec <command>` provides kernel interception but sets irreversible, inherited `NoNewPrivs`, preventing setuid/file-capability elevation. ACTIVE and a random cookie are published only after memory access, root/cwd and directory-descriptor pinning, `openat2`, and supervisor readiness succeed. Setup failure reaps the filtered child and execs the command in place of the unfiltered wrapper, with both markers cleared and the inherited signal state restored. No wrapper process stays resident in fallback mode. Supervisor startup failure aborts.
+
+Known open issue: Landlock rules installed by a target after wrapper startup are not reflected in the supervisor's credential comparison. A removal the target's Landlock policy forbids can therefore be moved to trash and reported successful. Memory access and directory-descriptor checks do not prove Landlock authorization. This permission mismatch is tracked in [#390](https://github.com/faratech/trashd/issues/390); the supervisor currently has no Landlock-domain delegation mechanism.
 
 `Device or resource busy (os error 16)` means an earlier inherited notification filter already owns a listener. Another listener cannot be installed, and namespaces cannot remove the inherited filter. The wrapper reports the downgrade and retains preload/shim fallback where available; it cannot undo privilege restrictions imposed upstream.
 
@@ -524,6 +528,8 @@ Per the FreeDesktop spec: "If info file corresponding to file in $trash/files is
 
 `trash fsck --fix` removes orphaned `.trashinfo` files and — after per-item confirmation — orphaned data files. Corrupt `.trashinfo` metadata is never auto-removed: the data file is intact, so it is preserved in place for manual recovery.
 
+`trash fsck` exits with status 1 when it finds a problem or a trash root cannot be checked; with `--fix`, it exits 1 when any problem remains afterwards (a failed or declined removal, a preserved corrupt entry).
+
 ## FreeDesktop.org Trash spec v1.0 compliance
 
 trashd implements the complete [FreeDesktop.org Trash specification v1.0](https://specifications.freedesktop.org/trash/latest/):
@@ -557,6 +563,8 @@ X-Trashd-Hash=a1b2c3...
 
 Desktop file managers (Nautilus, Dolphin, Thunar, Nemo) see the same trash and can restore files trashed by trashd, and vice versa. The extended `X-Trashd-*` fields are ignored by other implementations per spec.
 
+Trash entries are read from `.trashinfo` files. No SQLite cache is maintained; cache files left by older versions remain untouched.
+
 ## Operation log
 
 Every trash, restore, purge, and empty operation is logged to `~/.local/share/Trash/.trashd/operations.log`:
@@ -575,22 +583,27 @@ View with `trash log` (default: last 20 lines) or `trash log -n 100`.
 
 ### What's fast
 
-- **Same-filesystem trash** — A single `rename()` syscall. Same speed as a normal delete.
+- **Same-filesystem trash** — Renames data rather than copying it, with metadata, policy and publication checks around the move.
 - **LD_PRELOAD overhead** — A few string comparisons per `unlink()` call (skip-list check). Negligible for non-trashed files.
 - **fanotify daemon** — Kernel delivers events asynchronously. No blocking overhead on the deleting process.
 - **Hash (xxhash)** — XXH3-128 runs at ~10 GB/s. A 1 MB file hashes in ~100 microseconds.
+- **Large trash queries** — Selector commands reuse resolved matches, while find queries and ls date filters retain and sort only matching results. Find and du avoid data stats they do not use while retaining sidecar freshness checks.
+- **Directory-size cache repair** — Rebuilds use directory-entry types to skip unrelated regular files, then freshly validate candidate directories and their sidecar mtimes.
+- **JSON listings** — Stream to buffered output without duplicating every entry or retaining the complete JSON string.
 
 ### What's throttled
 
 - **Auto-purge** — Scans all `.trashinfo` files, but only runs once per `auto_purge_interval_secs` (default 60 seconds). Controlled via a timestamp marker file at `~/.local/share/Trash/.trashd/last_purge`.
-- **Directory size calculation** — Recursive walk capped at 10,000 files. Returns partial size if cap is hit.
+- **Directory size eligibility** — When a directory size limit is enabled, its check stops after 10,000 entries and refuses trees whose size could not be fully checked.
 - **Hash computation** — Only for files ≤ `sha256_max_size_mb` (default 1 MB). Large files skip hashing entirely.
 - **Auto-compression** — Runs during auto-purge (already throttled). Only compresses files >7 days old and >1 KB.
 
 ### What's potentially slow
 
-- **Cross-device trash** — Copies the entire file (same as `mv` across filesystems). Unavoidable.
-- **SQLite index write** — One `INSERT` per trash operation with implicit fsync (~1-5 ms).
+- **Cross-device trash** — Copies the entire file (same as `mv` across filesystems). Hardlinked regular files also get content checks before removing the first and final source links.
+- **Foreign directory accounting** — Status and retention measure foreign or unrecorded trees, stopping at the recorded size when present. A tree without a recorded size needs a full walk.
+
+Cross-device retirement preflight and snapshot collection share one walk. Mount surveys, copy-time validation, and source-retirement checks still run separately.
 
 ## Project structure
 
@@ -602,12 +615,11 @@ trashd/
 │   │   ├── store.rs         # TrashStore: trash, restore, purge, empty, auto-purge
 │   │   ├── trashinfo.rs     # .trashinfo parser/serializer (FreeDesktop spec)
 │   │   ├── mounts.rs        # multi-partition trash directory discovery
-│   │   ├── index.rs         # SQLite index (supplementary to .trashinfo)
 │   │   ├── directorysizes.rs # $trash/directorysizes cache (spec v1.0)
 │   │   └── oplog.rs         # operation log + desktop notifications
 │   ├── trashd-cli/          # `trash` CLI (clap-based, 12 subcommands)
 │   ├── trashd-shim/         # `rm` drop-in replacement
-│   ├── trashd-preload/      # LD_PRELOAD .so (standalone, no SQLite)
+│   ├── trashd-preload/      # LD_PRELOAD .so (standalone)
 │   ├── trashd-seccomp/      # seccomp supervisor + watchdog + BPF filter
 │   └── trashd/       # fanotify filesystem monitor
 ├── config/
@@ -625,7 +637,7 @@ trashd/
 |--------|-------|---------|
 | `trash` | trashd-cli | CLI: ls, find, info, restore, undo, purge, empty, compress, du, status, log, fsck |
 | `trashd-rm` | trashd-shim | Drop-in `rm` replacement (installed as `rm` in shim PATH) |
-| `libtrashd_preload.so` | trashd-preload | LD_PRELOAD shared library (~870 KB, no SQLite) |
+| `libtrashd_preload.so` | trashd-preload | LD_PRELOAD shared library (~870 KB) |
 | `trashd-exec` | trashd-seccomp | Seccomp supervisor, watchdog, and ancestor broker |
 | `trashd` | trashd | fanotify filesystem monitor (systemd service) |
 

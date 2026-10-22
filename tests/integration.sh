@@ -189,10 +189,13 @@ trash empty -y >/dev/null 2>&1
 # trash fsck
 # -----------------------------------------------------------------------
 echo "orphan" > ~/.local/share/Trash/files/trashd_it_orphan
-if trash fsck 2>&1 | grep >/dev/null "orphan"; then
+# A found problem fails the command (#156), so capture the status apart.
+FSCK_STATUS=0
+FSCK_OUTPUT="$(trash fsck 2>&1)" || FSCK_STATUS=$?
+if printf '%s\n' "$FSCK_OUTPUT" | grep >/dev/null "orphan" && [ "$FSCK_STATUS" -ne 0 ]; then
     pass "trash fsck detects orphans"
 else
-    fail "trash fsck detects orphans" "orphan not detected"
+    fail "trash fsck detects orphans" "orphan not detected or exit status $FSCK_STATUS"
 fi
 # --permanent: the shim now REFUSES plain rm on paths inside the trash
 # (audit #8) — deleting trash internals requires the explicit bypass.
@@ -311,6 +314,21 @@ if trash ls --json 2>&1 | grep >/dev/null '"id"'; then
     pass "trash ls --json outputs JSON"
 else
     fail "trash ls --json outputs JSON" "no JSON output"
+fi
+if python3 - <<'PY'
+import subprocess
+with open('/dev/full', 'wb') as full:
+    for args in (['ls'], ['ls', '--json'],
+                 ['ls', 'output-never-matches*'], ['ls', 'output-never-matches*', '--json']):
+        result = subprocess.run(['/opt/trashd/bin/trash', *args], stdout=full,
+                                stderr=subprocess.PIPE, text=True, timeout=20)
+        assert result.returncode == 1, (args, result.returncode, result.stderr)
+        assert 'No space left' in result.stderr and 'panicked' not in result.stderr, result.stderr
+PY
+then
+    pass "trash ls reports text and JSON output failures"
+else
+    fail "trash ls reports text and JSON output failures" "failed output must exit 1 without a panic"
 fi
 trash empty -y >/dev/null 2>&1
 

@@ -2,72 +2,77 @@ use crate::util::*;
 use colored::Colorize;
 use std::path::Path;
 use trashd_common::TrashStore;
-use trashd_common::store::TrashError;
+use trashd_common::store::{TrashEntry, TrashError};
 
-pub fn run(store: &TrashStore, target: &str, to: Option<&Path>, force: bool, all: bool) {
+pub fn run(
+    store: &TrashStore,
+    target: &std::ffi::OsStr,
+    to: Option<&Path>,
+    force: bool,
+    all: bool,
+) {
+    let label = printable(&target.to_string_lossy());
+    let mut entries = match store.select_entries(target, all) {
+        Ok(Some((_, entries))) => entries,
+        Ok(None) if all => fatal(format!("no matches for '{label}'")),
+        Ok(None) => fatal(format!("trash entry not found: {label}")),
+        Err(error) => fatal(error),
+    };
     if all {
-        run_all(store, target, to, force);
+        run_all(store, &entries, to, force);
         return;
     }
-
-    match restore_entry(store, target, to, force) {
-        Ok(path) => println!("{} {}", "Restored:".green().bold(), path.display()),
-        Err(TrashError::AmbiguousMatch { pattern, count }) => {
+    if entries.len() > 1 {
+        eprintln!(
+            "{} '{}' matches {} items. Use the exact trash ID, or --all to restore all:",
+            "trash: ambiguous:".yellow().bold(),
+            label,
+            entries.len()
+        );
+        for (i, entry) in entries.iter().take(20).enumerate() {
             eprintln!(
-                "{} '{}' matches {} items. Use the exact trash ID, or --all to restore all:",
-                "trash: ambiguous:".yellow().bold(),
-                pattern,
-                count,
+                "  {:>3}. {} {:>10} {} {}",
+                i + 1,
+                entry.info.deletion_date.format("%Y-%m-%d %H:%M"),
+                entry
+                    .info
+                    .size
+                    .map(format_size)
+                    .unwrap_or_else(|| "?".into()),
+                printable_path(&entry.info.original_path),
+                printable_path(&entry.trashed_path).dimmed()
             );
-            if let Ok(entries) = store.list(Some(&pattern)) {
-                for (i, entry) in entries.iter().take(20).enumerate() {
-                    eprintln!(
-                        "  {:>3}. {} {:>10} {} {}",
-                        i + 1,
-                        entry.info.deletion_date.format("%Y-%m-%d %H:%M"),
-                        entry
-                            .info
-                            .size
-                            .map(format_size)
-                            .unwrap_or_else(|| "?".into()),
-                        entry.info.original_path.display(),
-                        entry.trashed_path.display().to_string().dimmed(),
-                    );
-                }
-                if !entries.is_empty() {
-                    // The trashed path is unique even across trash roots (#210).
-                    eprintln!(
-                        "\n  {} {}",
-                        "trash restore".bold(),
-                        entries[0].trashed_path.display()
-                    );
-                    eprintln!("  {} {} --all", "trash restore".bold(), target,);
-                }
-            }
-            std::process::exit(1);
         }
-        Err(e) => fatal(e),
+        eprintln!(
+            "\n  {} {}",
+            "trash restore".bold(),
+            printable_path(&entries[0].trashed_path)
+        );
+        eprintln!("  {} {} --all", "trash restore".bold(), label);
+        std::process::exit(1);
+    }
+    match restore_selected_entry(store, &mut entries[0], to, force) {
+        Ok(path) => println!("{} {}", "Restored:".green().bold(), printable_path(&path)),
+        Err(error) => fatal(error),
     }
 }
 
-fn run_all(store: &TrashStore, target: &str, to: Option<&Path>, force: bool) {
-    let entries = match store.list(Some(target)) {
-        Ok(e) => e,
-        Err(e) => fatal(e),
-    };
-    if entries.is_empty() {
-        fatal(format!("no matches for '{target}'"));
-    }
+fn run_all(store: &TrashStore, entries: &[TrashEntry], to: Option<&Path>, force: bool) {
     let mut restored = 0;
     let mut failed = 0;
-    for (entry, result) in entries.iter().zip(store.restore_batch(&entries, to, force)) {
+    for (entry, result) in entries.iter().zip(store.restore_batch(entries, to, force)) {
         match result {
             Ok(path) => {
-                println!("{} {}", "Restored:".green().bold(), path.display());
+                println!("{} {}", "Restored:".green().bold(), printable_path(&path));
                 restored += 1;
             }
             Err(e) => {
-                eprintln!("{} {}: {e}", "trash: error:".red().bold(), entry.id);
+                eprintln!(
+                    "{} {}: {}",
+                    "trash: error:".red().bold(),
+                    printable(&entry.id),
+                    printable(&e.to_string())
+                );
                 failed += 1;
             }
         }
@@ -81,16 +86,15 @@ fn run_all(store: &TrashStore, target: &str, to: Option<&Path>, force: bool) {
 }
 
 /// Restore a single entry, handling --force conflict resolution.
-fn restore_entry(
+fn restore_selected_entry(
     store: &TrashStore,
-    target: &str,
+    entry: &mut TrashEntry,
     to: Option<&Path>,
     force: bool,
 ) -> Result<PathBuf, TrashError> {
     // Keep the same resolved snapshot through conflict handling instead of
     // enumerating every sidecar a second time for one --force restore.
-    let mut entry = store.find_entry(target)?;
-    let mut restore = |destination: Option<&Path>| store.restore_entry(&mut entry, destination);
+    let mut restore = |destination: Option<&Path>| store.restore_entry(entry, destination);
     match restore(to) {
         Ok(path) => Ok(path),
         Err(TrashError::RestoreConflict(path)) if force => {
@@ -110,6 +114,17 @@ fn restore_entry(
         }
         other => other,
     }
+}
+
+#[cfg(test)]
+fn restore_entry(
+    store: &TrashStore,
+    target: &str,
+    to: Option<&Path>,
+    force: bool,
+) -> Result<PathBuf, TrashError> {
+    let mut entry = store.find_entry(target)?;
+    restore_selected_entry(store, &mut entry, to, force)
 }
 
 #[cfg(test)]

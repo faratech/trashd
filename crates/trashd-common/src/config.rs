@@ -285,6 +285,17 @@ impl Config {
     }
 
     /// Global config path: /etc/trashd/config.toml
+    /// A configuration file's table as the loader reads it: settings an
+    /// older release kept under `[retention]` are moved to the top level.
+    /// Editors work on this table, so `config add/remove` see the settings
+    /// that actually apply, and a rewrite migrates the layout (#330).
+    pub fn normalized_table(contents: &str) -> Result<toml::Table, toml::de::Error> {
+        Ok(match legacy_config::normalize(contents)? {
+            toml::Value::Table(table) => table,
+            _ => toml::Table::new(),
+        })
+    }
+
     pub fn global_config_path() -> PathBuf {
         PathBuf::from("/etc/trashd/config.toml")
     }
@@ -371,21 +382,25 @@ impl Config {
             match read_local_config(dir) {
                 LocalConfigFile::Absent => {}
                 LocalConfigFile::Ignored(reason) => {
-                    eprintln!(
-                        "trashd: warning: ignoring {}: it {reason}",
-                        config_path.display()
-                    );
+                    warn_local_once(&config_path, || {
+                        format!(
+                            "trashd: warning: ignoring {}: it {reason}",
+                            config_path.display()
+                        )
+                    });
                     return None;
                 }
                 LocalConfigFile::Content(content) => {
                     let mut local = match toml::from_str::<LocalConfig>(&content) {
                         Ok(local) => local,
                         Err(e) => {
-                            eprintln!(
-                                "trashd: warning: ignoring broken {}: {}",
-                                config_path.display(),
-                                e.message()
-                            );
+                            warn_local_once(&config_path, || {
+                                format!(
+                                    "trashd: warning: ignoring broken {}: {}",
+                                    config_path.display(),
+                                    e.message()
+                                )
+                            });
                             return None;
                         }
                     };
@@ -397,6 +412,29 @@ impl Config {
             dir = dir.parent()?; // None at the filesystem root
         }
     }
+}
+
+/// Report an unusable local policy once per process: every operand of one
+/// `rm`, and every trapped delete of a long-lived supervisor, repeated the
+/// same warning. The set is bounded so a supervisor cannot grow it forever.
+fn warn_local_once(path: &Path, message: impl FnOnce() -> String) {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let warned = warned.get_or_insert_with(HashSet::new);
+    if warned.contains(path) {
+        return;
+    }
+    if warned.len() >= 1024 {
+        warned.clear();
+    }
+    warned.insert(path.to_path_buf());
+    // Never panic on a closed stderr (a supervisor may outlive its terminal).
+    let _ = writeln!(std::io::stderr(), "{}", message());
 }
 
 /// Per-directory config (.trashd.toml).
@@ -437,7 +475,7 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
     // Keep common literal prefix/suffix rules allocation-free, but only
     // after excluding interior wildcard syntax (#4).
     if let Some(prefix) = pattern.strip_suffix('*')
-        && !prefix.contains(['*', '?', '['])
+        && !prefix.contains(['*', '?', '[', '\\'])
     {
         return path.starts_with(prefix)
             || (!prefix.starts_with('/')
@@ -447,12 +485,12 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
     }
     if let Some(component) = pattern.strip_prefix("*/")
         && !component.is_empty()
-        && !component.contains(['/', '*', '?', '['])
+        && !component.contains(['/', '*', '?', '[', '\\'])
     {
         return path.split('/').any(|part| part == component);
     }
     if let Some(suffix) = pattern.strip_prefix('*')
-        && !suffix.contains(['*', '?', '['])
+        && !suffix.contains(['*', '?', '[', '\\'])
     {
         return path.ends_with(suffix);
     }
@@ -495,6 +533,35 @@ fn sanitize_patterns(list: &[String], what: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #337: an escaped `*` stays literal on the fast paths too.
+    #[test]
+    fn escaped_wildcards_are_literal_in_every_pattern_form() {
+        assert!(pattern_matches("draft\\*", "/home/u/draft*"));
+        assert!(!pattern_matches("draft\\*", "/home/u/draft1"));
+        assert!(pattern_matches("*.\\[x", "/home/u/file.[x"));
+        assert!(pattern_matches("*/name\\?", "/home/u/name?"));
+        assert!(!pattern_matches("*/name\\?", "/home/u/name1"));
+    }
+
+    #[test]
+    fn unusable_local_policy_warns_once_per_file() {
+        let path = Path::new("/nonexistent/warn-once-test/.trashd.toml");
+        let other = Path::new("/nonexistent/warn-once-other/.trashd.toml");
+        let built = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            warn_local_once(path, || {
+                built.set(built.get() + 1);
+                String::new()
+            });
+        }
+        assert_eq!(built.get(), 1);
+        warn_local_once(other, || {
+            built.set(built.get() + 1);
+            String::new()
+        });
+        assert_eq!(built.get(), 2);
+    }
     use std::path::Path;
 
     fn default_config() -> Config {

@@ -5,22 +5,25 @@ Examples (build the workspace first):
   sudo python3 tests/syscall_bench.py --build-dir target/release
   sudo python3 tests/syscall_bench.py --build-dir target/release --entries 6000 \
     --baseline-cli /path/to/previous/bin/trash \
+    --baseline-shim /path/to/previous/bin/trashd-rm \
     --baseline-preload /path/to/previous/lib/libtrashd_preload.so > comparison.json
 
-All fixture operations run through tests/sandbox.py. Baseline artifacts occupy
-the sandbox's trashd and trashd-exec slots as benchmark-only aliases; neither
-the daemon nor the seccomp supervisor is exercised. Counts include process
-startup and fixture operations performed by the traced process. They depend
-on the fixture, host and build/linker options, and are not latency gates.
+All fixture operations run through tests/sandbox.py. Baseline artifacts have
+dedicated benchmark-only slots; neither the daemon nor the seccomp supervisor
+is exercised. Counts include process startup and fixture operations performed
+by the traced process. They depend on the fixture, host and build/linker
+options, and are not latency gates.
 """
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,7 +36,12 @@ OPERATIONS = 100
 PAYLOAD = b"recoverable benchmark data\n"
 SCAN_PAYLOAD = b"s" * 64
 SCAN_DATE = "2026-10-20T12:00:00"
-SCAN_CASES = ("status", "ls_json", "info_exact")
+SCAN_STAMP = int(datetime.fromisoformat(SCAN_DATE).replace(tzinfo=timezone.utc).timestamp()) * 10**9
+SCAN_CASES = ("status", "ls_json", "info_exact", "find_one", "find_none",
+              "ls_date_none", "du_top", "restore_all_none", "restore_all_fullpath_glob",
+              "info_ambiguous", "restore_ambiguous", "purge_ambiguous",
+              "purge_file", "purge_directory", "compress_age_none")
+SHIM_CASES = ("shim_file_warm", "shim_cross_device")
 PRELOAD_WORKER = """import os, sys
 root, suffix = sys.argv[1:]
 for i in range(50):
@@ -89,7 +97,8 @@ def parse_strace(path):
     return {"total_syscalls": total, "syscalls": calls, "syscall_errors": errors}
 
 
-def profile(command, env, trace, preload=None, bypass="1"):
+def profile_result(command, env, trace, preload=None, bypass="1", expected_status=0,
+                   preexec_fn=None):
     # -E changes only the tracee's loader environment. The tracer and fixture
     # controller retain bypass, so their cleanup never becomes measured work.
     invocation = ["/usr/bin/strace", "-qq", "-f", "-c", "-o", str(trace),
@@ -97,10 +106,16 @@ def profile(command, env, trace, preload=None, bypass="1"):
     if preload:
         invocation += ["-E", f"LD_PRELOAD={preload}"]
     result = subprocess.run([*invocation, "--", *map(str, command)], env=env,
-                            capture_output=True, text=True, timeout=180)
-    if result.returncode:
+                            capture_output=True, text=True, timeout=180,
+                            preexec_fn=preexec_fn)
+    if result.returncode != expected_status:
         raise RuntimeError(f"Benchmark command failed ({result.returncode}): {command}\n{result.stderr}")
-    return parse_strace(trace), result.stdout
+    return parse_strace(trace), result
+
+
+def profile(command, env, trace, preload=None, bypass="1"):
+    counts, result = profile_result(command, env, trace, preload, bypass)
+    return counts, result.stdout
 
 
 def fixture_environment(root):
@@ -108,11 +123,14 @@ def fixture_environment(root):
     (root / "data").mkdir(mode=0o700)
     (root / "config/trashd").mkdir(parents=True, mode=0o700)
     (root / "config/trashd/config.toml").write_text(
-        'never_trash = ["*.tmp"]\nmax_file_size_mb = 0\nmax_dir_size_mb = 0\n')
+        'never_trash = ["*.tmp"]\nbypass_processes = []\n'
+        'max_file_size_mb = 0\nmax_dir_size_mb = 0\n'
+        '[retention]\nmax_age_days = 0\nmax_size_gb = 0\ndisk_pressure_percent = 0\n')
     env = dict(os.environ, HOME=str(root), XDG_DATA_HOME=str(root / "data"),
                XDG_CONFIG_HOME=str(root / "config"), TRASH_BYPASS="1",
                TZ="UTC", NO_COLOR="1")
-    for key in ("LD_PRELOAD", "TRASHD_SECCOMP_ACTIVE", "TRASHD_SECCOMP_COOKIE"):
+    for key in ("LD_PRELOAD", "TRASHD_SECCOMP_ACTIVE", "TRASHD_SECCOMP_COOKIE",
+                "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
         env.pop(key, None)
     return env
 
@@ -125,50 +143,112 @@ def scan_fixture(root, entries):
     for i in range(entries):
         name = f"scan-{i:06d}"
         (trash / "files" / name).write_bytes(SCAN_PAYLOAD)
-        (trash / "info" / (name + ".trashinfo")).write_text(scan_sidecar(name))
+        sidecar = trash / "info" / (name + ".trashinfo")
+        sidecar.write_text(scan_sidecar(name))
+        os.utime(sidecar, ns=(SCAN_STAMP + i, SCAN_STAMP + i))
     return trash
 
 
-def scan_sidecar(name):
-    return (f"[Trash Info]\nPath=/original/{name}\nDeletionDate={SCAN_DATE}\n"
-            f"X-Trashd-Size={len(SCAN_PAYLOAD)}\nX-Trashd-PID=1\n"
+def scan_sidecar(name, original=None, stamp=None, size=None):
+    if original is None:
+        original = f"/original/{name}"
+    if stamp is None:
+        stamp = SCAN_STAMP + int(name.removeprefix("scan-"))
+    if size is None:
+        size = len(SCAN_PAYLOAD)
+    return (f"[Trash Info]\nPath={original}\nDeletionDate={SCAN_DATE}\n"
+            f"X-Trashd-Size={size}\nX-Trashd-DeletedNs={stamp}\nX-Trashd-PID=1\n"
             "X-Trashd-Command=syscall-bench\n")
 
 
-def verify_scan(trash, entries):
+def verify_scan(trash, entries, extra=None):
+    extra = extra or {}
     expected = {f"scan-{i:06d}" for i in range(entries)}
-    assert {path.name for path in (trash / "files").iterdir()} == expected
+    assert {path.name for path in (trash / "files").iterdir()} == expected | extra.keys()
     assert {path.name for path in (trash / "info").iterdir()} == {
-        name + ".trashinfo" for name in expected}
+        name + ".trashinfo" for name in expected | extra.keys()}
     for name in expected:
         assert (trash / "files" / name).read_bytes() == SCAN_PAYLOAD
         assert (trash / "info" / (name + ".trashinfo")).read_text() == scan_sidecar(name)
+    for name, info in extra.items():
+        data = trash / "files" / name
+        if info["directory"]:
+            assert data.is_dir() and not list(data.iterdir())
+        else:
+            assert data.is_file() and data.read_bytes() == SCAN_PAYLOAD
+        assert (trash / "info" / (name + ".trashinfo")).read_text() == info["sidecar"]
+
+
+def add_scan_entry(trash, name, original, stamp, directory=False):
+    data = trash / "files" / name
+    data.mkdir() if directory else data.write_bytes(SCAN_PAYLOAD)
+    text = scan_sidecar(name, original, stamp, 0 if directory else len(SCAN_PAYLOAD))
+    sidecar = trash / "info" / (name + ".trashinfo")
+    sidecar.write_text(text)
+    os.utime(sidecar, ns=(stamp, stamp))
+    return {"directory": directory, "sidecar": text}
+
+
+def normalize_output(value, root):
+    return value.replace(str(root), "{fixture}")
 
 
 def run_scan(label, cli, case, root, entries):
     env = fixture_environment(root)
     trash = scan_fixture(root, entries)
     target = f"scan-{entries // 2:06d}"
+    extra = {}
+    restored = []
     args = {"status": ["status"], "ls_json": ["ls", "--json"],
-            "info_exact": ["info", target]}[case]
-    counts, output = profile([cli, *args], env, root / "strace.txt")
-    verify_scan(trash, entries)
+            "info_exact": ["info", target],
+            "find_one": ["find", f"/original/{target}"],
+            "find_none": ["find", "benchmark-never-present*"],
+            "ls_date_none": ["ls", "--json", "--after", "2100-01-01"],
+            "du_top": ["du", "--top", "5"],
+            "restore_all_none": ["restore", "benchmark-never-present*", "--all"],
+            "restore_all_fullpath_glob": ["restore", str(root / "restored/*/target.dat"), "--all"],
+            "info_ambiguous": ["info", "ambiguous.dat"],
+            "restore_ambiguous": ["restore", "ambiguous.dat"],
+            "purge_ambiguous": ["purge", "ambiguous.dat"],
+            "purge_file": ["purge", "victim"],
+            "purge_directory": ["purge", "victim"],
+            # Always younger than the threshold, independent of the run date.
+            "compress_age_none": ["compress", "--older", "4294967295d"]}[case]
+    if case.endswith("_ambiguous") or case == "restore_all_fullpath_glob":
+        for i, branch in enumerate(("a", "b")):
+            name = f"selected-{branch}"
+            original = (root / f"restored/{branch}/target.dat" if case == "restore_all_fullpath_glob"
+                        else Path(f"/original/{branch}/ambiguous.dat"))
+            extra[name] = add_scan_entry(trash, name, original, SCAN_STAMP + entries + i)
+            restored.append(original)
+    elif case in ("purge_file", "purge_directory"):
+        directory = case == "purge_directory"
+        extra["victim"] = add_scan_entry(trash, "victim", "/original/victim",
+                                          SCAN_STAMP + entries, directory)
+        if directory:
+            mtime = (trash / "info/victim.trashinfo").stat().st_mtime_ns // 10**9
+            (trash / "directorysizes").write_text(f"0 {mtime} victim\n")
+    expected_status = 1 if case.endswith("_ambiguous") or case == "restore_all_none" else 0
+    counts, result = profile_result([cli, *args], env, root / "strace.txt",
+                                     expected_status=expected_status)
+    output = result.stdout
+    destructive = case in ("restore_all_fullpath_glob", "purge_file", "purge_directory")
+    verify_scan(trash, entries, None if destructive else extra)
+    normalized = normalize_output(output, root)
     if case == "status":
         assert re.search(rf"^\s*Items:\s+{entries}\s*$", output, re.MULTILINE), output
-        normalized = output.replace(str(root), "{fixture}")
     elif case == "info_exact":
         assert re.search(rf"^\s*ID:\s+{target}\s*$", output, re.MULTILINE), output
         assert re.search(rf"^\s*Original path:\s+/original/{target}\s*$", output, re.MULTILINE), output
         assert re.search(r"^\s*Type:\s+file\s*$", output, re.MULTILINE), output
         assert re.search(r"^\s*Size:\s+64 B \(64 bytes\)\s*$", output, re.MULTILINE), output
-        normalized = output.replace(str(root), "{fixture}")
-    else:
+    elif case == "ls_json":
         records = json.loads(output)
         assert len(records) == entries
-        expected = {f"scan-{i:06d}" for i in range(entries)}
-        assert {record["id"] for record in records} == expected
+        expected = [f"scan-{i:06d}" for i in range(entries - 1, -1, -1)]
+        assert [record["id"] for record in records] == expected
         normalized = []
-        for record in sorted(records, key=lambda value: value["id"]):
+        for record in records:
             name = record["id"]
             assert record["original_path"] == f"/original/{name}"
             assert record["size"] == len(SCAN_PAYLOAD)
@@ -179,9 +259,39 @@ def run_scan(label, cli, case, root, entries):
             normalized.append({key: value.replace(str(root), "{fixture}")
                                if isinstance(value, str) else value
                                for key, value in record.items()})
+    elif case == "find_one":
+        assert f"/original/{target}" in output and "\n1 matches" in output, output
+        assert len(re.findall(r"/original/scan-\d+", output)) == 1, output
+    elif case == "find_none":
+        assert "No matches for 'benchmark-never-present*'." in output, output
+    elif case == "ls_date_none":
+        assert json.loads(output) == [], output
+    elif case == "du_top":
+        shown = re.findall(r"/original/(scan-\d+)\s+(scan-\d+)", output)
+        expected = [f"scan-{i:06d}" for i in range(entries - 1, max(-1, entries - 6), -1)]
+        assert shown == [(name, name) for name in expected], output
+    elif case == "restore_all_none":
+        assert "no matches" in result.stderr.lower(), result.stderr
+    elif case == "compress_age_none":
+        assert output.strip() == "Nothing to compress.", output
+    elif case == "restore_all_fullpath_glob":
+        assert "2 restored, 0 failed" in output, output
+        assert all(path.read_bytes() == SCAN_PAYLOAD for path in restored)
+    elif case.endswith("_ambiguous"):
+        assert "ambiguous" in result.stderr.lower(), result.stderr
+        assert all(name in result.stderr for name in extra), result.stderr
+        assert not (root / "restored").exists()
+    elif case in ("purge_file", "purge_directory"):
+        assert "Purged:" in output and "victim" in output, output
+        if case == "purge_directory":
+            assert not (trash / "directorysizes").read_text().strip()
     return {"label": label, "case": case, **counts,
             "behavior": {"entries": entries, "data_bytes": entries * len(SCAN_PAYLOAD),
-                         "fixture_unchanged": True,
+                         "fixture_unchanged": not destructive,
+                         "unrelated_payloads_verified": True,
+                         "restored_payloads": 2 if case == "restore_all_fullpath_glob" else 0,
+                         "exit_status": result.returncode,
+                         "stderr_sha256": output_digest(normalize_output(result.stderr, root)),
                          "output_sha256": output_digest(normalized)}}
 
 
@@ -217,11 +327,105 @@ def verify_preload(root, mode):
 def run_preload(label, preload, mode, root):
     env = fixture_environment(root)
     suffix = ".tmp" if mode == "excluded" else ""
-    counts, _ = profile(["/usr/bin/python3", "-c", PRELOAD_WORKER, root, suffix],
-                        env, root / "strace.txt", preload=preload,
-                        bypass="1" if mode == "bypass" else "0")
+    counts, result = profile_result(["/usr/bin/python3", "-c", PRELOAD_WORKER, root, suffix],
+                                    env, root / "strace.txt", preload=preload,
+                                    bypass="1" if mode == "bypass" else "0")
+    behavior = verify_preload(root, mode)
+    behavior.update(exit_status=result.returncode,
+                    output_sha256=output_digest(normalize_output(result.stdout, root)),
+                    stderr_sha256=output_digest(normalize_output(result.stderr, root)))
     return {"label": label, "case": f"preload_{mode}", **counts,
-            "behavior": verify_preload(root, mode)}
+            "behavior": behavior}
+
+
+def run_cross_device(label, shim, entries):
+    # A root-owned 0755 filesystem root cannot host nobody's topdir trash,
+    # so this exercises the real home-trash copy path, not a same-device
+    # rename into .Trash-65534. All mounts remain inside the outer sandbox.
+    with tempfile.TemporaryDirectory(prefix="syscall-bench-xdev-", dir="/home/nobody") as temporary:
+        base = Path(temporary)
+        os.chown(base, 65534, 65534)
+        root = base / "fixture"
+        env = fixture_environment(root)
+        for path in (root, *root.rglob("*")):
+            os.chown(path, 65534, 65534)
+        mountpoint = root / "xdev"
+        mountpoint.mkdir()
+        subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "-o", "mode=755", "none", str(mountpoint)],
+                       check=True, capture_output=True, text=True)
+        try:
+            source = mountpoint / "w/tree"
+            source.mkdir(parents=True)
+            for i in range(entries):
+                path = source / f"copy-{i:06d}"
+                path.write_bytes(SCAN_PAYLOAD)
+                os.chown(path, 65534, 65534)
+            for path in (mountpoint / "w", source):
+                os.chown(path, 65534, 65534)
+            assert source.stat().st_dev != (root / "data").stat().st_dev
+
+            def as_nobody():
+                os.setgroups([])
+                os.setgid(65534)
+                os.setuid(65534)
+
+            counts, result = profile_result([shim, "-r", source], env, root / "strace.txt",
+                                             bypass="0", preexec_fn=as_nobody)
+            assert not source.exists(), result.stderr
+            assert not (mountpoint / ".Trash-65534").exists()
+            trash = root / "data/Trash"
+            assert {path.name for path in (trash / "files").iterdir()} == {"tree"}
+            assert {path.name for path in (trash / "info").iterdir()} == {"tree.trashinfo"}
+            copy = trash / "files/tree"
+            expected = {f"copy-{i:06d}" for i in range(entries)}
+            assert {path.name for path in copy.iterdir()} == expected
+            assert all((copy / name).read_bytes() == SCAN_PAYLOAD for name in expected)
+            info = dict(line.split("=", 1) for line in (trash / "info/tree.trashinfo").read_text().splitlines()
+                        if "=" in line)
+            assert unquote(info["Path"]) == str(source)
+            return {"label": label, "case": "shim_cross_device", **counts,
+                    "behavior": {"entries": entries, "data_bytes": entries * len(SCAN_PAYLOAD),
+                                 "source_operands_removed": True, "trash_entries": 1,
+                                 "recoverable_files": entries, "payloads_verified": True,
+                                 "copy_between_devices": True, "effective_uid": 65534,
+                                 "exit_status": result.returncode,
+                                 "output_sha256": output_digest(normalize_output(result.stdout, root)),
+                                 "stderr_sha256": output_digest(normalize_output(result.stderr, root))}}
+        finally:
+            subprocess.run(["/usr/bin/umount", str(mountpoint)], check=True,
+                           capture_output=True, text=True)
+
+
+def run_warm_shim(label, shim, root):
+    env = fixture_environment(root)
+    warmup = root / "warmup"
+    source = root / "file"
+    warmup.write_bytes(PAYLOAD)
+    # Initialize the authenticated store and retention marker before the
+    # measured single-file invocation, matching the established warm path.
+    warmed = subprocess.run([shim, str(warmup)], env=dict(env, TRASH_BYPASS="0"),
+                            capture_output=True, text=True, timeout=30)
+    assert warmed.returncode == 0, warmed.stderr
+    source.write_bytes(PAYLOAD)
+    counts, result = profile_result([shim, source], env, root / "strace.txt", bypass="0")
+    trash = root / "data/Trash"
+    assert not warmup.exists() and not source.exists()
+    assert {path.name for path in (trash / "files").iterdir()} == {"warmup", "file"}
+    assert {path.name for path in (trash / "info").iterdir()} == {"warmup.trashinfo", "file.trashinfo"}
+    for name in ("warmup", "file"):
+        assert (trash / "files" / name).read_bytes() == PAYLOAD
+        fields = dict(line.split("=", 1) for line in (trash / "info" / (name + ".trashinfo")).read_text().splitlines()
+                      if "=" in line)
+        assert unquote(fields["Path"]) == str(root / name)
+        assert fields["X-Trashd-Size"] == str(len(PAYLOAD))
+    assert not (trash / "directorysizes").exists()
+    return {"label": label, "case": "shim_file_warm", **counts,
+            "behavior": {"operations": 1, "untraced_warmup_operations": 1,
+                         "source_operands_removed": True, "trash_entries": 2,
+                         "recoverable_files": 2, "payloads_verified": True,
+                         "directorysizes_absent": True, "exit_status": result.returncode,
+                         "output_sha256": output_digest(normalize_output(result.stdout, root)),
+                         "stderr_sha256": output_digest(normalize_output(result.stderr, root))}}
 
 
 def run_contained(args):
@@ -230,13 +434,16 @@ def run_contained(args):
     os.environ["TRASH_BYPASS"] = "1"
     os.environ.pop("LD_PRELOAD", None)
     cli = {"candidate": Path("/opt/trashd/bin/trash")}
+    shim = {"candidate": Path("/opt/trashd/bin/trashd-rm")}
     preload = {"candidate": Path("/opt/trashd/lib/libtrashd_preload.so")}
     if args.baseline_cli:
         cli["baseline"] = Path(args.baseline_cli)
+    if args.baseline_shim:
+        shim["baseline"] = Path(args.baseline_shim)
     if args.baseline_preload:
         preload["baseline"] = Path(args.baseline_preload)
     artifacts = {}
-    for kind, versions in (("cli", cli), ("preload", preload)):
+    for kind, versions in (("cli", cli), ("shim", shim), ("preload", preload)):
         for label, path in versions.items():
             artifacts.setdefault(label, {})[kind] = {
                 "sandbox_path": str(path), "sha256": digest(path)}
@@ -246,15 +453,23 @@ def run_contained(args):
         for label in ("baseline", "candidate"):
             if label in cli:
                 for case in SCAN_CASES:
-                    profiles.append(run_scan(label, cli[label], case,
-                                             root / f"{label}-{case}", args.entries))
+                    fixture = root / f"{label}-{case}"
+                    profiles.append(run_scan(label, cli[label], case, fixture, args.entries))
+                    shutil.rmtree(fixture)
             if label in preload:
                 for mode in ("protected", "excluded", "bypass"):
-                    profiles.append(run_preload(label, preload[label], mode,
-                                                root / f"{label}-{mode}"))
+                    fixture = root / f"{label}-{mode}"
+                    profiles.append(run_preload(label, preload[label], mode, fixture))
+                    shutil.rmtree(fixture)
+            if label in shim:
+                fixture = root / f"{label}-shim-file-warm"
+                profiles.append(run_warm_shim(label, shim[label], fixture))
+                shutil.rmtree(fixture)
+                profiles.append(run_cross_device(label, shim[label], args.entries))
     indexed = {(item["label"], item["case"]): item for item in profiles}
     comparisons = []
-    for case in (*SCAN_CASES, "preload_protected", "preload_excluded", "preload_bypass"):
+    for case in (*SCAN_CASES, *SHIM_CASES,
+                 "preload_protected", "preload_excluded", "preload_bypass"):
         before, after = indexed.get(("baseline", case)), indexed[("candidate", case)]
         if before:
             assert before["behavior"] == after["behavior"], f"Behavior differs for {case}"
@@ -272,9 +487,12 @@ def run_contained(args):
                      "python": platform.python_version()},
             "workload": {"scan_entries": args.entries, "scan_payload_bytes": len(SCAN_PAYLOAD),
                          "scan_deletion_date": SCAN_DATE, "timezone": "UTC",
+                         "scan_deletion_stamp_base_ns": SCAN_STAMP,
                          "exact_lookup_id": f"scan-{args.entries // 2:06d}",
                          "preload_operations": OPERATIONS,
                          "preload_description": "50 file create/write/unlink and 50 empty mkdir/rmdir operations in one Python process per mode",
+                         "cross_device_description": "uid 65534 recursively trashes one flat tree from root-owned 0755 tmpfs into home trash",
+                         "warm_shim_description": "one file trash after one untraced file trash initializes the store and retention marker",
                          "fresh_fixture_per_profile": True},
             "notes": ["Syscall totals include per-command loader/runtime startup and traced file creation/writes; filesystem caches are not flushed.",
                       "Bypass controls expose loader/build differences between libraries.",
@@ -286,6 +504,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build-dir", default="target/release")
     parser.add_argument("--baseline-cli", type=Path)
+    parser.add_argument("--baseline-shim", type=Path)
     parser.add_argument("--baseline-preload", type=Path)
     parser.add_argument("--entries", type=int, default=6000)
     args = parser.parse_args()
@@ -299,22 +518,25 @@ def main():
     if not Path("/usr/bin/strace").is_file():
         parser.error("/usr/bin/strace is required")
     build = Path(args.build_dir).resolve(strict=True)
-    sources = {"candidate": {"cli": build / "trash", "preload": build / "libtrashd_preload.so"}}
+    sources = {"candidate": {"cli": build / "trash", "shim": build / "trashd-rm",
+                             "preload": build / "libtrashd_preload.so"}}
     for path in sources["candidate"].values():
         if not path.is_file():
             parser.error(f"missing artifact: {path}; build the workspace first")
     runner = Path(__file__).resolve().with_name("sandbox.py")
     command = [sys.executable, str(runner), "--build-dir", str(build)]
     inner = ["/usr/bin/python3", "/tests/syscall_bench.py", "--entries", str(args.entries)]
-    for kind, path, alias in (("cli", args.baseline_cli, "trashd"),
-                              ("preload", args.baseline_preload, "trashd-exec")):
+    for kind, path, alias, destination in (
+            ("cli", args.baseline_cli, "bench-baseline-cli", "/opt/trashd/bin/bench-baseline-cli"),
+            ("shim", args.baseline_shim, "bench-baseline-shim", "/opt/trashd/bin/bench-baseline-shim"),
+            ("preload", args.baseline_preload, "bench-baseline-preload.so", "/opt/trashd/lib/bench-baseline-preload.so")):
         if path:
             source = path.resolve(strict=True)
             if not source.is_file():
                 parser.error(f"baseline artifact must be a regular file: {source}")
             sources.setdefault("baseline", {})[kind] = source
             command += ["--binary", f"{alias}={source}"]
-            inner += [f"--baseline-{kind}", f"/opt/trashd/bin/{alias}"]
+            inner += [f"--baseline-{kind}", destination]
     os.environ["TRASH_BYPASS"] = "1"
     os.environ.pop("LD_PRELOAD", None)
     result = subprocess.run([*command, "--", *inner], capture_output=True, text=True)

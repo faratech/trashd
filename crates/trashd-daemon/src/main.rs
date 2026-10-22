@@ -13,7 +13,7 @@ use logger::{DeletionEvent, escape_path, process_name};
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use trashd_common::Config;
 use trashd_common::mounts;
@@ -24,6 +24,7 @@ const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
 const FAN_NONBLOCK: libc::c_uint = 0x0000_0002;
 const FAN_REPORT_FID: libc::c_uint = 0x0000_0200;
 const FAN_REPORT_DFID_NAME: libc::c_uint = 0x0000_0C00;
+const FAN_REPORT_TARGET_FID: libc::c_uint = 0x0000_1000;
 
 const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
 const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
@@ -126,10 +127,19 @@ fn run() -> io::Result<()> {
     let config = Config::load();
 
     // Initialize fanotify with FAN_REPORT_FID | FAN_REPORT_DFID_NAME
-    // so FAN_DELETE events include the directory + filename (Linux 5.9+)
+    // so FAN_DELETE events include the directory + filename (Linux 5.9+).
+    // FAN_REPORT_TARGET_FID (5.17+) adds the removed object's own handle,
+    // which lets a removed directory's path resolve its entries' records
+    // after the directory itself is gone (#344).
     let init_flags =
         FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FID | FAN_REPORT_DFID_NAME;
-    let fan_fd = match fanotify_init(init_flags) {
+    let fan_fd = match fanotify_init(init_flags | FAN_REPORT_TARGET_FID).or_else(|e| {
+        if e.raw_os_error() == Some(libc::EINVAL) {
+            fanotify_init(init_flags)
+        } else {
+            Err(e)
+        }
+    }) {
         Ok(fd) => fd,
         Err(e) => {
             if e.raw_os_error() == Some(libc::EINVAL) {
@@ -139,6 +149,15 @@ fn run() -> io::Result<()> {
         }
     };
     eprintln!("trashd: fanotify initialized (fd {})", fan_fd);
+
+    // The mount table reports changes as POLLPRI on /proc/self/mounts, so
+    // mounts appearing after startup (#37), remounts (#98, #122) and
+    // unmounts are seen as they happen. Rescanning every second instead
+    // statfs'ed and re-marked every mount (a hung FUSE/NFS mount stalled the
+    // daemon each time) and re-read the table for nothing (#326). Without
+    // the file the timed rescan remains. Opened before the first scan, so a
+    // mount added while it runs is reported too (#344).
+    let mount_table = std::fs::File::open("/proc/self/mounts").ok();
 
     // Mark all real mount points
     let mount_list = mounts::list_mounts();
@@ -202,12 +221,33 @@ fn run() -> io::Result<()> {
         }
         mount_fds.push((mount.path.clone(), fsid_of_path(&mount.path)));
     }
+    order_for_resolution(&mut mount_fds);
 
     eprintln!("trashd: monitoring {} filesystem(s) for deletions", marked);
 
-    // Event loop
-    let mut buf = vec![0u8; 8192];
+    let mount_table_changed = |timeout: libc::c_int| {
+        mount_table.as_ref().is_some_and(|table| {
+            let mut pfd = libc::pollfd {
+                fd: table.as_raw_fd(),
+                events: libc::POLLPRI,
+                revents: 0,
+            };
+            (unsafe { libc::poll(&mut pfd, 1, timeout) }) > 0
+                && pfd.revents & (libc::POLLPRI | libc::POLLERR) != 0
+        })
+    };
+    let mut handles = HandleCache::default();
+
+    // Event loop. One read drains every queued event that fits, and only
+    // records read together resolve through each other: a removed
+    // directory's own record (after its entries) names the path their stale
+    // parent handle had. 8 KiB held fewer than one directory of 100 entries,
+    // so a removal the daemon read behind lost nearly every path. The
+    // zeroed buffer is only paged in as far as a burst fills it (#344).
+    let mut buf = vec![0u8; 1 << 20];
     let mut last_refresh = std::time::Instant::now();
+    let mut deferred: Vec<Deferred> = Vec::new();
+    let mut log = String::new();
 
     loop {
         let n = unsafe { libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -215,18 +255,33 @@ fn run() -> io::Result<()> {
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
-                let mut pfd = libc::pollfd {
-                    fd: fan_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe { libc::poll(&mut pfd, 1, 1000) };
-                // Pick up mounts that appeared after startup (USB sticks,
-                // network shares) — the startup snapshot never watched them
-                // (#37). The queue also drains after every busy batch, so
-                // throttle the full re-scan instead of running it per batch.
+                // Drained: nothing still queued can name a held record's
+                // directory.
+                handles.new_batch();
+                for held in deferred.drain(..) {
+                    let path = held.resolved.or_else(|| {
+                        resolve_event_path(&held.record, &held.event, &mount_fds, &mut handles)
+                    });
+                    log_deletion(&mut log, &config, path, held.event.pid as u32, held.process);
+                }
+                flush_log(&mut log);
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: fan_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: mount_table.as_ref().map_or(-1, |table| table.as_raw_fd()),
+                        events: libc::POLLPRI,
+                        revents: 0,
+                    },
+                ];
+                let timeout = if mount_table.is_some() { -1 } else { 1000 };
+                unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) };
                 let now = std::time::Instant::now();
-                if mount_refresh_due(last_refresh, now) {
+                let changed = pfds[1].revents & (libc::POLLPRI | libc::POLLERR) != 0;
+                if changed || (mount_table.is_none() && mount_refresh_due(last_refresh, now)) {
                     refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
                     last_refresh = now;
                 }
@@ -238,36 +293,81 @@ fn run() -> io::Result<()> {
             return Err(err);
         }
 
-        for (event, record) in parse_events(&buf[..n as usize]) {
+        let events = parse_events(&buf[..n as usize]);
+        handles.new_batch();
+        // rm -rf removes a directory right after its entries, so their
+        // records arrive with a parent handle that is already stale. The
+        // directory's own record carries that handle (FID) and a parent that
+        // still exists: learn each removed directory's path first, outermost
+        // first (the batch reversed), so its entries resolve below (#326).
+        // Records held from the previous batch are older: they follow this
+        // batch's, and their own directory records count too (#352).
+        let newest_first = events
+            .iter()
+            .rev()
+            .map(|(event, record)| (event, *record))
+            .chain(
+                deferred
+                    .iter()
+                    .rev()
+                    .map(|held| (&held.event, held.record.as_slice())),
+            );
+        for (event, record) in newest_first {
+            if event.mask & FAN_DELETE != 0
+                && event.mask & FAN_ONDIR != 0
+                && let Some(key) = deleted_object_key(record)
+                && let Some(path) = resolve_event_path(record, event, &mount_fds, &mut handles)
+                && path.is_absolute()
+            {
+                handles.remember(key, &path);
+            }
+        }
+        // The previous batch's held records, now that this batch's
+        // directories are known.
+        for held in deferred.drain(..) {
+            let path = held.resolved.or_else(|| {
+                resolve_event_path(&held.record, &held.event, &mount_fds, &mut handles)
+            });
+            log_deletion(&mut log, &config, path, held.event.pid as u32, held.process);
+        }
+        // Once a record is held, so are the later ones, keeping the log in
+        // event order (#352).
+        let mut holding = false;
+        // One rm removes many entries: name its process once per batch, not
+        // with a readlink per record.
+        let mut named: Option<(i32, std::ffi::OsString)> = None;
+        for (event, record) in events {
             // Queue overflow: events were DROPPED by the kernel — say so
             // loudly instead of silently producing an incomplete audit log
             // (#32).
             if event.mask & FAN_Q_OVERFLOW != 0 {
-                eprintln!("[trashd] WARNING: fanotify queue overflow — deletion events were lost");
+                log.push_str(
+                    "[trashd] WARNING: fanotify queue overflow — deletion events were lost\n",
+                );
             }
 
-            // Process event
             if event.mask & FAN_DELETE != 0 {
-                let path = resolve_event_path(record, &event, &mount_fds);
-                let pid = event.pid as u32;
-                let proc_name = process_name(pid);
-                if let Some(ref p) = path {
-                    let skipped = audit_skipped(&config, p);
-                    let ev = DeletionEvent {
-                        path: Some(p.clone()),
-                        pid,
-                        process: proc_name,
-                    };
-                    ev.log(skipped);
-                } else {
-                    // Could not resolve path — log with what we have through
-                    // the same byte-safe, single-line formatter.
-                    DeletionEvent {
-                        path: None,
-                        pid,
-                        process: proc_name,
+                let path = resolve_event_path(record, &event, &mount_fds, &mut handles);
+                let process = match &named {
+                    Some((pid, name)) if *pid == event.pid => name.clone(),
+                    _ => {
+                        let name = process_name(event.pid as u32);
+                        named = Some((event.pid, name.clone()));
+                        name
                     }
-                    .log(false);
+                };
+                // The directory's own record may be in the next read: hold
+                // this one for one more batch (#344).
+                holding |= path.as_ref().is_some_and(|name| !name.is_absolute());
+                if holding {
+                    deferred.push(Deferred {
+                        event,
+                        record: record.to_vec(),
+                        process,
+                        resolved: path.filter(|name| name.is_absolute()),
+                    });
+                } else {
+                    log_deletion(&mut log, &config, path, event.pid as u32, process);
                 }
             }
 
@@ -277,15 +377,60 @@ fn run() -> io::Result<()> {
             }
         }
 
-        // Also refresh after a busy batch: under a continuous delete stream
-        // read() never returns EAGAIN, so the idle-branch refresh alone
+        flush_log(&mut log);
+
+        // Also check after a busy batch: under a continuous delete stream
+        // read() never returns EAGAIN, so the idle-branch check alone
         // starved and mounts appearing after startup were never marked
-        // until a >=1s idle gap (#253). Throttled by the same interval.
+        // until an idle gap (#253).
         let now = std::time::Instant::now();
-        if mount_refresh_due(last_refresh, now) {
+        let changed = if mount_table.is_some() {
+            mount_table_changed(0)
+        } else {
+            mount_refresh_due(last_refresh, now)
+        };
+        if changed {
             refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
             last_refresh = now;
         }
+    }
+}
+
+/// A deletion record held for the next batch: its directory did not
+/// resolve in its own batch, or an earlier record of that batch was held.
+struct Deferred {
+    event: FanotifyEventMetadata,
+    record: Vec<u8>,
+    process: std::ffi::OsString,
+    /// The path already resolved, kept: the next batch's decodes may no
+    /// longer reach a directory removed since (#355).
+    resolved: Option<PathBuf>,
+}
+
+/// Log one deletion; an unresolved path is logged with what is known
+/// through the same byte-safe, single-line formatter.
+fn log_deletion(
+    out: &mut String,
+    config: &Config,
+    path: Option<PathBuf>,
+    pid: u32,
+    process: std::ffi::OsString,
+) {
+    let skipped = path.as_deref().is_some_and(|p| audit_skipped(config, p));
+    DeletionEvent { path, pid, process }.log_to(out, skipped);
+    // A long batch (or one stalled decoding on a hung mount) still shows
+    // its lines as it goes.
+    if out.len() >= 1 << 16 {
+        flush_log(out);
+    }
+}
+
+/// Write a batch's log lines at once.
+fn flush_log(out: &mut String) {
+    use std::io::Write;
+    if !out.is_empty() {
+        let _ = std::io::stderr().lock().write_all(out.as_bytes());
+        out.clear();
     }
 }
 
@@ -339,16 +484,135 @@ fn resolve_event_path(
     event_buf: &[u8],
     _event: &FanotifyEventMetadata,
     mount_fds: &[WatchedMount],
+    handles: &mut HandleCache,
 ) -> Option<PathBuf> {
     // No fd-based fallback: with FAN_REPORT_FID groups delete events always
     // carry fd=FAN_NOFD, so it was dead code (#29).
-    extract_dfid_name_path(event_buf, mount_fds)
+    extract_dfid_name_path(event_buf, mount_fds, handles)
+}
+
+/// Directory handle -> path last resolved for it. `rm -rf` removes a
+/// directory right after its entries, so by the time their events are read
+/// the parent's handle is stale (ESTALE): a third of a large removal's
+/// records lost their directory. A stale handle uses its last known path.
+#[derive(Default)]
+struct HandleCache {
+    paths: std::collections::HashMap<(Fsid, Vec<u8>), PathBuf>,
+    order: std::collections::VecDeque<(Fsid, Vec<u8>)>,
+    /// What decoding each handle found during the current batch. The
+    /// records of one batch share few directories, and decoding (a mount
+    /// open, fstatfs, open_by_handle_at, readlink and two closes) gives the
+    /// path at processing time for any record of the batch alike (#344).
+    batch: std::collections::HashMap<(Fsid, Vec<u8>), Option<PathBuf>>,
+}
+
+impl HandleCache {
+    const CAPACITY: usize = 4096;
+
+    fn new_batch(&mut self) {
+        self.batch.clear();
+    }
+
+    fn decoded(&self, key: &(Fsid, Vec<u8>)) -> Option<&Option<PathBuf>> {
+        self.batch.get(key)
+    }
+
+    fn record_decode(&mut self, key: (Fsid, Vec<u8>), decoded: Option<PathBuf>) {
+        self.batch.insert(key, decoded);
+    }
+
+    fn remember(&mut self, key: (Fsid, Vec<u8>), path: &std::path::Path) {
+        if self.paths.insert(key.clone(), path.to_path_buf()).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > Self::CAPACITY
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.paths.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, key: &(Fsid, Vec<u8>)) -> Option<&PathBuf> {
+        self.paths.get(key)
+    }
+}
+
+/// The removed object's own handle (the FID record), keyed like a parent
+/// directory handle.
+fn deleted_object_key(event_buf: &[u8]) -> Option<(Fsid, Vec<u8>)> {
+    let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
+    let fid_hdr_size = std::mem::size_of::<FanotifyEventInfoFid>();
+    let mut offset = META_SIZE;
+    while offset + info_hdr_size <= event_buf.len() {
+        let hdr = unsafe {
+            std::ptr::read_unaligned(
+                event_buf.as_ptr().add(offset) as *const FanotifyEventInfoHeader
+            )
+        };
+        let info_len = hdr.len as usize;
+        if info_len < info_hdr_size || offset + info_len > event_buf.len() {
+            return None;
+        }
+        if hdr.info_type == FAN_EVENT_INFO_TYPE_FID {
+            let fh_offset = offset + fid_hdr_size;
+            let handle_bytes =
+                u32::from_ne_bytes(event_buf.get(fh_offset..fh_offset + 4)?.try_into().ok()?)
+                    as usize;
+            let handle = event_buf.get(fh_offset..fh_offset + 8 + handle_bytes)?;
+            if fh_offset + 8 + handle_bytes > offset + info_len {
+                return None;
+            }
+            return Some((event_fsid(event_buf, fh_offset), handle.to_vec()));
+        }
+        offset += info_len;
+    }
+    None
+}
+
+/// Order mounts for handle resolution: whole-filesystem mounts before binds
+/// of a subdirectory, then the earliest mount. The longest-path-first order
+/// of list_mounts() let a bind (WSL's /mnt/wslg/distro, a service's private
+/// /var/tmp) win over "/", so audit records named the bind's path (#326).
+fn order_for_resolution(watched: &mut [WatchedMount]) {
+    let mut priorities = std::collections::HashMap::new();
+    if let Ok(info) = std::fs::read("/proc/self/mountinfo") {
+        for line in info.split(|&b| b == b'\n') {
+            // mount_id parent_id major:minor root mount_point ...
+            let mut fields = line.split(|&b| b == b' ');
+            let (Some(id), _, _, Some(root), Some(point)) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                continue;
+            };
+            let Some(id) = std::str::from_utf8(id)
+                .ok()
+                .and_then(|id| id.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            // An overmount at the same point is the visible one.
+            let entry = (root != b"/", id);
+            priorities
+                .entry(mounts::unescape_mount_path(point))
+                .and_modify(|seen: &mut (bool, u64)| {
+                    if id > seen.1 {
+                        *seen = entry;
+                    }
+                })
+                .or_insert(entry);
+        }
+    }
+    watched.sort_by_key(|(path, _)| priorities.get(path).copied().unwrap_or((true, u64::MAX)));
 }
 
 /// statfs f_fsid of the filesystem at `path` — the identity fanotify events
 /// carry, used to decode file handles against the RIGHT mount (#97).
 fn fsid_of_path(path: &std::path::Path) -> Fsid {
-    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
         return None;
@@ -378,7 +642,11 @@ fn event_fsid(event_buf: &[u8], fh_offset: usize) -> Fsid {
 /// Parse extended FID info to get a path from the DFID_NAME record: the parent
 /// directory's handle plus the deleted filename. Other records, such as the
 /// removed inode's own FID, are skipped (#228).
-fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[WatchedMount]) -> Option<PathBuf> {
+fn extract_dfid_name_path(
+    event_buf: &[u8],
+    mount_fds: &[WatchedMount],
+    handles: &mut HandleCache,
+) -> Option<PathBuf> {
     let info_hdr_size = std::mem::size_of::<FanotifyEventInfoHeader>();
     let mut offset = META_SIZE;
 
@@ -438,9 +706,28 @@ fn extract_dfid_name_path(event_buf: &[u8], mount_fds: &[WatchedMount]) -> Optio
             }
             let filename = OsStr::from_bytes(&name_bytes[..name_len]);
 
-            // Try to resolve the parent directory via open_by_handle_at
+            // Try to resolve the parent directory via open_by_handle_at,
+            // or recall it when the directory is already gone.
             let file_handle_ptr = event_buf[fh_offset..].as_ptr();
-            let parent_dir = resolve_handle_to_path(file_handle_ptr, fsid, mount_fds);
+            let key = (
+                fsid,
+                event_buf[fh_offset..fh_offset + 8 + handle_bytes].to_vec(),
+            );
+            let parent_dir = match handles.decoded(&key) {
+                Some(Some(dir)) => Some(dir.clone()),
+                Some(None) => handles.get(&key).cloned(),
+                None => {
+                    let decoded = resolve_handle_to_path(file_handle_ptr, fsid, mount_fds);
+                    handles.record_decode(key.clone(), decoded.clone());
+                    match decoded {
+                        Some(dir) => {
+                            handles.remember(key, &dir);
+                            Some(dir)
+                        }
+                        None => handles.get(&key).cloned(),
+                    }
+                }
+            };
 
             if let Some(dir) = parent_dir {
                 return Some(dir.join(filename));
@@ -491,24 +778,30 @@ fn resolve_handle_to_path(
         if mount_fd < 0 {
             continue;
         }
-        let fd = if fsid.is_none() || fsid_of_fd(mount_fd) == *fsid {
-            unsafe {
+        // Only an attempted decode has an errno worth reading (#344).
+        let decoded = (fsid.is_none() || fsid_of_fd(mount_fd) == *fsid).then(|| {
+            let fd = unsafe {
                 libc::syscall(
                     libc::SYS_open_by_handle_at,
                     mount_fd as libc::c_long,
                     file_handle_ptr as libc::c_long,
                     libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
                 )
-            }
-        } else {
-            -1
-        };
+            };
+            (fd, (fd < 0).then(io::Error::last_os_error))
+        });
         unsafe { libc::close(mount_fd) };
 
-        if fd >= 0 {
-            let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
-            unsafe { libc::close(fd as i32) };
-            return path;
+        match decoded {
+            Some((fd, None)) => {
+                let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
+                unsafe { libc::close(fd as i32) };
+                return path;
+            }
+            // The handle's object is gone from its filesystem: every other
+            // mount of that filesystem would fail the same way (#326).
+            Some((_, Some(error))) if error.raw_os_error() == Some(libc::ESTALE) => break,
+            _ => {}
         }
     }
 
@@ -549,7 +842,6 @@ fn refresh_mounts(
         ) {
             continue;
         }
-        let fsid = fsid_of_path(&mount.path);
 
         // Re-mark EVERY live mount on every refresh tick: f_fsid is stable
         // across unmount/remount of the SAME filesystem, so an identity
@@ -564,7 +856,10 @@ fn refresh_mounts(
             &mount.path,
         ) {
             Ok(()) => match marked.iter_mut().find(|(p, _)| p == &mount.path) {
+                // statfs only what could be marked: unmarkable mounts (9p,
+                // fuse.portal) failed every time and still cost a statfs.
                 Some(entry) => {
+                    let fsid = fsid_of_path(&mount.path);
                     if entry.1 != fsid && fsid.is_some() {
                         eprintln!(
                             "trashd: re-marking \"{}\" ({}) [filesystem changed]",
@@ -580,7 +875,7 @@ fn refresh_mounts(
                         escape_path(&mount.path),
                         mount.fstype
                     );
-                    marked.push((mount.path.clone(), fsid));
+                    marked.push((mount.path.clone(), fsid_of_path(&mount.path)));
                 }
             },
             Err(_) => continue,
@@ -588,11 +883,16 @@ fn refresh_mounts(
 
         // Record the current identity for handle resolution; descriptors are
         // opened per lookup, so a remount needs nothing else.
+        let fsid = marked
+            .iter()
+            .find(|(p, _)| p == &mount.path)
+            .and_then(|(_, fsid)| *fsid);
         match watched.iter_mut().find(|(p, _)| p == &mount.path) {
             Some(entry) => entry.1 = fsid,
             None => watched.push((mount.path.clone(), fsid)),
         }
     }
+    order_for_resolution(watched);
 }
 
 fn fanotify_init(flags: libc::c_uint) -> io::Result<RawFd> {
@@ -610,7 +910,7 @@ fn fanotify_mark(
     mask: u64,
     path: &std::path::Path,
 ) -> io::Result<()> {
-    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
 
     let ret = unsafe {
@@ -634,6 +934,59 @@ fn fanotify_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #381: mount discovery preserves raw Unix paths. Converting them to
+    // lossy UTF-8 before statfs/fanotify_mark queried a different pathname,
+    // leaving a filesystem mounted only there completely unmonitored.
+    #[test]
+    fn mount_wrappers_preserve_non_utf8_paths() {
+        use std::os::fd::FromRawFd;
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let base = Fixture(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("raw-mount-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&base.0).unwrap();
+        let raw = base.0.join(OsStr::from_bytes(b"mount-\xff"));
+        std::fs::create_dir(&raw).unwrap();
+        let expected = fsid_of_path(&base.0).expect("statfs of fixture parent");
+        assert_eq!(fsid_of_path(&raw), Some(expected));
+
+        let fan = match fanotify_init(
+            FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FID | FAN_REPORT_DFID_NAME,
+        ) {
+            Ok(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
+            Err(error) => {
+                eprintln!("SKIP: fanotify mark check unavailable: {error}");
+                return;
+            }
+        };
+        // A filesystem without handle support (e.g. tmpfs), or a host that
+        // denies marks, cannot exercise either spelling. Establish that the
+        // control works before asking the raw-path wrapper to do the same.
+        if let Err(error) = fanotify_mark(
+            fan.as_raw_fd(),
+            FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+            FAN_DELETE | FAN_ONDIR,
+            &base.0,
+        ) {
+            eprintln!("SKIP: filesystem mark check unavailable: {error}");
+            return;
+        }
+        fanotify_mark(
+            fan.as_raw_fd(),
+            FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+            FAN_DELETE | FAN_ONDIR,
+            &raw,
+        )
+        .unwrap();
+    }
 
     // Regression (#197): holding an O_PATH descriptor per watched mount kept
     // every mount busy, so `umount` failed with EBUSY while trashd ran.
@@ -772,9 +1125,106 @@ mod tests {
         let len = buf.len() as u32;
         buf[..4].copy_from_slice(&len.to_ne_bytes());
         assert_eq!(
-            extract_dfid_name_path(&buf, &[]),
+            extract_dfid_name_path(&buf, &[], &mut HandleCache::default()),
             Some(PathBuf::from("victim"))
         );
+    }
+
+    // #326: a directory removed before its entries' events are read (rm -rf)
+    // still names their parent, from the path last resolved for its handle.
+    #[test]
+    fn stale_directory_handles_recall_their_last_path() {
+        use std::os::unix::ffi::OsStrExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: open_by_handle_at needs CAP_DAC_READ_SEARCH");
+            return;
+        }
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("stale-handle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let mut handle = vec![0u8; 8 + 128];
+        handle[..4].copy_from_slice(&128u32.to_ne_bytes());
+        let mut mount_id: libc::c_int = 0;
+        let name = std::ffi::CString::new(canonical.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_name_to_handle_at,
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    handle.as_mut_ptr(),
+                    &mut mount_id,
+                    0,
+                )
+            },
+            0
+        );
+        let handle_bytes = u32::from_ne_bytes(handle[..4].try_into().unwrap()) as usize;
+        let mount = mounts::list_mounts()
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|path| canonical.starts_with(path))
+            .max_by_key(|path| path.as_os_str().len())
+            .unwrap();
+        let fsid = fsid_of_path(&mount);
+        let (a, b) = fsid.unwrap();
+        let mut record = vec![FAN_EVENT_INFO_TYPE_DFID_NAME, 0, 0, 0];
+        record.extend_from_slice(&a.to_ne_bytes());
+        record.extend_from_slice(&b.to_ne_bytes());
+        record.extend_from_slice(&handle[..8 + handle_bytes]);
+        record.extend_from_slice(b"entry\0");
+        while record.len() % 4 != 0 {
+            record.push(0);
+        }
+        let len = record.len() as u16;
+        record[2..4].copy_from_slice(&len.to_ne_bytes());
+        let mut buf = event_header(0);
+        buf.extend(record);
+        let total = buf.len() as u32;
+        buf[..4].copy_from_slice(&total.to_ne_bytes());
+        // The same filesystem reachable twice: a stale handle stops at once.
+        let watched: Vec<WatchedMount> = vec![(mount.clone(), fsid), (mount, fsid)];
+        let mut handles = HandleCache::default();
+        let live = extract_dfid_name_path(&buf, &watched, &mut handles);
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(live, Some(canonical.join("entry")));
+        assert_eq!(
+            extract_dfid_name_path(&buf, &watched, &mut handles),
+            Some(canonical.join("entry"))
+        );
+        assert_eq!(
+            extract_dfid_name_path(&buf, &watched, &mut HandleCache::default()),
+            Some(PathBuf::from("entry"))
+        );
+    }
+
+    #[test]
+    fn handle_cache_is_bounded() {
+        let mut cache = HandleCache::default();
+        for i in 0..HandleCache::CAPACITY + 10 {
+            cache.remember((None, i.to_ne_bytes().to_vec()), std::path::Path::new("/x"));
+        }
+        assert_eq!(cache.paths.len(), HandleCache::CAPACITY);
+        assert!(cache.get(&(None, 0usize.to_ne_bytes().to_vec())).is_none());
+        assert!(
+            cache
+                .get(&(None, (HandleCache::CAPACITY + 9).to_ne_bytes().to_vec()))
+                .is_some()
+        );
+    }
+
+    // #326: handles resolve through whole-filesystem mounts before binds and
+    // unknown paths, not through whichever mount has the longest path.
+    #[test]
+    fn resolution_prefers_whole_filesystem_mounts() {
+        let mut watched: Vec<WatchedMount> = vec![
+            (PathBuf::from("/nonexistent/bind/of/root"), None),
+            (PathBuf::from("/"), None),
+        ];
+        order_for_resolution(&mut watched);
+        assert_eq!(watched[0].0, PathBuf::from("/"));
     }
 
     // Regression (#97): the fsid recorded in a fanotify FID record must be

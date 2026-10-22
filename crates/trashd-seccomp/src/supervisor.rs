@@ -160,20 +160,28 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
     let store = match TrashStore::open() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("trashd-exec: supervisor: failed to open trash store: {e}");
+            report!("trashd-exec: supervisor: failed to open trash store: {e}");
             signal_ready(ready_fd, false);
             if ready_fd >= 0 {
                 return Err(io::Error::other(e));
             }
-            eprintln!("trashd-exec: supervisor: falling back to CONTINUE-only mode");
+            report!("trashd-exec: supervisor: falling back to CONTINUE-only mode");
             return run_passthrough(fd);
         }
     };
 
     let config = Config::load();
-    let own = std::fs::read_link("/proc/self/exe")
-        .map(|exe| own_component_ids(&exe))
-        .unwrap_or_default();
+    let mut own = OwnComponents::new();
+    // Only a privileged supervisor can outrank its targets (#311). An
+    // unreadable own status leaves nothing to compare with: protect nobody
+    // rather than lend our credentials blindly.
+    let credentials = match Credentials::of("self") {
+        Some(own) if own.privileged() => CredentialGate::Compare(own),
+        Some(_) => CredentialGate::Unprivileged,
+        None => CredentialGate::Unknown,
+    };
+    let session = SessionAncestry::discover();
+    store.defer_maintenance();
     signal_ready(ready_fd, true);
 
     loop {
@@ -188,7 +196,7 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
                 // ENOENT: a target died before we read its notification, or
                 // every filtered task has exited.
                 if e.raw_os_error() != Some(libc::ENOENT) {
-                    eprintln!("trashd-exec: supervisor: recv error: {e}");
+                    report!("trashd-exec: supervisor: recv error: {e}");
                 }
                 if listener_done(fd, -1) {
                     return Ok(());
@@ -197,8 +205,27 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
             }
         };
 
-        // Handle this notification (fail-safe: any error → CONTINUE)
-        handle_notification(fd, &notif, &store, &config, &own);
+        // Handle this notification (fail-safe: any error → CONTINUE). A
+        // panic must still answer it: neither the watchdog nor a respawned
+        // supervisor can receive a notification already read, so its thread
+        // would stay blocked in the syscall (#350).
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_notification(
+                fd,
+                &notif,
+                &store,
+                &config,
+                own.ids(),
+                &credentials,
+                session.as_ref(),
+            )
+        }));
+        if handled.is_err() {
+            decline(fd, &notif);
+        }
+        // Retention runs after the target has its answer, never while it
+        // waits on its trapped syscall (#319).
+        store.run_deferred_maintenance();
     }
 }
 
@@ -219,6 +246,8 @@ fn handle_notification(
     store: &TrashStore,
     config: &Config,
     own: &[(u64, u64)],
+    credentials: &CredentialGate,
+    session: Option<&SessionAncestry>,
 ) {
     // Check if the notification is still valid BEFORE touching the target's
     // /proc state: if the target died and its PID was recycled, the reads
@@ -232,9 +261,17 @@ fn handle_notification(
         return;
     }
 
+    // A target we will not lend our credentials to deletes with its own:
+    // a deferring preload trashes the entry itself, anything else is left to
+    // the kernel (#311, #349).
+    if !invalid_flags(notif) && !credentials.lends_to(notif.pid) {
+        decline(fd, notif);
+        return;
+    }
+
     // Capture only after CONTINUE-only gates. Protected operations retain
     // one pathname capture and the same pinned mutation path (#286).
-    let capture = capture_protected_path(notif, config, own, || {
+    let capture = capture_protected_path(notif, config, own, session, || {
         let raw = mem::read_arg_path(notif.pid, notif.data.nr, &notif.data.args)?;
         // Display only: mutation and policy use the pinned parent (#6, #226).
         let display = mem::resolve_syscall_path(notif.pid, notif.data.nr, &notif.data.args, &raw)?;
@@ -242,8 +279,14 @@ fn handle_notification(
     });
     let (raw, display) = match capture {
         Ok(Some(captured)) => captured,
-        _ => {
+        // Policy (bypass, store-internal, invalid flags): the kernel runs it.
+        Ok(None) => {
             respond_continue(fd, notif.id);
+            return;
+        }
+        // The path could not be read: the target's own layer decides (#355).
+        Err(_) => {
+            decline(fd, notif);
             return;
         }
     };
@@ -280,14 +323,37 @@ fn handle_notification(
             }
         }
         Ok(pin::Decision::Continue) => respond_continue(fd, notif.id),
+        Ok(pin::Decision::Decline) => decline(fd, notif),
         Ok(pin::Decision::Errno(e)) => {
             let _ = respond_errno(fd, notif.id, e);
         }
         // Kernel lacks pidfd_getfd/openat2, fds couldn't be pinned, or the
-        // trash lives on another device: execute the original syscall in the
-        // target's namespace. A supervisor-side path fallback could resolve
-        // the same string to an unrelated host inode.
-        Err(_) => respond_continue(fd, notif.id),
+        // trash lives on another device: leave the original syscall to the
+        // target's own layer (#355). A supervisor-side path fallback could
+        // resolve the same string to an unrelated host inode.
+        Err(_) => decline(fd, notif),
+    }
+}
+
+/// An unlinkat with flags the kernel rejects: it answers EINVAL itself.
+fn invalid_flags(notif: &SeccompNotif) -> bool {
+    notif.data.nr == libc::SYS_unlinkat as i32
+        && (notif.data.args[2] as i32 & !libc::AT_REMOVEDIR) != 0
+}
+
+/// A deletion the preload handed over (see `DEFER_MARK`).
+fn deferred_by_preload(notif: &SeccompNotif) -> bool {
+    notif.data.nr == libc::SYS_unlinkat as i32
+        && notif.data.args[3] == crate::seccomp_identity::DEFER_MARK
+}
+
+/// Leave a deletion to the target's own credentials: ENOSYS tells a
+/// deferring preload to trash it in-process; anything else the kernel runs.
+pub(crate) fn decline(fd: i32, notif: &SeccompNotif) {
+    if deferred_by_preload(notif) {
+        let _ = respond_errno(fd, notif.id, libc::ENOSYS);
+    } else {
+        respond_continue(fd, notif.id);
     }
 }
 
@@ -297,18 +363,179 @@ fn capture_protected_path(
     notif: &SeccompNotif,
     config: &Config,
     own: &[(u64, u64)],
+    session: Option<&SessionAncestry>,
     capture: impl FnOnce() -> io::Result<(std::path::PathBuf, std::path::PathBuf)>,
 ) -> io::Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
-    if (notif.data.nr == libc::SYS_unlinkat as i32
-        && (notif.data.args[2] as i32 & !libc::AT_REMOVEDIR) != 0)
+    if invalid_flags(notif)
         // Store-internal deletes must never be intercepted (#195, #196).
         || is_own_component(notif.pid, own)
-        || process_bypassed(notif.pid, &config.bypass_processes, &config.bypass_paths)
+        || process_bypassed(
+            notif.pid,
+            &config.bypass_processes,
+            &config.bypass_paths,
+            session,
+        )
         || target_bypassed(notif.pid)
     {
         return Ok(None);
     }
     capture().map(Some)
+}
+
+/// What the kernel checks for unlink/rmdir: filesystem UID and GID,
+/// supplementary groups and effective capabilities.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    fsuid: u32,
+    fsgid: u32,
+    groups: Vec<u32>,
+    cap_eff: u64,
+    /// The user namespace the capabilities belong to. Status shows a
+    /// sandbox's mapped root exactly like real root, but the kernel grants
+    /// its capabilities only over IDs mapped into its namespace (#341).
+    user_namespace: Option<(u64, u64)>,
+}
+
+impl Credentials {
+    /// Credentials of `/proc/<task>`: "self", or a trapped thread's id.
+    pub(crate) fn of(task: &str) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let mut credentials = Self::parse(&read_proc_text(&format!("/proc/{task}/status"))?)?;
+        credentials.user_namespace = std::fs::metadata(format!("/proc/{task}/ns/user"))
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()));
+        Some(credentials)
+    }
+
+    fn parse(status: &str) -> Option<Self> {
+        let (mut fsuid, mut fsgid, mut groups, mut cap_eff) = (None, None, None, None);
+        for line in status.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key {
+                // real, effective, saved, filesystem
+                "Uid" => fsuid = value.split_whitespace().nth(3)?.parse().ok(),
+                "Gid" => fsgid = value.split_whitespace().nth(3)?.parse().ok(),
+                "Groups" => {
+                    let mut list = value
+                        .split_whitespace()
+                        .map(|group| group.parse().ok())
+                        .collect::<Option<Vec<u32>>>()?;
+                    list.sort_unstable();
+                    list.dedup();
+                    groups = Some(list);
+                }
+                "CapEff" => cap_eff = u64::from_str_radix(value.trim(), 16).ok(),
+                _ => {}
+            }
+        }
+        Some(Self {
+            fsuid: fsuid?,
+            fsgid: fsgid?,
+            groups: groups?,
+            cap_eff: cap_eff?,
+            user_namespace: None,
+        })
+    }
+
+    /// Whether these credentials can remove files others cannot.
+    fn privileged(&self) -> bool {
+        self.fsuid == 0 || self.cap_eff != 0
+    }
+}
+
+/// The supervisor performs trapped deletes with its own credentials, and
+/// seccomp traps them before the kernel's permission check. A filter set up
+/// for a root session survives su/sudo, so a target switched to another
+/// user, or one that dropped capabilities, would borrow root's (#311).
+pub(crate) enum CredentialGate {
+    /// Privileged supervisor: only targets with identical credentials.
+    Compare(Credentials),
+    /// Unprivileged supervisor: no target can hold less than we do in a way
+    /// that matters to unlink (setuid cannot elevate past NoNewPrivs).
+    Unprivileged,
+    /// Our own credentials are unknown: lend them to nobody.
+    Unknown,
+}
+
+impl CredentialGate {
+    fn lends_to(&self, tid: u32) -> bool {
+        match self {
+            CredentialGate::Compare(own) => Credentials::of(&tid.to_string()).as_ref() == Some(own),
+            CredentialGate::Unprivileged => true,
+            CredentialGate::Unknown => false,
+        }
+    }
+}
+
+/// A small /proc text file, decoded lossily: status prints `Name:` as raw
+/// bytes the kernel may cut mid-character, which failed a strict UTF-8 read
+/// and refused the target outright (#350).
+fn read_proc_text(path: &str) -> Option<String> {
+    let bytes = read_proc_bytes(path, 4096)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A /proc file in one read into a buffer sized for typical contents. A
+/// short read ends these files, so there is no EOF probe; fs::read grows
+/// its buffer from 32 bytes for files that report size 0.
+fn read_proc_bytes(path: &str, capacity: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(capacity);
+    loop {
+        let filled = bytes.len();
+        if bytes.capacity() == filled {
+            bytes.reserve(capacity);
+        }
+        let spare = bytes.capacity() - filled;
+        bytes.resize(filled + spare, 0);
+        match file.read(&mut bytes[filled..]) {
+            Ok(n) => {
+                bytes.truncate(filled + n);
+                if n < spare {
+                    return Some(bytes);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => bytes.truncate(filled),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// trashd's own installed binaries, re-identified every few seconds: an
+/// update replaces them with new inodes mid-session, after which their store
+/// deletes were intercepted again (#195, #196, #323).
+struct OwnComponents {
+    exe: Option<std::path::PathBuf>,
+    ids: Vec<(u64, u64)>,
+    at: std::time::Instant,
+}
+
+impl OwnComponents {
+    const REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn new() -> Self {
+        let exe = std::fs::read_link("/proc/self/exe").ok();
+        let ids = exe.as_deref().map(own_component_ids).unwrap_or_default();
+        Self {
+            exe,
+            ids,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    fn ids(&mut self) -> &[(u64, u64)] {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.at) > Self::REFRESH {
+            if let Some(exe) = &self.exe {
+                self.ids = own_component_ids(exe);
+            }
+            self.at = now;
+        }
+        &self.ids
+    }
 }
 
 /// (device, inode) of trashd's own binaries installed beside this
@@ -346,9 +573,69 @@ fn is_own_component(pid: u32, own: &[(u64, u64)]) -> bool {
 /// (#18). Reading /proc/<pid>/environ requires same-user or root, which the
 /// supervisor necessarily is (it created the target).
 fn target_bypassed(pid: u32) -> bool {
-    match std::fs::read(format!("/proc/{pid}/environ")) {
-        Ok(data) => data.split(|&b| b == 0).any(|e| e == b"TRASH_BYPASS=1"),
-        Err(_) => false,
+    // A buffer that fits a typical environment: fs::read grows from 32 bytes
+    // for this size-0 proc file, ~13 syscalls for 5 KB, on every delete.
+    read_proc_bytes(&format!("/proc/{pid}/environ"), 16 * 1024)
+        .is_some_and(|data| data.split(|&b| b == 0).any(|e| e == b"TRASH_BYPASS=1"))
+}
+
+/// Ancestors examined above the deleting process, the same depth as the
+/// preload and shim walks so every layer decides alike (#23).
+const BYPASS_DEPTH: usize = 10;
+
+/// The orchestrator and its ancestors are shared by every target: their
+/// per-level bypass matches are computed once instead of walked again for
+/// every trapped delete, and recomputed after a few seconds so a bypass
+/// ancestor that exits stops applying (#249).
+pub(crate) struct SessionAncestry {
+    orchestrator: u32,
+    /// Process names per level, the orchestrator first.
+    cached: std::cell::RefCell<Option<(Vec<Vec<String>>, std::time::Instant)>>,
+}
+
+impl SessionAncestry {
+    const REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The supervisor's grandparent: supervisor <- watchdog <- orchestrator.
+    fn discover() -> Option<Self> {
+        let watchdog = unsafe { libc::getppid() } as u32;
+        let (_, orchestrator) = trashd_common::proc_stat::comm_and_parent(watchdog)?;
+        (orchestrator > 1).then(|| Self::new(orchestrator))
+    }
+
+    fn new(orchestrator: u32) -> Self {
+        Self {
+            orchestrator,
+            cached: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Whether a bypass name occurs among the first `levels` levels,
+    /// starting at the orchestrator.
+    fn bypassed_within(&self, levels: usize, bypass: &[String]) -> bool {
+        let now = std::time::Instant::now();
+        let fresh = self
+            .cached
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, at)| now.duration_since(*at) <= Self::REFRESH);
+        if !fresh {
+            let mut names = Vec::with_capacity(BYPASS_DEPTH + 1);
+            let mut cur = Some(self.orchestrator);
+            while let Some(pid) = cur.filter(|_| names.len() <= BYPASS_DEPTH) {
+                let (level, parent) = level_names(pid);
+                names.push(level);
+                cur = parent;
+            }
+            *self.cached.borrow_mut() = Some((names, now));
+        }
+        self.cached.borrow().as_ref().is_some_and(|(names, _)| {
+            names
+                .iter()
+                .take(levels)
+                .flatten()
+                .any(|name| bypass.contains(name))
+        })
     }
 }
 
@@ -356,64 +643,71 @@ fn target_bypassed(pid: u32) -> bool {
 /// process name is in the bypass list. Mirrors the preload layer's logic so a
 /// given process makes the same trash/skip decision regardless of which
 /// interception layer is active.
-fn process_bypassed(pid: u32, bypass: &[String], bypass_paths: &[String]) -> bool {
+fn process_bypassed(
+    pid: u32,
+    bypass: &[String],
+    bypass_paths: &[String],
+    session: Option<&SessionAncestry>,
+) -> bool {
     if bypass.is_empty() && bypass_paths.is_empty() {
         return false;
     }
+    if !bypass_paths.is_empty()
+        && std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
+            bypass_paths
+                .iter()
+                .any(|prefix| exe.to_string_lossy().starts_with(prefix.as_str()))
+        })
+    {
+        return true;
+    }
+    if bypass.is_empty() {
+        return false;
+    }
     let mut cur = pid;
-    for depth in 0..16 {
-        if let Ok(exe) = std::fs::read_link(format!("/proc/{cur}/exe")) {
-            if depth == 0
-                && bypass_paths
-                    .iter()
-                    .any(|prefix| exe.to_string_lossy().starts_with(prefix.as_str()))
-            {
-                return true;
-            }
-            if let Some(name) = exe.file_name()
-                && bypass
-                    .iter()
-                    .any(|candidate| candidate == name.to_string_lossy().as_ref())
-            {
-                return true;
-            }
-        }
-        if bypass.is_empty() {
-            break;
-        }
-        let stat = std::fs::read_to_string(format!("/proc/{cur}/stat")).ok();
-        if let Some((comm, parent)) = stat.as_deref().and_then(parse_process_stat) {
-            if bypass.iter().any(|candidate| candidate == comm) {
-                return true;
-            }
-            if parent > 1 && parent != cur {
-                cur = parent;
-                continue;
-            }
-        } else if std::fs::read_to_string(format!("/proc/{cur}/comm"))
-            .is_ok_and(|comm| bypass.iter().any(|candidate| candidate == comm.trim()))
+    for depth in 0..=BYPASS_DEPTH {
+        if depth > 0
+            && let Some(session) = session
+            && cur == session.orchestrator
         {
-            // Preserve name matching if stat is unreadable or malformed.
+            return session.bypassed_within(BYPASS_DEPTH + 1 - depth, bypass);
+        }
+        let (names, parent) = level_names(cur);
+        if names.iter().any(|name| bypass.contains(name)) {
             return true;
         }
-        break;
+        match parent {
+            Some(parent) => cur = parent,
+            None => break,
+        }
     }
     false
 }
 
-/// stat carries both the script's kernel comm and its parent. Use the last
-/// closing parenthesis because comm may itself contain parentheses/newlines.
-fn parse_process_stat(stat: &str) -> Option<(&str, u32)> {
-    let start = stat.find('(')? + 1;
-    let end = stat.rfind(')')?;
-    let comm = stat.get(start..end)?.trim();
-    let parent = stat
-        .get(end + 1..)?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
-    Some((comm, parent))
+/// `pid`'s executable basename and kernel comm, and the parent to examine
+/// next (none at init or on a cycle). One stat read yields comm and parent
+/// together (#302).
+fn level_names(pid: u32) -> (Vec<String>, Option<u32>) {
+    let mut names = Vec::with_capacity(2);
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+        && let Some(name) = exe.file_name()
+    {
+        names.push(name.to_string_lossy().into_owned());
+    }
+    let parent = match trashd_common::proc_stat::comm_and_parent(pid) {
+        Some((comm, parent)) => {
+            names.push(comm);
+            Some(parent).filter(|parent| *parent > 1 && *parent != pid)
+        }
+        // Preserve name matching if stat is unreadable or malformed.
+        None => {
+            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                names.push(comm.trim().to_string());
+            }
+            None
+        }
+    };
+    (names, parent)
 }
 
 /// Passthrough mode: respond CONTINUE to every notification.
@@ -421,7 +715,8 @@ fn parse_process_stat(stat: &str) -> Option<(&str, u32)> {
 fn run_passthrough(fd: i32) -> io::Result<()> {
     loop {
         match notif_recv(fd) {
-            Ok(notif) => respond_continue(fd, notif.id),
+            // Without a store, a deferring preload still trashes (#355).
+            Ok(notif) => decline(fd, &notif),
             Err(e) if e.raw_os_error() == Some(libc::EBADF) => return Ok(()),
             Err(_) if listener_done(fd, -1) => return Ok(()),
             Err(_) => continue,
@@ -434,15 +729,202 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn stat_names_and_parents_preserve_parentheses_and_whitespace() {
-        assert_eq!(parse_process_stat("12 (pip) S 34 5 6"), Some(("pip", 34)));
+    fn credentials_parse_filesystem_ids_groups_and_capabilities() {
+        let status = "Name:\tsh\nUid:\t1000\t1000\t1000\t1001\nGid:\t100\t100\t100\t102\n\
+                      Groups:\t27 4 27 100 \nCapEff:\t0000000000000000\n";
+        let parsed = Credentials::parse(status).unwrap();
         assert_eq!(
-            parse_process_stat("12 ( \nodd ) ( name\n ) S 34 5 6"),
-            Some(("odd ) ( name", 34))
+            parsed,
+            Credentials {
+                fsuid: 1001,
+                fsgid: 102,
+                groups: vec![4, 27, 100],
+                cap_eff: 0,
+                user_namespace: None,
+            }
         );
-        for malformed in ["12 pip S 34", "12 (pip", "12 (pip) S", "12 (pip) S bad"] {
-            assert_eq!(parse_process_stat(malformed), None);
+        assert!(!parsed.privileged());
+        let root = "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nGroups:\t\nCapEff:\t000001ffffffffff\n";
+        assert!(Credentials::parse(root).unwrap().privileged());
+        for broken in [
+            "",
+            "Uid:\t0\t0\t0\nGid:\t0\t0\t0\t0\nGroups:\nCapEff:\t0\n",
+            "Uid:\t0\t0\t0\t0\n",
+        ] {
+            assert_eq!(Credentials::parse(broken), None, "{broken:?}");
         }
+        assert!(Credentials::of("self").is_some());
+        // #350: a comm cut mid-character leaves raw bytes in Name:.
+        let cut = b"Name:\ta-\xe6\x97\nUid:\t5\t5\t5\t5\nGid:\t6\t6\t6\t6\nGroups:\t\nCapEff:\t0\n";
+        let text = String::from_utf8_lossy(cut);
+        assert_eq!(
+            Credentials::parse(&text).map(|c| (c.fsuid, c.fsgid)),
+            Some((5, 6))
+        );
+    }
+
+    // #349: only an unlinkat carrying the preload's mark is answered ENOSYS
+    // when declined; unmarked callers (static binaries) get CONTINUE.
+    #[test]
+    fn only_marked_unlinkat_is_a_preload_deferral() {
+        let notif = |nr: libc::c_long, flags: u64, mark: u64| SeccompNotif {
+            id: 1,
+            pid: 1,
+            flags: 0,
+            data: SeccompData {
+                nr: nr as i32,
+                arch: 0,
+                instruction_pointer: 0,
+                args: [libc::AT_FDCWD as u64, 0, flags, mark, 0, 0],
+            },
+        };
+        let mark = crate::seccomp_identity::DEFER_MARK;
+        assert!(deferred_by_preload(&notif(libc::SYS_unlinkat, 0, mark)));
+        assert!(deferred_by_preload(&notif(
+            libc::SYS_unlinkat,
+            libc::AT_REMOVEDIR as u64,
+            mark
+        )));
+        assert!(!deferred_by_preload(&notif(libc::SYS_unlinkat, 0, 0)));
+        assert!(!deferred_by_preload(&notif(
+            libc::SYS_unlinkat,
+            0,
+            mark ^ 1
+        )));
+        assert!(!deferred_by_preload(&notif(libc::SYS_getpid, 0, mark)));
+        assert!(invalid_flags(&notif(libc::SYS_unlinkat, 1024, mark)));
+        assert!(!invalid_flags(&notif(
+            libc::SYS_unlinkat,
+            libc::AT_REMOVEDIR as u64,
+            0
+        )));
+    }
+
+    // #311: a privileged supervisor lends its credentials only to targets
+    // that hold the same ones.
+    #[test]
+    fn privileged_supervisor_protects_only_targets_with_its_credentials() {
+        use std::os::unix::process::CommandExt;
+        let own = Credentials::of("self").unwrap();
+        if !own.privileged() || own.fsuid != 0 {
+            return; // needs root to start a target as another user
+        }
+        let gate = CredentialGate::Compare(own);
+        let mut same = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let mut dropped = std::process::Command::new("sleep")
+            .arg("5")
+            .uid(65534)
+            .gid(65534)
+            .spawn()
+            .unwrap();
+        assert!(gate.lends_to(same.id()));
+        assert!(!gate.lends_to(dropped.id()));
+        assert!(!CredentialGate::Unknown.lends_to(same.id()));
+        assert!(CredentialGate::Unprivileged.lends_to(dropped.id()));
+        for child in [&mut same, &mut dropped] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // A target that vanished is never lent anything.
+        assert!(!gate.lends_to(same.id()));
+
+        // #341: a sandbox's mapped root shows root's IDs and capabilities,
+        // which hold only inside its own user namespace.
+        let Ok(mut sandboxed) = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "sleep", "5"])
+            .spawn()
+        else {
+            return;
+        };
+        use std::os::unix::fs::MetadataExt;
+        let own_namespace = std::fs::metadata("/proc/self/ns/user").map(|meta| meta.ino());
+        let entered = (0..200).any(|_| {
+            let namespace = std::fs::metadata(format!("/proc/{}/ns/user", sandboxed.id()))
+                .map(|meta| meta.ino());
+            let entered =
+                namespace.is_ok() && namespace.ok() != own_namespace.as_ref().ok().copied();
+            if !entered {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            entered
+        });
+        if entered {
+            let status = Credentials::of(&sandboxed.id().to_string()).unwrap();
+            assert_eq!((status.fsuid, status.fsgid), (0, 0));
+            assert!(!gate.lends_to(sandboxed.id()));
+        }
+        let _ = sandboxed.kill();
+        let _ = sandboxed.wait();
+    }
+
+    // #320: stopping at the orchestrator and using its cached ancestry must
+    // decide exactly like the full walk, for every name along the chain.
+    #[test]
+    fn session_ancestry_cache_matches_the_full_walk() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let target = child.id();
+        let session = SessionAncestry::new(std::process::id());
+        let mut names = vec!["sleep".to_string(), "no-such-tool".to_string()];
+        let mut cur = Some(std::process::id());
+        while let Some(pid) = cur {
+            match trashd_common::proc_stat::comm_and_parent(pid) {
+                Some((comm, parent)) => {
+                    names.push(comm);
+                    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+                        names.push(exe.file_name().unwrap().to_string_lossy().into_owned());
+                    }
+                    cur = Some(parent).filter(|parent| *parent > 1);
+                }
+                None => break,
+            }
+        }
+        for name in &names {
+            let bypass = [name.clone()];
+            assert_eq!(
+                process_bypassed(target, &bypass, &[], Some(&session)),
+                process_bypassed(target, &bypass, &[], None),
+                "{name}"
+            );
+        }
+        // The cached levels are reused within the refresh interval.
+        let first = session.cached.borrow().as_ref().map(|(_, at)| *at);
+        process_bypassed(target, &["no-such-tool".into()], &[], Some(&session));
+        assert_eq!(session.cached.borrow().as_ref().map(|(_, at)| *at), first);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // #323: a reinstall replaces trashd's binaries with new inodes; the
+    // exemption follows them after the refresh interval.
+    #[test]
+    fn own_components_follow_a_reinstall() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let exe = fixture.path().join("trashd-exec");
+        let cli = fixture.path().join("trash");
+        std::fs::write(&cli, b"old").unwrap();
+        let identity = |path: &std::path::Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let mut own = OwnComponents {
+            exe: Some(exe),
+            ids: Vec::new(),
+            at: std::time::Instant::now() - 2 * OwnComponents::REFRESH,
+        };
+        assert_eq!(own.ids(), [identity(&cli)]);
+        let staged = fixture.path().join("trash.new");
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::rename(&staged, &cli).unwrap();
+        assert_ne!(own.ids(), [identity(&cli)], "fresh ids are reused");
+        own.at -= 2 * OwnComponents::REFRESH;
+        assert_eq!(own.ids(), [identity(&cli)]);
     }
 
     #[test]
@@ -456,13 +938,13 @@ pub(crate) mod tests {
         notif.data.nr = libc::SYS_unlinkat as i32;
         notif.data.args[2] = 0x4000;
         assert!(
-            capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+            capture_protected_path(&notif, &config, &[], None, || panic!("unexpected capture"))
                 .unwrap()
                 .is_none()
         );
         notif.data.args[2] = 0;
         let captures = std::cell::Cell::new(0);
-        let result = capture_protected_path(&notif, &config, &[], || {
+        let result = capture_protected_path(&notif, &config, &[], None, || {
             captures.set(captures.get() + 1);
             Ok((PathBuf::from("raw"), PathBuf::from("/display/raw")))
         })
@@ -474,14 +956,14 @@ pub(crate) mod tests {
         let exe = std::fs::read_link("/proc/self/exe").unwrap();
         config.bypass_processes = vec![exe.file_name().unwrap().to_string_lossy().into_owned()];
         assert!(
-            capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+            capture_protected_path(&notif, &config, &[], None, || panic!("unexpected capture"))
                 .unwrap()
                 .is_none()
         );
         config.bypass_processes.clear();
         config.bypass_paths = vec![exe.to_string_lossy().into_owned()];
         assert!(
-            capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+            capture_protected_path(&notif, &config, &[], None, || panic!("unexpected capture"))
                 .unwrap()
                 .is_none()
         );
@@ -497,20 +979,20 @@ pub(crate) mod tests {
                 unsafe { libc::prctl(libc::PR_SET_NAME, c"before ) (".as_ptr()) },
                 0
             );
-            assert!(process_bypassed(pid, &["before ) (".into()], &[]));
+            assert!(process_bypassed(pid, &["before ) (".into()], &[], None));
             assert_eq!(
                 unsafe { libc::prctl(libc::PR_SET_NAME, c"after".as_ptr()) },
                 0
             );
-            assert!(!process_bypassed(pid, &["before ) (".into()], &[]));
-            assert!(process_bypassed(pid, &["after".into()], &[]));
+            assert!(!process_bypassed(pid, &["before ) (".into()], &[], None));
+            assert!(process_bypassed(pid, &["after".into()], &[], None));
             let mut config = Config::default();
             config.bypass_processes.clear();
             let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
             notif.pid = pid;
             notif.data.nr = libc::SYS_unlinkat as i32;
             assert!(
-                capture_protected_path(&notif, &config, &[], || panic!("unexpected capture"))
+                capture_protected_path(&notif, &config, &[], None, || panic!("unexpected capture"))
                     .unwrap()
                     .is_none()
             );
@@ -589,7 +1071,7 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "pip")
         });
-        let bypassed = process_bypassed(pid, &["pip".to_string()], &[]);
+        let bypassed = process_bypassed(pid, &["pip".to_string()], &[], None);
         let _ = child.kill();
         let _ = child.wait();
         assert!(comm_ready, "script never started");

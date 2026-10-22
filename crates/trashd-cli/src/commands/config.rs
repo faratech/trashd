@@ -170,7 +170,7 @@ fn config_get(config: &Config, key: &str) -> Option<String> {
 /// every existing setting (#143).
 fn read_config_table(path: &Path) -> Result<toml::Table, String> {
     match trashd_common::config_file::read(path) {
-        Ok(content) => content.parse::<toml::Table>().map_err(|e| {
+        Ok(content) => Config::normalized_table(&content).map_err(|e| {
             format!(
                 "refusing to edit {}: the existing config does not parse:\n{e}\nFix or remove the file, then re-run",
                 path.display()
@@ -403,6 +403,27 @@ mod tests {
     // Regression (#211): only_trash in the user file REPLACES the inherited
     // whitelist, so `config add only_trash` starting from an empty user list
     // silently dropped the admin's patterns (their files became real deletes).
+    #[test]
+    fn legacy_layout_lists_are_edited_where_they_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[retention]\nmax_age_days = 7\nnever_trash = [\"*.bak\"]\n",
+        )
+        .unwrap();
+        let mut table = read_config_table(&path).unwrap();
+        assert!(config_list_remove(&mut table, "never_trash", "*.bak", &[]));
+        config_list_add(&mut table, "never_trash", "*.log", &[]);
+        assert_eq!(
+            table["never_trash"],
+            toml::Value::Array(vec!["*.log".into()])
+        );
+        // The rest of [retention] stays where it is.
+        assert_eq!(table["retention"]["max_age_days"].as_integer(), Some(7));
+        assert!(table["retention"].get("never_trash").is_none());
+    }
+
     #[test]
     fn adding_to_only_trash_keeps_the_inherited_whitelist() {
         let mut table = toml::Table::new();

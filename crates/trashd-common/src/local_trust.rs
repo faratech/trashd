@@ -63,15 +63,20 @@ pub(crate) fn read_local_config(dir: &Path) -> LocalConfigFile {
     if meta.mode() & 0o022 != 0 {
         return LocalConfigFile::Ignored("is writable by other users");
     }
-    let mut content = String::new();
+    // Size the buffer from fstat: an empty one made a small policy cost a
+    // series of growing probe reads (#308).
+    let mut bytes = Vec::with_capacity(meta.len().min(MAX_LOCAL_CONFIG_BYTES) as usize + 1);
     match file
         .take(MAX_LOCAL_CONFIG_BYTES + 1)
-        .read_to_string(&mut content)
+        .read_to_end(&mut bytes)
     {
         Ok(read) if read as u64 > MAX_LOCAL_CONFIG_BYTES => {
             LocalConfigFile::Ignored("is too large")
         }
-        Ok(_) => LocalConfigFile::Content(content),
+        Ok(_) => match String::from_utf8(bytes) {
+            Ok(content) => LocalConfigFile::Content(content),
+            Err(_) => LocalConfigFile::Ignored("is not readable UTF-8 text"),
+        },
         Err(_) => LocalConfigFile::Ignored("is not readable UTF-8 text"),
     }
 }

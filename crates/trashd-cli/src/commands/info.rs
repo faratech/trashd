@@ -1,23 +1,32 @@
 use crate::util::*;
 use colored::Colorize;
 use trashd_common::TrashStore;
-use trashd_common::store::TrashError;
 
-pub fn run(store: &TrashStore, target: &str) {
-    // Same resolution as restore/purge (find_entry): unique-ID preference,
-    // filename fallback, and refusal on cross-root ambiguous IDs — first-match
-    // here could describe the wrong copy (#148).
-    let entry = match store.find_entry(target) {
-        Ok(e) => e,
-        Err(TrashError::AmbiguousMatch { pattern, count }) => fatal(format!(
-            "'{pattern}' matches {count} entries in different trash roots — \
-             pass one entry's trashed path (from 'trash ls --json <pattern>') to select it"
-        )),
-        // A listing failure must surface as itself, not masquerade as "not
-        // found" (restore/purge share find_entry and do the same).
-        Err(e @ (TrashError::Io(_) | TrashError::Index(_))) => fatal(e),
-        Err(_) => fatal(format!("'{target}' not found in trash")),
+pub fn run(store: &TrashStore, target: &std::ffi::OsStr) {
+    let label = printable(&target.to_string_lossy());
+    let mut entries = match store.select_entries(target, false) {
+        Ok(Some((_, entries))) => entries,
+        Ok(None) => fatal(format!("'{label}' not found in trash")),
+        Err(error) => fatal(error),
     };
+    if entries.len() > 1 {
+        eprintln!(
+            "{} '{}' matches {} entries — pass one entry's trashed path (right column) to select it",
+            "trash: ambiguous:".yellow().bold(),
+            label,
+            entries.len(),
+        );
+        for entry in entries.iter().take(10) {
+            eprintln!(
+                "  {} {} {}",
+                entry.info.deletion_date.format("%Y-%m-%d %H:%M"),
+                printable_path(&entry.info.original_path),
+                printable_path(&entry.trashed_path).dimmed()
+            );
+        }
+        std::process::exit(1);
+    }
+    let entry = entries.remove(0);
 
     println!("{}", "Trash Entry".bold().underline());
     println!("  ID:            {}", printable(&entry.id));
