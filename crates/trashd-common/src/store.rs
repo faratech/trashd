@@ -9939,6 +9939,11 @@ mod tests {
     // removed, and unreadable data can still be locked for purge.
     #[test]
     fn raw_removal_handles_read_only_trees_and_unreadable_data() {
+        // The fixture is chowned to nobody before the case drops
+        // privileges; a non-root runner cannot chown and has no case.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
         let base = tempfile::tempdir().unwrap();
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let tree = base.path().join("tree");
@@ -10156,6 +10161,9 @@ mod tests {
     // read-only directory needs nothing of itself.
     #[test]
     fn retire_checks_ask_only_directories_with_entries() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
         let base = tempfile::tempdir().unwrap();
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
         for tree in ["empty-leaf", "full-leaf"] {
