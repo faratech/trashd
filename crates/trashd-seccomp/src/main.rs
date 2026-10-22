@@ -1029,6 +1029,10 @@ impl CommandStatus {
                         rlim_max: 0,
                     };
                     libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+                    // A piped core_pattern (systemd-coredump, apport)
+                    // ignores RLIMIT_CORE; only a non-dumpable process is
+                    // never captured, whatever the host handler is.
+                    libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
                     libc::signal(signal, libc::SIG_DFL);
                     let mut only: libc::sigset_t = std::mem::zeroed();
                     libc::sigemptyset(&mut only);
