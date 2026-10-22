@@ -17,6 +17,10 @@ pub fn run(store: &TrashStore) {
             println!("{}", "Trash Status".bold().underline());
             println!("  Items:    {total_count}");
             println!("  Size:     {}", format_size(total_size));
+            let pending: usize = partitions.iter().map(|p| p.pending_cleanup).sum();
+            if pending > 0 {
+                println!("  Pending cleanup: {pending} deletion jobs (run `trash empty`)");
+            }
             println!();
 
             if partitions.len() > 1 || partitions.iter().any(|p| p.label != "home") {
@@ -28,6 +32,12 @@ pub fn run(store: &TrashStore) {
                         ps.count,
                         format_size(ps.total_size),
                     );
+                    if ps.pending_cleanup > 0 {
+                        println!(
+                            "      Pending cleanup: {} deletion jobs",
+                            ps.pending_cleanup
+                        );
+                    }
                     println!("      {}", printable_path(&ps.trash_dir).dimmed());
                 }
             } else if let Some(ps) = partitions.first() {

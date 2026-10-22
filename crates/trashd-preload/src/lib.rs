@@ -2169,28 +2169,57 @@ fn finish_attempt(attempt: TrashAttempt, saved_errno: libc::c_int) -> Option<lib
     }
 }
 
+/// The libc deletion entry point being handed to the supervisor. Keep its
+/// native syscall family: an existing application filter may allow unlink
+/// or rmdir on x86-64 while rejecting unlinkat.
+enum DeletionCall {
+    Unlink,
+    UnlinkAt(libc::c_int, libc::c_int),
+    Rmdir,
+}
+
 /// Hand a deletion to the trashd supervisor filtering this process: it
 /// trashes the entry or answers with the deletion's real result. `None`
 /// when it declined (ENOSYS: it will not act with its own credentials for
 /// this process, or its listener is gone); the hook then trashes the entry
 /// in-process (#349).
 fn defer_to_supervisor(
-    dirfd: libc::c_int,
+    call: DeletionCall,
     pathname: *const libc::c_char,
-    flags: libc::c_int,
     saved_errno: libc::c_int,
 ) -> Option<libc::c_int> {
     if is_bypass_active() || !is_seccomp_active() {
         return None;
     }
     let ret = unsafe {
-        libc::syscall(
-            libc::SYS_unlinkat,
-            dirfd as libc::c_long,
-            pathname,
-            flags as libc::c_long,
-            seccomp_identity::DEFER_MARK as libc::c_long,
-        )
+        match call {
+            #[cfg(target_arch = "x86_64")]
+            DeletionCall::Unlink | DeletionCall::Rmdir => libc::syscall(
+                if matches!(call, DeletionCall::Unlink) {
+                    libc::SYS_unlink
+                } else {
+                    libc::SYS_rmdir
+                },
+                pathname,
+                0 as libc::c_long,
+                0 as libc::c_long,
+                seccomp_identity::DEFER_MARK as libc::c_long,
+            ),
+            call => {
+                let (dirfd, flags) = match call {
+                    DeletionCall::Unlink => (libc::AT_FDCWD, 0),
+                    DeletionCall::Rmdir => (libc::AT_FDCWD, libc::AT_REMOVEDIR),
+                    DeletionCall::UnlinkAt(dirfd, flags) => (dirfd, flags),
+                };
+                libc::syscall(
+                    libc::SYS_unlinkat,
+                    dirfd as libc::c_long,
+                    pathname,
+                    flags as libc::c_long,
+                    seccomp_identity::DEFER_MARK as libc::c_long,
+                )
+            }
+        }
     } as libc::c_int;
     match ret {
         0 => Some(success_with_errno(saved_errno)),
@@ -2206,11 +2235,11 @@ fn defer_remove_to_supervisor(
     pathname: *const libc::c_char,
     saved_errno: libc::c_int,
 ) -> Option<libc::c_int> {
-    let ret = defer_to_supervisor(libc::AT_FDCWD, pathname, 0, saved_errno)?;
+    let ret = defer_to_supervisor(DeletionCall::Unlink, pathname, saved_errno)?;
     if ret == 0 || unsafe { *libc::__errno_location() } != libc::EISDIR {
         return Some(ret);
     }
-    defer_to_supervisor(libc::AT_FDCWD, pathname, libc::AT_REMOVEDIR, saved_errno)
+    defer_to_supervisor(DeletionCall::Rmdir, pathname, saved_errno)
 }
 
 /// PID and time sample for a hook about to trash, unless its process is
@@ -2264,7 +2293,7 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
             if is_bypass_active() || known_bypassed() {
                 return None;
             }
-            if let Some(ret) = defer_to_supervisor(libc::AT_FDCWD, pathname, 0, saved_errno) {
+            if let Some(ret) = defer_to_supervisor(DeletionCall::Unlink, pathname, saved_errno) {
                 return Some(ret);
             }
 
@@ -2315,7 +2344,9 @@ pub unsafe extern "C" fn unlinkat(
             if flags & !libc::AT_REMOVEDIR != 0 || is_bypass_active() || known_bypassed() {
                 return None;
             }
-            if let Some(ret) = defer_to_supervisor(dirfd, pathname, flags, saved_errno) {
+            if let Some(ret) =
+                defer_to_supervisor(DeletionCall::UnlinkAt(dirfd, flags), pathname, saved_errno)
+            {
                 return Some(ret);
             }
             let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
@@ -2379,9 +2410,7 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
             if is_bypass_active() || known_bypassed() {
                 return None;
             }
-            if let Some(ret) =
-                defer_to_supervisor(libc::AT_FDCWD, pathname, libc::AT_REMOVEDIR, saved_errno)
-            {
+            if let Some(ret) = defer_to_supervisor(DeletionCall::Rmdir, pathname, saved_errno) {
                 return Some(ret);
             }
 

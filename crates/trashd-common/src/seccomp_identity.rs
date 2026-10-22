@@ -1,13 +1,16 @@
 //! Nonblocking filter provenance protocol; shared without store dependencies.
 #![allow(dead_code)]
 pub const COOKIE_ENV: &str = "TRASHD_SECCOMP_COOKIE";
-pub const PROOF_ERRNO: i32 = 4093;
+/// Protocol version: only filters using this proof support marked native
+/// unlink/rmdir deferrals. Reject older supervisors rather than having their
+/// decline path continue an unrecognized handoff as a permanent deletion.
+pub const PROOF_ERRNO: i32 = 4092;
 
-/// Fourth syscall argument of an unlinkat the preload hands to the
-/// supervisor (unlinkat ignores it). A marked deletion the supervisor will
-/// not perform with its own credentials is answered ENOSYS instead of being
-/// left to the kernel, so the preload trashes it in-process with the
-/// target's own (#349). Sixty-four bits: an unmarked call's stale register
+/// Fourth syscall argument of a deletion the preload hands to the
+/// supervisor (unlink, rmdir and unlinkat ignore it). A marked deletion the
+/// supervisor will not perform with its own credentials is answered ENOSYS
+/// instead of being left to the kernel, so the preload trashes it in-process
+/// with the target's own (#349). Sixty-four bits: an unmarked call's stale register
 /// does not match by accident.
 pub const DEFER_MARK: u64 = 0x7472_6173_6864_6d6b;
 

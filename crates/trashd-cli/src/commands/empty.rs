@@ -41,15 +41,22 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
             );
         }
 
-        if count == 0 {
+        let pending = match store.pending_cleanup() {
+            Ok(pending) => pending,
+            Err(error) => fatal(error),
+        };
+        if count == 0 && pending == 0 {
             println!("{}", "Nothing would be deleted.".dimmed());
-        } else {
+        } else if count > 0 {
             println!(
                 "\n{} {} items ({}) would be permanently deleted",
                 "Dry run:".yellow().bold(),
                 count,
                 format_size(total_size),
             );
+        }
+        if pending > 0 {
+            println!("  {pending} unfinished deletion jobs would be retried.");
         }
         return;
     }
@@ -63,7 +70,9 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
         Err(e) => fatal(e),
     };
     if selected.is_empty() {
-        println!("{}", "Nothing to empty.".dimmed());
+        if cleanup_unfinished(store) == 0 {
+            println!("{}", "Nothing to empty.".dimmed());
+        }
         return;
     }
     if !yes {
@@ -91,4 +100,28 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
             count
         );
     }
+    cleanup_unfinished(store);
+}
+
+/// These jobs were retired by an earlier purge, so retrying them never adds
+/// ordinary entries to the selection the user just confirmed.
+fn cleanup_unfinished(store: &TrashStore) -> usize {
+    let report = match store.cleanup_unfinished() {
+        Ok(report) => report,
+        Err(error) => fatal(error),
+    };
+    if report.removed > 0 {
+        println!(
+            "{} removed {} unfinished deletion jobs",
+            "Cleaned:".green().bold(),
+            report.removed,
+        );
+    }
+    if report.pending > 0 {
+        fatal(format!(
+            "{} deletion jobs still need cleanup; retry `trash empty`",
+            report.pending,
+        ));
+    }
+    report.removed
 }

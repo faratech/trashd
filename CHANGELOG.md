@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Landlock setup is tracked before the kernel continues it in every
+  notification path, including watchdog recovery and supervisor fallback.
+  A shared session flag survives worker replacement without a task-record
+  limit or dependence on live ancestry. After any restriction attempt,
+  including a failed attempt, all session deletions use the target's own
+  security context: preload handles them in process, and direct syscalls
+  receive their native kernel checks.
+- Preload supervisor handoff preserves native `unlink` and `rmdir` syscalls
+  on x86-64, including libc `remove`, so application seccomp policies do not
+  encounter a substituted `unlinkat`. Update the wrapper and preload
+  together and restart wrapped sessions to use the complete protocol.
+- Staged directory copies refuse publication if atomic no-replace rename
+  is unavailable, retaining the source and any competing destination.
+- `trash empty`, including the scheduled age-filtered cleanup command,
+  retries unfinished purges even when no ordinary entries are selected.
+  Status reports pending deletion jobs, and cleanup failures return an
+  error for retry. Dry runs and the ordinary confirmed selection are
+  preserved. Cleanup helpers now live in a separate store module.
+- Interactive deletion plans have explicit descriptor, memory and depth
+  budgets and refuse an oversized operand before mutation. Pinned
+  directory identities remain protected, and sorted filename lookup
+  removes quadratic verification work in wide directories.
+
 ## 0.1.13 (2026-10-22)
 
 This round fixes a privilege boundary in the root seccomp supervisor,

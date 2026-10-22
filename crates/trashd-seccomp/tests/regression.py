@@ -98,8 +98,8 @@ def wait_until(predicate, description, timeout=8):
     raise AssertionError(f"timed out: {description}")
 
 
-def line(process):
-    if not select.select([process.stdout], [], [], 10)[0]:
+def line(process, timeout=10):
+    if not select.select([process.stdout], [], [], timeout)[0]:
         raise AssertionError("wrapped command stopped responding")
     result = process.stdout.readline().strip()
     assert result, f"wrapped command exited unexpectedly ({process.poll()})"
@@ -159,7 +159,8 @@ for row in sys.stdin:
         # wrapper readiness. The completed copy publishes between pinned fds
         # on one filesystem; supervisor rename remains available too (#392).
         subprocess.run(command, env=child_env, preexec_fn=force_copy_error(), check=True, timeout=8)
-    elif mode in ["landlock", "landlock-attempt", "landlock-child"]:
+    elif mode in ["landlock", "landlock-attempt", "landlock-child",
+                  "landlock-setup", "landlock-orphan", "landlock-overflow"]:
         # A domain handling REMOVE_FILE with no allow rule: the deletion
         # must be refused natively, never completed by the supervisor
         # with credentials outside the domain (#390).
@@ -169,13 +170,53 @@ for row in sys.stdin:
             _fields_ = [("handled_access_fs", _ctypes.c_uint64),
                         ("handled_access_net", _ctypes.c_uint64),
                         ("scoped", _ctypes.c_uint64)]
-        if mode == "landlock":
+        def _restrict():
             _attr = _Attr()
             _attr.handled_access_fs = 1 << 5  # LANDLOCK_ACCESS_FS_REMOVE_FILE
             _rs = _libc.syscall(444, _ctypes.byref(_attr), _ctypes.sizeof(_attr), 0)
             assert _rs >= 0, "landlock_create_ruleset failed"
             _libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
             assert _libc.syscall(446, _rs, 0) == 0, "landlock_restrict_self failed"
+        if mode == "landlock-overflow":
+            # Distinct exited tasks formerly consumed the broker's lifetime
+            # record budget, leaving this parent's later restriction lost.
+            for _ in range(513):
+                _child = os.fork()
+                if _child == 0:
+                    _result = _libc.syscall(446, -1, 0)
+                    os._exit(0 if _result == -1 and _ctypes.get_errno() == 9 else 1)
+                _, _status = os.waitpid(_child, 0)
+                assert _status == 0, "invalid restriction changed native EBADF"
+            _restrict()
+            print(json.dumps("installed"), flush=True)
+            continue
+        if mode == "landlock-orphan":
+            _read, _write = os.pipe()
+            _parent = os.fork()
+            if _parent == 0:
+                os.close(_read)
+                _restrict()
+                _restricted_parent = os.getpid()
+                if os.fork(): os._exit(0)
+                while os.getppid() == _restricted_parent: time.sleep(0.01)
+                try:
+                    os.unlink(path)
+                    _result = b"removed"
+                except PermissionError:
+                    _result = b"denied"
+                os.write(_write, _result)
+                os._exit(0)
+            os.close(_write)
+            _result = os.read(_read, 32).decode()
+            os.close(_read)
+            os.waitpid(_parent, 0)
+            print(json.dumps(_result), flush=True)
+            continue
+        if mode in ["landlock", "landlock-setup"]:
+            _restrict()
+        if mode == "landlock-setup":
+            print(json.dumps("installed"), flush=True)
+            continue
         if mode == "landlock-child":
             _child = os.fork()
             if _child == 0:
@@ -490,6 +531,80 @@ def run():
             finally:
                 stop(process)
         print("PASS: Landlock refusals survive supervisor credentials, fork and restart", flush=True)
+
+        # Queue setup while the supervisor is stopped, so only the watchdog
+        # can release it before replacement. The target reports installation
+        # before the replacement is forked (watchdog backoff is 250 ms).
+        with (fixture / "landlock-during-replacement.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                target, active = line(process)
+                assert active == "1"
+                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
+                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                os.kill(supervisor, signal.SIGSTOP)
+                wait_until(lambda: "State:\tT" in Path(f"/proc/{supervisor}/status").read_text(), "stopped supervisor")
+                process.stdin.write(json.dumps(["landlock-setup", ""]) + "\n"); process.stdin.flush()
+                def queued_restriction():
+                    try:
+                        return Path(f"/proc/{target}/syscall").read_text().split()[0] == "446"
+                    except (OSError, IndexError):
+                        return False
+                wait_until(queued_restriction, "queued Landlock restriction")
+                os.kill(supervisor, signal.SIGKILL)
+                assert line(process) == "installed"
+                wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
+                victim = work / "landlock-during-replacement.txt"
+                victim.write_bytes(b"watchdog restriction survives\n")
+                process.stdin.write(json.dumps(["landlock-attempt", str(victim)]) + "\n"); process.stdin.flush()
+                assert line(process) == "denied"
+                assert victim.read_bytes() == b"watchdog restriction survives\n"
+                assert not recovery_records(data, victim)
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: Landlock setup drained by watchdog survives replacement", flush=True)
+
+        with (fixture / "landlock-orphan.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                _, active = line(process)
+                assert active == "1"
+                victim = work / "landlock-orphan.txt"
+                victim.write_bytes(b"inherited refusal survives parent exit\n")
+                process.stdin.write(json.dumps(["landlock-orphan", str(victim)]) + "\n"); process.stdin.flush()
+                assert line(process) == "denied"
+                assert victim.read_bytes() == b"inherited refusal survives parent exit\n"
+                assert not recovery_records(data, victim)
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: Landlock inheritance survives restricting parent exit", flush=True)
+
+        with (fixture / "landlock-overflow.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                target, active = line(process)
+                assert active == "1"
+                process.stdin.write(json.dumps(["landlock-overflow", ""]) + "\n"); process.stdin.flush()
+                assert line(process, timeout=40) == "installed"
+                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
+                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                os.kill(supervisor, signal.SIGKILL)
+                wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
+                victim = work / "landlock-overflow.txt"
+                victim.write_bytes(b"restriction has no record limit\n")
+                process.stdin.write(json.dumps(["landlock-attempt", str(victim)]) + "\n"); process.stdin.flush()
+                assert line(process) == "denied"
+                assert victim.read_bytes() == b"restriction has no record limit\n"
+                assert not recovery_records(data, victim)
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: more than 512 distinct Landlock attempts survive restart", flush=True)
 
         with (fixture / "descriptor-backend.log").open("w") as log:
             process = launch(protected_env, log, errno.ENOSYS, SYSCALL_PIDFD_GETFD)

@@ -427,6 +427,72 @@ def main():
         assert len(added) == 1 and f"Path={tree}\n" in added[0], added
         print("PASS: -ri prompts for each entry and trashes confirmed subtrees whole")
 
+        # Keep directory inodes pinned, but refuse the complete operand
+        # before mutation if its plan cannot leave descriptor headroom.
+        import resource
+        def low_fd_limit():
+            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard))
+        for width, should_succeed in [(3, True), (128, False)]:
+            tree = root / f"low-fd-wide-{width}"
+            for index in range(width):
+                child = tree / f"dir-{index:03}"
+                child.mkdir(parents=True)
+                (child / "payload").write_bytes(b"complete wide tree")
+            before = set(info.glob("*.trashinfo"))
+            result = subprocess.run([str(binary), "-ri", str(tree)], input="y\n" * 1000,
+                text=True, capture_output=True, env=env, cwd=root, preexec_fn=low_fd_limit, timeout=20)
+            added = set(info.glob("*.trashinfo")) - before
+            if should_succeed:
+                assert result.returncode == 0 and not tree.exists(), result.stderr
+                assert len(added) == 1, added
+                stored = root / "data/Trash/files" / added.pop().stem
+                assert sum(1 for _ in stored.glob("*/payload")) == width
+                assert all(path.read_bytes() == b"complete wide tree" for path in stored.glob("*/payload"))
+            else:
+                assert result.returncode != 0 and "file descriptor budget" in result.stderr, result.stderr
+                assert not added, added
+                assert sum(1 for _ in tree.glob("*/payload")) == width
+                assert all(path.read_bytes() == b"complete wide tree" for path in tree.glob("*/payload"))
+        tree = root / "low-fd-deep"
+        leaf = tree.joinpath(*["sub"] * 32)
+        leaf.mkdir(parents=True)
+        (leaf / "payload").write_bytes(b"never partially apply a refused plan")
+        before = set(info.glob("*.trashinfo"))
+        refused = subprocess.run([str(binary), "-ri", str(tree)], input="y\n" * 100,
+            text=True, capture_output=True, env=env, cwd=root, preexec_fn=low_fd_limit, timeout=10)
+        assert refused.returncode != 0 and "file descriptor budget" in refused.stderr, refused.stderr
+        assert (leaf / "payload").read_bytes() == b"never partially apply a refused plan"
+        assert set(info.glob("*.trashinfo")) == before
+        print("PASS: at 32 FDs small interactive plans succeed; wide/deep plans refuse without mutation")
+
+        # Verification and the filesystem-boundary survey need descriptors
+        # in addition to the retained pins. A plan that fits only its pins must
+        # still refuse before any entrywise fallback can mutate the source.
+        def medium_fd_limit():
+            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+        for depth, should_succeed, one_filesystem in [
+                (8, True, False), (40, False, False), (8, True, True), (17, False, True)]:
+            tree = root / f"medium-fd-deep-{depth}-{one_filesystem}"
+            leaf = tree.joinpath(*["sub"] * depth)
+            leaf.mkdir(parents=True)
+            (leaf / "payload").write_bytes(b"complete deep tree")
+            before = set(info.glob("*.trashinfo"))
+            flags = ["-ri", "--one-file-system"] if one_filesystem else ["-ri"]
+            result = subprocess.run([str(binary), *flags, str(tree)], input="y\n" * 200,
+                text=True, capture_output=True, env=env, cwd=root, preexec_fn=medium_fd_limit, timeout=20)
+            added = set(info.glob("*.trashinfo")) - before
+            if should_succeed:
+                assert result.returncode == 0 and not tree.exists(), result.stderr
+                assert len(added) == 1, added
+                stored = root / "data/Trash/files" / added.pop().stem
+                assert stored.joinpath(*["sub"] * depth, "payload").read_bytes() == b"complete deep tree"
+            else:
+                assert result.returncode != 0 and "file descriptor budget" in result.stderr, result.stderr
+                assert not added and (leaf / "payload").read_bytes() == b"complete deep tree"
+        print("PASS: deep plans reserve verification/survey FDs before accepting confirmations")
+
         # Answers are carried out only on what was confirmed: an entry that
         # appears before the last answer stays, never-trash or not (#351).
         for name in ["late-plan", "late-plan.tmp"]:

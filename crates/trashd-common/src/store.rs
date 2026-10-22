@@ -2,6 +2,12 @@ use crate::config::Config;
 use crate::mounts;
 use crate::store_lock::RootMutationGuard;
 use crate::trashinfo::TrashInfo;
+
+mod cleanup;
+mod listing;
+pub use cleanup::CleanupReport;
+use cleanup::*;
+use listing::newest_first;
 use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
@@ -30,6 +36,8 @@ pub enum TrashError {
     },
     #[error("trash entry not found: {0}")]
     EntryNotFound(String),
+    #[error("unfinished deletion jobs remain: {0}; retry `trash empty`")]
+    CleanupPending(usize),
     #[error("original path already exists: {0}")]
     RestoreConflict(PathBuf),
     #[error("refusing to restore outside the original location (possible path traversal): {0}")]
@@ -1294,336 +1302,6 @@ impl TrashStore {
         Ok(id)
     }
 
-    /// List all items across all trash directories, newest first.
-    pub fn list(&self, pattern: Option<&str>) -> Result<Vec<TrashEntry>, TrashError> {
-        self.list_with(pattern, ScanMetadata::MUTATION)
-    }
-
-    /// `list` for display: entries carry no data identity (`identity` is
-    /// None), which only mutations verify. Listing statted every entry's
-    /// data for nothing (#353).
-    pub fn list_for_display(&self, pattern: Option<&str>) -> Result<Vec<TrashEntry>, TrashError> {
-        self.list_with(pattern, ScanMetadata::DISPLAY)
-    }
-
-    /// A read-only query: preserve sidecar freshness checks, omit data
-    /// identities, and retain/sort only the entries the predicate accepts.
-    /// Mutation callers must use `list` or selected mutation snapshots.
-    pub fn list_for_query(
-        &self,
-        keep: impl FnMut(&TrashEntry) -> bool,
-    ) -> Result<Vec<TrashEntry>, TrashError> {
-        self.list_filtered_with(None, ScanMetadata::QUERY, keep)
-    }
-
-    /// Display listing with a filter applied after orphan bookkeeping and
-    /// before collecting/sorting entries, for example a deletion-date range.
-    pub fn list_for_display_filtered(
-        &self,
-        pattern: Option<&str>,
-        keep: impl FnMut(&TrashEntry) -> bool,
-    ) -> Result<Vec<TrashEntry>, TrashError> {
-        self.list_filtered_with(pattern, ScanMetadata::DISPLAY, keep)
-    }
-
-    fn list_with(
-        &self,
-        pattern: Option<&str>,
-        metadata: ScanMetadata,
-    ) -> Result<Vec<TrashEntry>, TrashError> {
-        self.list_filtered_with(pattern, metadata, |_| true)
-    }
-
-    fn list_filtered_with(
-        &self,
-        pattern: Option<&str>,
-        metadata: ScanMetadata,
-        mut keep: impl FnMut(&TrashEntry) -> bool,
-    ) -> Result<Vec<TrashEntry>, TrashError> {
-        let mut entries = Vec::new();
-        let roots: Vec<PathBuf> = self
-            .all_trash_dirs()
-            .into_iter()
-            .map(|(dir, _)| dir)
-            .collect();
-        self.visit_roots_for_id(&roots, pattern, None, metadata, &mut |entry, _| {
-            if keep(&entry) {
-                entries.push(entry);
-            }
-        })?;
-        newest_first(&mut entries);
-        Ok(entries)
-    }
-
-    fn scanned_data_metadata(&self, path: &Path, metadata: ScanMetadata) -> Option<fs::Metadata> {
-        if !metadata.data {
-            return None;
-        }
-        #[cfg(test)]
-        self.scan_data_stats.set(self.scan_data_stats.get() + 1);
-        fs::symlink_metadata(path).ok()
-    }
-
-    /// List one trash root, newest first.
-    pub fn list_root(&self, root: &Path) -> Result<Vec<TrashEntry>, TrashError> {
-        let mut entries = Vec::new();
-        self.list_roots(&[root.to_path_buf()], None, &mut entries)?;
-        newest_first(&mut entries);
-        Ok(entries)
-    }
-
-    /// List several roots. One unreadable non-home root (a broken USB stick)
-    /// is skipped with a warning instead of failing ls/restore/purge for
-    /// every other root (#221); the home root still fails loudly, so a broken
-    /// trash never reads as an empty one (#147).
-    fn list_roots(
-        &self,
-        roots: &[PathBuf],
-        pattern: Option<&str>,
-        entries: &mut Vec<TrashEntry>,
-    ) -> Result<(), TrashError> {
-        self.visit_roots(roots, pattern, &mut |entry, _| entries.push(entry))
-    }
-
-    /// Visit entries with the data metadata already needed for their identity.
-    /// Status can aggregate each snapshot immediately instead of retaining a
-    /// sorted listing and statting every entry for a second time.
-    fn visit_roots(
-        &self,
-        roots: &[PathBuf],
-        pattern: Option<&str>,
-        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
-    ) -> Result<(), TrashError> {
-        self.visit_roots_for_id(roots, pattern, None, ScanMetadata::MUTATION, visitor)
-            .map(|_| ())
-    }
-
-    /// A name-only prefilter still traverses every directory entry, preserving
-    /// scan errors, while exact selectors need only open their own sidecars.
-    fn visit_roots_for_id(
-        &self,
-        roots: &[PathBuf],
-        pattern: Option<&str>,
-        only_id: Option<&OsStr>,
-        metadata: ScanMetadata,
-        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
-    ) -> Result<Vec<(PathBuf, TrashError)>, TrashError> {
-        let mut parser = crate::trashinfo::TrashInfoParser::default();
-        let mut deferred_warnings: Vec<(PathBuf, TrashError)> = Vec::new();
-        for root in roots {
-            if let Err(e) =
-                self.visit_in_dir(root, pattern, only_id, metadata, &mut parser, visitor)
-            {
-                if *root == self.home {
-                    for (root, error) in deferred_warnings {
-                        Self::warn_unreadable_root(&root, error);
-                    }
-                    return Err(e);
-                }
-                if only_id.is_some() {
-                    // A missing exact ID falls back to a complete scan. Let
-                    // that scan report failures once, without duplicate
-                    // warnings from its preliminary name-only pass.
-                    deferred_warnings.push((root.clone(), e));
-                } else {
-                    Self::warn_unreadable_root(root, e);
-                }
-            }
-        }
-        Ok(deferred_warnings)
-    }
-
-    fn warn_unreadable_root(root: &Path, error: TrashError) {
-        eprintln!(
-            "trashd: warning: skipping unreadable trash {}: {error}",
-            root.display()
-        );
-    }
-
-    #[cfg(test)]
-    fn list_in_dir(
-        &self,
-        trash_dir: &Path,
-        pattern: Option<&str>,
-        entries: &mut Vec<TrashEntry>,
-    ) -> Result<(), TrashError> {
-        self.visit_in_dir(
-            trash_dir,
-            pattern,
-            None,
-            ScanMetadata::MUTATION,
-            &mut crate::trashinfo::TrashInfoParser::default(),
-            &mut |entry, _| entries.push(entry),
-        )
-    }
-
-    /// Visit items in a single trash directory.
-    fn visit_in_dir(
-        &self,
-        trash_dir: &Path,
-        pattern: Option<&str>,
-        only_id: Option<&OsStr>,
-        metadata: ScanMetadata,
-        parser: &mut crate::trashinfo::TrashInfoParser,
-        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
-    ) -> Result<(), TrashError> {
-        // Orphan detection below must compare against ids from THIS directory
-        // only: visitors may aggregate across all trash roots, so an
-        // orphaned files/<id> in root B would otherwise be hidden by a real
-        // entry with the same id in root A.
-        let info_dir = trash_dir.join("info");
-        let files_dir = trash_dir.join("files");
-
-        if !info_dir.exists() {
-            return Ok(());
-        }
-
-        // IDs with a readable sidecar, recorded BEFORE the pattern filter:
-        // orphan detection must know every real entry in this directory, or a
-        // filtered-out entry's own files/<id> would be re-synthesized as a
-        // fake "orphaned" copy of itself (#144).
-        let mut seen_ids = std::collections::HashSet::new();
-
-        for entry in fs::read_dir(&info_dir)? {
-            let entry = entry?;
-            let raw_filename = entry.file_name();
-            // Compare raw stems: a lossy ID can collapse distinct filenames,
-            // and even the unusual ".trashinfo" leaf has file_stem semantics
-            // that must agree with the full scan below.
-            if let Some(id) = only_id
-                && Path::new(&raw_filename).file_stem() != Some(id)
-            {
-                continue;
-            }
-            let filename = raw_filename.to_string_lossy().into_owned();
-            if !filename.ends_with(".trashinfo") {
-                continue;
-            }
-            // The on-disk stem in raw bytes: the String ID is lossy for
-            // non-UTF-8 names, and paths built from it point nowhere (#247).
-            let raw_stem = entry
-                .path()
-                .file_stem()
-                .map(|s| s.to_os_string())
-                .unwrap_or_default();
-
-            let id = filename
-                .strip_suffix(".trashinfo")
-                .unwrap_or(&filename)
-                .to_string();
-            #[cfg(test)]
-            self.sidecar_reads.set(self.sidecar_reads.get() + 1);
-            let (content, sidecar_metadata) =
-                match crate::trashinfo::read_sidecar_snapshot(&entry.path()) {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => continue,
-                };
-            let sidecar_version = Some(SidecarVersion::from_metadata(&sidecar_metadata));
-            // Confirm the path still names what was read. A display listing
-            // skips it: every mutation re-checks the version under the lock
-            // (#354).
-            if metadata.verify_sidecar && sidecar_version != self::sidecar_version(&entry.path()) {
-                continue;
-            }
-
-            let mut info = match parser.parse(&content) {
-                Some(i) => i,
-                None => continue,
-            };
-            seen_ids.insert(raw_stem.clone());
-
-            // Spec: topdir trash may store relative paths. Resolve to absolute
-            // using the topdir (parent of the trash directory).
-            if !info.original_path.is_absolute() {
-                let topdir = Self::topdir_for_trash(trash_dir);
-                info.original_path = topdir.join(&info.original_path);
-            }
-
-            // Apply pattern filter
-            if let Some(pat) = pattern {
-                let name = info
-                    .original_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if !simple_glob_match(pat, &name)
-                    && !simple_glob_match(pat, &info.original_path.to_string_lossy())
-                {
-                    continue;
-                }
-            }
-
-            let trashed_path = files_dir.join(&raw_stem);
-            let data_metadata = self.scanned_data_metadata(&trashed_path, metadata);
-            let identity = data_metadata
-                .as_ref()
-                .map(|metadata| (metadata.dev(), metadata.ino()));
-            visitor(
-                TrashEntry {
-                    identity,
-                    sidecar_version,
-                    id,
-                    info,
-                    trashed_path,
-                    info_path: entry.path(),
-                    trash_root: trash_dir.to_path_buf(),
-                    orphaned: false,
-                },
-                data_metadata,
-            );
-        }
-
-        // Spec: "If info file corresponding to file in $trash/files is unavailable,
-        // this is emergency case and MUST be presented as such."
-        // Scan files/ for entries without matching .trashinfo.
-        if files_dir.exists() {
-            let known_ids = seen_ids;
-            if let Ok(file_entries) = fs::read_dir(&files_dir) {
-                for fe in file_entries.flatten() {
-                    let raw_name = fe.file_name();
-                    if let Some(id) = only_id
-                        && raw_name != id
-                    {
-                        continue;
-                    }
-                    if !known_ids.contains(&raw_name) {
-                        let name = raw_name.to_string_lossy().into_owned();
-                        // Apply pattern filter to orphans too
-                        if let Some(pat) = pattern
-                            && !simple_glob_match(pat, &name)
-                        {
-                            continue;
-                        }
-                        // Real on-disk paths in raw bytes (#247).
-                        let trashed_path = fe.path();
-                        let mut raw_info_name = raw_name.clone();
-                        raw_info_name.push(".trashinfo");
-                        let info_path = info_dir.join(&raw_info_name);
-                        let data_metadata = self.scanned_data_metadata(&trashed_path, metadata);
-                        let identity = data_metadata
-                            .as_ref()
-                            .map(|metadata| (metadata.dev(), metadata.ino()));
-                        visitor(
-                            TrashEntry {
-                                identity,
-                                sidecar_version: sidecar_snapshot(&info_path),
-                                id: name.clone(),
-                                info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
-                                trashed_path,
-                                info_path,
-                                trash_root: trash_dir.to_path_buf(),
-                                orphaned: true,
-                            },
-                            data_metadata,
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Restore a trashed item by ID or pattern match to its original location.
     pub fn restore(
         &self,
@@ -1968,10 +1646,16 @@ impl TrashStore {
         Ok(())
     }
 
-    /// Empty the trash (across all partitions).
+    /// Empty the trash (across all partitions) and retry detached cleanup.
+    /// Return an error when any detached deletion job still cannot finish.
     pub fn empty(&self, max_age_days: Option<u32>) -> Result<u64, TrashError> {
         let selected = self.entries_older_than(max_age_days)?;
-        Ok(self.empty_entries(&selected, max_age_days))
+        let count = self.empty_entries(&selected, max_age_days);
+        let cleanup = self.cleanup_unfinished()?;
+        if cleanup.pending > 0 {
+            return Err(TrashError::CleanupPending(cleanup.pending));
+        }
+        Ok(count)
     }
 
     /// Entries at least `max_age_days` old (all entries for `None`).
@@ -2142,10 +1826,9 @@ impl TrashStore {
         let max_age = self.config.retention.max_age_days;
         let max_size_bytes = (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let pressure_pct = self.config.retention.disk_pressure_percent;
-        for root in roots {
-            let candidates = sweep_detached(root);
-            self.sweep_abandoned_stages(root, &candidates);
-        }
+        // Failure to finish earlier cleanup must not prevent retention of
+        // ordinary entries. Explicit cleanup reports these failures instead.
+        let _ = self.cleanup_unfinished_in_roots(roots);
 
         let mut entries = Vec::new();
         self.list_roots(roots, None, &mut entries)?;
@@ -2467,52 +2150,6 @@ impl TrashStore {
         result.map_err(TrashError::Io)
     }
 
-    /// Unpublished stages still have their original data. Claim abandoned
-    /// work under the root lock, then remove outside it. Cross-device copies
-    /// hold the root lock; announced data stages hold their own file locks.
-    /// Sample at most 32 candidates in the existing unlocked sweep, keeping
-    /// writer-lock work bounded and reaching stages behind live work over
-    /// later maintenance passes (#383, #388, #389).
-    fn claim_abandoned_stages(
-        &self,
-        root: &Path,
-        candidates: &[CString],
-    ) -> Option<(fs::File, Vec<CString>)> {
-        if candidates.is_empty() {
-            return None;
-        }
-        let uid = unsafe { libc::geteuid() };
-        self.ensure_trusted_parent_recent(root, uid).ok()?;
-        let guard = RootMutationGuard::try_acquire_as(root, uid).ok()??;
-        let state_dir = CString::new(root.join(".trashd").as_os_str().as_bytes()).ok()?;
-        let state = open_directory_at(libc::AT_FDCWD, &state_dir, true, false).ok()?;
-        let mut claimed = Vec::new();
-        for name in candidates.iter().take(STAGES_PER_SWEEP) {
-            if is_copy_stage(name) {
-                if let Ok(claim) = claim_copy_stage_at(state.as_raw_fd(), name) {
-                    claimed.push(claim);
-                }
-            } else if is_data_stage(name)
-                && let Ok(Some(stage)) = try_lock_data_stage_at(state.as_raw_fd(), name)
-                && let Ok(claim) = claim_data_stage_at(state.as_raw_fd(), name, &stage)
-            {
-                claimed.push(claim);
-            }
-        }
-        drop(guard);
-        Some((state, claimed))
-    }
-
-    fn sweep_abandoned_stages(&self, root: &Path, candidates: &[CString]) {
-        if let Some((state, claimed)) = self.claim_abandoned_stages(root, candidates) {
-            for name in claimed {
-                // Failed removals retain the purging- claim and are retried
-                // by the existing sweep; mount roots are never traversed.
-                let _ = remove_tree_at(state.as_raw_fd(), &name, 0);
-            }
-        }
-    }
-
     /// Retire the exact listed snapshot, never a newly resolved reused ID.
     pub fn purge_resolved(&self, entry: &TrashEntry) -> Result<(), TrashError> {
         self.purge_resolved_with_maintenance(entry, false)
@@ -2597,6 +2234,7 @@ impl TrashStore {
                 label: label.clone(),
                 total_size: 0,
                 count: 0,
+                pending_cleanup: self.pending_cleanup_in_root(dir)?,
             });
         }
 
@@ -2609,6 +2247,7 @@ impl TrashStore {
                     label: entry.trash_root.to_string_lossy().into_owned(),
                     total_size: 0,
                     count: 0,
+                    pending_cleanup: 0,
                 });
             ps.count += 1;
             // Use actual disk size (may be smaller than info.size after compression)
@@ -2702,297 +2341,6 @@ impl TrashStore {
     pub fn config(&self) -> &Config {
         &self.config
     }
-
-    /// The selector (trashed path) of the entry whose original file name is
-    /// exactly `raw`. IDs are built from lossy names, so a non-UTF-8 name
-    /// must never reach ID matching through a lossy conversion: it matched
-    /// another entry's ID exactly, and purge deleted the wrong file (#209).
-    pub fn selector_for_raw_name(&self, raw: &OsStr) -> Result<String, TrashError> {
-        let entries = self.list(None)?;
-        let matching: Vec<&TrashEntry> = entries
-            .iter()
-            .filter(|e| e.info.original_path.file_name() == Some(raw))
-            .collect();
-        let lossy = raw.to_string_lossy().into_owned();
-        match matching.as_slice() {
-            [entry] => entry
-                .trashed_path
-                .to_str()
-                .map(str::to_owned)
-                .ok_or(TrashError::EntryNotFound(lossy)),
-            [] => Err(TrashError::EntryNotFound(lossy)),
-            _ => Err(TrashError::AmbiguousMatch {
-                pattern: lossy,
-                count: matching.len(),
-            }),
-        }
-    }
-
-    /// Resolve a trash entry by exact ID (or filename fallback), refusing
-    /// ambiguity when the same ID exists in more than one trash root — the
-    /// same resolution rules restore/purge apply, so `trash info` can never
-    /// describe a different copy than the one restore would publish (#148).
-    pub fn find_entry(&self, id_or_pattern: &str) -> Result<TrashEntry, TrashError> {
-        let roots: Vec<PathBuf> = self
-            .all_trash_dirs()
-            .into_iter()
-            .map(|(dir, _)| dir)
-            .collect();
-        self.find_entry_in_roots(&roots, id_or_pattern)
-    }
-
-    /// Resolve a command's selector once, retaining the snapshots needed for
-    /// ambiguity output and mutation. Raw names never pass through lossy IDs.
-    /// With `every_copy`, exact IDs include every original-filename copy and
-    /// the glob fallback also matches complete original paths (restore --all).
-    pub fn select_entries(
-        &self,
-        selector: &OsStr,
-        every_copy: bool,
-    ) -> Result<Option<(MatchTier, Vec<TrashEntry>)>, TrashError> {
-        let roots: Vec<PathBuf> = self
-            .all_trash_dirs()
-            .into_iter()
-            .map(|(root, _)| root)
-            .collect();
-        if let Some(selector) = selector.to_str() {
-            return self.select_utf8_in_roots(&roots, selector, every_copy, every_copy);
-        }
-        let mut entries = Vec::new();
-        self.list_roots(&roots, None, &mut entries)?;
-        newest_first(&mut entries);
-        if Path::new(selector).is_absolute()
-            && let Some(entry) = entries
-                .iter()
-                .find(|entry| entry.trashed_path == Path::new(selector))
-        {
-            return Ok(Some((MatchTier::TrashedPath, vec![entry.clone()])));
-        }
-        entries.retain(|entry| entry.info.original_path.file_name() == Some(selector));
-        Ok((!entries.is_empty()).then_some((MatchTier::FileName, entries)))
-    }
-
-    fn find_entry_in_roots(
-        &self,
-        roots: &[PathBuf],
-        selector: &str,
-    ) -> Result<TrashEntry, TrashError> {
-        match self.select_utf8_in_roots(roots, selector, false, false)? {
-            Some((_, mut entries)) if entries.len() == 1 => Ok(entries.remove(0)),
-            Some((_, entries)) => Err(TrashError::AmbiguousMatch {
-                pattern: selector.into(),
-                count: entries.len(),
-            }),
-            None => Err(TrashError::EntryNotFound(selector.into())),
-        }
-    }
-
-    fn select_utf8_in_roots(
-        &self,
-        roots: &[PathBuf],
-        id_or_pattern: &str,
-        every_copy: bool,
-        original_path_glob: bool,
-    ) -> Result<Option<(MatchTier, Vec<TrashEntry>)>, TrashError> {
-        let selector = Path::new(id_or_pattern);
-        // Replacement characters may stand for multiple non-UTF-8 raw names.
-        // Filename/glob fallbacks also need the complete listing. Ordinary
-        // exact IDs and selectors within a known files/ directory can filter
-        // raw names before reading sidecars, without changing their snapshots.
-        let ordinary_leaf = |name: &str| {
-            !name.is_empty()
-                && name != "."
-                && name != ".."
-                && !name.contains(['/', '\0', '\u{fffd}', '*', '?', '[', ']'])
-        };
-        let only_id = if ordinary_leaf(id_or_pattern) {
-            Some(OsStr::new(id_or_pattern))
-        } else if selector.is_absolute()
-            && roots
-                .iter()
-                .any(|root| selector.parent() == Some(root.join("files").as_path()))
-        {
-            selector
-                .file_name()
-                .filter(|name| name.to_str().is_some_and(ordinary_leaf))
-        } else {
-            None
-        };
-
-        if let Some(id) = only_id.filter(|_| !every_copy) {
-            let mut entries = Vec::new();
-            let warnings = self.visit_roots_for_id(
-                roots,
-                None,
-                Some(id),
-                ScanMetadata::MUTATION,
-                &mut |entry, _| entries.push(entry),
-            )?;
-            let matched = if selector.is_absolute() {
-                entries.iter().any(|entry| entry.trashed_path == selector)
-            } else {
-                entries.iter().any(|entry| entry.id == id_or_pattern)
-            };
-            if matched {
-                for (root, error) in warnings {
-                    Self::warn_unreadable_root(&root, error);
-                }
-                newest_first(&mut entries);
-                return Ok(Self::selected_entries(entries, id_or_pattern, false, false));
-            }
-        }
-
-        let mut entries = Vec::new();
-        self.list_roots(roots, None, &mut entries)?;
-        newest_first(&mut entries);
-        Ok(Self::selected_entries(
-            entries,
-            id_or_pattern,
-            every_copy,
-            original_path_glob,
-        ))
-    }
-
-    #[cfg(test)]
-    fn resolve_listed_entry(
-        entries: &[TrashEntry],
-        id_or_pattern: &str,
-    ) -> Result<TrashEntry, TrashError> {
-        match Self::matching_tier(entries, id_or_pattern, false) {
-            Some((_, matches)) if matches.len() == 1 => Ok(matches[0].clone()),
-            Some((_, matches)) => Err(TrashError::AmbiguousMatch {
-                pattern: id_or_pattern.into(),
-                count: matches.len(),
-            }),
-            None => Err(TrashError::EntryNotFound(id_or_pattern.into())),
-        }
-    }
-
-    /// The entries a selector names, by the same tiers `find_entry` uses:
-    /// for reporting an ambiguous selector, and for acting on all of them.
-    /// Listing the selector as a glob instead named other entries whenever
-    /// an exact name contained glob syntax (`a[1].txt` -> `a1.txt`, #328).
-    pub fn matching_entries(
-        &self,
-        id_or_pattern: &str,
-    ) -> Result<Option<(MatchTier, Vec<TrashEntry>)>, TrashError> {
-        self.matching_entries_with(id_or_pattern, false)
-    }
-
-    /// The entries `--all` acts on: those of `matching_entries`, except that
-    /// an exact ID also selects every entry trashed under that file name
-    /// (`foo`, `foo.2`, `foo.3`). The ID tier alone restored one of three
-    /// copies that listing the name had selected (#340).
-    pub fn matching_entries_all(
-        &self,
-        id_or_pattern: &str,
-    ) -> Result<Option<(MatchTier, Vec<TrashEntry>)>, TrashError> {
-        self.matching_entries_with(id_or_pattern, true)
-    }
-
-    fn matching_entries_with(
-        &self,
-        id_or_pattern: &str,
-        every_copy: bool,
-    ) -> Result<Option<(MatchTier, Vec<TrashEntry>)>, TrashError> {
-        let roots: Vec<PathBuf> = self
-            .all_trash_dirs()
-            .into_iter()
-            .map(|(root, _)| root)
-            .collect();
-        self.select_utf8_in_roots(&roots, id_or_pattern, every_copy, false)
-    }
-
-    fn selected_entries(
-        entries: Vec<TrashEntry>,
-        selector: &str,
-        every_copy: bool,
-        original_path_glob: bool,
-    ) -> Option<(MatchTier, Vec<TrashEntry>)> {
-        let selected = Self::matching_tier(&entries, selector, every_copy);
-        if original_path_glob
-            && selected
-                .as_ref()
-                .is_none_or(|(tier, _)| *tier == MatchTier::Glob)
-        {
-            let matches = entries
-                .iter()
-                .filter(|entry| {
-                    let name = entry
-                        .info
-                        .original_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    if entry.orphaned {
-                        simple_glob_match(selector, &entry.id)
-                    } else {
-                        simple_glob_match(selector, &name)
-                            || simple_glob_match(
-                                selector,
-                                &entry.info.original_path.to_string_lossy(),
-                            )
-                    }
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            return (!matches.is_empty()).then_some((MatchTier::Glob, matches));
-        }
-        selected.map(|(tier, matches)| (tier, matches.into_iter().cloned().collect()))
-    }
-
-    /// The first selector tier with any match, and its matches. With
-    /// `every_copy`, an ID match also takes the file-name matches.
-    fn matching_tier<'a>(
-        entries: &'a [TrashEntry],
-        id_or_pattern: &str,
-        every_copy: bool,
-    ) -> Option<(MatchTier, Vec<&'a TrashEntry>)> {
-        // An entry's trashed path is unique even when two roots hold the
-        // same ID, so it selects exactly one entry (#210).
-        if id_or_pattern.starts_with('/')
-            && let Some(entry) = entries
-                .iter()
-                .find(|e| e.trashed_path == Path::new(id_or_pattern))
-        {
-            return Some((MatchTier::TrashedPath, vec![entry]));
-        }
-
-        // Exact ID match. IDs are unique WITHIN one trash dir, but two
-        // partitions can hold entries with the same ID (same filename trashed
-        // on two mounts); picking either nondeterministically could restore
-        // or purge the WRONG copy (#41). Distinct raw names can also share a
-        // lossy display ID inside one root: an ID must select exactly one
-        // entry before a restore or purge acts on it.
-        let file_name = |e: &TrashEntry| {
-            e.info
-                .original_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
-        if entries.iter().any(|e| e.id == id_or_pattern) {
-            let exact: Vec<&TrashEntry> = entries
-                .iter()
-                .filter(|e| e.id == id_or_pattern || (every_copy && file_name(e) == id_or_pattern))
-                .collect();
-            return Some((MatchTier::Id, exact));
-        }
-
-        let filename_matches: Vec<&TrashEntry> = entries
-            .iter()
-            .filter(|e| file_name(e) == id_or_pattern)
-            .collect();
-        if !filename_matches.is_empty() {
-            return Some((MatchTier::FileName, filename_matches));
-        }
-
-        let glob_matches: Vec<&TrashEntry> = entries
-            .iter()
-            .filter(|e| simple_glob_match(id_or_pattern, &file_name(e)))
-            .collect();
-        (!glob_matches.is_empty()).then_some((MatchTier::Glob, glob_matches))
-    }
 }
 
 /// How a selector matched entries (see `TrashStore::matching_entries`).
@@ -3004,28 +2352,15 @@ pub enum MatchTier {
     Glob,
 }
 
-/// Newest first. DeletionDate has one-second precision, so entries trashed
-/// within one second kept directory-listing (hash) order and `undo` picked an
-/// arbitrary one (#329). The recorded nanosecond deletion stamp orders them,
-/// or for older entries the sidecar's mtime from when it was published: the
-/// filesystem's coarse clock can tie those (#345).
-fn newest_first(entries: &mut [TrashEntry]) {
-    entries.sort_by_key(|entry| {
-        let stamp = entry.info.deletion_ns.map(i128::from).or_else(|| {
-            entry.sidecar_version.map(|version| {
-                i128::from(version.modified.0) * 1_000_000_000 + i128::from(version.modified.1)
-            })
-        });
-        std::cmp::Reverse((entry.info.deletion_date, stamp))
-    });
-}
-
 #[derive(Debug, Clone)]
 pub struct PartitionStatus {
     pub trash_dir: PathBuf,
     pub label: String,
     pub total_size: u64,
     pub count: usize,
+    /// Detached deletion jobs still occupying private state. Excluded from
+    /// ordinary item counts and sizes because they were already purged.
+    pub pending_cleanup: usize,
 }
 
 /// Atomically create a unique trashinfo file using O_CREAT|O_EXCL.
@@ -3962,11 +3297,6 @@ impl CacheRefresh {
     }
 }
 
-/// Prefix of trees detached for deletion inside a root's `.trashd/`.
-const DETACHED_PREFIX: &str = "purging-";
-const COPY_STAGE_PREFIX: &str = ".trashd-copy-";
-const STAGES_PER_SWEEP: usize = 32;
-
 /// Reserved data-stage names are visible only after their original file
 /// descriptor holds an exclusive lifetime lock (#389).
 pub const DATA_STAGE_PREFIX: &str = ".trashd-stage-v1-";
@@ -4000,194 +3330,6 @@ pub fn create_data_stage(root: &Path) -> io::Result<tempfile::NamedTempFile> {
         .map_err(|error| error.error)?;
     let path = tempfile::TempPath::try_from_path(announced)?;
     Ok(tempfile::NamedTempFile::from_parts(file, path))
-}
-
-fn is_data_stage(name: &CStr) -> bool {
-    name.to_bytes()
-        .strip_prefix(DATA_STAGE_PREFIX.as_bytes())
-        .is_some_and(|token| {
-            token.len() == DATA_STAGE_RANDOM_LEN && token.iter().all(u8::is_ascii_alphanumeric)
-        })
-}
-
-/// Opening read-only also handles preserved 0400 modes. Root may have
-/// restored another owner's metadata onto the stage; the private parent
-/// and announced-name protocol authorize cleanup, not the inode's owner.
-fn try_lock_data_stage_at(state: RawFd, name: &CStr) -> io::Result<Option<fs::File>> {
-    let before = stat_at(state, name, libc::AT_SYMLINK_NOFOLLOW)?;
-    if before.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Ok(None);
-    }
-    let descriptor = unsafe {
-        libc::openat(
-            state,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { fs::File::from_raw_fd(descriptor) };
-    if stat_identity(&stat_fd(descriptor)?) != stat_identity(&before) {
-        return Ok(None);
-    }
-    // A shared lock conflicts with the producer's exclusive lock and also
-    // works on read-only descriptors on NFS. Root guards serialize claims.
-    if unsafe { libc::flock(descriptor, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-        return if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
-            Ok(None)
-        } else {
-            Err(io::Error::last_os_error())
-        };
-    }
-    Ok(Some(file))
-}
-
-fn claim_data_stage_at(state: RawFd, name: &CStr, locked: &fs::File) -> io::Result<CString> {
-    let opened = stat_fd(locked.as_raw_fd())?;
-    let current = stat_at(state, name, libc::AT_SYMLINK_NOFOLLOW)?;
-    if opened.st_mode & libc::S_IFMT != libc::S_IFREG
-        || stat_identity(&opened) != stat_identity(&current)
-    {
-        return Err(io::Error::from_raw_os_error(libc::EBUSY));
-    }
-    claim_copy_stage_at(state, name)
-}
-
-fn is_copy_stage(name: &CStr) -> bool {
-    let Some(suffix) = name.to_bytes().strip_prefix(COPY_STAGE_PREFIX.as_bytes()) else {
-        return false;
-    };
-    let mut parts = suffix.split(|&byte| byte == b'-');
-    (0..3).all(|_| {
-        parts
-            .next()
-            .is_some_and(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
-    }) && parts.next().is_none()
-}
-
-/// Exclusive mkdir claims a private container even on filesystems without
-/// RENAME_NOREPLACE. Its data name is initially absent, so the rename cannot
-/// replace another stage or unrelated state. A crash leaves a purging-
-/// container that the normal detached sweep can finish.
-fn claim_copy_stage_at(state: RawFd, name: &CStr) -> io::Result<CString> {
-    for attempt in 0u32..64 {
-        let claim = CString::new(format!(
-            "{DETACHED_PREFIX}copy-{}-{}-{attempt}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.subsec_nanos())
-        ))?;
-        if unsafe { libc::mkdirat(state, claim.as_ptr(), 0o700) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
-                continue;
-            }
-            return Err(error);
-        }
-        let claimed = (|| {
-            let directory = open_directory_at(state, &claim, true, false)?;
-            if unsafe {
-                libc::renameat(
-                    state,
-                    name.as_ptr(),
-                    directory.as_raw_fd(),
-                    c"data".as_ptr(),
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        })();
-        if let Err(error) = claimed {
-            let _ = raw_unlinkat(state, &claim, libc::AT_REMOVEDIR);
-            return Err(error);
-        }
-        return Ok(claim);
-    }
-    Err(io::Error::from(io::ErrorKind::AlreadyExists))
-}
-
-/// Move a directory entry's data into its root's private state directory
-/// (same filesystem), returning that directory and the new name.
-fn detach_for_removal(entry: &TrashEntry) -> io::Result<(fs::File, CString)> {
-    let state_dir = CString::new(entry.trash_root.join(".trashd").as_os_str().as_bytes())?;
-    let state = open_directory_at(libc::AT_FDCWD, &state_dir, true, false)?;
-    let files_dir = CString::new(entry.trash_root.join("files").as_os_str().as_bytes())?;
-    let files = open_directory_at(libc::AT_FDCWD, &files_dir, true, true)?;
-    let data_name = CString::new(
-        entry
-            .trashed_path
-            .file_name()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
-            .as_bytes(),
-    )?;
-    for attempt in 0u32..64 {
-        let name = CString::new(format!(
-            "{DETACHED_PREFIX}{}-{}-{attempt}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.subsec_nanos())
-        ))?;
-        match rename_noreplace_at(files.as_raw_fd(), &data_name, state.as_raw_fd(), &name) {
-            Ok(()) => return Ok((state, name)),
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
-                // No RENAME_NOREPLACE here: delete in place, under the lock.
-                remove_tree_at(files.as_raw_fd(), &data_name, 0)?;
-                return Ok((state, CString::default()));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::from(io::ErrorKind::AlreadyExists))
-}
-
-/// Delete trees an earlier purge detached but could not finish. Reuse the
-/// full unlocked enumeration to sample bounded unpublished stages. A large
-/// stage pool is reclaimed across later passes, rather than in one pass.
-fn sweep_detached(root: &Path) -> Vec<CString> {
-    use std::hash::BuildHasher;
-    let selection = std::collections::hash_map::RandomState::new();
-    sweep_detached_prioritized(root, |name| selection.hash_one(name.to_bytes()))
-}
-
-fn sweep_detached_prioritized(root: &Path, priority: impl Fn(&CStr) -> u64) -> Vec<CString> {
-    let Ok(state_dir) = CString::new(root.join(".trashd").as_os_str().as_bytes()) else {
-        return Vec::new();
-    };
-    let Ok(state) = open_directory_at(libc::AT_FDCWD, &state_dir, true, false) else {
-        return Vec::new();
-    };
-    // Sample the full scan, keeping only 32 names. Always keeping the first
-    // 32 could hide abandoned stages behind long-lived locked ones forever.
-    let mut candidates: std::collections::BinaryHeap<(u64, CString)> =
-        std::collections::BinaryHeap::new();
-    let scanned = for_each_entry(state.as_raw_fd(), |name, _| {
-        if name.to_bytes().starts_with(DETACHED_PREFIX.as_bytes()) {
-            let _ = remove_tree_at(state.as_raw_fd(), name, 0);
-        } else if is_copy_stage(name) || is_data_stage(name) {
-            let rank = priority(name);
-            if candidates.len() < STAGES_PER_SWEEP {
-                candidates.push((rank, name.to_owned()));
-            } else if candidates
-                .peek()
-                .is_some_and(|(last, saved)| (rank, name) < (*last, saved.as_c_str()))
-            {
-                candidates.pop();
-                candidates.push((rank, name.to_owned()));
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    });
-    if scanned.is_err() {
-        return Vec::new();
-    }
-    candidates.into_iter().map(|(_, name)| name).collect()
 }
 
 const REMOVE_TREE_MAX_DEPTH: u32 = 4096;
@@ -5359,6 +4501,26 @@ fn copy_staged_at(
     staging_parent: RawFd,
     source: &libc::stat,
 ) -> io::Result<(u64, u64)> {
+    copy_staged_at_with_rename(
+        src_parent,
+        src_name,
+        dst_parent,
+        dst_name,
+        staging_parent,
+        source,
+        rename_noreplace_at,
+    )
+}
+
+fn copy_staged_at_with_rename(
+    src_parent: RawFd,
+    src_name: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    staging_parent: RawFd,
+    source: &libc::stat,
+    rename: impl FnOnce(RawFd, &CStr, RawFd, &CStr) -> io::Result<()>,
+) -> io::Result<(u64, u64)> {
     let (staging, identity) = (0u32..64)
         .find_map(|attempt| {
             let staging = CString::new(format!(
@@ -5390,8 +4552,13 @@ fn copy_staged_at(
             }
         })
         .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::AlreadyExists)))?;
-    let published = match rename_noreplace_at(staging_parent, &staging, dst_parent, dst_name) {
-        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
+    let published = match rename(staging_parent, &staging, dst_parent, dst_name) {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            ) =>
+        {
             publish_without_noreplace(staging_parent, &staging, dst_parent, dst_name, source)
         }
         result => result,
@@ -5403,9 +4570,9 @@ fn copy_staged_at(
     Ok(identity)
 }
 
-/// Publication where RENAME_NOREPLACE is unsupported: a hard link fails on
-/// an existing name; a directory, which cannot be linked, is renamed only
-/// onto a name that is still free.
+/// Publication where RENAME_NOREPLACE is unsupported: regular files can be
+/// linked exclusively. There is no equivalent directory operation: a plain
+/// rename could replace a competing empty directory after any absence check.
 fn publish_without_noreplace(
     staging_parent: RawFd,
     staging: &CStr,
@@ -5413,38 +4580,25 @@ fn publish_without_noreplace(
     dst_name: &CStr,
     source: &libc::stat,
 ) -> io::Result<()> {
-    if source.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        if unsafe {
-            libc::linkat(
-                staging_parent,
-                staging.as_ptr(),
-                dst_parent,
-                dst_name.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        return raw_unlinkat(staging_parent, staging, 0);
-    }
-    match stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW) {
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
-        Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
-        Err(error) => return Err(error),
+    if source.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot publish a directory without atomic no-replace support; source retained",
+        ));
     }
     if unsafe {
-        libc::renameat(
+        libc::linkat(
             staging_parent,
             staging.as_ptr(),
             dst_parent,
             dst_name.as_ptr(),
+            0,
         )
     } != 0
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    raw_unlinkat(staging_parent, staging, 0)
 }
 
 /// Cross-device/unsupported-rename publication. Every destination node is
@@ -7272,6 +6426,61 @@ mod tests {
     }
 
     #[test]
+    fn pending_cleanup_reads_tolerate_secondary_errors_but_preserve_home_errors() {
+        let (store, _data, work, _) = test_store();
+        fs::write(store.home.join("files/home-entry"), b"home bytes").unwrap();
+        fs::create_dir(store.home.join(".trashd/purging-interrupted")).unwrap();
+        let foreign = work.path().join("foreign-trash");
+        fs::create_dir_all(foreign.join("info")).unwrap();
+        fs::create_dir(foreign.join("files")).unwrap();
+        fs::write(foreign.join("files/foreign-entry"), b"foreign bytes").unwrap();
+        fs::write(foreign.join(".trashd"), b"malformed state directory").unwrap();
+        let roots = vec![
+            (store.home.clone(), "home".into()),
+            (foreign.clone(), "foreign".into()),
+        ];
+        let partitions = store.status_in_roots(&roots).unwrap();
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|partition| partition.count)
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|partition| partition.pending_cleanup)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(store.pending_cleanup().unwrap(), 1);
+        assert_eq!(store.pending_cleanup_in_root(&foreign).unwrap(), 0);
+        // Read-only tolerance must not conceal failures to perform cleanup.
+        assert!(
+            store
+                .cleanup_unfinished_in_roots(std::slice::from_ref(&foreign))
+                .is_err()
+        );
+        fs::rename(store.home.join(".trashd"), store.home.join("saved-state")).unwrap();
+        fs::write(
+            store.home.join(".trashd"),
+            b"malformed home state directory",
+        )
+        .unwrap();
+        assert!(store.status_in_roots(&roots).is_err());
+        assert!(store.pending_cleanup().is_err());
+        assert_eq!(
+            fs::read(store.home.join("files/home-entry")).unwrap(),
+            b"home bytes"
+        );
+        assert_eq!(
+            fs::read(foreign.join("files/foreign-entry")).unwrap(),
+            b"foreign bytes"
+        );
+    }
+
+    #[test]
     fn streaming_status_matches_list_accounting_for_mixed_home_and_foreign_entries() {
         use std::os::unix::fs::symlink;
         let (store, _data, work, _) = test_store();
@@ -7826,6 +7035,121 @@ mod tests {
                 restore_hash_mismatch_at(libc::AT_FDCWD, &source_name, expected),
                 None,
             );
+        }
+    }
+
+    // The absence check can become stale while a copy is staged. Simulate
+    // each unsupported atomic-rename result at the publication boundary and
+    // create a competing empty directory at exactly that point.
+    #[test]
+    fn unsupported_directory_publication_keeps_competitors_and_source() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+            for competing in [false, true] {
+                let (store, _data, work, _) = test_store();
+                let source = work.path().join("tree");
+                fs::create_dir(&source).unwrap();
+                fs::write(source.join("payload"), b"recoverable bytes").unwrap();
+                let id = store.trash(&source, None).unwrap();
+                let entry = store.find_entry(&id).unwrap();
+                let sidecar = fs::read(&entry.info_path).unwrap();
+                let destination = work.path().join("restored");
+                assert!(!destination.exists());
+                let source_parent = fs::File::open(store.home.join("files")).unwrap();
+                let source_name = CString::new(id).unwrap();
+                let before = stat_at(
+                    source_parent.as_raw_fd(),
+                    &source_name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+                .unwrap();
+                let destination_parent = fs::File::open(work.path()).unwrap();
+                let competitor = std::cell::Cell::new(None);
+                let result = copy_staged_at_with_rename(
+                    source_parent.as_raw_fd(),
+                    &source_name,
+                    destination_parent.as_raw_fd(),
+                    c"restored",
+                    destination_parent.as_raw_fd(),
+                    &before,
+                    |_, _, _, _| {
+                        assert!(!destination.exists());
+                        if competing {
+                            fs::create_dir(&destination).unwrap();
+                            fs::set_permissions(&destination, fs::Permissions::from_mode(0o711))
+                                .unwrap();
+                            let metadata = fs::metadata(&destination).unwrap();
+                            competitor.set(Some((metadata.ino(), metadata.mode())));
+                        }
+                        Err(io::Error::from_raw_os_error(errno))
+                    },
+                );
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                assert!(error.to_string().contains("atomic no-replace"));
+                assert_eq!(
+                    fs::metadata(&entry.trashed_path).unwrap().ino(),
+                    before.st_ino
+                );
+                assert_eq!(
+                    fs::read(entry.trashed_path.join("payload")).unwrap(),
+                    b"recoverable bytes"
+                );
+                assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+                if let Some((inode, mode)) = competitor.get() {
+                    let metadata = fs::metadata(&destination).unwrap();
+                    assert_eq!((metadata.ino(), metadata.mode()), (inode, mode));
+                    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+                } else {
+                    assert!(!destination.exists());
+                }
+                assert!(fs::read_dir(work.path()).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .as_bytes()
+                        .starts_with(COPY_STAGE_PREFIX.as_bytes())
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_regular_publication_keeps_exclusive_link_fallback() {
+        for competing in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            let destination = fixture.path().join("restored");
+            fs::write(&source, b"source bytes").unwrap();
+            let parent = fs::File::open(fixture.path()).unwrap();
+            let before = stat_at(parent.as_raw_fd(), c"source", libc::AT_SYMLINK_NOFOLLOW).unwrap();
+            let result = copy_staged_at_with_rename(
+                parent.as_raw_fd(),
+                c"source",
+                parent.as_raw_fd(),
+                c"restored",
+                parent.as_raw_fd(),
+                &before,
+                |_, _, _, _| {
+                    if competing {
+                        fs::write(&destination, b"competing bytes").unwrap();
+                    }
+                    Err(io::Error::from_raw_os_error(libc::ENOSYS))
+                },
+            );
+            assert_eq!(result.is_ok(), !competing);
+            if competing {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+            }
+            assert_eq!(fs::read(&source).unwrap(), b"source bytes");
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                if competing {
+                    b"competing bytes".as_slice()
+                } else {
+                    b"source bytes".as_slice()
+                }
+            );
+            assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 2);
         }
     }
 
@@ -10240,6 +9564,126 @@ mod tests {
         fs::create_dir_all(state.join("purging-stale/x")).unwrap();
         sweep_detached(store.home_dir());
         assert_eq!(leftovers(), 0);
+    }
+
+    #[test]
+    fn unfinished_cleanup_preserves_ordinary_entries_and_live_work() {
+        let (mut store, _data, work, _) = test_store();
+        let source = create_file(work.path(), "ordinary", "keep ordinary bytes");
+        let id = store.trash(&source, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        // Even ordinary entries eligible for retention stay outside cleanup.
+        let mut info = entry.info.clone();
+        info.deletion_date -= chrono::Duration::days(90);
+        fs::write(&entry.info_path, info.to_trashinfo_string()).unwrap();
+        let sidecar = fs::read(&entry.info_path).unwrap();
+        store.config.retention.max_age_days = 1;
+        let state = store.home.join(".trashd");
+        fs::create_dir_all(state.join("purging-interrupted/nested")).unwrap();
+        fs::write(
+            state.join("purging-interrupted/nested/payload"),
+            b"retired bytes",
+        )
+        .unwrap();
+        fs::write(state.join(".trashd-copy-123-456-0"), b"abandoned copy").unwrap();
+        let mut abandoned = create_data_stage(store.home_dir()).unwrap();
+        abandoned.write_all(b"abandoned encoding").unwrap();
+        let (file, path) = abandoned.into_parts();
+        let abandoned = path.keep().unwrap();
+        drop(file);
+        let live = create_data_stage(store.home_dir()).unwrap();
+        fs::write(state.join("unknown-state"), b"keep unknown bytes").unwrap();
+        let before = store.status_per_partition().unwrap();
+        assert_eq!(before[0].count, 1);
+        assert_eq!(before[0].pending_cleanup, 1);
+        assert!(
+            state.join("purging-interrupted/nested/payload").exists(),
+            "status mutated pending data"
+        );
+        let report = store.cleanup_unfinished().unwrap();
+        assert_eq!(
+            report,
+            CleanupReport {
+                removed: 3,
+                pending: 0
+            }
+        );
+        assert!(!abandoned.exists());
+        assert!(live.path().exists());
+        assert_eq!(
+            fs::read(state.join("unknown-state")).unwrap(),
+            b"keep unknown bytes"
+        );
+        assert_eq!(
+            fs::read(&entry.trashed_path).unwrap(),
+            b"keep ordinary bytes"
+        );
+        assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+        assert_eq!(store.status_per_partition().unwrap()[0].pending_cleanup, 0);
+    }
+
+    #[test]
+    fn empty_retries_unfinished_cleanup_without_selected_entries() {
+        let (store, _data, work, _) = test_store();
+        let fresh = create_file(work.path(), "fresh", "retain fresh bytes");
+        let id = store.trash(&fresh, None).unwrap();
+        let state = store.home.join(".trashd/purging-interrupted");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("payload"), b"retired bytes").unwrap();
+        assert_eq!(store.empty(Some(30)).unwrap(), 0);
+        assert!(!state.exists());
+        assert_eq!(
+            fs::read(store.find_entry(&id).unwrap().trashed_path).unwrap(),
+            b"retain fresh bytes"
+        );
+        store.purge(&id).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("payload"), b"more retired bytes").unwrap();
+        assert!(store.list(None).unwrap().is_empty());
+        assert_eq!(store.empty(None).unwrap(), 0);
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn unfinished_cleanup_reports_and_retries_busy_mounts() {
+        let outcome = mounts::in_private_mounts(
+            "store::tests::unfinished_cleanup_reports_and_retries_busy_mounts",
+            || {
+                let (store, _data, work, _) = test_store();
+                let pending = store.home.join(".trashd/purging-busy");
+                let mount = pending.join("mount");
+                fs::create_dir_all(&mount).unwrap();
+                let outside = work.path().join("outside");
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("KEEP"), b"external bytes").unwrap();
+                if !mount_at(Some(&outside), &mount) {
+                    return false;
+                }
+                let report = store.cleanup_unfinished().unwrap();
+                let status = store.status_per_partition().unwrap();
+                assert!(matches!(
+                    store.empty(None),
+                    Err(TrashError::CleanupPending(1))
+                ));
+                let preserved = fs::read(outside.join("KEEP")).unwrap() == b"external bytes";
+                unmount(&mount);
+                let retried = store.cleanup_unfinished().unwrap();
+                report
+                    == CleanupReport {
+                        removed: 0,
+                        pending: 1,
+                    }
+                    && status[0].pending_cleanup == 1
+                    && preserved
+                    && retried
+                        == CleanupReport {
+                            removed: 1,
+                            pending: 0,
+                        }
+                    && !pending.exists()
+            },
+        );
+        assert_ne!(outcome, Some(false));
     }
 
     #[test]

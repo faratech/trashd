@@ -183,12 +183,6 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
     let session = SessionAncestry::discover();
     store.defer_maintenance();
     signal_ready(ready_fd, true);
-    // Domains restricted before a previous supervisor died are relearned
-    // from the stable ancestor; local records cover this generation (#390).
-    // This fetch must follow the ready signal: the orchestrator does not
-    // serve broker requests until startup completes, so asking earlier
-    // deadlocks the supervisor against its own readiness.
-    let mut landlock = LandlockGate::new(crate::broker::landlock_records().unwrap_or_default());
 
     loop {
         // Block until a notification arrives
@@ -224,7 +218,6 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
                 own.ids(),
                 &credentials,
                 session.as_ref(),
-                &mut landlock,
             )
         }));
         if handled.is_err() {
@@ -256,8 +249,14 @@ fn handle_notification(
     own: &[(u64, u64)],
     credentials: &CredentialGate,
     session: Option<&SessionAncestry>,
-    landlock: &mut LandlockGate,
 ) {
+    // Record security transitions before validation or any fallible work.
+    // The same decline path serves watchdog recovery and passthrough modes.
+    if notif.data.nr == SYS_LANDLOCK_RESTRICT_SELF {
+        decline(fd, notif);
+        return;
+    }
+
     // Check if the notification is still valid BEFORE touching the target's
     // /proc state: if the target died and its PID was recycled, the reads
     // below must not inspect an unrelated process's memory or fds (#92).
@@ -270,21 +269,12 @@ fn handle_notification(
         return;
     }
 
-    // Sandbox setup is never blocked: record the domain the calling
-    // thread is about to enter, then let the kernel apply it (#390).
-    if notif.data.nr == SYS_LANDLOCK_RESTRICT_SELF {
-        landlock.note(notif.pid);
-        respond_continue(fd, notif.id);
-        return;
-    }
-
     // A target we will not lend our credentials to deletes with its own:
     // a deferring preload trashes the entry itself, anything else is left to
     // the kernel (#311, #349). A Landlock domain the supervisor does not
     // share is the same refusal: our rename would bypass the target's own
     // policy, so the deletion stays with the target's credentials (#390).
-    if !invalid_flags(notif) && (!credentials.lends_to(notif.pid) || landlock.restricts(notif.pid))
-    {
+    if !invalid_flags(notif) && (!credentials.lends_to(notif.pid) || crate::landlock::restricts()) {
         decline(fd, notif);
         return;
     }
@@ -363,13 +353,28 @@ fn invalid_flags(notif: &SeccompNotif) -> bool {
 
 /// A deletion the preload handed over (see `DEFER_MARK`).
 fn deferred_by_preload(notif: &SeccompNotif) -> bool {
-    notif.data.nr == libc::SYS_unlinkat as i32
-        && notif.data.args[3] == crate::seccomp_identity::DEFER_MARK
+    let deletion = notif.data.nr == libc::SYS_unlinkat as i32;
+    #[cfg(target_arch = "x86_64")]
+    let deletion = deletion
+        || notif.data.nr == libc::SYS_unlink as i32
+        || notif.data.nr == libc::SYS_rmdir as i32;
+    deletion && notif.data.args[3] == crate::seccomp_identity::DEFER_MARK
 }
 
 /// Leave a deletion to the target's own credentials: ENOSYS tells a
 /// deferring preload to trash it in-process; anything else the kernel runs.
 pub(crate) fn decline(fd: i32, notif: &SeccompNotif) {
+    if notif.data.nr == SYS_LANDLOCK_RESTRICT_SELF {
+        // Acknowledge the shared tracking update before the kernel may apply
+        // the restriction. Missing state must never silently allow setup.
+        match crate::landlock::note_restriction() {
+            Ok(()) => respond_continue(fd, notif.id),
+            Err(_) => {
+                let _ = respond_errno(fd, notif.id, libc::EPERM);
+            }
+        }
+        return;
+    }
     if deferred_by_preload(notif) {
         let _ = respond_errno(fd, notif.id, libc::ENOSYS);
     } else {
@@ -491,93 +496,6 @@ impl CredentialGate {
 
 /// landlock_restrict_self on x86_64 and aarch64.
 const SYS_LANDLOCK_RESTRICT_SELF: i32 = 446;
-
-/// Threads that entered a Landlock domain the supervisor does not share.
-///
-/// Landlock gives a supervisor no way to list another thread's domains,
-/// so the filter traps landlock_restrict_self itself: every domain a
-/// target adds after startup is recorded here (and with the stable
-/// ancestor, for replacement supervisors) before the kernel applies it.
-/// Domains inherited at session start are shared with the supervisor,
-/// whose renames the kernel checks against them already. A recorded
-/// restriction declines the delete to the target's own credentials —
-/// the preload then trashes in-process under the same domain, and any
-/// other caller's kernel check (including its refusal) runs natively.
-pub(crate) struct LandlockGate {
-    /// (tid, tgid) pairs that restricted themselves.
-    recorded: Vec<(u32, u32)>,
-}
-
-impl LandlockGate {
-    fn new(recorded: Vec<(u32, u32)>) -> Self {
-        Self { recorded }
-    }
-
-    fn note(&mut self, tid: u32) {
-        let tgid = thread_group(tid).unwrap_or(tid);
-        if !self.recorded.contains(&(tid, tgid)) {
-            self.recorded.push((tid, tgid));
-        }
-        let _ = crate::broker::record_landlock(tid, tgid);
-    }
-
-    fn restricts(&self, tid: u32) -> bool {
-        // Sessions that never sandbox pay no /proc reads for this gate.
-        if self.recorded.is_empty() {
-            return false;
-        }
-        if self.recorded.iter().any(|&(recorded, _)| recorded == tid) {
-            return true;
-        }
-        // Kernels exposing a thread's domain answer directly; this also
-        // covers domains inherited from an ancestor that has since exited.
-        if attr_restricted(tid) {
-            return true;
-        }
-        let restricted_groups: Vec<u32> = self.recorded.iter().map(|&(_, tgid)| tgid).collect();
-        if let Some(tgid) = thread_group(tid)
-            && restricted_groups.contains(&tgid)
-        {
-            return true;
-        }
-        // A process forked by a restricted thread inherits its domain.
-        // Walk parents while they live; the attr check above covers the
-        // orphaned case on kernels that expose it.
-        let mut current = tid;
-        for _ in 0..BYPASS_DEPTH {
-            let Some((_, parent)) = trashd_common::proc_stat::comm_and_parent(current) else {
-                return false;
-            };
-            if parent <= 1 {
-                return false;
-            }
-            if restricted_groups.contains(&parent) {
-                return true;
-            }
-            current = parent;
-        }
-        false
-    }
-}
-
-/// Thread group of a task from `/proc/<tid>/status`.
-fn thread_group(tid: u32) -> Option<u32> {
-    read_proc_text(&format!("/proc/{tid}/status"))?
-        .lines()
-        .find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok())
-}
-
-/// Whether `/proc/<tid>/attr/landlock/domain` reports a domain. Absent
-/// files and the explicit `none` both mean no domain is visible.
-fn attr_restricted(tid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{tid}/attr/landlock/domain"))
-        .is_ok_and(|content| domain_attr_restricted(&content))
-}
-
-fn domain_attr_restricted(content: &str) -> bool {
-    let content = content.trim();
-    !content.is_empty() && content != "none"
-}
 
 /// A small /proc text file, decoded lossily: status prints `Name:` as raw
 /// bytes the kernel may cut mid-character, which failed a strict UTF-8 read
@@ -838,28 +756,6 @@ fn run_passthrough(fd: i32) -> io::Result<()> {
 pub(crate) mod tests {
     use super::*;
 
-    // #390: only threads recorded at restrict time (or reporting a
-    // domain through the kernel attr) lose supervisor credentials.
-    #[test]
-    fn landlock_gate_records_restricted_threads() {
-        assert!(!domain_attr_restricted(""));
-        assert!(!domain_attr_restricted("  none\n"));
-        assert!(domain_attr_restricted("17179869184\n"));
-
-        let gate = LandlockGate::new(vec![]);
-        assert!(!gate.restricts(std::process::id()));
-
-        let gate = LandlockGate::new(vec![(424_242, 424_242)]);
-        assert!(gate.restricts(424_242), "the restricting thread itself");
-        assert!(!gate.restricts(u32::MAX - 1), "a task that does not exist");
-
-        // This test process is in nobody's recorded group, and reading
-        // its thread group must agree with getpid for the main thread.
-        let gate = LandlockGate::new(vec![(424_242, 424_242)]);
-        assert!(!gate.restricts(std::process::id()));
-        assert_eq!(thread_group(std::process::id()), Some(std::process::id()));
-    }
-
     #[test]
     fn credentials_parse_filesystem_ids_groups_and_capabilities() {
         let status = "Name:\tsh\nUid:\t1000\t1000\t1000\t1001\nGid:\t100\t100\t100\t102\n\
@@ -895,10 +791,10 @@ pub(crate) mod tests {
         );
     }
 
-    // #349: only an unlinkat carrying the preload's mark is answered ENOSYS
+    // #349: only a deletion carrying the preload's mark is answered ENOSYS
     // when declined; unmarked callers (static binaries) get CONTINUE.
     #[test]
-    fn only_marked_unlinkat_is_a_preload_deferral() {
+    fn only_marked_deletions_are_preload_deferrals() {
         let notif = |nr: libc::c_long, flags: u64, mark: u64| SeccompNotif {
             id: 1,
             pid: 1,
@@ -924,6 +820,12 @@ pub(crate) mod tests {
             mark ^ 1
         )));
         assert!(!deferred_by_preload(&notif(libc::SYS_getpid, 0, mark)));
+        #[cfg(target_arch = "x86_64")]
+        for syscall in [libc::SYS_unlink, libc::SYS_rmdir] {
+            assert!(deferred_by_preload(&notif(syscall, 0, mark)));
+            assert!(!deferred_by_preload(&notif(syscall, 0, 0)));
+            assert!(!deferred_by_preload(&notif(syscall, 0, mark ^ 1)));
+        }
         assert!(invalid_flags(&notif(libc::SYS_unlinkat, 1024, mark)));
         assert!(!invalid_flags(&notif(
             libc::SYS_unlinkat,

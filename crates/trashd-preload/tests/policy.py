@@ -428,28 +428,32 @@ def run():
         # lend its credentials to, or a listener gone) answers ENOSYS; the
         # preload then trashes in-process instead of leaving the kernel to
         # delete (#349). A plain filter stands in for the supervisor: it
-        # proves the cookie and answers marked unlinkat calls.
+        # proves the cookie and answers marked deletion calls.
         import ctypes
         from seccomp_regression import Instruction, Program, LIBC, SYSCALL_SECCOMP
         cookie = [0x01234567, 0x89abcdef, 0x0badf00d, 0x5eedcafe]
         mark = 0x7472_6173_6864_6d6b  # seccomp_identity::DEFER_MARK
         unlinkat_nr = {"x86_64": 263, "aarch64": 35}[os.uname().machine]
         getpid_nr = {"x86_64": 39, "aarch64": 172}[os.uname().machine]
-        def supervisor_answering(error):
+        def supervisor_answering(error, proof_errno=4092, native_deletions=True):
             def install():
                 allow, answer = 0x7FFF0000, 0x00050000 | error
                 program = [Instruction(0x20, 0, 0, 0)]  # nr
                 proof = [Instruction(0x20, 0, 0, 16 + 8 * i) for i in range(4)]
-                # getpid(cookie...) -> PROOF_ERRNO (4093)
+                # getpid(cookie...) -> versioned PROOF_ERRNO (4092)
                 program += [Instruction(0x15, 0, 9, getpid_nr)]
                 for i, word in enumerate(cookie):
                     program += [proof[i], Instruction(0x15, 0, 7 - 2 * i, word)]
-                program += [Instruction(0x06, 0, 0, 0x00050000 | 4093)]
-                # unlinkat(.., .., .., DEFER_MARK) -> error
-                program += [Instruction(0x20, 0, 0, 0), Instruction(0x15, 0, 5, unlinkat_nr),
-                            Instruction(0x20, 0, 0, 40), Instruction(0x15, 0, 3, mark & 0xFFFFFFFF),
-                            Instruction(0x20, 0, 0, 44), Instruction(0x15, 0, 1, mark >> 32),
-                            Instruction(0x06, 0, 0, answer), Instruction(0x06, 0, 0, allow)]
+                program += [Instruction(0x06, 0, 0, 0x00050000 | proof_errno)]
+                # The fourth argument marks all native deletion families.
+                deletion_nrs = [unlinkat_nr]
+                if native_deletions and os.uname().machine == "x86_64": deletion_nrs += [87, 84]
+                for nr in deletion_nrs:
+                    program += [Instruction(0x20, 0, 0, 0), Instruction(0x15, 0, 5, nr),
+                                Instruction(0x20, 0, 0, 40), Instruction(0x15, 0, 3, mark & 0xFFFFFFFF),
+                                Instruction(0x20, 0, 0, 44), Instruction(0x15, 0, 1, mark >> 32),
+                                Instruction(0x06, 0, 0, answer)]
+                program += [Instruction(0x06, 0, 0, allow)]
                 instructions = (Instruction * len(program))(*program)
                 filt = Program(len(program), instructions)
                 if LIBC.prctl(38, 1, 0, 0, 0) or LIBC.syscall(SYSCALL_SECCOMP, 1, 0, ctypes.byref(filt)):
@@ -459,12 +463,15 @@ def run():
             fixture, data, environment = focused_fixture(f"declined-{error}")
             environment["TRASHD_SECCOMP_ACTIVE"] = "1"
             environment["TRASHD_SECCOMP_COOKIE"] = "".join(f"{w:08x}" for w in cookie)
-            for mode in ["unlink", "remove", "rmdir"]:
+            for mode in ["unlink", "remove", "rmdir", "unlinkat", "unlinkat-dir"]:
                 victim = fixture / f"victim-{mode}"
-                if mode == "rmdir": victim.mkdir()
+                if mode in ["rmdir", "unlinkat-dir"]: victim.mkdir()
                 else: victim.write_bytes(b"recoverable")
+                invocation = (f"c.unlinkat(-100,path,{512 if mode == 'unlinkat-dir' else 0})"
+                              if mode.startswith("unlinkat") else f"c.{mode}(path)")
                 code = ("import ctypes,os,sys\nc=ctypes.CDLL(None,use_errno=True)\n"
-                        f"r=c.{mode}(ctypes.c_char_p(os.fsencode(sys.argv[1])))\n"
+                        "path=ctypes.c_char_p(os.fsencode(sys.argv[1]))\n"
+                        f"r={invocation}\n"
                         "print(r, ctypes.get_errno())")
                 result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
                     capture_output=True, text=True, preexec_fn=supervisor_answering(error), timeout=10)
@@ -477,6 +484,66 @@ def run():
                     assert result.stdout.split() == ["-1", str(errno.EACCES)], (mode, result.stdout)
                     assert os.path.lexists(victim) and not records, mode
         print("PASS: a declined deferral is trashed in-process; a supervisor's error is returned")
+
+        # A still-running older supervisor proves errno 4093 and recognizes
+        # only marked unlinkat. New preload must reject that protocol, keeping
+        # protection in-process instead of letting its native unlink/rmdir
+        # deferrals run as permanent deletions through the old decline path.
+        for mode in ["unlink", "rmdir", "remove"]:
+            fixture, data, environment = focused_fixture("legacy-proof-" + mode)
+            environment["TRASHD_SECCOMP_ACTIVE"] = "1"
+            environment["TRASHD_SECCOMP_COOKIE"] = "".join(f"{w:08x}" for w in cookie)
+            victim = fixture / "victim"
+            if mode == "rmdir": victim.mkdir()
+            else: victim.write_bytes(b"recoverable with an older supervisor")
+            code = ("import ctypes,errno,os,sys\nc=ctypes.CDLL(None,use_errno=True)\n"
+                    "ctypes.set_errno(errno.EDOM)\n"
+                    f"assert c.{mode}(ctypes.c_char_p(os.fsencode(sys.argv[1])))==0, ctypes.get_errno()\n"
+                    "assert ctypes.get_errno()==errno.EDOM\n")
+            result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
+                capture_output=True, preexec_fn=supervisor_answering(errno.EACCES, 4093, False), timeout=10)
+            assert result.returncode == 0 and not victim.exists(), (mode, result.stderr)
+            records = list((data / "Trash/info").glob("*.trashinfo"))
+            assert len(records) == 1, (mode, records)
+            stored = data / "Trash/files" / records[0].stem
+            assert stored.is_dir() if mode == "rmdir" else stored.read_bytes() == b"recoverable with an older supervisor"
+        print("PASS: older supervisor proof keeps new preload protection in-process")
+
+        # With active cookie proof, preserve the same native syscalls libc
+        # needs. Both ERRNO and KILL take precedence over USER_NOTIF: even
+        # attempting the alternative syscall can break the application.
+        if os.uname().machine == "x86_64":
+            for action in [0x00050000 | errno.EACCES, 0x80000000]:
+                def deny_unlinkat():
+                    supervisor_answering(errno.ENOSYS)()
+                    program = (Instruction * 4)(
+                        Instruction(0x20, 0, 0, 0), Instruction(0x15, 0, 1, unlinkat_nr),
+                        Instruction(0x06, 0, 0, action), Instruction(0x06, 0, 0, 0x7FFF0000))
+                    filt = Program(4, program)
+                    if LIBC.syscall(SYSCALL_SECCOMP, 1, 0, ctypes.byref(filt)):
+                        raise RuntimeError("cannot install the application's unlinkat denial")
+                for mode, directory in [("unlink", False), ("rmdir", True),
+                                        ("remove", False), ("remove", True)]:
+                    fixture, data, environment = focused_fixture(f"active-native-{action}-{mode}-{directory}")
+                    environment["TRASHD_SECCOMP_ACTIVE"] = "1"
+                    environment["TRASHD_SECCOMP_COOKIE"] = "".join(f"{w:08x}" for w in cookie)
+                    victim = fixture / "victim"
+                    if directory: victim.mkdir()
+                    else: victim.write_bytes(b"recoverable under original syscall policy")
+                    code = ("import ctypes,errno,os,sys\nc=ctypes.CDLL(None,use_errno=True)\n"
+                            f"call=c.{mode}; path=ctypes.c_char_p(os.fsencode(sys.argv[1]))\n"
+                            "ctypes.set_errno(errno.EDOM)\n"
+                            "assert call(path)==0, ctypes.get_errno()\n"
+                            "assert ctypes.get_errno()==errno.EDOM\n"
+                            "assert call(path)==-1 and ctypes.get_errno()==errno.ENOENT\n")
+                    result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)],
+                        env=environment, capture_output=True, preexec_fn=deny_unlinkat, timeout=10)
+                    assert result.returncode == 0 and not victim.exists(), (mode, directory, result.stderr)
+                    records = list((data / "Trash/info").glob("*.trashinfo"))
+                    assert len(records) == 1, records
+                    stored = data / "Trash/files" / records[0].stem
+                    assert stored.is_dir() if directory else stored.read_bytes() == b"recoverable under original syscall policy"
+            print("PASS: active supervision preserves x86 unlink/rmdir/remove with unlinkat denied or killed")
 
         # The preload runs inside every process, including those under
         # seccomp allowlists that kill syscalls newer than they know: it must

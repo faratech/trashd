@@ -141,6 +141,53 @@ else
 fi
 
 # -----------------------------------------------------------------------
+# Interrupted purge cleanup runs even when age selection is empty. Dry-run
+# and status remain read-only, and fresh ordinary entries keep their data.
+# -----------------------------------------------------------------------
+echo "retain fresh" > /home/test/trashd_it_cleanup_fresh.txt
+rm /home/test/trashd_it_cleanup_fresh.txt
+STATE="$XDG_DATA_HOME/Trash/.trashd"
+mkdir -p "$STATE/purging-interrupted/nested"
+echo "already purged" > "$STATE/purging-interrupted/nested/payload"
+OUTPUT=$(trash status 2>&1)
+DRY_OUTPUT=$(trash empty --older 30d --dry-run -y 2>&1)
+if [[ "$OUTPUT" == *"Pending cleanup: 1 deletion jobs"* ]] && [[ "$DRY_OUTPUT" == *"1 unfinished deletion jobs would be retried"* ]] && [[ -f "$STATE/purging-interrupted/nested/payload" ]]; then
+    pass "Pending cleanup status and dry-run preserve data"
+else
+    fail "Pending cleanup status and dry-run preserve data" "got: $OUTPUT"
+fi
+trash empty --older 30d -y >/dev/null 2>&1
+if [[ ! -e "$STATE/purging-interrupted" ]] && trash ls 2>&1 | grep -q trashd_it_cleanup_fresh; then
+    pass "Age-filtered empty retries cleanup without selecting fresh entries"
+else
+    fail "Age-filtered empty retries cleanup without selecting fresh entries" "cleanup residue or missing fresh entry"
+fi
+trash empty -y >/dev/null 2>&1
+mkdir -p "$STATE/purging-no-entries/nested"
+echo "already purged" > "$STATE/purging-no-entries/nested/payload"
+trash empty --older 30d -y >/dev/null 2>&1
+if [[ ! -e "$STATE/purging-no-entries" ]]; then
+    pass "Empty trash retries unfinished purges"
+else
+    fail "Empty trash retries unfinished purges" "detached data remains"
+fi
+
+# A failed physical cleanup remains visible and fails the scheduled command.
+mkdir -p "$STATE/purging-busy/mount" /work/cleanup-outside
+echo "external bytes" > /work/cleanup-outside/KEEP
+mount --bind /work/cleanup-outside "$STATE/purging-busy/mount"
+CLEANUP_STATUS=0
+trash empty --older 30d -y >/work/cleanup-busy.log 2>&1 || CLEANUP_STATUS=$?
+OUTPUT=$(trash status 2>&1)
+if [[ $CLEANUP_STATUS -ne 0 ]] && [[ "$OUTPUT" == *"Pending cleanup: 1 deletion jobs"* ]] && [[ "$(cat /work/cleanup-outside/KEEP)" == "external bytes" ]]; then
+    pass "Failed cleanup remains visible and returns failure"
+else
+    fail "Failed cleanup remains visible and returns failure" "status $CLEANUP_STATUS: $OUTPUT"
+fi
+umount "$STATE/purging-busy/mount"
+trash empty --older 30d -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
 # .git/* pattern (infix glob)
 # -----------------------------------------------------------------------
 mkdir -p /home/test/trashd_it_repo/.git/objects

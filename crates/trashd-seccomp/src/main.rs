@@ -25,6 +25,7 @@ macro_rules! report {
 
 mod broker;
 mod filter;
+mod landlock;
 mod mem;
 mod pin;
 #[path = "../../trashd-common/src/seccomp_identity.rs"]
@@ -277,6 +278,10 @@ fn run(
     let (broker_server, broker_client) = UnixDatagram::pair()?;
     let (ready_server, ready_client) = UnixDatagram::pair()?;
     ready_server.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+
+    // Keep permission tracking outside the target address space, shared by
+    // every worker generation before the target can start restricting itself.
+    landlock::initialize()?;
 
     // fork duplicates the listener reference; the parent drops its copy
     // once the watchdog has started the supervisor.

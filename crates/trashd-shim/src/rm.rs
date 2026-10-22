@@ -351,6 +351,7 @@ fn main() -> ExitCode {
                 command: &cmd_str,
                 notification: &mut notification,
                 failures: 0,
+                budget: PlanBudget::new(),
             };
             if !walk.remove(file) {
                 exit_code = ExitCode::FAILURE;
@@ -656,7 +657,7 @@ enum Walked {
     /// A descended directory, pinned by its descriptor, with the decisions
     /// for the entries it held.
     Dir {
-        dir: std::fs::File,
+        dir: PlannedDir,
         entries: Vec<Planned>,
         state: DirState,
     },
@@ -697,6 +698,96 @@ struct Planned {
     decision: Walked,
 }
 
+/// A directory inode pinned until its confirmations are applied or dropped.
+/// Sharing the live count with the budget refunds pins for declined subtrees.
+struct PlannedDir {
+    file: std::fs::File,
+    pins: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl std::ops::Deref for PlannedDir {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl Drop for PlannedDir {
+    fn drop(&mut self) {
+        self.pins.set(self.pins.get() - 1);
+    }
+}
+
+/// Bound a single operand's pending confirmations. Refuse the whole operand
+/// before mutation if a limit is reached, preserving both its answers and
+/// the pinned directory identities even under a low descriptor limit.
+struct PlanBudget {
+    bytes_left: usize,
+    max_pins: usize,
+    pins: std::rc::Rc<std::cell::Cell<usize>>,
+    exhausted: bool,
+}
+
+impl PlanBudget {
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_DEPTH: usize = 128;
+    const MAX_PINS: usize = 256;
+
+    fn new() -> Self {
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // The filesystem-boundary survey holds a directory and listing per
+        // traversal level in addition to retained plan pins. Reserve both,
+        // plus room for the store, diagnostics, and operand parent handle.
+        let max_pins = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            let open = std::fs::read_dir("/proc/self/fd")
+                .map(|listing| listing.count())
+                .unwrap_or(16);
+            ((limit.rlim_cur as usize).saturating_sub(open + 16) / 3).min(Self::MAX_PINS)
+        } else {
+            16
+        };
+        Self {
+            bytes_left: Self::MAX_BYTES,
+            max_pins,
+            pins: std::rc::Rc::new(std::cell::Cell::new(0)),
+            exhausted: false,
+        }
+    }
+
+    fn reserve(&mut self, name: &std::ffi::OsStr) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        // Include spare Vec capacity and the temporary listing of names,
+        // which overlaps the growing plan while children are traversed.
+        let bytes = 2
+            * (std::mem::size_of::<Planned>()
+                + std::mem::size_of::<std::ffi::OsString>()
+                + name.as_bytes().len());
+        match self.bytes_left.checked_sub(bytes) {
+            Some(left) => {
+                self.bytes_left = left;
+                true
+            }
+            None => {
+                self.exhausted = true;
+                false
+            }
+        }
+    }
+
+    fn pin(&mut self, file: std::fs::File) -> Option<PlannedDir> {
+        if self.pins.get() >= self.max_pins {
+            self.exhausted = true;
+            return None;
+        }
+        self.pins.set(self.pins.get() + 1);
+        Some(PlannedDir {
+            file,
+            pins: self.pins.clone(),
+        })
+    }
+}
+
 /// Remove a directory operand entry by entry: confined to `device` when
 /// given (--one-file-system), and confirming each entry under -i. Every
 /// answer is collected before anything moves, so each fully confirmed
@@ -719,6 +810,7 @@ struct Walk<'a> {
     /// Errors reported so far. Like rm, a directory with one below it
     /// stays without another message (#363, #368).
     failures: usize,
+    budget: PlanBudget,
 }
 
 /// What trashing an entry came to.
@@ -737,7 +829,10 @@ impl Walk<'_> {
     /// Returns whether every entry was handled without error.
     fn remove(mut self, path: &std::path::Path) -> bool {
         use std::os::fd::AsRawFd;
-        let (decision, identity) = self.plan(path, path, true);
+        let (decision, identity) = self.plan(path, path, true, 0);
+        if self.budget.exhausted {
+            return false;
+        }
         if matches!(decision, Walked::Kept | Walked::Held | Walked::Gone) {
             return self.failures == 0;
         }
@@ -794,6 +889,26 @@ impl Walk<'_> {
         Walked::Held
     }
 
+    fn open_plan_dir(
+        &mut self,
+        access: &std::path::Path,
+        display: &std::path::Path,
+    ) -> Option<PlannedDir> {
+        match open_walk_dir(access) {
+            Ok(file) => match self.budget.pin(file) {
+                Some(dir) => Some(dir),
+                None => {
+                    self.report(display, "confirmation plan exceeds file descriptor budget");
+                    None
+                }
+            },
+            Err(e) => {
+                self.report(display, e);
+                None
+            }
+        }
+    }
+
     /// Plan the removal of `access`, which is the walk's `operand` itself
     /// or an entry below it.
     fn plan(
@@ -801,6 +916,7 @@ impl Walk<'_> {
         access: &std::path::Path,
         display: &std::path::Path,
         operand: bool,
+        depth: usize,
     ) -> (Walked, (u64, u64)) {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
@@ -840,8 +956,8 @@ impl Walk<'_> {
                 (true, true) if mount => (Walked::Busy, identity),
                 // Not a mount (a btrfs subvolume): removed if it is still
                 // empty when carried out (#361).
-                (true, true) => match open_walk_dir(access) {
-                    Ok(dir) => (
+                (true, true) => match self.open_plan_dir(access, display) {
+                    Some(dir) => (
                         Walked::Dir {
                             dir,
                             entries: Vec::new(),
@@ -849,10 +965,7 @@ impl Walk<'_> {
                         },
                         identity,
                     ),
-                    Err(e) => {
-                        self.report(display, e);
-                        (Walked::Held, identity)
-                    }
+                    None => (Walked::Held, identity),
                 },
                 (true, false) => (self.skip_device(display), identity),
             };
@@ -921,12 +1034,16 @@ impl Walk<'_> {
             return (decision, identity);
         }
 
-        let dir = match open_walk_dir(access) {
-            Ok(dir) => dir,
-            Err(e) => {
-                self.report(display, e);
-                return (Walked::Held, identity);
-            }
+        if depth >= PlanBudget::MAX_DEPTH {
+            self.budget.exhausted = true;
+            self.report(
+                display,
+                "confirmation plan exceeds directory depth or file descriptor budget",
+            );
+            return (Walked::Held, identity);
+        }
+        let Some(dir) = self.open_plan_dir(access, display) else {
+            return (Walked::Held, identity);
         };
         match dir.metadata() {
             Ok(meta) if (meta.dev(), meta.ino()) != identity => {
@@ -940,15 +1057,28 @@ impl Walk<'_> {
             }
         }
         let pinned = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
-        let names: Vec<std::ffi::OsString> = match std::fs::read_dir(&pinned)
-            .and_then(|listing| listing.map(|entry| entry.map(|e| e.file_name())).collect())
-        {
-            Ok(names) => names,
+        let listing = match std::fs::read_dir(&pinned) {
+            Ok(listing) => listing,
             Err(e) => {
                 self.report(display, e);
                 return (Walked::Held, identity);
             }
         };
+        let mut names = Vec::new();
+        for entry in listing {
+            let name = match entry {
+                Ok(entry) => entry.file_name(),
+                Err(e) => {
+                    self.report(display, e);
+                    return (Walked::Held, identity);
+                }
+            };
+            if !self.budget.reserve(&name) {
+                self.report(display, "confirmation plan exceeds 32 MiB memory budget");
+                return (Walked::Held, identity);
+            }
+            names.push(name);
+        }
         // rm asks to descend only into a directory that has entries.
         if interactive
             && !names.is_empty()
@@ -962,7 +1092,8 @@ impl Walk<'_> {
         let (mut whole, mut held) = (true, false);
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
-            let (decision, identity) = self.plan(&pinned.join(&name), &display.join(&name), false);
+            let (decision, identity) =
+                self.plan(&pinned.join(&name), &display.join(&name), false, depth + 1);
             match &decision {
                 Walked::Whole | Walked::Gone => {}
                 Walked::Dir {
@@ -981,6 +1112,9 @@ impl Walk<'_> {
                 identity,
                 decision,
             });
+            if self.budget.exhausted {
+                return (Walked::Held, identity);
+            }
         }
         // Like rm: a held entry keeps its directories without a question;
         // after a declined one rm still asks, and removing then fails as
@@ -1022,6 +1156,9 @@ impl Walk<'_> {
         } else {
             DirState::Refused
         };
+        // Binary lookup during verification avoids a linear search for
+        // every current name in a wide directory.
+        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         (
             Walked::Dir {
                 dir,
@@ -1419,12 +1556,13 @@ fn unchanged(dir: &std::fs::File, entries: &[Planned]) -> bool {
             return false;
         };
         let name = entry.file_name();
-        let Some(planned) = entries
-            .iter()
-            .find(|p| p.name == name && !matches!(p.decision, Walked::Gone))
-        else {
+        let Ok(index) = entries.binary_search_by(|planned| planned.name.cmp(&name)) else {
             return false;
         };
+        let planned = &entries[index];
+        if matches!(planned.decision, Walked::Gone) {
+            return false;
+        }
         // Still the entry confirmed, and not since become a mount point (a
         // bind over it keeps its identity): a mount never moves with its
         // directory (#361).
