@@ -2,6 +2,100 @@
 
 ## Unreleased
 
+### Fixed
+
+- The shim honors `--preserve-root`/`--no-preserve-root` in command-line
+  order (the last flag wins, as in GNU rm) and refuses abbreviated
+  `--no-preserve-root` spellings that GNU rejects. (#430, #431)
+- The shim prompts before removing a write-protected file the way GNU rm
+  does when prompting is enabled and `-f` is absent, accepts GNU
+  `--interactive` synonyms and unambiguous abbreviations (`no`, `none`,
+  `yes`, `al`, …), diagnoses an empty-string operand without aborting the
+  remaining operands, prints one `removed …` line per entry to stdout under
+  `-v`, and no longer panics with exit 101 when stderr or the prompt cannot
+  be written (a full `/dev/full` no longer turns a completed trash into a
+  reported failure). (#432, #433, #434, #435, #436)
+- An empty `only_trash` pattern is dropped at load time with a loud
+  warning; the whitelist `[""]` previously matched nothing and made every
+  deletion permanent. (#402)
+- A trash root whose `info/` directory is missing no longer reads as an
+  empty store: its stranded `files/` data is listed as orphans and can be
+  purged by `trash empty`. (#403)
+- Orphaned entries age by the data file's mtime instead of a synthetic
+  "now" deletion date, so age-based retention and `empty --older` can
+  retire them. (#404)
+- `trash empty` exits non-zero when a selected entry cannot be deleted,
+  instead of printing "Nothing to empty." and reporting success to scripts
+  and timers. Already-vanished entries still count as success. (#409)
+- First-occurrence-wins in `.trashinfo` parsing holds even when the first
+  duplicate value is malformed: a later well-formed duplicate can no
+  longer slip in a size, deletion date, PID or nanosecond stamp. (#413)
+- A directory replaced between metadata read and rename is re-surveyed on
+  the seccomp trash path, so the sidecar records the tree's real size
+  instead of the replacement inode's ~4 KiB. (#414)
+- `compress --dry-run` applies the same keep/discard decision as the real
+  run (through the same code path), so incompressible files are no longer
+  reported as "would be compressed". (#415)
+- `trash undo` escapes control characters in restored paths, matching
+  `trash restore`, so trashed filenames cannot inject terminal escape
+  sequences. (#416)
+- `trash ls` with a pattern or date filter that matches nothing now says
+  so instead of "Trash is empty."; the unfiltered message is unchanged.
+  (#417)
+- `self-update` ignores a relative `XDG_CACHE_HOME` (as the XDG spec
+  requires) instead of creating the marker directory under the current
+  working directory. (#418)
+- `trash config add` accepts literal values for `bypass_paths` and
+  `bypass_processes` (they are prefix/exact matched, not globs) while
+  still rejecting brace patterns in the glob lists and empty values
+  everywhere. (#419)
+- The preload's cross-device copy preserves timestamps, `user.*` xattrs
+  and sparseness (SEEK_DATA/SEEK_HOLE), matching the store's own copy, so
+  restored files keep their metadata and large sparse files no longer
+  expand on the trash filesystem. (#405)
+- `rmdir`/`unlinkat(AT_REMOVEDIR)` of an unreadable empty directory is no
+  longer declined into permanent deletion, in both the preload and the
+  seccomp supervisor: an owned target is scanned under a temporary
+  read/write grant that is restored afterwards, and only a
+  positively-confirmed empty directory is trashed — a non-empty one
+  answers `ENOTEMPTY` with its contents untouched. (#410, #411)
+- The preload enforces `max_dir_size_mb`/`max_file_size_mb` on every
+  intercepted deletion with exact byte comparison (no integer
+  truncation), so oversized trees cannot sneak past the cap during
+  `rm -rf`. (#412)
+- The seccomp supervisor reloads its configuration (and store) when the
+  config file changes mid-session, matching the preload's mtime-based
+  reload, so long-lived wrapped sessions see config edits. (#437)
+- Isolated stores (`TrashStore::open_isolated`) refuse to purge or empty
+  entries resolved in another store's trash root, the same boundary
+  restore already enforced; retention over roots given explicitly still
+  crosses roots. (#428)
+- Directory trees nested deeper than the old 100-level survey cap are
+  recorded with their real size — the survey walk is now iterative and
+  self-limits by the descriptor limit instead of a depth cap. (#429)
+- The fanotify daemon strips the kernel's ` (deleted)` marker from
+  resolved audit paths and no longer poisons its handle cache when a
+  process holds a deleted directory open. (#438)
+- The operation log rotates at 1 MiB, keeping one previous generation
+  (`operations.log.1`); `trash log` reads across the rotation boundary.
+  (#439)
+- Install/packaging: bash completions fall back to the PREFIX completions
+  directory when `/etc/bash_completion.d` does not exist; the fanotify
+  unit installs whenever `/etc/systemd` exists (only enable/start needs a
+  running systemd); RPM `%post`/`%postun` and Arch
+  `post_install`/`post_remove` hooks now register and unregister the
+  LD_PRELOAD entry; preload registration switches between flat and `$LIB`
+  entry forms instead of freezing the first one; installers refuse
+  PREFIX/path values containing whitespace or colons; the profile hook
+  and every `make install`/`uninstall` destination are quoted against
+  spaces; `make uninstall` removes the full fixed man-page set even after
+  `make clean`; the daemon unit wants `multi-user.target` (with legacy
+  `default.target.wants` links cleaned) so uninstalls stop both
+  uninstallers' symlink removal; uninstall sweeps user-enabled timer
+  symlinks per home; and uninstall/purge enumerate homes from
+  `getent passwd` instead of only `/home/*` and `/root`.
+  (#406, #407, #408, #420, #421, #422, #423, #424, #425, #426, #427)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

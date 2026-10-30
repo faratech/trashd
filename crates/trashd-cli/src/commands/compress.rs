@@ -56,26 +56,29 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
         if size_before > restore_limit {
             continue;
         }
-        if dry_run {
-            // Unmarked zstd data (a trashed .zst) is skipped by the real run,
-            // which checks the magic itself under the entry lock.
-            if is_zstd(&entry.trashed_path) {
-                continue;
-            }
-            println!(
-                "  {} {} ({})",
-                printable_path(&entry.trashed_path),
-                entry.id.dimmed(),
-                format_size(size_before),
-            );
-            compressed += 1;
-            continue;
-        }
-
-        match compress_file_zstd(store, entry, size_before) {
+        // --dry-run performs the real compression into a stage file it then
+        // discards, so "would be compressed" means exactly what the real run
+        // would keep: one keep/discard decision, one code path (#415). The
+        // shared path also skips already-zstd data the way the real run does,
+        // by checking the magic under the entry's lock.
+        let mode = if dry_run {
+            CommitMode::ReportOnly
+        } else {
+            CommitMode::Publish
+        };
+        match compress_file_zstd(store, entry, size_before, mode) {
             Ok(Some(size_after)) => {
-                saved += size_before.saturating_sub(size_after);
                 compressed += 1;
+                if dry_run {
+                    println!(
+                        "  {} {} ({})",
+                        printable_path(&entry.trashed_path),
+                        entry.id.dimmed(),
+                        format_size(size_before),
+                    );
+                } else {
+                    saved += size_before.saturating_sub(size_after);
+                }
             }
             Ok(None) => {} // not worth compressing; original untouched
             Err(e) => {
@@ -169,6 +172,9 @@ fn sweep_attempts_changed_before(
 
 /// Sniff only the first 4 bytes for the zstd magic (0x28 B5 2F FD
 /// little-endian) — never slurp a whole file just to test its header.
+/// Production skips zstd data through the checked magic read under the
+/// entry lock; the standalone probe is a test assertion aid.
+#[cfg(test)]
 fn is_zstd(path: &std::path::Path) -> bool {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -182,9 +188,20 @@ fn is_zstd(path: &std::path::Path) -> bool {
         && u32::from_le_bytes(magic) == 0xFD2FB528
 }
 
+/// What happens to a staged compression that passed the keep/discard
+/// decision: the compressed copy is smaller than the source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitMode {
+    /// The real run: publish the stage (marker, then rename) via the hooks.
+    Publish,
+    /// `--dry-run`: report the verdict and drop the stage untouched, so the
+    /// estimate can never claim a file the real run would discard (#415).
+    ReportOnly,
+}
+
 /// Compress a trashed entry's data in-place with zstd (streaming, bounded
-/// memory). Returns `Some(new_size)` when swapped, `None` when compression
-/// wasn't worthwhile.
+/// memory). Returns `Some(new_size)` when swapped (or, in `ReportOnly`, when
+/// the stage qualified), `None` when compression wasn't worthwhile.
 ///
 /// Crash-safe ordering (#23): the `X-Trashd-Compressed` marker is recorded
 /// BEFORE the compressed data is renamed over the original. A crash in the
@@ -196,23 +213,16 @@ fn compress_file_zstd(
     store: &TrashStore,
     entry: &trashd_common::store::TrashEntry,
     size_before: u64,
+    mode: CommitMode,
 ) -> std::io::Result<Option<u64>> {
-    compress_before_commit(store, entry, size_before, || {})
-}
-
-fn compress_before_commit(
-    store: &TrashStore,
-    entry: &trashd_common::store::TrashEntry,
-    size_before: u64,
-    before_commit: impl FnOnce(),
-) -> std::io::Result<Option<u64>> {
-    compress_before_publish(store, entry, size_before, before_commit, || {})
+    compress_before_publish(store, entry, size_before, mode, || {}, || {})
 }
 
 fn compress_before_publish(
     store: &TrashStore,
     entry: &trashd_common::store::TrashEntry,
     size_before: u64,
+    mode: CommitMode,
     before_commit: impl FnOnce(),
     before_persist: impl FnOnce(),
 ) -> std::io::Result<Option<u64>> {
@@ -269,7 +279,14 @@ fn compress_before_publish(
     let compressed_len = tmp.as_file().metadata()?.len();
     if compressed_len >= size_before {
         // Incompressible content — discard the attempt, keep the original.
+        // This is the single keep/discard verdict: --dry-run reports exactly
+        // what passes it, so the estimate cannot drift from the real run.
         return Ok(None);
+    }
+    if mode == CommitMode::ReportOnly {
+        // The verdict is in and the trash is still untouched: no marker, no
+        // swap, no timestamps. Dropping `tmp` removes the stage file (#415).
+        return Ok(Some(compressed_len));
     }
     // Preserve ownership before restoring modes, so set-ID permissions keep
     // their original meaning. Refuse the swap if ownership cannot be kept.
@@ -365,26 +382,33 @@ mod tests {
             let (store, entry) = fixture(dir.path(), "data");
             let sidecar = fs::read(&entry.info_path).unwrap();
             let inode = fs::metadata(&entry.trashed_path).unwrap().ino();
-            let result = compress_before_commit(&store, &entry, 8192, || match action {
-                "append" => fs::OpenOptions::new()
-                    .append(true)
-                    .open(&entry.trashed_path)
-                    .unwrap()
-                    .write_all(b"newer content")
+            let result = compress_before_publish(
+                &store,
+                &entry,
+                8192,
+                CommitMode::Publish,
+                || match action {
+                    "append" => fs::OpenOptions::new()
+                        .append(true)
+                        .open(&entry.trashed_path)
+                        .unwrap()
+                        .write_all(b"newer content")
+                        .unwrap(),
+                    "rewrite" => fs::write(&entry.trashed_path, b"updated data").unwrap(),
+                    "mode" => fs::set_permissions(
+                        &entry.trashed_path,
+                        fs::Permissions::from_mode(
+                            fs::metadata(&entry.trashed_path).unwrap().mode() ^ 0o100,
+                        ),
+                    )
                     .unwrap(),
-                "rewrite" => fs::write(&entry.trashed_path, b"updated data").unwrap(),
-                "mode" => fs::set_permissions(
-                    &entry.trashed_path,
-                    fs::Permissions::from_mode(
-                        fs::metadata(&entry.trashed_path).unwrap().mode() ^ 0o100,
-                    ),
-                )
-                .unwrap(),
-                "link" => {
-                    fs::hard_link(&entry.trashed_path, dir.path().join("another-link")).unwrap()
-                }
-                _ => unreachable!(),
-            })
+                    "link" => {
+                        fs::hard_link(&entry.trashed_path, dir.path().join("another-link")).unwrap()
+                    }
+                    _ => unreachable!(),
+                },
+                || {},
+            )
             .unwrap();
             assert!(result.is_none(), "{action}: changed source was published");
             assert_eq!(fs::metadata(&entry.trashed_path).unwrap().ino(), inode);
@@ -452,6 +476,7 @@ mod tests {
                 &store,
                 &entry,
                 8192,
+                CommitMode::Publish,
                 || {
                     assert_live_stage();
                     if phase == "staging" {
@@ -488,6 +513,92 @@ mod tests {
                         .starts_with(COMPRESS_PREFIX.as_bytes()))
             );
         }
+    }
+
+    // Regression (#415): --dry-run counted every candidate as "would be
+    // compressed", including files the real run discards as incompressible.
+    // ReportOnly must reach the same keep/discard verdict through the same
+    // code, and leave the entry exactly as it was.
+    #[test]
+    fn dry_run_makes_the_real_keep_or_discard_decision_without_publishing() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Compressible data: the dry run reports the swap the real run would
+        // make, but data, sidecar, identity and timestamps are untouched.
+        let (store, entry) = fixture(dir.path(), "data");
+        let path = entry.trashed_path.clone();
+        let sidecar = fs::read(&entry.info_path).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let reported = compress_before_publish(
+            &store,
+            &entry,
+            8192,
+            CommitMode::ReportOnly,
+            || panic!("a dry run must stop before publishing"),
+            || panic!("a dry run must not persist"),
+        )
+        .unwrap();
+        assert!(reported.is_some(), "8 KiB of one repeated byte compresses");
+        assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 8192]);
+        assert!(!is_zstd(&path), "no zstd data may be written");
+        assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar, "no marker");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(dir.path().join("Trash/files"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            !fs::read_dir(dir.path().join("Trash/.trashd"))
+                .unwrap()
+                .flatten()
+                .any(|left| left
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(COMPRESS_PREFIX.as_bytes())),
+            "the discarded stage must not survive the call"
+        );
+
+        // Incompressible data: the dry run reports nothing, matching the real
+        // run that discards the stage at the same verdict.
+        let mut random = Vec::with_capacity(8192);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..8192 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            random.push(state as u8);
+        }
+        let (store, entry) = fixture(dir.path(), "random");
+        fs::write(&entry.trashed_path, &random).unwrap();
+        assert!(
+            compress_file_zstd(&store, &entry, 8192, CommitMode::Publish)
+                .unwrap()
+                .is_none(),
+            "the fixture must actually be incompressible"
+        );
+        let sidecar = fs::read(&entry.info_path).unwrap();
+        let reported = compress_before_publish(
+            &store,
+            &entry,
+            8192,
+            CommitMode::ReportOnly,
+            || panic!("a dry run must stop before publishing"),
+            || panic!("a dry run must not persist"),
+        )
+        .unwrap();
+        assert!(
+            reported.is_none(),
+            "the dry run must agree with the real run's discard"
+        );
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), random);
+        assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
     }
 
     // #327: compression replaces the data inode, so it must skip hard-linked
@@ -604,7 +715,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
 
         assert!(
-            compress_file_zstd(&store, &entry, content.len() as u64)
+            compress_file_zstd(&store, &entry, content.len() as u64, CommitMode::Publish)
                 .unwrap()
                 .is_some()
         );
@@ -660,7 +771,11 @@ mod tests {
         let input = fs::File::open(&path).unwrap();
         assert_eq!(unsafe { libc::fchown(input.as_raw_fd(), 65534, 65534) }, 0);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o4700)).unwrap();
-        assert!(compress_file_zstd(&store, &entry, 8192).unwrap().is_some());
+        assert!(
+            compress_file_zstd(&store, &entry, 8192, CommitMode::Publish)
+                .unwrap()
+                .is_some()
+        );
         let metadata = fs::metadata(path).unwrap();
         assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o4700);
@@ -697,7 +812,7 @@ mod tests {
                     barrier.wait();
                     let store =
                         TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
-                    let _ = compress_file_zstd(&store, &entry, 8192);
+                    let _ = compress_file_zstd(&store, &entry, 8192, CommitMode::Publish);
                 });
             }
         });
@@ -715,7 +830,7 @@ mod tests {
         let path = entry.trashed_path.clone();
         let content = vec![b'x'; 8192];
         entry.info_path = dir.path().join("missing/info");
-        let result = compress_file_zstd(&store, &entry, 8192);
+        let result = compress_file_zstd(&store, &entry, 8192, CommitMode::Publish);
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), content);
         assert_eq!(
@@ -736,7 +851,7 @@ mod tests {
         fs::write(&target, &content).unwrap();
         fs::remove_file(&path).unwrap();
         symlink(&target, &path).unwrap();
-        assert!(compress_file_zstd(&store, &entry, 8192).is_err());
+        assert!(compress_file_zstd(&store, &entry, 8192, CommitMode::Publish).is_err());
         assert_eq!(fs::read(target).unwrap(), content);
         assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
     }
@@ -750,12 +865,12 @@ mod tests {
         fs::remove_file(&entry.trashed_path).unwrap();
         fs::write(&entry.trashed_path, vec![b'y'; 8192]).unwrap();
         let replacement = fs::read(&entry.info_path).unwrap();
-        assert!(compress_file_zstd(&store, &entry, 8192).is_err());
+        assert!(compress_file_zstd(&store, &entry, 8192, CommitMode::Publish).is_err());
         assert_eq!(fs::read(&entry.trashed_path).unwrap(), vec![b'y'; 8192]);
         assert_eq!(fs::read(&entry.info_path).unwrap(), replacement);
         let fresh = store.find_entry("data").unwrap();
         fs::write(&fresh.info_path, b"changed metadata").unwrap();
-        assert!(compress_file_zstd(&store, &fresh, 8192).is_err());
+        assert!(compress_file_zstd(&store, &fresh, 8192, CommitMode::Publish).is_err());
         assert_eq!(fs::read(&fresh.info_path).unwrap(), b"changed metadata");
     }
 }

@@ -184,9 +184,15 @@ impl TrashStore {
         let info_dir = trash_dir.join("info");
         let files_dir = trash_dir.join("files");
 
-        if !info_dir.exists() {
-            return Ok(());
-        }
+        // A missing info/ directory must not hide the data: every files/
+        // entry then has no readable sidecar and is reported as an orphan,
+        // so list/empty/purge still see the stranded data (#403). Other
+        // read failures still fail the scan loudly.
+        let info_entries = match fs::read_dir(&info_dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
 
         // IDs with a readable sidecar, recorded BEFORE the pattern filter:
         // orphan detection must know every real entry in this directory, or a
@@ -194,7 +200,7 @@ impl TrashStore {
         // fake "orphaned" copy of itself (#144).
         let mut seen_ids = std::collections::HashSet::new();
 
-        for entry in fs::read_dir(&info_dir)? {
+        for entry in info_entries.into_iter().flatten() {
             let entry = entry?;
             let raw_filename = entry.file_name();
             // Compare raw stems: a lossy ID can collapse distinct filenames,
@@ -313,12 +319,39 @@ impl TrashStore {
                         let identity = data_metadata
                             .as_ref()
                             .map(|metadata| (metadata.dev(), metadata.ino()));
+                        // An orphan's true deletion time is unknowable without
+                        // its sidecar, but a synthetic "now" would make it age
+                        // zero forever and never expire by retention (#404).
+                        // Fall back to the data's own mtime — the last time
+                        // its content changed — so age-based purge and
+                        // retention see a meaningful age. Stat even display
+                        // scans here: orphans are the spec's emergency case,
+                        // and one stat per orphan keeps aging correct.
+                        let mtime = data_metadata
+                            .clone()
+                            .or_else(|| fs::symlink_metadata(&trashed_path).ok())
+                            .and_then(|metadata| metadata.modified().ok())
+                            .map(chrono::DateTime::<chrono::Local>::from);
+                        let info = if let Some(deletion_date) = mtime {
+                            TrashInfo {
+                                original_path: PathBuf::from(format!("(orphaned: {name})")),
+                                deletion_date,
+                                command: None,
+                                pid: None,
+                                size: None,
+                                sha256: None,
+                                compressed: None,
+                                deletion_ns: None,
+                            }
+                        } else {
+                            TrashInfo::new(PathBuf::from(format!("(orphaned: {name})")))
+                        };
                         visitor(
                             TrashEntry {
                                 identity,
                                 sidecar_version: sidecar_snapshot(&info_path),
                                 id: name.clone(),
-                                info: TrashInfo::new(PathBuf::from(format!("(orphaned: {name})"))),
+                                info,
                                 trashed_path,
                                 info_path,
                                 trash_root: trash_dir.to_path_buf(),

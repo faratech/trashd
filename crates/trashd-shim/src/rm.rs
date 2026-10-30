@@ -1,9 +1,29 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use trashd_common::TrashStore;
 use trashd_common::store::is_parent_bypassed;
+
+/// `eprintln!` that never panics: stderr can be full (ENOSPC) or closed, and
+/// a diagnostic that aborts the process AFTER a removal succeeded would turn
+/// a trashed file into a reported failure with exit 101 (#436). GNU rm's
+/// fprintf ignores the error the same way.
+macro_rules! rm_err {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+/// `println!` that never panics, for the same reason as `rm_err!` (#436):
+/// GNU aborts on a failed stdout through close_stdout, but a trash tool must
+/// never turn completed work into a reported failure.
+macro_rules! rm_out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
 
 /// trashd rm shim — drop-in replacement that moves files to trash instead of deleting.
 ///
@@ -37,8 +57,9 @@ struct Rm {
     /// Without this, `rm --interactive` failed to parse and fell through to a
     /// PERMANENT delete instead of trashing. require_equals matches GNU's
     /// optional-argument convention and stops a following filename being eaten
-    /// as the WHEN value.
-    #[arg(long = "interactive", num_args = 0..=1, default_missing_value = "always", require_equals = true, value_name = "WHEN", value_parser = ["never", "once", "always"], action = clap::ArgAction::Append)]
+    /// as the WHEN value. The spellings are GNU's synonym table, checked
+    /// after parsing (#434).
+    #[arg(long = "interactive", num_args = 0..=1, default_missing_value = "always", require_equals = true, value_name = "WHEN", action = clap::ArgAction::Append)]
     interactive: Vec<String>,
 
     /// Remove empty directories
@@ -56,10 +77,14 @@ struct Rm {
     one_file_system: bool,
 
     /// Accepted for GNU rm compatibility. Optional value `all` is allowed.
+    /// The switch itself is resolved from the raw command line in
+    /// `scan_preserve_root`, because its state is ORDER-dependent (#430).
     #[arg(long = "preserve-root", num_args = 0..=1, require_equals = true, value_name = "all", value_parser = clap::builder::PossibleValuesParser::new(["all"]))]
     preserve_root: Option<String>,
 
-    /// Accepted for GNU rm compatibility.
+    /// Accepted for GNU rm compatibility. Like `preserve_root`, this only
+    /// feeds the initial value of the scan; the last occurrence on the
+    /// command line decides (#430).
     #[arg(long = "no-preserve-root")]
     no_preserve_root: bool,
 
@@ -79,8 +104,95 @@ struct Rm {
     /// No trailing_var_arg: GNU rm permutes operands so `rm f -r` must work,
     /// and swallowing everything after the first operand silently turned
     /// later flags into filenames (#51). Invalid options fail without deleting.
-    #[arg(allow_hyphen_values = false)]
+    /// The parser accepts empty operands, which GNU diagnoses like any other
+    /// missing file while removing the rest (#433).
+    #[arg(allow_hyphen_values = false, value_parser = OperandParser)]
     files: Vec<PathBuf>,
+}
+
+/// Accepts any operand, including the empty one: GNU rm diagnoses `rm ""`
+/// like any other missing file (`rm: cannot remove '': No such file or
+/// directory`) and still removes the rest (#433). Clap's own PathBuf parser
+/// refuses empty values outright.
+#[derive(Clone)]
+struct OperandParser;
+
+impl clap::builder::TypedValueParser for OperandParser {
+    type Value = PathBuf;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        Ok(PathBuf::from(value.to_os_string()))
+    }
+}
+
+/// GNU rm's `--interactive` spellings and what each means (rm.c's
+/// interactive_args/interactive_vals) (#434). The value is checked after
+/// clap parses, not in a value parser: clap would dress the diagnostic in
+/// its own `error:` format, and GNU's wording is the spec here.
+const INTERACTIVE_WHEN: &[(&str, &str)] = &[
+    ("never", "never"),
+    ("no", "never"),
+    ("none", "never"),
+    ("once", "once"),
+    ("always", "always"),
+    ("yes", "always"),
+];
+
+/// The meaning of a --interactive=WHEN value, the way GNU rm's XARGMATCH
+/// resolves it (#434): an exact spelling wins; otherwise the value
+/// abbreviates every spelling it prefixes and is accepted when they all
+/// agree (`n` means never through three spellings), ambiguous when they
+/// disagree, and invalid when it abbreviates none. `Err` carries GNU's
+/// diagnostic either way.
+fn interactive_when(value: &str) -> Result<&'static str, String> {
+    let mut meaning: Option<&str> = None;
+    let mut ambiguous = false;
+    for (spelling, canonical) in INTERACTIVE_WHEN {
+        if *spelling == value {
+            // An exact spelling is never ambiguous.
+            return Ok(canonical);
+        }
+        if spelling.starts_with(value) {
+            match meaning {
+                Some(previous) if previous != *canonical => ambiguous = true,
+                _ => meaning = Some(canonical),
+            }
+        }
+    }
+    if ambiguous {
+        // The value abbreviates spellings with different meanings.
+        return Err(interactive_diagnostic(value, meaning));
+    }
+    match meaning {
+        Some(canonical) => Ok(canonical),
+        // The value abbreviates nothing.
+        None => Err(interactive_diagnostic(value, None)),
+    }
+}
+
+/// GNU's diagnostic under a rejected --interactive value, with its hint
+/// grouped the way the argmatch listing groups synonyms (#434).
+fn interactive_diagnostic(value: &str, meaning: Option<&str>) -> String {
+    let complaint = if meaning.is_some() {
+        "ambiguous"
+    } else {
+        "invalid"
+    };
+    format!(
+        "{}\n{}",
+        format_args!("rm: {complaint} argument '{value}' for '--interactive'"),
+        concat!(
+            "Valid arguments are:\n",
+            "  - 'never', 'no', 'none'\n",
+            "  - 'once'\n",
+            "  - 'always', 'yes'"
+        )
+    )
 }
 
 fn main() -> ExitCode {
@@ -100,42 +212,65 @@ fn main() -> ExitCode {
     let matches = match Rm::command().try_get_matches() {
         Ok(matches) => matches,
         Err(e) => {
-            eprintln!("{e}");
+            rm_err!("{e}");
             // Parsing a flag must never escalate a protected removal into a
             // permanent deletion. Valid repeated flags are accepted above.
             return ExitCode::FAILURE;
         }
     };
     let args = Rm::from_arg_matches(&matches).expect("validated rm arguments");
+    // GNU answers a bad --interactive=WHEN during option parsing, in argv
+    // order, and removes nothing (#434).
+    if let Some(values) = matches.get_many::<String>("interactive") {
+        for value in values {
+            if let Err(message) = interactive_when(value) {
+                rm_err!("{message}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let behavior = RemovalBehavior::from_matches(&matches);
 
+    // GNU rm keeps ONE preserve-root switch over the whole command line, so
+    // its state is resolved from the raw argv here: clap only sees two
+    // unrelated flags with no order between them (#430, #431).
+    let preserve_root =
+        match scan_preserve_root(!args.no_preserve_root, std::env::args_os().skip(1)) {
+            Some(preserve_root) => preserve_root,
+            None => {
+                rm_err!("rm: you may not abbreviate the --no-preserve-root option");
+                return ExitCode::FAILURE;
+            }
+        };
+
     if args.help {
-        println!("trashd rm — files are moved to trash instead of deleted");
-        println!("Use --permanent or TRASH_BYPASS=1 for real deletion");
-        println!("Use `trash undo` to restore the last deletion");
-        println!("Use `trash ls` to see trashed files\n");
+        rm_out!("trashd rm — files are moved to trash instead of deleted");
+        rm_out!("Use --permanent or TRASH_BYPASS=1 for real deletion");
+        rm_out!("Use `trash undo` to restore the last deletion");
+        rm_out!("Use `trash ls` to see trashed files\n");
         return passthrough_with_args(&[std::ffi::OsString::from("--help")]);
     }
 
     if args.version {
-        println!("trashd rm shim {}", env!("TRASHD_VERSION"));
+        rm_out!("trashd rm shim {}", env!("TRASHD_VERSION"));
         return ExitCode::SUCCESS;
     }
 
     // GNU rm's preserve-root guard, actually enforced: the flags were parsed
     // "for compatibility" and discarded, so `rm -rf /` proceeded to destroy
     // the whole tree (#2). Refuse operands that ARE the root unless
-    // --no-preserve-root was given (matches GNU semantics — top-level
-    // entries like /* expand to operands that are not "/" itself).
+    // --no-preserve-root was the LAST spelling of the switch (matches GNU
+    // semantics — top-level entries like /* expand to operands that are not
+    // "/" itself).
     if args.recursive
-        && !args.no_preserve_root
+        && preserve_root
         && args
             .files
             .iter()
             .any(|f| is_root_operand(&effective_operand(f)))
     {
-        eprintln!("rm: it is dangerous to operate recursively on '/'");
-        eprintln!("rm: use --no-preserve-root to override the failsafe");
+        rm_err!("rm: it is dangerous to operate recursively on '/'");
+        rm_err!("rm: use --no-preserve-root to override the failsafe");
         return ExitCode::FAILURE;
     }
 
@@ -162,7 +297,7 @@ fn main() -> ExitCode {
         if behavior.ignore_missing {
             return ExitCode::SUCCESS;
         }
-        eprintln!("rm: missing operand");
+        rm_err!("rm: missing operand");
         return ExitCode::FAILURE;
     }
 
@@ -176,8 +311,8 @@ fn main() -> ExitCode {
     let store = match TrashStore::open_with_config(config) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("trashd: failed to open trash store: {e}");
-            eprintln!("trashd: refusing removal because protected storage is unavailable");
+            rm_err!("trashd: failed to open trash store: {e}");
+            rm_err!("trashd: refusing removal because protected storage is unavailable");
             return ExitCode::FAILURE;
         }
     };
@@ -221,7 +356,7 @@ fn main() -> ExitCode {
         // trailing `..` collapsed to its parent's parent by normalize_path
         // used to trash the caller's CWD and report success (#83).
         if is_dot_operand(operand) {
-            eprintln!(
+            rm_err!(
                 "rm: refusing to remove '.' or '..': skipping directory '{}'",
                 operand.display()
             );
@@ -236,7 +371,7 @@ fn main() -> ExitCode {
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!(
+                rm_err!(
                     "rm: cannot remove '{}': No such file or directory",
                     file.display()
                 );
@@ -244,7 +379,7 @@ fn main() -> ExitCode {
                 continue;
             }
             Err(e) => {
-                eprintln!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
+                rm_err!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
                 exit_code = ExitCode::FAILURE;
                 continue;
             }
@@ -254,7 +389,7 @@ fn main() -> ExitCode {
 
         // Check if it's a directory without -r
         if is_dir && !args.recursive && !args.dir {
-            eprintln!("rm: cannot remove '{}': Is a directory", file.display());
+            rm_err!("rm: cannot remove '{}': Is a directory", file.display());
             exit_code = ExitCode::FAILURE;
             continue;
         }
@@ -262,7 +397,7 @@ fn main() -> ExitCode {
         // --preserve-root=all: refuse directory operands that are mount
         // points, like GNU rm's "Device or resource busy" (#119).
         if is_dir && preserve_all && is_mount_point(file) {
-            eprintln!(
+            rm_err!(
                 "rm: cannot remove '{}': Device or resource busy",
                 file.display()
             );
@@ -291,7 +426,7 @@ fn main() -> ExitCode {
                 {
                     continue;
                 }
-                eprintln!(
+                rm_err!(
                     "rm: cannot remove '{}': Device or resource busy",
                     file.display()
                 );
@@ -305,7 +440,7 @@ fn main() -> ExitCode {
             match std::fs::read_dir(file).map(|mut d| d.next().is_some()) {
                 Ok(false) => {}
                 Ok(true) => {
-                    eprintln!(
+                    rm_err!(
                         "rm: cannot remove '{}': Directory not empty",
                         file.display()
                     );
@@ -326,7 +461,7 @@ fn main() -> ExitCode {
                         continue;
                     }
                     if let Err(e) = real_rm(file, false, true) {
-                        eprintln!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
+                        rm_err!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
                         exit_code = ExitCode::FAILURE;
                     }
                     continue;
@@ -366,26 +501,60 @@ fn main() -> ExitCode {
             if !prompt_user(&msg) {
                 continue;
             }
+        } else if matches!(
+            behavior.interaction,
+            Interaction::Sometimes | Interaction::Once
+        ) && write_protected(&meta)
+        {
+            // GNU rm's default asks before removing anything the effective
+            // user may not write to, and -I leaves that check active after
+            // its one question (#432). -f and --interactive=never suppress
+            // it. Unlike GNU, which checks for a tty first, the question is
+            // asked unconditionally: stdin that is not a tty answers EOF and
+            // the file is kept, which errs toward keeping data. GNU words
+            // other types (fifos, sockets, devices) by kind too; the plain
+            // question here follows the filed wording for them.
+            let kind = kind_of(&meta);
+            let msg = match kind {
+                "regular file" | "regular empty file" | "directory" => {
+                    format!("rm: remove write-protected {kind} '{}'? ", file.display())
+                }
+                _ => format!("rm: remove '{}'? ", file.display()),
+            };
+            if !prompt_user(&msg) {
+                continue;
+            }
         }
 
+        // GNU -v names every entry it removes, children before the directory
+        // holding them, the operand last (#435). The tree moves with a single
+        // rename, so it is listed BEFORE it moves and reported only once the
+        // move succeeded.
+        let listed = if args.verbose {
+            list_removal_order(file, is_dir)
+        } else {
+            Vec::new()
+        };
+
         match store.trash(file, Some(&cmd_str)) {
-            Ok(id) => {
-                if args.verbose {
-                    eprintln!("trashed '{}' [{}]", file.display(), id);
+            Ok(_) => {
+                for (path, was_dir) in &listed {
+                    report_removed(path, *was_dir);
                 }
                 notification.add(file);
             }
             Err(trashd_common::store::TrashError::Excluded(_)) => {
-                if args.verbose {
-                    eprintln!("rm (real): '{}'", file.display());
-                }
                 // -d excluded empty directories fall back to rmdir semantics
                 // (not real rm's blanket "Is a directory" error) (#149).
                 if let Err(e) = real_rm(file, args.recursive, args.dir) {
                     if !is_reported(&e) {
-                        eprintln!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
+                        rm_err!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
                     }
                     exit_code = ExitCode::FAILURE;
+                } else {
+                    for (path, was_dir) in &listed {
+                        report_removed(path, *was_dir);
+                    }
                 }
             }
             // Configured guards are REFUSALS, not fallbacks: a size cap or a
@@ -399,27 +568,27 @@ fn main() -> ExitCode {
                 | trashd_common::store::TrashError::Refused(_)
                 | trashd_common::store::TrashError::HoldsMount(_)),
             ) => {
-                eprintln!("rm: refusing to remove '{}': {e}", file.display());
+                rm_err!("rm: refusing to remove '{}': {e}", file.display());
                 exit_code = ExitCode::FAILURE;
             }
             // What rm could not remove either (a mount point, a read-only
             // filesystem): --permanent would not help (#368, #370).
             Err(trashd_common::store::TrashError::Unremovable(e)) => {
-                eprintln!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
+                rm_err!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
                 exit_code = ExitCode::FAILURE;
             }
             Err(trashd_common::store::TrashError::Io(e))
                 if e.raw_os_error() == Some(libc::EBUSY) =>
             {
-                eprintln!(
+                rm_err!(
                     "rm: cannot remove '{}': Device or resource busy",
                     file.display()
                 );
                 exit_code = ExitCode::FAILURE;
             }
             Err(e) => {
-                eprintln!("trashd: failed to trash '{}': {e}", file.display());
-                eprintln!("trashd: refusing permanent removal; use --permanent to bypass trash");
+                rm_err!("trashd: failed to trash '{}': {e}", file.display());
+                rm_err!("trashd: refusing permanent removal; use --permanent to bypass trash");
                 exit_code = ExitCode::FAILURE;
             }
         }
@@ -462,11 +631,19 @@ impl TrashedNotification {
     }
 }
 
+/// How much rm asks. The default is GNU rm's RMI_SOMETIMES: without any
+/// flag, a question is asked only for entries the effective user may not
+/// write to (#432).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Interaction {
-    #[default]
+    /// -f and --interactive=never: no question is ever asked.
     Never,
+    /// The default: ask only for write-protected entries.
+    #[default]
+    Sometimes,
+    /// -I and --interactive=once: one question up front, then like Sometimes.
     Once,
+    /// -i and --interactive=always: a question for every entry.
     Always,
 }
 
@@ -501,7 +678,9 @@ impl RemovalBehavior {
                     matches
                         .get_many::<String>("interactive")
                         .unwrap()
-                        .map(String::as_str),
+                        .map(|value| {
+                            interactive_when(value).expect("validated --interactive value")
+                        }),
                 ),
             );
         }
@@ -552,6 +731,52 @@ fn is_root_operand(p: &std::path::Path) -> bool {
         (Ok(operand), Ok(root)) => operand.dev() == root.dev() && operand.ino() == root.ino(),
         _ => false,
     }
+}
+
+/// The final state of GNU rm's one preserve-root switch across the raw
+/// command line: `--no-preserve-root` clears it, a later `--preserve-root`
+/// sets it again, and the last occurrence decides (rm.c answers the two
+/// spellings sequentially in argv order) (#430). Clap has no ordering
+/// between two different flags, so the raw argv is walked again here; GNU
+/// permutes operands, so options count anywhere before `--`. `initial` only
+/// reads the `--no-preserve-root` clap field; with no occurrence of either
+/// spelling the switch is on either way.
+///
+/// `None` rejects an unambiguous abbreviation of `--no-preserve-root`, which
+/// GNU answers with a diagnostic and removes nothing, checking the exact
+/// spelling of this one option while all others may abbreviate (#431).
+/// A --help/--version option stops the scan like GNU's option loop, leaving
+/// those short-circuits (which run before any removal) in charge.
+fn scan_preserve_root(
+    initial: bool,
+    tokens: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut guard = initial;
+    for token in tokens {
+        let bytes = token.as_bytes();
+        if bytes == b"--" {
+            break; // Only operands follow, and none of them is an option.
+        }
+        let Some(body) = bytes.strip_prefix(b"--") else {
+            continue; // Short flags and operands never touch the switch.
+        };
+        let body = &body[..body.iter().position(|&b| b == b'=').unwrap_or(body.len())];
+        if b"help".starts_with(body) || b"version".starts_with(body) {
+            break;
+        }
+        match body {
+            b"no-preserve-root" => guard = false,
+            // Reaching the parser at all means clap resolved the spelling,
+            // so only --no-preserve-root can share this prefix (#431).
+            other if b"no-preserve-root".starts_with(other) => return None,
+            // Abbreviated or not, any spelling of --preserve-root sets the
+            // switch again (#430).
+            other if b"preserve-root".starts_with(other) => guard = true,
+            _ => {}
+        }
+    }
+    Some(guard)
 }
 
 /// The object rm actually removes. A trailing slash makes the kernel follow a
@@ -865,7 +1090,7 @@ impl Walk<'_> {
     }
 
     fn report(&mut self, display: &std::path::Path, error: impl std::fmt::Display) {
-        eprintln!(
+        rm_err!(
             "rm: cannot remove '{}': {}",
             display.display(),
             as_rm_says(error)
@@ -881,7 +1106,7 @@ impl Walk<'_> {
     }
 
     fn skip_device(&mut self, display: &std::path::Path) -> Walked {
-        eprintln!(
+        rm_err!(
             "rm: skipping '{}', since it's on a different device",
             display.display()
         );
@@ -1337,6 +1562,15 @@ impl Walk<'_> {
                 }
             }
         }
+        // Read before the move: afterwards the entry is gone (#435). A
+        // directory that moves whole still holds its entries and is named
+        // entry by entry; one emptied beforehand is past its entries, so its
+        // listing is the directory alone.
+        let listed = if self.args.verbose {
+            list_removal_order(display, was_directory(access))
+        } else {
+            Vec::new()
+        };
         let moved = match self
             .store
             .trash_at(parent, name, access, Some(self.command))
@@ -1347,9 +1581,9 @@ impl Walk<'_> {
             other => other,
         };
         match moved {
-            Ok(id) => {
-                if self.args.verbose {
-                    eprintln!("trashed '{}' [{}]", display.display(), id);
+            Ok(_) => {
+                for (path, was_dir) in &listed {
+                    report_removed(path, *was_dir);
                 }
                 self.notification.add(display);
                 Some(Outcome::Done)
@@ -1370,13 +1604,29 @@ impl Walk<'_> {
 
     /// Remove an excluded entry the walk did not descend for real.
     fn real_remove(&mut self, access: &std::path::Path, display: &std::path::Path, is_dir: bool) {
+        // Listed before the real removal reaches it (#435).
+        let listed = if self.args.verbose {
+            list_removal_order(display, is_dir)
+        } else {
+            Vec::new()
+        };
         match real_rm_shown(access, display, is_dir, false) {
-            Ok(()) if self.args.verbose => eprintln!("rm (real): '{}'", display.display()),
-            Ok(()) => {}
+            Ok(()) => {
+                for (path, was_dir) in &listed {
+                    report_removed(path, *was_dir);
+                }
+            }
             Err(e) if is_reported(&e) => self.failures += 1,
             Err(e) => self.report_io(display, e),
         }
     }
+}
+
+/// Whether `path` is a directory a removal would have descended into — a
+/// symlink is a leaf, whatever it points at (#435).
+fn was_directory(path: &std::path::Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
 }
 
 /// What a walk needs to know about an entry, from one statx: its type,
@@ -1586,15 +1836,122 @@ fn unchanged(dir: &std::fs::File, entries: &[Planned]) -> bool {
 
 /// Prompt user on stderr, return true if they answer 'y' or 'Y'.
 fn prompt_user(msg: &str) -> bool {
-    eprint!("{msg}");
-    let _ = std::io::stderr().flush();
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
+    prompt_user_with(
+        msg,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+/// The core of `prompt_user` on injected streams: the question goes to
+/// `prompt`, one line is read from `input` (#432). A question that cannot be
+/// written (a full or closed stderr) is answered no WITHOUT reading: an
+/// unaskable question must never panic (#436) nor remove.
+fn prompt_user_with(
+    msg: &str,
+    input: &mut dyn std::io::BufRead,
+    prompt: &mut dyn std::io::Write,
+) -> bool {
+    if prompt
+        .write_all(msg.as_bytes())
+        .and_then(|()| prompt.flush())
+        .is_err()
+    {
+        return false;
+    }
+    let mut answer = String::new();
+    if input.read_line(&mut answer).is_err() {
         return false;
     }
     // GNU's C-locale rule: an answer starting with y or Y ("yeah" yes,
     // " y" no) (#355).
-    matches!(input.as_bytes().first(), Some(b'y' | b'Y'))
+    matches!(answer.as_bytes().first(), Some(b'y' | b'Y'))
+}
+
+/// Whether rm's default interactive mode asks before removing this entry:
+/// GNU rm asks when the effective user may not write to it, and exempts
+/// symlinks (whose permission bits are meaningless) (#432).
+fn write_protected(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // GNU grants privileged users every write (can_write_any_file), so it
+    // never asks root; neither do we, keeping root's scripted removals
+    // silent like GNU's.
+    let privileged = unsafe { libc::geteuid() == 0 };
+    !privileged
+        && !meta.file_type().is_symlink()
+        && write_protected_by_bits(meta.mode(), meta.uid(), meta.gid())
+}
+
+/// The mode-bit half of that question, on injected ids: the owner class when
+/// euid owns the entry, the group class when egid matches, "other"
+/// otherwise. GNU answers through faccessat(W_OK, AT_EACCESS), which also
+/// credits ACLs and supplementary groups; the bit comparison answers the
+/// same for ordinary permission bits and errs toward asking where an ACL
+/// would grant write — that is, toward keeping data (#432).
+fn write_protected_by_bits(mode: u32, uid: u32, gid: u32) -> bool {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    if uid == euid {
+        mode & libc::S_IWUSR == 0
+    } else if gid == egid {
+        mode & libc::S_IWGRP == 0
+    } else {
+        mode & libc::S_IWOTH == 0
+    }
+}
+
+/// GNU -v's stdout line for one removed entry (#435). Write errors are
+/// ignored (#436): GNU aborts through close_stdout when stdout fails, but a
+/// trash tool must never turn a completed removal into a reported failure.
+fn report_removed(path: &std::path::Path, is_dir: bool) {
+    let what = if is_dir {
+        "removed directory"
+    } else {
+        "removed"
+    };
+    rm_out!("{what} '{}'", path.display());
+}
+
+/// Every entry `rm -v` names for one trashed operand (#435): depth-first
+/// post-order in each directory's read order — children before the
+/// directory holding them, the operand last — which is the order GNU rm's
+/// removal follows. A non-directory is the operand alone.
+fn list_removal_order(path: &std::path::Path, is_dir: bool) -> Vec<(PathBuf, bool)> {
+    let mut listed = Vec::new();
+    if is_dir {
+        collect_removal_order(path, &mut listed, 0);
+    }
+    listed.push((path.to_path_buf(), is_dir));
+    listed
+}
+
+/// The `-v` listing of everything under `dir`, each directory after its own
+/// entries. The cap keeps an enormous tree from trading unbounded memory for
+/// messages: past it, deeper entries stay unreported while the move itself
+/// is unaffected.
+fn collect_removal_order(dir: &std::path::Path, listed: &mut Vec<(PathBuf, bool)>, depth: usize) {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_DEPTH: usize = 100;
+    if depth >= MAX_DEPTH || listed.len() >= MAX_ENTRIES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // Unreadable now: the move itself will report it if it fails.
+    };
+    for entry in entries.flatten() {
+        if listed.len() >= MAX_ENTRIES {
+            return;
+        }
+        let path = entry.path();
+        // file_type does not follow symlinks: a link to a directory is
+        // removed as a link, like GNU's leaf handling (#435).
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            collect_removal_order(&path, listed, depth + 1);
+            listed.push((path, true));
+        } else {
+            listed.push((path, false));
+        }
+    }
 }
 
 /// How rm names a file's type in its prompts.
@@ -1626,7 +1983,7 @@ fn real_rm_path() -> PathBuf {
                 // Poisoned stash: executing a copy of THIS SHIM as the "real"
                 // rm recurses without bound (the copy passes through to itself
                 // even with TRASH_BYPASS=1). Fall back to PATH discovery.
-                eprintln!(
+                rm_err!(
                     "trashd: warning: {} is a copy of the trashd shim — ignoring it (reinstall to repair)",
                     stashed.display()
                 );
@@ -1654,7 +2011,7 @@ fn real_rm_path() -> PathBuf {
         match genuine_rm(&p) {
             None => {}
             Some(true) => return p,
-            Some(false) => eprintln!(
+            Some(false) => rm_err!(
                 "trashd: warning: {} is a copy of the trashd shim — ignoring it (reinstall to repair)",
                 p.display()
             ),
@@ -1953,7 +2310,7 @@ fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
     // exec'ing it would recurse without bound (each copy bypasses to its own
     // passthrough). Fail loudly instead of forking forever.
     if stash_is_shim(&rm) {
-        eprintln!(
+        rm_err!(
             "trashd: error: no genuine rm binary found ({} is a shim copy); refusing to recurse",
             rm.display()
         );
@@ -1965,7 +2322,7 @@ fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
     // the real rm's death by a signal into exit 1 (#353).
     use std::os::unix::process::CommandExt;
     let error = Command::new(&rm).args(args).env("TRASH_BYPASS", "1").exec();
-    eprintln!("trashd: failed to exec {}: {error}", rm.display());
+    rm_err!("trashd: failed to exec {}: {error}", rm.display());
     ExitCode::FAILURE
 }
 
@@ -2076,7 +2433,7 @@ fn remove_tree_shown(path: &std::path::Path, display: &std::path::Path) -> std::
             } else {
                 display.join(below)
             };
-            eprintln!(
+            rm_err!(
                 "rm: cannot remove '{}': {}",
                 shown.display(),
                 as_rm_says(error)
@@ -2158,12 +2515,126 @@ mod tests {
         assert!(Rm::try_parse_from(["rm", "--preserve-root=all", "-f", "f"]).is_ok());
     }
 
+    // #430: the preserve-root switch is ONE value over the command line —
+    // the last spelling of either option decides, wherever it appears.
+    #[test]
+    fn preserve_root_switch_follows_the_last_spelling() {
+        let from_clap = |tokens: &[&str]| {
+            // This mirrors main(): the initial value is the clap field, and
+            // clap only sees option spellings before the `--` separator.
+            let options = tokens.splitn(2, |token| *token == "--").next().unwrap();
+            let no_preserve_root = options.contains(&"--no-preserve-root");
+            scan_preserve_root(
+                !no_preserve_root,
+                tokens.iter().map(std::ffi::OsString::from),
+            )
+        };
+        assert_eq!(from_clap(&[]), Some(true));
+        assert_eq!(from_clap(&["--no-preserve-root"]), Some(false));
+        assert_eq!(
+            from_clap(&["--no-preserve-root", "--preserve-root"]),
+            Some(true)
+        );
+        assert_eq!(
+            from_clap(&["--preserve-root=all", "--no-preserve-root"]),
+            Some(false)
+        );
+        // GNU permutes operands: options count anywhere before `--`.
+        assert_eq!(
+            from_clap(&["-rf", "dir", "--no-preserve-root"]),
+            Some(false)
+        );
+        assert_eq!(from_clap(&["--", "--no-preserve-root"]), Some(true));
+        // --help/--version stop the scan like GNU's option loop; whatever
+        // state it reached is moot, because those short-circuits run before
+        // any removal.
+        assert!(from_clap(&["--no-preserve-root", "--help"]).is_some());
+        assert!(from_clap(&["--help", "--no-preserve-root"]).is_some());
+    }
+
+    // #431: GNU checks the exact spelling of --no-preserve-root and rejects
+    // any abbreviation with a diagnostic, removing nothing. Every other
+    // option may still abbreviate.
+    #[test]
+    fn abbreviating_no_preserve_root_is_refused() {
+        let scan =
+            |tokens: &[&str]| scan_preserve_root(true, tokens.iter().map(std::ffi::OsString::from));
+        assert_eq!(scan(&["--no-preserve"]), None);
+        assert_eq!(scan(&["--no-p"]), None);
+        assert_eq!(scan(&["--no-preserve-root"]), Some(false));
+        assert_eq!(scan(&["--no-preserve-root", "--no-preserve"]), None);
+        assert_eq!(scan(&["--no-preserve", "--help"]), None);
+        // --no-trash is --permanent's alias, not a spelling of the switch.
+        assert_eq!(scan(&["--no-trash"]), Some(true));
+        // Abbreviations of --preserve-root keep setting it, as GNU's do.
+        assert_eq!(scan(&["--no-preserve-root", "--preserv"]), Some(true));
+        assert_eq!(scan(&["--no-preserve-root", "--preserve-root"]), Some(true));
+    }
+
     // A bare --interactive must default to "always" and NOT swallow the file.
     #[test]
     fn bare_interactive_defaults_to_always_and_keeps_file() {
         let a = Rm::try_parse_from(["rm", "--interactive", "f"]).unwrap();
         assert_eq!(a.interactive, vec!["always"]);
         assert_eq!(a.files, vec![PathBuf::from("f")]);
+    }
+
+    // #434: GNU's XARGMATCH table for --interactive, including exact
+    // synonyms and prefixes that agree on one meaning.
+    #[test]
+    fn interactive_when_matches_gnu_xargmatch() {
+        for (value, expected) in [
+            ("never", "never"),
+            ("no", "never"),
+            ("none", "never"),
+            ("n", "never"),
+            ("ne", "never"),
+            ("non", "never"),
+            ("once", "once"),
+            ("o", "once"),
+            ("on", "once"),
+            ("always", "always"),
+            ("yes", "always"),
+            ("a", "always"),
+            ("al", "always"),
+            ("y", "always"),
+        ] {
+            assert_eq!(interactive_when(value), Ok(expected), "{value}");
+            // The invocation still parses, so a valid WHEN never falls
+            // through to a permanent delete.
+            let args = Rm::try_parse_from(["rm", &format!("--interactive={value}"), "f"]).unwrap();
+            assert_eq!(args.files, vec![PathBuf::from("f")], "{value}");
+        }
+    }
+
+    // #434: a value no spelling matches is invalid; one abbreviating
+    // spellings with different meanings is ambiguous ('' prefixes all six).
+    // Both carry GNU's wording and valid-arguments listing.
+    #[test]
+    fn invalid_interactive_when_carries_gnus_diagnostic() {
+        for (value, complaint) in [("xx", "invalid"), ("nope", "invalid"), ("", "ambiguous")] {
+            let err = interactive_when(value).unwrap_err();
+            let expected = format!("rm: {complaint} argument '{value}' for '--interactive'\n");
+            assert!(
+                err.starts_with(&expected),
+                "{value}: expected {expected:?}, got {err:?}"
+            );
+            assert!(
+                err.contains("Valid arguments are:\n  - 'never', 'no', 'none'\n  - 'once'\n  - 'always', 'yes'"),
+                "{value}: {err:?}"
+            );
+        }
+    }
+
+    // #433: an empty operand parses, so the loop can diagnose it like GNU
+    // (`rm: cannot remove '': No such file or directory`) and remove the
+    // rest.
+    #[test]
+    fn empty_operands_are_accepted() {
+        let args = Rm::try_parse_from(["rm", "", "f"]).unwrap();
+        assert_eq!(args.files, vec![PathBuf::from(""), PathBuf::from("f")]);
+        let args = Rm::try_parse_from(["rm", "f", ""]).unwrap();
+        assert_eq!(args.files, vec![PathBuf::from("f"), PathBuf::from("")]);
     }
 
     fn behavior(argv: &[&str]) -> RemovalBehavior {
@@ -2284,6 +2755,150 @@ mod tests {
             assert!(behavior.prompt_once(false, 4));
         }
         assert!(!behavior(&["rm", "-If"]).prompt_once(true, 4));
+    }
+
+    // #432: with no flag at all the shim behaves like GNU's RMI_SOMETIMES,
+    // and only -f / --interactive=never silence it entirely.
+    #[test]
+    fn default_interaction_is_sometimes() {
+        assert_eq!(
+            RemovalBehavior::default().interaction,
+            Interaction::Sometimes
+        );
+        assert_eq!(behavior(&["rm", "f"]).interaction, Interaction::Sometimes);
+        assert_eq!(behavior(&["rm", "-I", "f"]).interaction, Interaction::Once);
+        for argv in [
+            &["rm", "-f", "f"][..],
+            &["rm", "--interactive=never", "f"],
+            &["rm", "-f", "--interactive=never", "f"],
+        ] {
+            assert_eq!(behavior(argv).interaction, Interaction::Never, "{argv:?}");
+        }
+    }
+
+    // #432: the write-protected question follows the effective identity —
+    // owner class, then group class, then "other" — and a symlink is never
+    // asked about, whatever it points at.
+    #[test]
+    fn write_protection_follows_the_effective_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        // The owner class decides when euid owns the entry.
+        assert!(write_protected_by_bits(0o444, euid, egid.wrapping_add(1)));
+        assert!(!write_protected_by_bits(0o644, euid, egid.wrapping_add(1)));
+        // The group class when the owner is someone else but egid matches.
+        assert!(write_protected_by_bits(0o444, euid.wrapping_add(1), egid));
+        assert!(!write_protected_by_bits(0o464, euid.wrapping_add(1), egid));
+        // Otherwise "other".
+        assert!(write_protected_by_bits(
+            0o444,
+            euid.wrapping_add(1),
+            egid.wrapping_add(1)
+        ));
+        assert!(!write_protected_by_bits(
+            0o446,
+            euid.wrapping_add(1),
+            egid.wrapping_add(1)
+        ));
+
+        let dir = scratch("wprot");
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .unwrap();
+        let meta = std::fs::symlink_metadata(&file).unwrap();
+        // Whatever this process's privilege, the answer matches the bits.
+        assert_eq!(
+            write_protected(&meta),
+            unsafe { libc::geteuid() } != 0
+                && write_protected_by_bits(meta.mode(), meta.uid(), meta.gid())
+        );
+        // A symlink's bits are meaningless: never asked about.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(!write_protected(&std::fs::symlink_metadata(&link).unwrap()));
+    }
+
+    // #432/#436: prompting reads one line and applies GNU's yes rule; a
+    // question that cannot be written is answered no WITHOUT reading stdin.
+    #[test]
+    fn prompting_declines_when_the_question_cannot_be_asked() {
+        let answer = |input: &str| {
+            let mut reader = std::io::BufReader::new(input.as_bytes());
+            let mut sink = std::io::sink();
+            prompt_user_with("rm: remove 'f'? ", &mut reader, &mut sink)
+        };
+        assert!(answer("y\n"));
+        assert!(answer("yes\n"));
+        assert!(answer("Y\n"));
+        assert!(answer("yeah\n"));
+        assert!(!answer("n\n"));
+        assert!(!answer(" y\n"));
+        assert!(!answer(""), "EOF declines");
+
+        struct Full;
+        impl std::io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Untouched;
+        impl std::io::Read for Untouched {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("stdin must not be read when the question cannot be asked")
+            }
+        }
+        let mut reader = std::io::BufReader::new(Untouched);
+        let mut full = Full;
+        assert!(!prompt_user_with(
+            "rm: remove 'f'? ",
+            &mut reader,
+            &mut full
+        ));
+    }
+
+    // #435: -v names entries in GNU's removal order — each directory after
+    // its entries, the operand last — without following a symlinked
+    // directory.
+    #[test]
+    fn verbose_listing_is_postorder_children_before_directories() {
+        let dir = scratch("verbose");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a"), b"x").unwrap();
+        std::fs::write(dir.join("sub/b"), b"x").unwrap();
+        let listed = list_removal_order(&dir, true);
+        let position = |name: &str| {
+            listed
+                .iter()
+                .position(|(path, _)| *path == dir.join(name))
+                .unwrap_or_else(|| panic!("{name} absent from {listed:?}"))
+        };
+        let (b, sub, operand) = (position("sub/b"), position("sub"), position(""));
+        assert!(b < sub && sub < operand, "{listed:?}");
+        assert_eq!(operand, listed.len() - 1, "{listed:?}");
+        let is_dir = |name: &str| {
+            listed
+                .iter()
+                .find(|(path, _)| *path == dir.join(name))
+                .unwrap()
+                .1
+        };
+        assert!(is_dir("sub") && is_dir(""));
+        assert!(!is_dir("a") && !is_dir("sub/b"));
+        // A file operand is the operand alone.
+        let file = dir.join("a");
+        assert_eq!(
+            list_removal_order(&file, false),
+            vec![(file.clone(), false)]
+        );
+        // A symlink to the directory itself is a leaf: listed, not followed.
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        let listed = list_removal_order(&dir, true);
+        assert_eq!(listed.len(), 5, "{listed:?}"); // sub/b, a, loop, sub, dir
     }
 
     #[test]

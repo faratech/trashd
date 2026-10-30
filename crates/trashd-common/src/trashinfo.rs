@@ -262,6 +262,14 @@ impl TrashInfo {
         let mut sha256 = None;
         let mut compressed = None;
         let mut deletion_ns = None;
+        // Fallible parses must not get a second chance: a malformed first
+        // occurrence is still the first occurrence (#413). Track consumption
+        // separately from parse success so a later duplicate can never fill
+        // a value the first occurrence failed to parse.
+        let mut date_seen = false;
+        let mut pid_seen = false;
+        let mut size_seen = false;
+        let mut deletion_ns_seen = false;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -306,7 +314,8 @@ impl TrashInfo {
                         }
                         path = Some(decoded);
                     }
-                    "DeletionDate" if date.is_none() => {
+                    "DeletionDate" if !date_seen => {
+                        date_seen = true;
                         if let Ok(naive) =
                             NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%dT%H:%M:%S")
                         {
@@ -315,20 +324,28 @@ impl TrashInfo {
                     }
                     // First occurrence wins for the extensions too: a later
                     // duplicate must never override e.g. the integrity-hash
-                    // marker recorded at trash time (#30).
+                    // marker recorded at trash time (#30). A malformed first
+                    // value is consumed all the same (#413).
                     "X-Trashd-Command" if command.is_none() => {
                         command = Some(value.trim().to_string())
                     }
-                    "X-Trashd-PID" if pid.is_none() => pid = value.trim().parse().ok(),
-                    "X-Trashd-Size" if size.is_none() => size = value.trim().parse().ok(),
+                    "X-Trashd-PID" if !pid_seen => {
+                        pid_seen = true;
+                        pid = value.trim().parse().ok();
+                    }
+                    "X-Trashd-Size" if !size_seen => {
+                        size_seen = true;
+                        size = value.trim().parse().ok();
+                    }
                     "X-Trashd-Hash" | "X-Trashd-SHA256" if sha256.is_none() => {
                         sha256 = Some(value.trim().to_string())
                     }
                     "X-Trashd-Compressed" if compressed.is_none() => {
                         compressed = Some(value.trim().to_string())
                     }
-                    "X-Trashd-DeletedNs" if deletion_ns.is_none() => {
-                        deletion_ns = value.trim().parse().ok()
+                    "X-Trashd-DeletedNs" if !deletion_ns_seen => {
+                        deletion_ns_seen = true;
+                        deletion_ns = value.trim().parse().ok();
                     }
                     _ => {}
                 }
@@ -779,6 +796,59 @@ X-Trashd-SHA256=deadbeef
     fn parse_missing_date_returns_none() {
         let content = "[Trash Info]\nPath=/tmp/test.txt\n";
         assert!(TrashInfo::from_trashinfo(content).is_none());
+    }
+
+    // Regression (#413): first-occurrence-wins must hold even when the first
+    // duplicate value is malformed — a later well-formed duplicate must not
+    // fill the field. Residual of #30, which only covered valid-first cases.
+    #[test]
+    fn malformed_first_duplicate_beats_valid_second() {
+        // DeletionDate is required: a malformed first occurrence consumes the
+        // field, no valid date remains, and the sidecar as a whole is invalid
+        // (previously the later duplicate slipped in).
+        let content = "[Trash Info]\n\
+                       Path=/tmp/test.txt\n\
+                       DeletionDate=not-a-date\n\
+                       DeletionDate=2030-01-01T00:00:00\n";
+        assert!(TrashInfo::from_trashinfo(content).is_none());
+
+        // Optional extension fields: a malformed first value must consume the
+        // field instead of leaving it to a later duplicate.
+        let content = "[Trash Info]\n\
+                       Path=/tmp/test.txt\n\
+                       DeletionDate=2026-03-20T14:30:00\n\
+                       X-Trashd-Size=abc\n\
+                       X-Trashd-Size=999999\n\
+                       X-Trashd-PID=nope\n\
+                       X-Trashd-PID=4242\n\
+                       X-Trashd-DeletedNs=-1\n\
+                       X-Trashd-DeletedNs=123456789\n";
+        let info = TrashInfo::from_trashinfo(content).unwrap();
+        assert!(
+            info.size.is_none(),
+            "malformed first Size must consume the field"
+        );
+        assert!(
+            info.pid.is_none(),
+            "malformed first PID must consume the field"
+        );
+        assert!(
+            info.deletion_ns.is_none(),
+            "malformed first DeletedNs must consume the field"
+        );
+        // And a valid first value still beats a different valid second.
+        let content = "[Trash Info]\n\
+                       Path=/tmp/test.txt\n\
+                       DeletionDate=2026-03-20T14:30:00\n\
+                       DeletionDate=2030-01-01T00:00:00\n\
+                       X-Trashd-Size=12\n\
+                       X-Trashd-Size=999999\n";
+        let info = TrashInfo::from_trashinfo(content).unwrap();
+        assert_eq!(info.size, Some(12));
+        assert_eq!(
+            info.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "2026-03-20T14:30:00"
+        );
     }
 
     #[test]

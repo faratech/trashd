@@ -90,10 +90,28 @@ pub fn read_log(max_lines: usize) -> Vec<String> {
     read_log_file(&log_path(), max_lines)
 }
 
+/// The operation log is rotated before it grows past this size, keeping one
+/// previous generation (`operations.log.1`) so a long-lived install stays
+/// bounded while `trash log` still reaches back across a rotation (#439).
+const OPERATIONS_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 fn read_log_file(path: &Path, max_lines: usize) -> Vec<String> {
     if max_lines == 0 {
         return Vec::new();
     }
+    let current = read_single_log(path, max_lines);
+    if current.len() >= max_lines {
+        return current;
+    }
+    // Older history may live in the previous generation (#439).
+    let mut rotated = path.as_os_str().to_os_string();
+    rotated.push(".1");
+    let mut entries = read_single_log(Path::new(&rotated), max_lines - current.len());
+    entries.extend(current);
+    entries
+}
+
+fn read_single_log(path: &Path, max_lines: usize) -> Vec<String> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
@@ -230,11 +248,29 @@ fn write_log(home: &Path, message: &str) {
         if metadata.permissions().mode() & 0o7777 != 0o600 {
             f.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
+        rotate_oversized_log(&path, metadata.len() + line.len() as u64);
         f.write_all(line.as_bytes())
     });
 
     if let Err(e) = result {
         eprintln!("trashd: failed to write operation log: {e}");
+    }
+}
+
+/// Retire the current log as `operations.log.1` (replacing any older
+/// generation) once this record would grow it past the rotation size. The
+/// open handle keeps writing into the retired file, so the triggering record
+/// is never lost; the next write starts a fresh log. A failed rotation (for
+/// example a directory squatting on the `.1` name) only warns: appending to
+/// an unrotated log beats dropping the record.
+fn rotate_oversized_log(path: &Path, projected_len: u64) {
+    if projected_len <= OPERATIONS_LOG_MAX_BYTES {
+        return;
+    }
+    let mut rotated = path.as_os_str().to_os_string();
+    rotated.push(".1");
+    if let Err(e) = fs::rename(path, Path::new(&rotated)) {
+        eprintln!("trashd: warning: could not rotate operation log: {e}");
     }
 }
 
@@ -287,6 +323,47 @@ mod tests {
         let current = std::fs::read_to_string(&log).unwrap();
         assert!(current.contains("id=third\n"));
         assert!(!current.contains("id=first\n"));
+    }
+
+    // Regression (#439): the log must not grow forever. Past the rotation
+    // size it retires as operations.log.1, replacing any older generation,
+    // and reads reach back across the rotation boundary.
+    #[test]
+    fn oversized_log_rotates_keeping_one_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(".trashd/operations.log");
+        let rotated = home.path().join(".trashd/operations.log.1");
+        let huge = "x".repeat(super::OPERATIONS_LOG_MAX_BYTES as usize);
+
+        log_purge_in(home.path(), &huge);
+        log_purge_in(home.path(), "after-first-rotation");
+        let current = std::fs::read_to_string(&log).unwrap();
+        assert!(current.contains("id=after-first-rotation"));
+        assert!(!current.contains("xxxx"), "current log must be fresh");
+        let retired = std::fs::read_to_string(&rotated).unwrap();
+        assert!(retired.contains(&huge), "old generation must be kept");
+
+        // A second rotation replaces the previous generation.
+        let huge2 = "y".repeat(super::OPERATIONS_LOG_MAX_BYTES as usize);
+        log_purge_in(home.path(), &huge2);
+        log_purge_in(home.path(), "after-second-rotation");
+        let retired = std::fs::read_to_string(&rotated).unwrap();
+        assert!(retired.contains(&huge2));
+        assert!(!retired.contains(&huge), "only ONE generation is kept");
+        let current = std::fs::read_to_string(&log).unwrap();
+        assert!(current.contains("id=after-second-rotation"));
+
+        // Reads fall back through the rotation boundary.
+        let recent = read_log_file(&log, 2);
+        assert_eq!(recent.len(), 2);
+        assert!(recent[0].contains("id=huge2") || recent[0].contains(&huge2[..16]));
+        let historical = read_log_file(&log, 5);
+        assert!(historical.len() >= 3, "expected history from .1");
+        assert!(
+            historical
+                .iter()
+                .any(|line| line.contains("id=after-first-rotation"))
+        );
     }
 
     #[test]

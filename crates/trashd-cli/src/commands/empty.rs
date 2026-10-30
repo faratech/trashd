@@ -90,15 +90,25 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
         }
     }
 
-    let count = store.empty_entries(&selected, days);
-    if count == 0 {
-        println!("{}", "Nothing to empty.".dimmed());
-    } else {
+    // A purge that could not complete must not report success: scripts and
+    // timers read this exit status, and leftovers would silently outlive
+    // the "empty" (#409).
+    let (count, failed) = store.empty_entries_reporting(&selected, days);
+    if count > 0 {
         println!(
             "{} permanently deleted {} items",
             "Emptied:".green().bold(),
             count
         );
+    } else if failed == 0 {
+        println!("{}", "Nothing to empty.".dimmed());
+    }
+    if failed > 0 {
+        cleanup_unfinished(store);
+        fatal(format!(
+            "{failed} of {} selected item(s) could not be deleted; the trash is not empty",
+            selected.len()
+        ));
     }
     cleanup_unfinished(store);
 }

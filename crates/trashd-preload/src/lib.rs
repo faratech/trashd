@@ -41,6 +41,7 @@ use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1522,6 +1523,10 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 
 /// Copy a regular file with a race-hardened source open (see try_trash's
 /// cross-device branch). The destination is created exclusively.
+///
+/// Mirrors trashd-common's copy_regular_at (store.rs): sparse-aware extents,
+/// a source-version check, then ownership/mode, xattrs and timestamps on the
+/// still-open destination, and a sync before the source is retired (#405).
 fn copy_regular_verified(
     src: &Path,
     dst: &Path,
@@ -1546,28 +1551,162 @@ fn copy_regular_verified(
         .open(dst)?;
     let metadata = output.metadata()?;
     *created = Some((metadata.dev(), metadata.ino()));
-    copy_verified_contents(&mut input, &mut output, &m)?;
-    // Change the descriptor we created, never a replacement at dst.
-    let _ = output.set_permissions(m.permissions());
+    copy_checked_contents(&mut input, &mut output, &m)?;
+    apply_copy_metadata(&output, &m)?;
+    copy_xattrs(&input, &output);
+    apply_copy_times(&output, &m)?;
+    output.sync_all()?;
     Ok(m)
 }
 
-/// A growing source must not keep the hook copying indefinitely. Read one
-/// byte past the selected size to detect growth, then recheck the open inode.
-fn copy_verified_contents(
+/// Copy the selected version's bytes and refuse a source that changed while
+/// being copied. A growing source must not keep the hook copying indefinitely:
+/// extents past the selected size are never read, and the version check —
+/// which also compares lengths and nanosecond timestamps — reports the rest.
+fn copy_checked_contents(
     input: &mut fs::File,
-    output: &mut impl io::Write,
+    output: &mut fs::File,
     source: &fs::Metadata,
 ) -> io::Result<()> {
-    use std::io::Read;
-    let copied = io::copy(
-        &mut (&mut *input).take(source.len().saturating_add(1)),
-        output,
-    )?;
-    if copied != source.len() || !same_copy_source(source, &input.metadata()?) {
+    copy_extents(input, output, source.len())?;
+    if !same_copy_source(source, &input.metadata()?) {
         return Err(io::Error::from_raw_os_error(libc::EBUSY));
     }
     Ok(())
+}
+
+/// Copy a file's data extents only, leaving its holes as holes: a plain copy
+/// expanded an 8-block sparse file to one block per written position (#405),
+/// which can fail with ENOSPC where `mv` succeeds. Mirrors trashd-common's
+/// copy_extents (store.rs): filesystems without SEEK_DATA get a plain copy.
+fn copy_extents(source: &mut fs::File, destination: &mut fs::File, len: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    if len == 0 {
+        return destination.set_len(0);
+    }
+    let fd = source.as_raw_fd();
+    let mut offset: libc::off_t = 0;
+    loop {
+        let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                // No data past `offset`: the rest is a hole.
+                Some(libc::ENXIO) => break,
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) if offset == 0 => {
+                    source.seek(SeekFrom::Start(0))?;
+                    io::copy(&mut io::Read::by_ref(source).take(len), destination)?;
+                    return Ok(());
+                }
+                _ => return Err(error),
+            }
+        }
+        // A writer can append data beyond the captured EOF after the caller's
+        // stat. Neither that extent nor a growing final extent is ours to copy.
+        if data as u64 >= len {
+            break;
+        }
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        source.seek(SeekFrom::Start(data as u64))?;
+        destination.seek(SeekFrom::Start(data as u64))?;
+        let wanted = (hole as u64).min(len) - data as u64;
+        let copied = io::copy(&mut io::Read::by_ref(source).take(wanted), destination)?;
+        if copied < wanted {
+            // Truncated meanwhile; the caller's version check rejects it.
+            break;
+        }
+        offset = hole;
+        if offset as u64 >= len {
+            break;
+        }
+    }
+    // Trailing holes: size the copy without writing them.
+    destination.set_len(len)
+}
+
+/// Mode and ownership of the copy, mirroring trashd-common's
+/// apply_fd_metadata: chown may clear set-id bits, so permissions are always
+/// applied last, and a set-id copy owned by someone else would grant that
+/// owner's privileges (#203).
+fn apply_copy_metadata(destination: &fs::File, source: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut mode = (source.permissions().mode() & 0o7777) as libc::mode_t;
+    if unsafe { libc::fchown(destination.as_raw_fd(), source.uid(), source.gid()) } != 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+            || unsafe { libc::geteuid() } == 0
+        {
+            return Err(error);
+        }
+        mode &= !0o6000;
+    }
+    if unsafe { libc::fchmod(destination.as_raw_fd(), mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Timestamps through the descriptor we created, before it is closed — the
+/// destination otherwise gets the deletion instant for both (#405). Mirrors
+/// trashd-common's apply_fd_times.
+fn apply_copy_times(destination: &fs::File, source: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let times = [
+        libc::timespec {
+            tv_sec: source.atime() as libc::time_t,
+            tv_nsec: source.atime_nsec() as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: source.mtime() as libc::time_t,
+            tv_nsec: source.mtime_nsec() as libc::c_long,
+        },
+    ];
+    if unsafe { libc::futimens(destination.as_raw_fd(), times.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Best-effort extended-attribute copy, mirroring trashd-common's
+/// copy_xattrs_fd: every namespace listxattr reports is carried over, and a
+/// failure (unsupported filesystem, permissions) never fails the move (#405).
+fn copy_xattrs(source: &fs::File, destination: &fs::File) {
+    let src = source.as_raw_fd();
+    let size = unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return;
+    }
+    let mut names = vec![0u8; size as usize];
+    if unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) } < 0 {
+        return;
+    }
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let Ok(cname) = CString::new(name) else {
+            continue;
+        };
+        let vsize = unsafe { libc::fgetxattr(src, cname.as_ptr(), std::ptr::null_mut(), 0) };
+        if vsize < 0 {
+            continue;
+        }
+        let mut value = vec![0u8; vsize as usize];
+        if unsafe { libc::fgetxattr(src, cname.as_ptr(), value.as_mut_ptr().cast(), value.len()) }
+            < 0
+        {
+            continue;
+        }
+        unsafe {
+            libc::fsetxattr(
+                destination.as_raw_fd(),
+                cname.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            );
+        }
+    }
 }
 
 /// A copied source must still name the exact version we opened. Nanosecond
@@ -1617,10 +1756,24 @@ fn retire_copied_source(
     }
 }
 
-fn exceeds_file_size_limit(cfg: &PreloadConfig, meta: &fs::Metadata) -> bool {
-    meta.is_file()
-        && cfg.max_file_size_mb != 0
-        && meta.len() > cfg.max_file_size_mb.saturating_mul(1024 * 1024)
+/// Whether a trashed item exceeds a configured size cap. Mirrors trashd-common
+/// store.rs's limits (prepare_source :508 and trash_at_display :969): every
+/// knob is an EXACT-byte comparison — `len > mb.saturating_mul(1 MiB)`, which
+/// whole-MiB truncation let ~1 MiB slip past (#245) — and a zero value
+/// disables the knob. max_file_size_mb bounds a regular file and
+/// max_dir_size_mb a directory tree; a file the preload trashes piece by piece
+/// inside an `rm -rf` tree is a degenerate one-entry tree, so it must satisfy
+/// BOTH caps and the smaller configured one is the effective limit (#412).
+fn exceeds_size_limit(cfg: &PreloadConfig, meta: &fs::Metadata) -> bool {
+    exceeds_size_limit_mb(cfg, meta.is_file(), meta.len())
+}
+
+fn exceeds_size_limit_mb(cfg: &PreloadConfig, is_file: bool, len: u64) -> bool {
+    is_file && (over_size_cap(cfg.max_file_size_mb, len) || over_size_cap(cfg.max_dir_size_mb, len))
+}
+
+fn over_size_cap(cap_mb: u64, len: u64) -> bool {
+    cap_mb != 0 && len > cap_mb.saturating_mul(1024 * 1024)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1643,11 +1796,23 @@ enum TrashAttempt {
 const MAX_CLAIM_ATTEMPTS: u32 = 8;
 
 fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttempt {
+    trash_entry(path, meta, pid, now).0
+}
+
+/// `try_trash`, plus the published entry's data and sidecar paths: an rmdir
+/// that cannot verify emptiness before the move verifies it at the destination
+/// instead (#410). `Some` only accompanies `TrashAttempt::Trashed`.
+fn trash_entry(
+    path: &Path,
+    meta: &fs::Metadata,
+    pid: u32,
+    now: u64,
+) -> (TrashAttempt, Option<(PathBuf, PathBuf)>) {
     // The hook's own lstat of `path` supplies the identity; the pre-move
     // recheck below detects a replacement (#44) without a second stat here.
     let (expect_dev, expect_ino) = (meta.dev(), meta.ino());
-    if exceeds_file_size_limit(config(), meta) {
-        return TrashAttempt::NotTrashed;
+    if exceeds_size_limit(config(), meta) {
+        return (TrashAttempt::NotTrashed, None);
     }
     // Directory size cap (#118): the other layers refuse oversized trees, so
     // trashing one here file-by-file would gut it where the user asked for a
@@ -1656,8 +1821,9 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
         let cfg = config();
         if cfg.max_dir_size_mb > 0 {
             let (bytes, capped) = dir_size_capped(path);
-            if capped || bytes / (1024 * 1024) > cfg.max_dir_size_mb {
-                return TrashAttempt::NotTrashed;
+            // Exact bytes, as the store compares them (#245).
+            if capped || bytes > cfg.max_dir_size_mb.saturating_mul(1024 * 1024) {
+                return (TrashAttempt::NotTrashed, None);
             }
         }
     }
@@ -1668,18 +1834,21 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
         home,
     } = match trash_dir_for(path, expect_dev, uid, now) {
         Ok(selected) => selected,
-        Err(StoreError::Unavailable) => return TrashAttempt::NotTrashed,
-        Err(StoreError::Unsafe) => return TrashAttempt::UnsafeStore,
+        Err(StoreError::Unavailable) => return (TrashAttempt::NotTrashed, None),
+        Err(StoreError::Unsafe) => return (TrashAttempt::UnsafeStore, None),
         Err(StoreError::Lock(e))
             if matches!(
                 e.raw_os_error(),
                 Some(libc::EACCES | libc::ELOOP | libc::ENOTDIR)
             ) =>
         {
-            return TrashAttempt::UnsafeStore;
+            return (TrashAttempt::UnsafeStore, None);
         }
         Err(StoreError::Lock(e)) => {
-            return TrashAttempt::Error(e.raw_os_error().unwrap_or(libc::EIO));
+            return (
+                TrashAttempt::Error(e.raw_os_error().unwrap_or(libc::EIO)),
+                None,
+            );
         }
     };
 
@@ -1695,7 +1864,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
     } else {
         match std::env::current_dir() {
             Ok(cwd) => cwd.join(path),
-            Err(_) => return TrashAttempt::NotTrashed,
+            Err(_) => return (TrashAttempt::NotTrashed, None),
         }
     };
 
@@ -1731,10 +1900,10 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
     // one second, which DeletionDate and coarse sidecar mtimes cannot
     // (#345). The clock read is a vDSO call, not a syscall.
     let Ok(stamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-        return TrashAttempt::NotTrashed;
+        return (TrashAttempt::NotTrashed, None);
     };
     let Some(date) = local_time(stamp.as_secs()) else {
-        return TrashAttempt::NotTrashed;
+        return (TrashAttempt::NotTrashed, None);
     };
     let trashinfo = format!(
         "[Trash Info]\nPath={}\nDeletionDate={:04}-{:02}-{:02}T{:02}:{:02}:{:02}\nX-Trashd-Command=preload\nX-Trashd-PID={}\nX-Trashd-Size={size}\nX-Trashd-DeletedNs={}\n",
@@ -1751,7 +1920,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
 
     let source = match CString::new(path.as_os_str().as_bytes()) {
         Ok(s) => s,
-        Err(_) => return TrashAttempt::Error(libc::EINVAL),
+        Err(_) => return (TrashAttempt::Error(libc::EINVAL), None),
     };
 
     // Atomic unique ID via O_CREAT|O_EXCL. A FreeDesktop tool that ignores our
@@ -1762,7 +1931,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
         let (id, info_path, mut info_file) =
             match unique_id_atomic(&info_dir, &files_dir, &base_name, &date) {
                 Some(v) => v,
-                None => return TrashAttempt::NotTrashed,
+                None => return (TrashAttempt::NotTrashed, None),
             };
         let dest = files_dir.join(&id);
 
@@ -1772,7 +1941,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
         drop(info_file);
         if written.is_err() {
             let _ = fs::remove_file(&info_path);
-            return TrashAttempt::NotTrashed;
+            return (TrashAttempt::NotTrashed, None);
         }
 
         // TOCTOU re-check just before the move (#44)
@@ -1780,7 +1949,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
             Ok(now) if now.dev() == expect_dev && now.ino() == expect_ino => {}
             Ok(_) => {
                 let _ = fs::remove_file(&info_path);
-                return TrashAttempt::NotTrashed; // replaced — let the real unlink handle the path
+                return (TrashAttempt::NotTrashed, None); // replaced — let the real unlink handle the path
             }
             Err(_) => {} // vanished; rename below fails cleanly
         }
@@ -1790,7 +1959,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
             Ok(s) => s,
             Err(_) => {
                 let _ = fs::remove_file(&info_path);
-                return TrashAttempt::Error(libc::EINVAL);
+                return (TrashAttempt::Error(libc::EINVAL), None);
             }
         };
         if unsafe {
@@ -1811,7 +1980,10 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
                 path.display(),
                 dest.display()
             ));
-            return TrashAttempt::Trashed;
+            return (
+                TrashAttempt::Trashed,
+                Some((dest.clone(), info_path.clone())),
+            );
         }
         let rename_error = io::Error::last_os_error().raw_os_error();
         if rename_error == Some(libc::EEXIST) || dest.symlink_metadata().is_ok() {
@@ -1820,7 +1992,7 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
             if attempts < MAX_CLAIM_ATTEMPTS {
                 continue;
             }
-            return TrashAttempt::NotTrashed;
+            return (TrashAttempt::NotTrashed, None);
         }
         break (info_path, dest, rename_error);
     };
@@ -1832,18 +2004,18 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
         Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
     ) {
         let _ = fs::remove_file(&info_path);
-        return TrashAttempt::NotTrashed;
+        return (TrashAttempt::NotTrashed, None);
     }
     // Cross-device: copy preserving symlinks, then remove original
     let meta = match fs::symlink_metadata(path) {
         Ok(m) if m.dev() == expect_dev && m.ino() == expect_ino => m,
         Ok(_) => {
             let _ = fs::remove_file(&info_path);
-            return TrashAttempt::Error(libc::EBUSY);
+            return (TrashAttempt::Error(libc::EBUSY), None);
         }
         Err(_) => {
             let _ = fs::remove_file(&info_path);
-            return TrashAttempt::NotTrashed;
+            return (TrashAttempt::NotTrashed, None);
         }
     };
 
@@ -1864,21 +2036,21 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
             if result == TrashAttempt::Trashed {
                 log_preload(&format!("trashed (cross-dev symlink): {}", path.display()));
             }
-            return result;
+            return located(result, &dest, &info_path);
         }
     } else if meta.is_dir() {
         // Cross-device dirs: best-effort. For preload, fall back to real delete.
         let _ = fs::remove_file(&info_path);
-        return TrashAttempt::NotTrashed;
+        return (TrashAttempt::NotTrashed, None);
     } else if meta.file_type().is_fifo() || meta.file_type().is_socket() {
         // fs::copy on a FIFO blocks forever waiting for a writer (#11);
         // sockets have no persistent data. Let the real unlink proceed.
         let _ = fs::remove_file(&info_path);
-        return TrashAttempt::NotTrashed;
+        return (TrashAttempt::NotTrashed, None);
     } else if meta.file_type().is_char_device() || meta.file_type().is_block_device() {
         // Copying a device node would read unbounded data from it.
         let _ = fs::remove_file(&info_path);
-        return TrashAttempt::NotTrashed;
+        return (TrashAttempt::NotTrashed, None);
     } else {
         // Regular file: copy + delete original. The copy opens the source
         // with O_NOFOLLOW|O_NONBLOCK and re-verifies dev/ino first: a racer
@@ -1896,9 +2068,9 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
                 if error.raw_os_error() == Some(libc::EBUSY)
                     || fs::symlink_metadata(path).is_ok_and(|now| !same_copy_source(&meta, &now))
                 {
-                    return TrashAttempt::Error(libc::EBUSY);
+                    return (TrashAttempt::Error(libc::EBUSY), None);
                 }
-                return TrashAttempt::NotTrashed;
+                return (TrashAttempt::NotTrashed, None);
             }
         };
         let result = retire_copied_source(
@@ -1912,11 +2084,147 @@ fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttem
         if result == TrashAttempt::Trashed {
             log_preload(&format!("trashed (cross-dev): {}", path.display()));
         }
-        return result;
+        return located(result, &dest, &info_path);
     }
 
     let _ = fs::remove_file(&info_path);
-    TrashAttempt::NotTrashed
+    (TrashAttempt::NotTrashed, None)
+}
+
+/// Pair a cross-device retirement result with where its entry landed.
+fn located(
+    result: TrashAttempt,
+    dest: &Path,
+    info_path: &Path,
+) -> (TrashAttempt, Option<(PathBuf, PathBuf)>) {
+    (
+        result,
+        (result == TrashAttempt::Trashed).then(|| (dest.to_path_buf(), info_path.to_path_buf())),
+    )
+}
+
+/// The rmdir family's emptiness verdict for a directory, decided before
+/// anything moves: a caller must be able to POSITIVELY confirm emptiness
+/// before it emulates a successful rmdir.
+enum Emptiness {
+    /// No entries besides `.` and `..`: trash it as today.
+    Empty,
+    /// Populated, or unreadable in a way the kernel will answer for itself.
+    Populated,
+    /// This user cannot read it, yet the kernel's rmdir only needs the
+    /// PARENT's write permission — such a directory would be removed for real
+    /// where today's read-based emptiness gate must decline (#410).
+    Unreadable,
+}
+
+fn emptiness(path: &Path) -> Emptiness {
+    match fs::read_dir(path) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                Emptiness::Populated
+            } else {
+                Emptiness::Empty
+            }
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+            Emptiness::Unreadable
+        }
+        // Vanished, or otherwise unreportable: the real syscall produces the
+        // exact errno.
+        Err(_) => Emptiness::Populated,
+    }
+}
+
+/// The rmdir/unlinkat(AT_REMOVEDIR)/remove(directory) decision for a real
+/// directory. `None` lets the real syscall run and answer for itself.
+fn rmdir_attempt(abs: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> Option<TrashAttempt> {
+    match emptiness(abs) {
+        Emptiness::Empty => Some(try_trash(abs, meta, pid, now)),
+        Emptiness::Populated => None,
+        Emptiness::Unreadable => rmdir_unreadable(abs, meta, pid, now),
+    }
+}
+
+/// #410: an unreadable directory is scanned under a temporary read and write
+/// grant instead of being left to the kernel's rmdir, which removes it for
+/// real. The grant is needed for the move too: renaming a directory OUT of
+/// its parent requires the directory's OWN write permission (a 0300
+/// directory renames across parents, a 0500 one fails EACCES), and the scan
+/// needs read. The entry's own mode goes back on whichever copy it ends up
+/// as, and a populated directory is answered with the kernel's own ENOTEMPTY
+/// without trashing anything.
+fn rmdir_unreadable(abs: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> Option<TrashAttempt> {
+    // Only the entry's owner can grant and restore its mode.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    let path = match CString::new(abs.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let set_mode = |granted: bool, target: &CString| {
+        let value = if granted {
+            mode | libc::S_IRUSR | libc::S_IWUSR
+        } else {
+            mode
+        };
+        unsafe { libc::chmod(target.as_ptr(), value as libc::mode_t) == 0 }
+    };
+    if !set_mode(true, &path) {
+        return None;
+    }
+    let scanned = fs::read_dir(abs).map(|mut entries| entries.next().is_none());
+    let empty = match scanned {
+        Ok(empty) => empty,
+        Err(error) => {
+            // Even the grant does not make it scannable: decline as before.
+            if !set_mode(false, &path) {
+                log_preload(&format!(
+                    "unreadable rmdir: could not restore the mode of {}: {error}",
+                    abs.display()
+                ));
+            }
+            return None;
+        }
+    };
+    if !empty {
+        // The kernel would have answered ENOTEMPTY: nothing is trashed and
+        // the victim's own mode is restored.
+        if !set_mode(false, &path) {
+            log_preload(&format!(
+                "unreadable rmdir: could not restore the mode of {}",
+                abs.display()
+            ));
+        }
+        return Some(TrashAttempt::Error(libc::ENOTEMPTY));
+    }
+    let (attempt, located) = trash_entry(abs, meta, pid, now);
+    match located {
+        // The entry moved under the granted mode: put its own mode back on
+        // the copy in the trash.
+        Some((dest, _info)) => {
+            if let Ok(dest) = CString::new(dest.as_os_str().as_bytes())
+                && !set_mode(false, &dest)
+            {
+                log_preload(&format!(
+                    "unreadable rmdir: could not restore the mode of the trashed copy of {}",
+                    abs.display()
+                ));
+            }
+        }
+        // Not moved (store failure, another device, a size cap): put the
+        // original's mode back before the real syscall runs.
+        None => {
+            if !set_mode(false, &path) {
+                log_preload(&format!(
+                    "unreadable rmdir: could not restore the mode of {}",
+                    abs.display()
+                ));
+            }
+        }
+    }
+    Some(attempt)
 }
 
 /// Atomically claim a unique trashinfo filename using O_CREAT|O_EXCL.
@@ -2367,11 +2675,11 @@ pub unsafe extern "C" fn unlinkat(
                         // TOCTOU — a sibling could repopulate the dir in between.
                         // The result is still recoverable from the trash (residual
                         // L8), so we accept it rather than add fragile locking.
+                        // (#410) settles the unreadable case at the destination,
+                        // where a non-empty entry is moved back.
                         if is_real_dir
-                            && let Ok(mut rd) = fs::read_dir(&abs)
-                            && rd.next().is_none()
-                            && let Some(result) =
-                                finish_attempt(try_trash(&abs, &meta, pid, now), saved_errno)
+                            && let Some(result) = rmdir_attempt(&abs, &meta, pid, now)
+                            && let Some(result) = finish_attempt(result, saved_errno)
                         {
                             return Some(result);
                         }
@@ -2424,10 +2732,8 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                     && !is_inside_trash(&abs)
                     && let Some((pid, now)) = intercepted()
                     && !policy_skips(&abs)
-                    && let Ok(mut rd) = fs::read_dir(&abs)
-                    && rd.next().is_none()
-                    && let Some(result) =
-                        finish_attempt(try_trash(&abs, &meta, pid, now), saved_errno)
+                    && let Some(result) = rmdir_attempt(&abs, &meta, pid, now)
+                    && let Some(result) = finish_attempt(result, saved_errno)
                 {
                     return Some(result);
                 }
@@ -2474,16 +2780,16 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
                     && !policy_skips(&abs)
                 {
                     let is_real_dir = meta.is_dir() && !meta.file_type().is_symlink();
-                    let eligible = if is_real_dir {
-                        fs::read_dir(&abs)
-                            .map(|mut rd| rd.next().is_none())
-                            .unwrap_or(false)
+                    // remove() == unlink() for non-directories and rmdir() for
+                    // (empty) directories; an unreadable directory follows the
+                    // rmdir decision, not a permanent delete (#410).
+                    let attempt = if is_real_dir {
+                        rmdir_attempt(&abs, &meta, pid, now)
                     } else {
-                        true
+                        Some(try_trash(&abs, &meta, pid, now))
                     };
-                    if eligible
-                        && let Some(result) =
-                            finish_attempt(try_trash(&abs, &meta, pid, now), saved_errno)
+                    if let Some(result) = attempt
+                        && let Some(result) = finish_attempt(result, saved_errno)
                     {
                         return Some(result);
                     }
@@ -2569,59 +2875,175 @@ mod tests {
         assert!(!info.join(format!("{truncated}.trashinfo")).exists());
     }
 
+    // #405: the copy reads exactly the selected version. Data appended past
+    // the captured EOF is never read, and a source that grew or shrank while
+    // being copied is refused with EBUSY like any other rewrite.
     #[test]
     fn copied_source_growth_is_bounded_and_shrink_is_detected_during_copy() {
-        struct ChangingOutput<'a> {
-            source: &'a Path,
-            shrink: bool,
-            changed: bool,
-            copied: u64,
-        }
-        impl io::Write for ChangingOutput<'_> {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if !self.changed {
-                    self.changed = true;
-                    let mut source = fs::OpenOptions::new().append(true).open(self.source)?;
-                    if self.shrink {
-                        source.set_len(0)?;
-                    } else {
-                        source.write_all(&[b'x'; 16 * 1024])?;
-                    }
-                }
-                self.copied += bytes.len() as u64;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        for shrink in [false, true] {
+        use std::io::Write as _;
+        for grow in [false, true] {
             let fixture = tempfile::tempdir().unwrap();
             let source = fixture.path().join("source");
             fs::write(&source, b"original bytes").unwrap();
             let mut input = fs::File::open(&source).unwrap();
             let selected = input.metadata().unwrap();
-            let mut output = ChangingOutput {
-                source: &source,
-                shrink,
-                changed: false,
-                copied: 0,
-            };
-            let error = copy_verified_contents(&mut input, &mut output, &selected).unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
-            assert!(output.changed);
-            assert!(output.copied <= selected.len() + 1);
-            if shrink {
-                assert_eq!(output.copied, selected.len());
-                assert_eq!(fs::metadata(&source).unwrap().len(), 0);
+            let destination = fixture.path().join("copy");
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .unwrap();
+            if grow {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap()
+                    .write_all(&[b'x'; 16 * 1024])
+                    .unwrap();
             } else {
-                assert_eq!(output.copied, selected.len() + 1);
-                assert_eq!(
-                    fs::metadata(&source).unwrap().len(),
-                    selected.len() + 16 * 1024
-                );
+                fs::File::options()
+                    .write(true)
+                    .open(&source)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
             }
+            let error = copy_checked_contents(&mut input, &mut output, &selected).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+            let copied = output.metadata().unwrap().len();
+            if grow {
+                assert_eq!(copied, selected.len(), "the append is not ours to copy");
+            } else {
+                assert_eq!(copied, selected.len(), "the hole is sized, not written");
+            }
+            assert_eq!(
+                fs::metadata(&source).unwrap().len(),
+                if grow { selected.len() + 16 * 1024 } else { 0 }
+            );
         }
+    }
+
+    // #405: a cross-device trash copy must mirror trashd-common's
+    // copy_regular_at — holes stay holes, timestamps and extended attributes
+    // survive, and the block count proves neither expanded.
+    #[test]
+    fn cross_device_copy_preserves_sparse_holes_times_and_xattrs() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("sparse");
+        // Two 8-byte data extents around holes: [0,8), [1 MiB, 1 MiB+8), len
+        // 2 MiB. The gap spans whole pages so sparseness survives the copy on
+        // any page-granular filesystem.
+        const GAP: u64 = 1024 * 1024;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .unwrap();
+        use std::io::{Seek, SeekFrom, Write as _};
+        file.write_all(b"extent0").unwrap();
+        file.seek(SeekFrom::Start(GAP)).unwrap();
+        file.write_all(b"extent1").unwrap();
+        file.set_len(2 * GAP).unwrap();
+        let (seconds, nanos) = (1_000_000_000i64, 123_456_789i64);
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::new(seconds as u64, nanos as u32);
+        file.set_times(fs::FileTimes::new().set_accessed(stamp).set_modified(stamp))
+            .unwrap();
+        drop(file);
+
+        // user.* may be unsupported on the fixture's filesystem (a tmpfs
+        // without user xattrs): probe it before asserting anything about it.
+        let cname = c"user.trashd.test";
+        let set_xattr = |path: &Path, value: &[u8]| {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            unsafe {
+                libc::setxattr(
+                    name.as_ptr(),
+                    cname.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            }
+        };
+        let xattr_set = set_xattr(&source, b"kept") == 0;
+
+        let original = fs::symlink_metadata(&source).unwrap();
+        let root = fixture.path().join("Trash");
+        lock_store(&root, unsafe { libc::geteuid() }).unwrap();
+        let dest = root.join("files/sparse");
+        let mut created = None;
+        let copied =
+            copy_regular_verified(&source, &dest, original.dev(), original.ino(), &mut created)
+                .unwrap();
+        assert_eq!(copied.len(), 2 * GAP);
+        // Stat BEFORE reading: a read updates the copy's own atime.
+        let copy_meta = fs::symlink_metadata(&dest).unwrap();
+        use std::io::Read as _;
+        let mut copy = fs::File::open(&dest).unwrap();
+        let mut hole = vec![0u8; 2 * GAP as usize];
+        copy.read_exact(&mut hole).unwrap();
+        assert_eq!(&hole[0..7], b"extent0");
+        assert_eq!(&hole[GAP as usize..GAP as usize + 7], b"extent1");
+        assert!(hole[8..GAP as usize].iter().all(|b| *b == 0));
+        // The same block-count probe the issue used: holes must not be written.
+        // A plain io::copy lands 4096 blocks for 2 MiB; the two page-backed
+        // extents need a small multiple of 8 blocks.
+        assert!(
+            copy_meta.blocks() < (2 * GAP) / 512 / 8,
+            "sparse copy expanded to {} blocks",
+            copy_meta.blocks()
+        );
+        assert_eq!(copy_meta.mtime(), seconds);
+        assert_eq!(copy_meta.mtime_nsec(), nanos);
+        assert_eq!(copy_meta.atime(), seconds, "access time preserved too");
+        let name = CString::new(dest.as_os_str().as_bytes()).unwrap();
+        let mut value = [0u8; 16];
+        let got = unsafe {
+            libc::getxattr(
+                name.as_ptr(),
+                cname.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if xattr_set {
+            // Whatever the probe wrote must have travelled to the copy.
+            let source_name = CString::new(source.as_os_str().as_bytes()).unwrap();
+            let mut expected = [0u8; 16];
+            let want = unsafe {
+                libc::getxattr(
+                    source_name.as_ptr(),
+                    cname.as_ptr(),
+                    expected.as_mut_ptr().cast(),
+                    expected.len(),
+                )
+            };
+            assert_eq!(got, want, "xattr length");
+            assert_eq!(&value[..got as usize], &expected[..want as usize]);
+        } else {
+            eprintln!(
+                "SKIP: user.* xattrs unsupported on {}",
+                fixture.path().display()
+            );
+        }
+
+        // A file without xattrs still copies, and mode travels with it.
+        let plain = fixture.path().join("plain");
+        fs::write(&plain, b"no xattrs").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o640)).unwrap();
+        let meta = fs::symlink_metadata(&plain).unwrap();
+        let dest = root.join("files/plain");
+        let mut created = None;
+        let copied =
+            copy_regular_verified(&plain, &dest, meta.dev(), meta.ino(), &mut created).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"no xattrs");
+        let copy_meta = fs::symlink_metadata(&dest).unwrap();
+        assert_eq!(copy_meta.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(
+            copied.dev(),
+            meta.dev(),
+            "the return is the source's identity"
+        );
     }
 
     // #382: exercise the production retirement helper after deterministic
@@ -3102,6 +3524,46 @@ mod tests {
         assert_eq!(cfg.max_dir_size_mb, 5);
     }
 
+    // #412: the caps compare exact bytes, and every item is checked — a file
+    // is a degenerate one-entry tree, so the tree cap binds for it too.
+    #[test]
+    fn size_limits_compare_exact_bytes_and_degenerate_trees() {
+        const MIB: u64 = 1024 * 1024;
+        let mut cfg = PreloadConfig::default();
+        assert_eq!(cfg.max_file_size_mb, 1024);
+        assert_eq!(cfg.max_dir_size_mb, 0, "default is unlimited");
+
+        // Whole-MiB truncation used to admit these (#245).
+        assert!(exceeds_size_limit_mb(
+            &cfg,
+            true,
+            cfg.max_file_size_mb * MIB + 1
+        ));
+        assert!(!exceeds_size_limit_mb(
+            &cfg,
+            true,
+            cfg.max_file_size_mb * MIB
+        ));
+        // Zero never binds, whatever the size.
+        assert!(!over_size_cap(0, u64::MAX));
+        // The default dir cap is unlimited, so only the file cap can refuse.
+        assert!(!exceeds_size_limit_mb(&cfg, true, 2 * MIB));
+        // A degenerate tree: with max_dir_size_mb = 1, a 2 MiB file inside an
+        // rm -rf'd tree must not be trashed file-by-file (#412).
+        cfg.max_dir_size_mb = 1;
+        assert!(exceeds_size_limit_mb(&cfg, true, 2 * MIB));
+        assert!(exceeds_size_limit_mb(&cfg, true, MIB + 1));
+        assert!(!exceeds_size_limit_mb(&cfg, true, MIB));
+        // The file cap alone disabled still leaves the tree cap binding.
+        cfg.max_file_size_mb = 0;
+        assert!(exceeds_size_limit_mb(&cfg, true, MIB + 1));
+        // Both disabled: unlimited.
+        cfg.max_dir_size_mb = 0;
+        assert!(!exceeds_size_limit_mb(&cfg, true, u64::MAX));
+        // Directories take the bounded walk instead, never the size compare.
+        assert!(!exceeds_size_limit_mb(&cfg, false, u64::MAX));
+    }
+
     // Regression (#108): lookalike .Trash-<other-uid> directories are user
     // data, not trash — the hook must intercept them (not skip, which would
     // permanently delete).
@@ -3171,5 +3633,249 @@ mod tests {
             assert!(ensure_trusted_ancestors(&link.join("new"), uid).is_err());
             assert!(!private.join("new").exists());
         }
+    }
+
+    // #410: rmdir of an unreadable directory must never decline into a
+    // permanent deletion. The scenarios need a dedicated child: a redirected
+    // trash root and policy (no ambient /tmp exclusion, no bypassed ancestor —
+    // this harness runs under cargo, which every default bypass list names),
+    // and an owner that cannot read the directory, which root never can.
+    #[test]
+    fn rmdir_of_unreadable_directory_is_never_a_permanent_deletion() {
+        const MARKER: &str = "TRASHD_PRELOAD_RMDIR_CHILD";
+        const TEST: &str = "tests::rmdir_of_unreadable_directory_is_never_a_permanent_deletion";
+        match std::env::var_os(MARKER).as_deref().and_then(OsStr::to_str) {
+            None => {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .stderr(std::process::Stdio::inherit())
+                    .env(MARKER, "fork")
+                    .status()
+                    .expect("spawn hook child");
+                assert!(status.success(), "hook child failed: {status}");
+            }
+            Some("fork") => run_reparented_scenarios(MARKER),
+            _ => run_unreadable_rmdir_scenarios(),
+        }
+    }
+
+    /// The fork helper of the #410 test: raw-fork the scenario process and
+    /// exit so it reparents away from this harness's bypassed ancestry. The
+    /// pipe carries the scenario's verdict back to the helper.
+    fn run_reparented_scenarios(marker: &str) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0);
+        if forked == 0 {
+            unsafe { libc::close(fds[0]) };
+            let middle = unsafe { libc::fork() };
+            if middle == 0 {
+                // The scenario process. Its verdict travels the pipe; panics
+                // are reported raw (the harness's stderr may hold no lock a
+                // forked child could deadlock on).
+                unsafe { libc::alarm(120) };
+                std::panic::set_hook(Box::new(|info| {
+                    let message = info.to_string();
+                    unsafe { libc::write(2, message.as_ptr().cast(), message.len()) };
+                }));
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Safety: the scenario process is single-threaded.
+                    unsafe { std::env::remove_var(marker) };
+                    run_unreadable_rmdir_scenarios();
+                }))
+                .is_ok();
+                let byte = [u8::from(ok)];
+                let _ = unsafe { libc::write(fds[1], byte.as_ptr().cast(), 1) };
+                unsafe {
+                    libc::close(fds[1]);
+                    libc::_exit(if ok { 0 } else { 3 });
+                }
+            }
+            // Leaving now reparents the scenario process to init, so its
+            // ancestor walk never reaches this harness's process names.
+            unsafe { libc::close(fds[1]) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut verdict = [0u8; 1];
+        let read = unsafe { libc::read(fds[0], verdict.as_mut_ptr().cast(), 1) };
+        unsafe { libc::close(fds[0]) };
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(forked, &mut status, 0) }, forked);
+        let ok = read == 1
+            && verdict[0] == 1
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 0;
+        std::process::exit(i32::from(!ok));
+    }
+
+    /// The #410 scenarios, in a process that owns its environment, mount
+    /// namespace and (as root) drops to an unprivileged user for real EACCES.
+    fn run_unreadable_rmdir_scenarios() {
+        // The host global config's never_trash and bypass lists must not
+        // decide this test: a private mount namespace with an empty
+        // /etc/trashd leaves only the defaults and this child's user config.
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+            eprintln!("SKIP: a private mount namespace is unavailable");
+            return;
+        }
+        let shadowed = c"/etc/trashd";
+        if unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                shadowed.as_ptr(),
+                c"tmpfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            eprintln!("SKIP: /etc/trashd cannot be shadowed");
+            return;
+        }
+        // /tmp itself is in every default never_trash list; /var/lib is not.
+        let Ok(base) = tempfile::Builder::new()
+            .prefix("trashd-preload-rmdir-")
+            .tempdir_in("/var/lib")
+        else {
+            eprintln!("SKIP: no writable /var/lib for a non-excluded fixture");
+            return;
+        };
+        let (home, data, config_dir, work) = (
+            base.path().join("home"),
+            base.path().join("data"),
+            base.path().join("config"),
+            base.path().join("work"),
+        );
+        for dir in [&home, &data, &config_dir, &work] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::create_dir_all(config_dir.join("trashd")).unwrap();
+        fs::write(config_dir.join("trashd/config.toml"), "never_trash = []\n").unwrap();
+        let uid = 65534;
+        let dropping = unsafe { libc::geteuid() } == 0;
+        if dropping {
+            for dir in [base.path(), &home, &data, &config_dir, &work] {
+                use std::os::unix::fs::MetadataExt;
+                assert!(std::os::unix::fs::chown(dir, Some(uid), Some(uid)).is_ok());
+                assert_eq!(
+                    fs::symlink_metadata(dir).unwrap().uid(),
+                    uid,
+                    "{}",
+                    dir.display()
+                );
+            }
+            assert!(
+                std::os::unix::fs::chown(
+                    config_dir.join("trashd/config.toml"),
+                    Some(uid),
+                    Some(uid)
+                )
+                .is_ok()
+            );
+            assert_eq!(unsafe { libc::setgid(uid) }, 0);
+            assert_eq!(unsafe { libc::setuid(uid) }, 0);
+        }
+        // Safety: the scenario process is single-threaded.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", &data);
+            std::env::set_var("XDG_CONFIG_HOME", &config_dir);
+            std::env::remove_var("TRASH_BYPASS");
+            std::env::remove_var("TRASHD_SECCOMP_ACTIVE");
+        }
+        // Reparenting escapes cargo, but any other bypassed ancestor (an
+        // init named systemd, per the host config) would make the hooks
+        // decline and the scenarios assert against the wrong behavior.
+        if process_is_bypassed(config(), std::process::id()) {
+            eprintln!("SKIP: the scenario process is bypassed by policy");
+            return;
+        }
+
+        let files = data.join("Trash/files");
+        let infos = data.join("Trash/info");
+        let errno = || unsafe { *libc::__errno_location() };
+        let remove_dir = |name: &Path| {
+            let path = CString::new(name.as_os_str().as_bytes()).unwrap();
+            unsafe { unlinkat(libc::AT_FDCWD, path.as_ptr(), libc::AT_REMOVEDIR) }
+        };
+        let entries = |dir: &Path| {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        };
+        let owner = unsafe { libc::geteuid() };
+
+        // (1) Empty and unreadable: the caller's rmdir succeeds and the entry
+        // lands in the trash whole, with its own mode restored after the scan.
+        let locked = work.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o300)).unwrap();
+        assert_eq!(
+            remove_dir(&locked),
+            0,
+            "empty unreadable rmdir: {}",
+            io::Error::last_os_error()
+        );
+        assert!(!locked.exists(), "removed from its directory");
+        let mut trashed = entries(&files);
+        assert_eq!(trashed.len(), 1, "kept recoverable in the trash");
+        let trashed = trashed.pop().unwrap();
+        let meta = fs::symlink_metadata(&trashed).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.uid(), owner);
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o300,
+            "the scan's read grant was undone"
+        );
+        assert_eq!(entries(&infos).len(), 1, "sidecar present");
+        // Scan the copy the way the hook scanned the origin: grant, read,
+        // restore.
+        let copy = CString::new(trashed.as_os_str().as_bytes()).unwrap();
+        let chmod = |granted: bool| unsafe {
+            libc::chmod(
+                copy.as_ptr(),
+                if granted { 0o700 } else { 0o300 } as libc::mode_t,
+            )
+        };
+        assert_eq!(chmod(true), 0);
+        let scanned = fs::read_dir(&trashed)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap();
+        assert_eq!(chmod(false), 0);
+        assert!(scanned, "the copy is verifiably empty");
+
+        // (2) Unreadable and populated: the kernel's own ENOTEMPTY, nothing
+        // trashed, the entry and its contents untouched at the origin.
+        let full = work.join("full");
+        fs::create_dir(&full).unwrap();
+        fs::write(full.join("kept"), b"inside").unwrap();
+        fs::set_permissions(&full, fs::Permissions::from_mode(0o300)).unwrap();
+        assert_eq!(remove_dir(&full), -1);
+        assert_eq!(errno(), libc::ENOTEMPTY);
+        assert!(full.exists());
+        assert_eq!(
+            fs::symlink_metadata(&full).unwrap().permissions().mode() & 0o7777,
+            0o300,
+            "the victim's mode is never modified"
+        );
+        assert_eq!(fs::read(full.join("kept")).unwrap(), b"inside");
+        // Scenario (1)'s entry is still there; nothing new was added.
+        assert_eq!(entries(&files).len(), 1, "nothing new stays trashed");
+        let sidecars = entries(&infos);
+        if sidecars.len() != 1 {
+            panic!("no sidecar stays behind: {sidecars:?}");
+        }
+
+        // (3) A readable empty directory still trashes the ordinary way.
+        let open = work.join("open");
+        fs::create_dir(&open).unwrap();
+        assert_eq!(remove_dir(&open), 0);
+        assert!(!open.exists());
+        assert_eq!(entries(&files).len(), 2, "scenario (1)'s entry is joined");
+        assert_eq!(entries(&infos).len(), 2);
     }
 }

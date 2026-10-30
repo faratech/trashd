@@ -48,9 +48,10 @@ pub fn run(cmd: ConfigCmd) {
             }
         }
         ConfigCmd::Add { key, value } => {
-            // Refuse patterns the loader would silently drop on every read,
-            // instead of reporting success for a no-op write (#259).
-            validate_list_pattern(&value).unwrap_or_else(|e| fatal(e));
+            // Refuse values the loader would drop or that can never do what
+            // they promise, instead of reporting success for a no-op write
+            // (#259, #419).
+            validate_list_value(&key, &value).unwrap_or_else(|e| fatal(e));
             let mut table = load_user_config_table();
             config_list_add(&mut table, &key, &value, &Config::load().only_trash);
             write_user_config_table(&table);
@@ -339,14 +340,24 @@ fn seed_inherited_whitelist(table: &mut toml::Table, key: &str, inherited: &[Str
     }
 }
 
-/// The loader's pattern rules, applied at write time (#259).
-fn validate_list_pattern(value: &str) -> Result<(), String> {
-    if trashd_common::config::pattern_is_supported(value) {
-        Ok(())
-    } else {
-        Err(format!(
-            "unsupported pattern '{value}' (brace expansion is not supported)"
-        ))
+/// Write-time validation matching each list's matching semantics (#259, #419).
+/// `never_trash`/`only_trash` are glob lists: the loader silently drops
+/// patterns our matcher cannot honour, so `add` refuses them up front.
+/// `bypass_paths` (a literal path prefix, `starts_with` against the process
+/// exe) and `bypass_processes` (an exact process name) match literally, so
+/// braces and other glob characters are ordinary characters there and are
+/// accepted as-is. No list accepts an empty value: an empty `bypass_paths`
+/// prefix matches every executable, and an empty glob pattern is a no-op the
+/// user cannot have meant.
+fn validate_list_value(key: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("refusing to add an empty value to '{key}'"));
+    }
+    match key {
+        "never_trash" | "only_trash" if !trashd_common::config::pattern_is_supported(value) => Err(
+            format!("unsupported pattern '{value}' (brace expansion is not supported)"),
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -542,10 +553,33 @@ mod tests {
     // the loader drops on every read.
     #[test]
     fn brace_patterns_are_rejected_at_add_time() {
-        assert!(validate_list_pattern("{a,b}.py").is_err());
-        assert!(validate_list_pattern("a}.py").is_err());
-        assert!(validate_list_pattern("*.py").is_ok());
-        assert!(validate_list_pattern("*.[ch]").is_ok());
+        for key in ["never_trash", "only_trash"] {
+            assert!(validate_list_value(key, "{a,b}.py").is_err(), "{key}");
+            assert!(validate_list_value(key, "a}.py").is_err(), "{key}");
+            assert!(validate_list_value(key, "*.py").is_ok(), "{key}");
+            assert!(validate_list_value(key, "*.[ch]").is_ok(), "{key}");
+        }
+    }
+
+    // Regression (#419): the glob validator ran for every list, so literal
+    // bypass values containing braces were rejected although bypass_paths is
+    // a literal prefix match and bypass_processes an exact name. Only the
+    // glob lists get pattern validation, and no list accepts empty values.
+    #[test]
+    fn bypass_lists_accept_literals_and_no_list_accepts_empty() {
+        for key in ["bypass_paths", "bypass_processes"] {
+            assert!(
+                validate_list_value(key, "/opt/{tools}/bin").is_ok(),
+                "{key}"
+            );
+            assert!(validate_list_value(key, "my-{proc}").is_ok(), "{key}");
+            assert!(validate_list_value(key, "").is_err(), "{key}");
+        }
+        for key in ["never_trash", "only_trash"] {
+            assert!(validate_list_value(key, "").is_err(), "{key}");
+        }
+        // Unknown keys are left for config_list_add to reject by name.
+        assert!(validate_list_value("max_file_size_mb", "{x}").is_ok());
     }
 
     // Regression (#211): `config edit` seeded the user file with every default

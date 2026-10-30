@@ -167,7 +167,7 @@ rm file.txt              # moved to trash, not deleted
 rm -rf project/          # whole directory moved to trash as one entry
 rm -i important.txt      # asks before each file (same wording style as GNU rm)
 rm -I *.tmp              # asks once when removing 3+ files or recursing
-rm -v file.txt           # verbose: trashed 'file.txt' [file.txt]
+rm -v file.txt           # verbose: prints "removed 'file.txt'" per entry, like rm
 rm -d empty_dir/         # remove an empty directory (refuses a non-empty one, like rm)
 rm -- *.txt              # names starting with a dash still work after --
 ```

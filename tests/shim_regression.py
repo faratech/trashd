@@ -343,6 +343,82 @@ def main():
         assert run([plain / "x"]).returncode == 1 and plain.exists()
         print("PASS: -f ignores ENOTDIR operands")
 
+        # The preserve-root switch is ONE sequential value: --no-preserve-root
+        # clears it and a LATER --preserve-root restores the guard, which then
+        # refuses '/' before anything is touched (#430). The refusal happens
+        # before the store is opened, so this never reaches the filesystem.
+        for flags in [
+            ["-rf", "--no-preserve-root", "--preserve-root"],
+            ["-rf", "--preserve-root=all", "--no-preserve-root", "--preserve-root"],
+        ]:
+            result = run([*flags, "/"])
+            assert result.returncode != 0, (flags, result.returncode)
+            assert "it is dangerous to operate recursively on '/'" in result.stderr, (flags, result.stderr)
+        print("PASS: a later --preserve-root restores the guard over '/'")
+
+        # GNU checks the exact spelling of --no-preserve-root alone: an
+        # unambiguous abbreviation is diagnosed and removes nothing (#431),
+        # while the exact spelling keeps lifting the guard (#119, #250).
+        for flags in [["--no-preserve"], ["-rf", "--no-p"]]:
+            operand = root / "abbrev-no-preserve-root"
+            operand.write_bytes(b"kept")
+            result = run([*flags, operand])
+            assert result.returncode == 1, (flags, result.returncode, result.stderr)
+            assert result.stderr == "rm: you may not abbreviate the --no-preserve-root option\n", (flags, result.stderr)
+            assert operand.read_bytes() == b"kept", flags
+        operand = root / "exact-no-preserve-root"
+        operand.write_bytes(b"recoverable")
+        result = run(["--no-preserve-root", operand])
+        assert result.returncode == 0 and not operand.exists(), result.stderr
+        assert list((root / "data/Trash/info").glob("exact-no-preserve-root*")), "the exact spelling must still lift the guard"
+        print("PASS: an abbreviated --no-preserve-root is refused; the exact spelling still works")
+
+        # An empty operand is diagnosed like any other missing file and the
+        # remaining operands are still removed, as GNU does (#433).
+        survivor = root / "empty-operand-a"
+        other = root / "empty-operand-b"
+        survivor.write_bytes(b"recoverable")
+        other.write_bytes(b"recoverable")
+        result = run(["", survivor])
+        assert result.returncode == 1, result.stderr
+        assert "rm: cannot remove '': No such file or directory" in result.stderr, result.stderr
+        assert not survivor.exists() and list((root / "data/Trash/info").glob("empty-operand-a*")), result.stderr
+        result = run([other, ""])
+        assert result.returncode == 1, result.stderr
+        assert "rm: cannot remove '': No such file or directory" in result.stderr, result.stderr
+        assert not other.exists() and list((root / "data/Trash/info").glob("empty-operand-b*")), result.stderr
+        print("PASS: an empty operand is diagnosed and the rest is still trashed")
+
+        # GNU's --interactive synonym table: never/no/none mean never,
+        # once means once, always/yes mean always, and any unambiguous prefix
+        # of one meaning is accepted (#434).
+        for value, asks in [("never", False), ("no", False), ("none", False), ("n", False),
+                            ("once", False), ("o", False), ("always", True), ("yes", True),
+                            ("a", True), ("al", True)]:
+            victim = root / f"interactive-{value}"
+            victim.write_bytes(b"recoverable")
+            result = run([f"--interactive={value}", victim])
+            if asks:
+                assert "[y/N]" in result.stderr and victim.exists(), (value, result.stderr)
+            else:
+                assert result.returncode == 0 and not victim.exists(), (value, result.stderr)
+                assert list((root / "data/Trash/info").glob(f"interactive-{value}*")), value
+        invalid = root / "interactive-invalid"
+        invalid.write_bytes(b"kept")
+        result = run(["--interactive=xx", invalid])
+        assert result.returncode == 1 and invalid.exists(), result.stderr
+        assert result.stderr == (
+            "rm: invalid argument 'xx' for '--interactive'\n"
+            "Valid arguments are:\n"
+            "  - 'never', 'no', 'none'\n"
+            "  - 'once'\n"
+            "  - 'always', 'yes'\n"
+        ), result.stderr
+        result = run(["--interactive="])
+        assert result.returncode == 1, result.stderr
+        assert result.stderr.startswith("rm: ambiguous argument '' for '--interactive'\n"), result.stderr
+        print("PASS: --interactive accepts GNU's synonyms and prefixes and replicates its diagnostics")
+
         # -d on a directory the caller cannot list: only rmdir(2) knows it is
         # not empty; the shim used to trash it with its unseen contents.
         # The temporary root is 0700: nobody must reach its fixtures, or
@@ -372,6 +448,63 @@ def main():
         assert (unlistable / "secret").read_bytes() == b"keep"
         assert not list((nobody / "data/Trash/info").glob("*.trashinfo")) if (nobody / "data/Trash/info").exists() else True
         print("PASS: -d on an unlistable non-empty directory refuses like rm")
+
+        # GNU rm's default asks before removing an entry the effective user
+        # may not write to; EOF or any non-y answer keeps the file without an
+        # error, and -f / --interactive=never remove without asking (#432).
+        def nobody_fixture(name, mode=0o444, content=b"precious"):
+            path = nobody / name
+            path.write_bytes(content)
+            os.chmod(path, mode)
+            os.chown(path, 65534, 65534)
+            return path
+        protected = nobody_fixture("write-protected")
+        declined = subprocess.run([str(binary), str(protected)], env=nobody_env, cwd=nobody,
+                                  capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert declined.returncode == 0 and protected.exists(), declined.stderr
+        assert declined.stderr == f"rm: remove write-protected regular file '{protected}'? ", declined.stderr
+        confirmed = subprocess.run([str(binary), str(protected)], env=nobody_env, cwd=nobody,
+                                   input="y\n", capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert confirmed.returncode == 0 and not protected.exists(), confirmed.stderr
+        assert confirmed.stderr == f"rm: remove write-protected regular file '{protected}'? ", confirmed.stderr
+        assert list((nobody / "data/Trash/info").glob("write-protected*")), "answering yes must trash"
+
+        empty = nobody_fixture("write-protected-empty", content=b"")
+        asked = subprocess.run([str(binary), str(empty)], env=nobody_env, cwd=nobody,
+                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert asked.returncode == 0 and empty.exists(), asked.stderr
+        assert asked.stderr == f"rm: remove write-protected regular empty file '{empty}'? ", asked.stderr
+        sealed = nobody / "write-protected-dir"
+        sealed.mkdir()
+        os.chmod(sealed, 0o555)
+        os.chown(sealed, 65534, 65534)
+        asked = subprocess.run([str(binary), "-d", str(sealed)], env=nobody_env, cwd=nobody,
+                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert asked.returncode == 0 and sealed.is_dir(), asked.stderr
+        assert asked.stderr == f"rm: remove write-protected directory '{sealed}'? ", asked.stderr
+        link = nobody / "write-protected-link"
+        link.symlink_to("no-such-target")
+        asked = subprocess.run([str(binary), str(link)], env=nobody_env, cwd=nobody,
+                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert asked.returncode == 0 and not link.exists() and asked.stderr == "", asked.stderr
+        forced = nobody_fixture("write-protected-force")
+        forced_run = subprocess.run([str(binary), "-f", str(forced)], env=nobody_env, cwd=nobody,
+                                    capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert forced_run.returncode == 0 and not forced.exists() and forced_run.stderr == "", forced_run.stderr
+        never = nobody_fixture("write-protected-never")
+        never_run = subprocess.run([str(binary), "--interactive=never", str(never)], env=nobody_env, cwd=nobody,
+                                   capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert never_run.returncode == 0 and not never.exists() and never_run.stderr == "", never_run.stderr
+        writable = nobody_fixture("plain-writable", mode=0o644)
+        quiet = subprocess.run([str(binary), str(writable)], env=nobody_env, cwd=nobody,
+                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        assert quiet.returncode == 0 and not writable.exists() and quiet.stderr == "", quiet.stderr
+        # Later assertions count nobody's trash contents: this block's entries
+        # must not litter them.
+        for stored in (nobody / "data/Trash/files").glob("*"):
+            shutil.rmtree(stored) if stored.is_dir() else stored.unlink()
+        shutil.rmtree(nobody / "data/Trash/info", ignore_errors=True)
+        print("PASS: write-protected entries are asked about, kept on decline, silent under -f and never")
 
         # -ri confirms every entry, as rm does, instead of one prompt for the tree.
         def interactive(answers, tree):
@@ -1014,6 +1147,52 @@ def main():
         bypassed = subprocess.run([str(make), "-c", f"{binary} -f {victim}"], env=broken, cwd=root, capture_output=True, text=True, timeout=10)
         assert bypassed.returncode == 0 and not victim.exists(), bypassed.stderr
         print("PASS: bypassed callers pass through without opening the store")
+
+        # -v names every removed entry on stdout, children before the
+        # directory holding them and the operand last, like GNU rm; the old
+        # stderr annotation is gone (#435).
+        tree = root / "verbose-tree"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "a").write_bytes(b"x")
+        (tree / "sub/b").write_bytes(b"x")
+        result = run(["-rv", tree])
+        assert result.returncode == 0 and result.stderr == "", result.stderr
+        lines = result.stdout.splitlines()
+        assert sorted(lines) == sorted([
+            f"removed '{tree / 'sub/b'}'",
+            f"removed directory '{tree / 'sub'}'",
+            f"removed '{tree / 'a'}'",
+            f"removed directory '{tree}'",
+        ]), lines
+        # The operand is named last, after the directory holding its entries.
+        assert lines[-1] == f"removed directory '{tree}'", lines
+        assert lines.index(f"removed '{tree / 'sub/b'}'") < lines.index(f"removed directory '{tree / 'sub'}'"), lines
+        assert list((root / "data/Trash/info").glob("verbose-tree*")), "verbose removal must still trash"
+        single = root / "verbose-single"
+        single.write_bytes(b"x")
+        result = run(["-v", single])
+        assert result.returncode == 0 and result.stderr == "", result.stderr
+        assert result.stdout == f"removed '{single}'\n", result.stdout
+        print("PASS: -v reports every removed entry on stdout in removal order")
+
+        # A failed stderr must never turn a completed removal into a reported
+        # failure, and an unaskable question keeps the file (#436).
+        victim = root / "full-stderr"
+        victim.write_bytes(b"x")
+        with open("/dev/full", "w") as full:
+            result = subprocess.run([str(binary), "-v", victim], env=env, cwd=root,
+                                    stdout=subprocess.PIPE, stderr=full, text=True, timeout=10)
+        assert result.returncode == 0 and not victim.exists(), (result.returncode, result.stdout)
+        assert result.stdout == f"removed '{victim}'\n", result.stdout
+        assert list((root / "data/Trash/info").glob("full-stderr*")), "the removal itself must succeed"
+        kept = root / "full-stderr-prompt"
+        kept.write_bytes(b"x")
+        os.chmod(kept, 0o444)
+        with open("/dev/full", "w") as full:
+            result = subprocess.run([str(binary), "-i", kept], env=env, cwd=root,
+                                    input="y\n", stdout=subprocess.PIPE, stderr=full, text=True, timeout=10)
+        assert result.returncode == 0 and kept.exists(), (result.returncode, kept)
+        print("PASS: a full stderr never fails a completed removal nor removes on a declined prompt")
 
         # One desktop notification per invocation, not one per operand.
         fake_bin = root / "fake-bin"

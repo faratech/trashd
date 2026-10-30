@@ -503,14 +503,14 @@ pub fn dir_is_empty(parent_fd: RawFd, name: &OsStr) -> io::Result<bool> {
     Ok(empty)
 }
 
-/// fstatat(AT_SYMLINK_NOFOLLOW) convenience: (st_mode, st_dev, st_size).
-pub fn stat_nofollow(parent_fd: RawFd, name: &OsStr) -> io::Result<(u32, u64, i64)> {
+/// fstatat(AT_SYMLINK_NOFOLLOW) convenience: (st_mode, st_dev, st_size, uid).
+pub fn stat_nofollow(parent_fd: RawFd, name: &OsStr) -> io::Result<(u32, u64, i64, u32)> {
     let c = CString::new(name.as_bytes())?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatat(parent_fd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((st.st_mode, st.st_dev as u64, st.st_size))
+    Ok((st.st_mode, st.st_dev as u64, st.st_size, st.st_uid))
 }
 
 /// Outcome of the pinned interception attempt.
@@ -672,11 +672,15 @@ pub fn try_pinned(
 
     // Type checks against the PINNED parent (symlinks NOT followed for the
     // final component — matches unlink/rmdir semantics).
-    let (mode, _dev, _size) = match stat_nofollow(parent, name) {
+    let (mode, _dev, _size, owner) = match stat_nofollow(parent, name) {
         Ok(v) => v,
         Err(_) => return Ok(Decision::Continue),
     };
     let fmt = mode & libc::S_IFMT;
+    // An unreadable but owned rmdir target is scanned under a temporary read
+    // and write grant; the grant must last through the pin (see below), so
+    // whichever copy the entry ends up as gets its own mode back.
+    let mut scan_grant: Option<libc::mode_t> = None;
     if remove_dir {
         if fmt != libc::S_IFDIR {
             return Ok(Decision::Errno(libc::ENOTDIR));
@@ -684,10 +688,41 @@ pub fn try_pinned(
         // rmdir requires POSITIVELY-confirmed emptiness. A sibling repopulating
         // the dir between this check and the move lands the whole tree in the
         // trash (recoverable), which is still safer than permanent deletion.
-        match dir_is_empty(parent, name) {
-            Ok(true) => {}
-            Ok(false) => return Ok(Decision::Errno(libc::ENOTEMPTY)),
+        let verified = match dir_is_empty(parent, name) {
+            Ok(empty) => Ok(empty),
+            // An unreadable directory we own is not left to the kernel: it
+            // would rmdir it for real. Read and write permission are granted
+            // for one scan; the WRITE must last through the pin, because
+            // moving a directory out of its parent needs the directory's OWN
+            // write permission (a 0300 directory renames across parents, a
+            // 0500 one fails EACCES), and the scan needs READ (#411).
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+                    && owner == unsafe { libc::geteuid() } =>
+            {
+                if grant_read_write(parent, name, mode as libc::mode_t) {
+                    scan_grant = Some(mode as libc::mode_t);
+                    dir_is_empty(parent, name)
+                } else {
+                    Err(error)
+                }
+            }
             Err(_) => return Ok(Decision::Decline),
+        };
+        match verified {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(granted) = scan_grant.take() {
+                    restore_mode(parent, name, granted);
+                }
+                return Ok(Decision::Errno(libc::ENOTEMPTY));
+            }
+            Err(_) => {
+                if let Some(granted) = scan_grant.take() {
+                    restore_mode(parent, name, granted);
+                }
+                return Ok(Decision::Decline);
+            }
         }
     } else if fmt == libc::S_IFDIR {
         return Ok(Decision::Errno(libc::EISDIR));
@@ -711,7 +746,14 @@ pub fn try_pinned(
     let still_valid = || notify_fd < 0 || crate::supervisor::notif_id_valid(notify_fd, notify_id);
     let trashed = store.trash_at_canonical(parent, name, &physical, Some("seccomp"), still_valid);
     match trashed {
-        Ok(_id) => Ok(Decision::Trashed),
+        Ok(id) => {
+            // The scan grant lasted through the pin: the moved entry carries
+            // it, so its own mode goes back on the copy in the trash.
+            if let Some(granted) = scan_grant {
+                restore_pinned_mode(store, &id, granted);
+            }
+            Ok(Decision::Trashed)
+        }
         // Policy: the preload would decide the same, so declining only
         // cost a second round trip (#357).
         Err(TrashError::Excluded(_) | TrashError::Refused(_) | TrashError::TooLarge { .. }) => {
@@ -720,13 +762,72 @@ pub fn try_pinned(
         // EXDEV (namespaced/cross-device target), hash/store hiccups, and
         // unsafe stores all defer to the target's own layer. Re-resolving
         // `display` in the supervisor could mutate an unrelated host path.
-        Err(_) => Ok(Decision::Decline),
+        Err(_) => {
+            if let Some(granted) = scan_grant {
+                // The pin failed with the grant still in place and the
+                // original still at its name: put its own mode back.
+                restore_mode(parent, name, granted);
+            }
+            Ok(Decision::Decline)
+        }
     }
+}
+
+/// Put the entry's own mode back after a scan grant lasted through the pin:
+/// the entry now lives at its pinned path, where this supervisor — the same
+/// user trashd-exec spawned it with — is the owner.
+fn restore_pinned_mode(store: &TrashStore, id: &str, mode: libc::mode_t) {
+    let pinned = store
+        .list(None)
+        .ok()
+        .and_then(|entries| entries.into_iter().find(|entry| entry.id == id));
+    let Some(entry) = pinned else {
+        report!(
+            "trashd-exec: supervisor: could not restore the scanned rmdir target's mode: entry not found"
+        );
+        return;
+    };
+    let Ok(c) = CString::new(entry.trashed_path.as_os_str().as_bytes()) else {
+        return;
+    };
+    if unsafe { libc::chmod(c.as_ptr(), mode & 0o7777) } != 0 {
+        report!(
+            "trashd-exec: supervisor: could not restore the scanned rmdir target's mode: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// Grant this owner read and write permission on the pinned name for one
+/// scan, reporting whether the grant took. Only the owner (checked by the
+/// caller) can do this, and [`restore_mode`] puts the original mode back on
+/// every path that follows.
+fn grant_read_write(parent: RawFd, name: &OsStr, mode: libc::mode_t) -> bool {
+    fchmodat_nofollow(parent, name, mode | libc::S_IRUSR | libc::S_IWUSR)
+}
+
+/// Put `mode` back after a grant. A mode that cannot be restored is a leaked
+/// permission on the caller's own entry, not a content change: report it and
+/// go on rather than make the deletion fail on it.
+fn restore_mode(parent: RawFd, name: &OsStr, mode: libc::mode_t) {
+    if !fchmodat_nofollow(parent, name, mode) {
+        report!(
+            "trashd-exec: supervisor: could not restore the mode of an rmdir target after an emptiness scan"
+        );
+    }
+}
+
+fn fchmodat_nofollow(parent: RawFd, name: &OsStr, mode: libc::mode_t) -> bool {
+    let Ok(c) = CString::new(name.as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::fchmodat(parent, c.as_ptr(), mode, 0) == 0 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     struct ForeignTarget(std::process::Child);
@@ -1498,6 +1599,188 @@ time.sleep(60)
         );
         c2.kill().unwrap();
         let _ = c2.wait();
+    }
+
+    // #411: an rmdir the supervisor cannot verify for emptiness must not
+    // decline into the kernel's permanent delete. The scenario needs a
+    // supervisor that really cannot read the directory, which root never
+    // can: it runs as nobody in a child of this test, pinning a helper as
+    // the deleting target.
+    #[test]
+    fn unreadable_directory_rmdir_is_pinned_then_verified() {
+        const MARKER: &str = "TRASHD_SECCOMP_PIN_UNREADABLE_CHILD";
+        const SCRATCH: &str = "TRASHD_SECCOMP_PIN_UNREADABLE_SCRATCH";
+        const TEST: &str = "pin::tests::unreadable_directory_rmdir_is_pinned_then_verified";
+        if std::env::var_os(MARKER).is_some() {
+            run_unreadable_pin_scenarios();
+            return;
+        }
+        // nobody cannot traverse /root to exec this harness: stage a copy of
+        // the binary and its writable fixture root where it can.
+        let root = if unsafe { libc::geteuid() } == 0 {
+            tempfile::Builder::new()
+                .prefix("trashd-pin-unreadable-")
+                .tempdir_in("/var/lib")
+                .expect("fixture under a world-traversable root")
+        } else {
+            tempfile::Builder::new()
+                .prefix("trashd-pin-unreadable-")
+                .tempdir()
+                .unwrap()
+        };
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let staged = bin.join("exec");
+        // A hard link never opens the staged inode for writing, so an exec
+        // cannot fail ETXTBSY because a concurrent fork carried the copy's
+        // write descriptor away; fall back to a copy across filesystems.
+        if std::fs::hard_link(std::env::current_exe().unwrap(), &staged).is_err() {
+            std::fs::copy(std::env::current_exe().unwrap(), &staged).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for dir in [root.path(), &bin] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let logged = root.path().join("child-stderr");
+        let status = if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&scratch, Some(65534), Some(65534)).unwrap();
+            let log = std::fs::File::create(&logged).unwrap();
+            std::process::Command::new("setpriv")
+                .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+                .arg(&staged)
+                .args(["--exact", TEST, "--nocapture"])
+                .env(MARKER, "1")
+                .env(SCRATCH, &scratch)
+                .current_dir("/")
+                .stderr(std::process::Stdio::from(log))
+                .status()
+                .expect("run the scenario as nobody")
+        } else {
+            std::fs::File::create(&logged).unwrap();
+            std::os::unix::fs::chown(&scratch, None, None).ok();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(MARKER, "1")
+                .env(SCRATCH, &scratch)
+                .status()
+                .unwrap()
+        };
+        assert!(
+            status.success(),
+            "pinned rmdir child failed: {status}: {}",
+            std::fs::read_to_string(&logged).unwrap_or_default()
+        );
+    }
+
+    /// The #411 scenario, run as an unprivileged supervisor (nobody) that
+    /// pins an equally unprivileged deleting target.
+    fn run_unreadable_pin_scenarios() {
+        let scratch = std::path::PathBuf::from(
+            std::env::var_os("TRASHD_SECCOMP_PIN_UNREADABLE_SCRATCH").expect("scratch passed"),
+        );
+        let fixture = tempfile::Builder::new()
+            .prefix("pin-")
+            .tempdir_in(scratch)
+            .unwrap();
+        let work = fixture.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let config = trashd_common::Config {
+            never_trash: Vec::new(),
+            only_trash: Vec::new(),
+            ..Default::default()
+        };
+        let store = TrashStore::open_isolated(&fixture.path().join("trash"), config).unwrap();
+        let mut child = spawn_with_cwd(&work);
+        let nr = unlinkat_nr();
+        let args_rm: [u64; 6] = [libc::AT_FDCWD as u64, 0, libc::AT_REMOVEDIR as u64, 0, 0, 0];
+        let attempt = |name: &OsStr, display: &Path| {
+            try_pinned(child.id(), nr, &args_rm, name, display, true, -1, 0, &store)
+                .expect("pinned rmdir attempt")
+        };
+
+        // (0) Control: a readable empty directory trashes the ordinary way,
+        // so any decline below is about unverifiable emptiness.
+        let control = work.join("control");
+        std::fs::create_dir(&control).unwrap();
+        let decision = attempt(OsStr::new("control"), &control);
+        assert!(matches!(decision, Decision::Trashed), "{decision:?}");
+        assert_eq!(store.list(None).unwrap().len(), 1);
+
+        // (1) Empty and unreadable: pinned first, verified empty on the copy,
+        // and the caller gets its successful rmdir.
+        let hollow = work.join("hollow");
+        std::fs::create_dir(&hollow).unwrap();
+        std::fs::set_permissions(&hollow, std::fs::Permissions::from_mode(0o111)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&hollow).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the supervisor really cannot verify emptiness"
+        );
+        let decision = attempt(OsStr::new("hollow"), &hollow);
+        assert!(matches!(decision, Decision::Trashed), "{decision:?}");
+        assert!(!hollow.exists(), "removed from its directory");
+        let entries = store.list(None).unwrap();
+        assert_eq!(entries.len(), 2, "the control's entry is joined");
+        let pinned = std::fs::symlink_metadata(&entries[0].trashed_path).unwrap();
+        assert!(pinned.is_dir());
+        let pinned_entry = entries
+            .into_iter()
+            .find(|entry| entry.info.original_path == hollow)
+            .expect("hollow's entry");
+        assert_eq!(
+            std::fs::symlink_metadata(&pinned_entry.trashed_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o111,
+            "the scan's grant was undone on the copy"
+        );
+
+        // (2) Unreadable and populated: the kernel's own ENOTEMPTY, the entry
+        // back at its origin, nothing new left pinned.
+        let full = work.join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("kept"), b"inside").unwrap();
+        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let decision = attempt(OsStr::new("full"), &full);
+        assert!(
+            matches!(decision, Decision::Errno(e) if e == libc::ENOTEMPTY),
+            "{decision:?}"
+        );
+        assert!(full.exists());
+        assert_eq!(std::fs::read(full.join("kept")).unwrap(), b"inside");
+        assert_eq!(
+            std::fs::symlink_metadata(&full)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o111,
+            "the scan's grant was undone on the victim"
+        );
+        assert_eq!(
+            store.list(None).unwrap().len(),
+            2,
+            "nothing new stays pinned"
+        );
+        let infos = fixture.path().join("trash/info");
+        assert_eq!(
+            std::fs::read_dir(infos).unwrap().count(),
+            2,
+            "no sidecar stays behind"
+        );
+
+        // (3) A readable empty directory still trashes through the normal gate.
+        let open = work.join("open");
+        std::fs::create_dir(&open).unwrap();
+        let decision = attempt(OsStr::new("open"), &open);
+        assert!(matches!(decision, Decision::Trashed), "{decision:?}");
+        assert_eq!(store.list(None).unwrap().len(), 3);
+        child.kill().unwrap();
+        let _ = child.wait();
     }
 
     #[test]

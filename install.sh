@@ -11,6 +11,66 @@ REAL_DIR="${PREFIX}/lib/trashd/real"
 LIB_DIR="${PREFIX}/lib/trashd"
 BIN_DIR="${PREFIX}/bin"
 
+# /etc/ld.so.preload and the profile hook are parsed as whitespace/colon
+# separated tokens: a prefix like '/opt/my dir' produced an entry ld.so
+# splits at the space (two errors from EVERY dynamically linked process)
+# that this script's own registered-check never matched again, so each
+# reinstall appended another broken line (#422). Refuse such paths before
+# anything is created, for install and uninstall alike.
+for _path_var in PREFIX SHIM_DIR REAL_DIR LIB_DIR BIN_DIR; do
+    case "${!_path_var}" in
+        *[[:space:]]*|*:*)
+            echo "error: \$${_path_var}='${!_path_var}' contains whitespace or ':' — unsafe for /etc/ld.so.preload and the profile hook" >&2
+            exit 1
+            ;;
+    esac
+done
+unset _path_var
+
+# -----------------------------------------------------------------------
+# /etc/ld.so.preload helpers (uninstall and the flat <-> $LIB transition)
+# -----------------------------------------------------------------------
+
+# True when $1 (an exact entry token) is registered. The file lists
+# libraries separated by whitespace or colons, with `#` comments (#229):
+# whole tokens only, so a different prefix's libtrashd_preload.so never
+# counts (#261).
+preload_registered() {
+    [ -f /etc/ld.so.preload ] || return 1
+    awk -v lib="$1" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null
+}
+
+# Drop this prefix's exact entries (flat AND $LIB form), keeping any other
+# libraries sharing a line: deleting whole lines lost other libraries
+# (#229), and dropping any libtrashd_preload.so token deregistered a
+# different prefix's install (#261). Used by uninstall and when a
+# transition replaces the other registration form (#406).
+preload_remove_entries() {
+    awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{
+        line = $0; comment = ""
+        if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) }
+        if (index(line, lib) == 0 && index(line, libalt) == 0) { print $0; next }
+        n = split(line, entry, /[ \t:]+/); out = ""
+        for (i = 1; i <= n; i++)
+            if (entry[i] != "" && entry[i] != lib && entry[i] != libalt)
+                out = out (out == "" ? "" : " ") entry[i]
+        if (comment != "") out = out (out == "" ? "" : " ") comment
+        if (out != "") print out
+    }' /etc/ld.so.preload > /etc/ld.so.preload.trashd-new
+    chmod 0644 /etc/ld.so.preload.trashd-new
+    mv -f /etc/ld.so.preload.trashd-new /etc/ld.so.preload
+}
+
+# Append one entry, keeping the file well-formed: a trailing-newline fix
+# first, because appending after a file that lacks one would glue our entry
+# onto the previous line and corrupt the whole preload list.
+preload_append_entry() {
+    if [ -s /etc/ld.so.preload ] && [ "$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then
+        printf '\n' >> /etc/ld.so.preload
+    fi
+    echo "$1" >> /etc/ld.so.preload
+}
+
 # -----------------------------------------------------------------------
 # Uninstall
 # -----------------------------------------------------------------------
@@ -91,28 +151,62 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
         echo "    Removed $_path"
     }
 
+    # Remove per-user trashd enablement symlinks (e.g. the cleanup timer a
+    # user enabled with `systemctl --user enable --now trashd-cleanup.timer`,
+    # as the installer instructs): the old uninstall only removed the
+    # system-wide unit copies and left the link in the user's
+    # timers.target.wants dangling forever (#420). Same traversal rules as
+    # remove_home_tree — never through a symlinked component (#215) — and
+    # only symlinks NAMED for a unit this project ships are touched, never
+    # regular files.
+    remove_home_unit_links() {
+        _home="$1"
+        _path="$_home"
+        _old_ifs="$IFS"; IFS='/'
+        for _part in .config systemd user; do
+            _path="$_path/$_part"
+            if [ -L "$_path" ] || [ ! -d "$_path" ]; then
+                IFS="$_old_ifs"
+                return 0
+            fi
+        done
+        IFS="$_old_ifs"
+        for _wants in "$_path"/*; do
+            [ -d "$_wants" ] || continue
+            for _unit in trashd.service trashd-cleanup.service trashd-cleanup.timer; do
+                if [ -L "${_wants}/${_unit}" ]; then
+                    "$RM" -f -- "${_wants}/${_unit}"
+                    echo "    Removed ${_wants}/${_unit}"
+                fi
+            done
+        done
+    }
+
+    # Homes to sweep: every passwd entry with uid >= 1000 plus root (#421) —
+    # homes outside /home (e.g. /srv/home/joe, /var/lib/foo recorded in
+    # passwd) used to keep their configs after uninstall and their trash
+    # after --purge — unioned with the classic /home/* + /root globs, so the
+    # result is a superset of the old scan. Deduplicated, and entries are
+    # re-checked as real, non-symlink directories by the callers. Without
+    # getent, only the globs remain (the old behavior).
+    list_trashd_homes() {
+        {
+            if command -v getent >/dev/null 2>&1; then
+                getent passwd 2>/dev/null | awk -F: '($3 + 0 >= 1000) || ($1 == "root") { if ($6 != "") print $6 }'
+            fi
+            for _d in /home/*; do
+                [ -d "$_d" ] && [ ! -L "$_d" ] && printf '%s\n' "$_d"
+            done
+            printf '%s\n' /root
+        } | awk '!_seen[$0]++'
+    }
+
     # 1. Remove the LD_PRELOAD entry FIRST — before deleting the .so — otherwise
     #    every dynamically-linked process errors about the missing library.
     if [ -f /etc/ld.so.preload ]; then
-        if awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib || e[i] == libalt) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then
-            # The file lists libraries separated by whitespace or colons, with
-            # `#` comments. Drop only this prefix's exact entries (flat or
-            # $LIB form): deleting whole lines lost other libraries sharing
-            # a line (#229), and dropping any libtrashd_preload.so token
-            # deregistered a different prefix's install (#261).
-            awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{
-                line = $0; comment = ""
-                if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) }
-                if (index(line, lib) == 0 && index(line, libalt) == 0) { print $0; next }
-                n = split(line, entry, /[ \t:]+/); out = ""
-                for (i = 1; i <= n; i++)
-                    if (entry[i] != "" && entry[i] != lib && entry[i] != libalt)
-                        out = out (out == "" ? "" : " ") entry[i]
-                if (comment != "") out = out (out == "" ? "" : " ") comment
-                if (out != "") print out
-            }' /etc/ld.so.preload > /etc/ld.so.preload.trashd-new
-            chmod 0644 /etc/ld.so.preload.trashd-new
-            mv -f /etc/ld.so.preload.trashd-new /etc/ld.so.preload
+        if preload_registered "${LIB_DIR}/libtrashd_preload.so" \
+            || preload_registered "${LIB_DIR}/\$LIB/libtrashd_preload.so"; then
+            preload_remove_entries
             echo "    Removed from /etc/ld.so.preload"
         fi
         # Drop the file entirely if nothing else is left in it.
@@ -130,11 +224,14 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
     fi
     # Units live in /etc/systemd/system (install.sh) or /usr/lib/systemd/
     # system (Makefile/packaging): remove both, plus enablement symlinks,
-    # so a cross-installer uninstall leaves no dangling unit (#262).
+    # so a cross-installer uninstall leaves no dangling unit (#262). The
+    # default.target.wants links are from units older than the
+    # multi-user.target [Install] (#426).
     for _unitdir in /etc/systemd/system /usr/lib/systemd/system; do
         for svc in trashd trashd-daemon; do
             remove_files "${_unitdir}/${svc}.service" \
-                "${_unitdir}/multi-user.target.wants/${svc}.service"
+                "${_unitdir}/multi-user.target.wants/${svc}.service" \
+                "${_unitdir}/default.target.wants/${svc}.service"
         done
     done
     for _userdir in /etc/systemd/user /usr/lib/systemd/user; do
@@ -202,21 +299,23 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-
         echo "    Removed /etc/trashd"
     fi
 
-    # 9. Remove per-user configs for all users (and root).
-    for home_dir in /home/* /root; do
-        [ -d "$home_dir" ] && [ ! -L "$home_dir" ] || continue
+    # 9. Remove per-user configs for all users (and root), plus per-user
+    #    systemd enablement links this project installed (#420).
+    while IFS= read -r home_dir; do
+        [ -n "$home_dir" ] && [ -d "$home_dir" ] && [ ! -L "$home_dir" ] || continue
         remove_home_tree "$home_dir" ".config/trashd"
-    done
+        remove_home_unit_links "$home_dir"
+    done < <(list_trashd_homes)
 
     # 10. Optionally remove every FreeDesktop.org Trash spec v1.0 trash
     #     directory (home + per-mountpoint). This DESTROYS trashed files, so it
     #     only runs with --purge.
     if [ "${PURGE}" -eq 1 ]; then
         echo "==> Removing all trash directories (--purge)..."
-        for home_dir in /home/* /root; do
-            [ -d "$home_dir" ] && [ ! -L "$home_dir" ] || continue
+        while IFS= read -r home_dir; do
+            [ -n "$home_dir" ] && [ -d "$home_dir" ] && [ ! -L "$home_dir" ] || continue
             remove_home_tree "$home_dir" ".local/share/Trash"
-        done
+        done < <(list_trashd_homes)
         while IFS= read -r mpoint; do
             for d in "${mpoint}"/.Trash-*; do
                 [ -d "$d" ] && { "$RM" -rf "$d"; echo "    Removed $d"; }
@@ -456,10 +555,23 @@ fi
 
 echo "==> Installing shell completions..."
 if [ -d "${COMP_DIR}" ]; then
-    # Bash
+    # Bash: the system dir carries the live registration, and a
+    # PREFIX-relative copy keeps non-default prefixes complete — the old
+    # either/or skipped bash completions entirely on systems where
+    # /etc/bash_completion.d does not exist, leaving `trash <TAB>` dead
+    # (#427). Both copies are removed on uninstall.
+    BASH_COMP_SYSTEM=0
     if [ -d /etc/bash_completion.d ]; then
         install -Dm644 "${COMP_DIR}/trash.bash" /etc/bash_completion.d/trash
-        echo "    Installed bash completions"
+        BASH_COMP_SYSTEM=1
+    fi
+    BASH_COMP_DIR="${PREFIX}/share/bash-completion/completions"
+    mkdir -p "${BASH_COMP_DIR}"
+    install -Dm644 "${COMP_DIR}/trash.bash" "${BASH_COMP_DIR}/trash"
+    if [ "${BASH_COMP_SYSTEM}" -eq 1 ]; then
+        echo "    Installed bash completions (system + ${BASH_COMP_DIR})"
+    else
+        echo "    Installed bash completions to ${BASH_COMP_DIR}"
     fi
     # Zsh
     ZSH_COMP_DIR="${PREFIX}/share/zsh/site-functions"
@@ -491,19 +603,31 @@ if [ -n "${PRELOAD32_SRC}" ] && [ -f "${PRELOAD32_SRC}" ]; then
     atomic_install "${PRELOAD32_SRC}" "${LIB_DIR}/lib/libtrashd_preload.so"
     PRELOAD_ENTRY="${LIB_DIR}/\$LIB/libtrashd_preload.so"
     echo "    Installed 32-bit preload ${LIB_DIR}/lib/libtrashd_preload.so (registered via \$LIB)"
+else
+    # The flat entry resolves to the copy installed above, so per-ABI
+    # copies left by a previous $LIB install would never be referenced
+    # again — drop the stale trees (#406).
+    rm -rf "${LIB_DIR}/lib" "${LIB_DIR}/lib64"
 fi
 # Enable system-wide: catches unlink/rmdir from any dynamically-linked program.
-# Ensure a trailing newline first — appending after a file that lacks one would
-# glue our entry onto the previous line and corrupt the whole preload list.
-# Either this prefix's flat or $LIB entry counts as registered (#261, #229).
-if ! awk -v lib="${LIB_DIR}/libtrashd_preload.so" -v libalt="${LIB_DIR}/\$LIB/libtrashd_preload.so" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib || e[i] == libalt) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then
-    if [ -s /etc/ld.so.preload ] && [ "$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then
-        printf '\n' >> /etc/ld.so.preload
-    fi
-    echo "${PRELOAD_ENTRY}" >> /etc/ld.so.preload
-    echo "    Enabled system-wide via /etc/ld.so.preload"
-else
+# Registration is FORM-SPECIFIC (#406): a prior install without the i686
+# library registered the flat path, one with it registered the $LIB path. The
+# old either-form check froze whichever came first in place, so the other
+# ABI's library was never preloaded after an upgrade or downgrade. A
+# transition replaces the other form's entry.
+if preload_registered "${PRELOAD_ENTRY}"; then
     echo "    Already in /etc/ld.so.preload"
+else
+    if preload_registered "${LIB_DIR}/libtrashd_preload.so" \
+        || preload_registered "${LIB_DIR}/\$LIB/libtrashd_preload.so"; then
+        preload_remove_entries
+        echo "    Replaced the other registration form in /etc/ld.so.preload"
+    fi
+    # Ensure a trailing newline first — appending after a file that lacks one
+    # would glue our entry onto the previous line and corrupt the whole
+    # preload list.
+    preload_append_entry "${PRELOAD_ENTRY}"
+    echo "    Enabled system-wide via /etc/ld.so.preload"
 fi
 
 echo "==> Installing PATH + seccomp hook (Layers 1 & 4)..."
@@ -537,14 +661,18 @@ if [ -d /etc/profile.d ]; then
 fi
 
 echo "==> Installing fanotify daemon (Layer 3)..."
-# /run/systemd/system exists only while systemd is PID 1. A systemctl binary
-# without a running systemd (WSL without systemd, containers) made
-# daemon-reload fail and aborted the install halfway under set -e (#216).
-if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+# The unit FILE installs whenever systemd's configuration exists: a chroot or
+# offline image build has /etc/systemd but no running PID 1, and gating the
+# copy on a running systemd left Layer 3 uninstallable after boot (#407).
+# Only enable/start needs a running systemd (#216).
+if [ -d /etc/systemd ]; then
+    mkdir -p /etc/systemd/system
     # Migrate from old trashd-daemon.service name
     if [ -f /etc/systemd/system/trashd-daemon.service ]; then
-        systemctl stop trashd-daemon 2>/dev/null || true
-        systemctl disable trashd-daemon 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop trashd-daemon 2>/dev/null || true
+            systemctl disable trashd-daemon 2>/dev/null || true
+        fi
         rm -f /etc/systemd/system/trashd-daemon.service
         echo "    Migrated from trashd-daemon.service -> trashd.service"
     fi
@@ -563,6 +691,15 @@ if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v system
             print out s
         }' \
         "$(dirname "$0")/install/systemd/trashd.service" > /etc/systemd/system/trashd.service
+    chmod 0644 /etc/systemd/system/trashd.service
+    echo "    Installed /etc/systemd/system/trashd.service"
+fi
+# /run/systemd/system exists only while systemd is PID 1. A systemctl binary
+# without a running systemd (WSL without systemd, containers) made
+# daemon-reload fail and aborted the install halfway under set -e (#216).
+SYSTEMD_RUNNING=0
+if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    SYSTEMD_RUNNING=1
     systemctl daemon-reload || true
     systemctl enable trashd 2>/dev/null || true
     systemctl restart trashd 2>/dev/null || true
@@ -572,9 +709,15 @@ if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v system
         echo "    trashd installed but could not start (needs CAP_SYS_ADMIN)"
         echo "    Start manually: sudo systemctl start trashd"
     fi
-else
-    echo "    systemd not available, skipping daemon install"
-    echo "    Run manually: sudo trashd --foreground"
+fi
+if [ "${SYSTEMD_RUNNING}" -eq 0 ]; then
+    if [ -f /etc/systemd/system/trashd.service ]; then
+        echo "    systemd not running: unit installed but not enabled"
+        echo "    After boot: sudo systemctl enable --now trashd"
+    else
+        echo "    systemd not available, skipping daemon install"
+        echo "    Run manually: sudo trashd --foreground"
+    fi
 fi
 
 # The cleanup timer is a per-user unit (trash is per-user), installed disabled

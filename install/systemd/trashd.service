@@ -29,4 +29,7 @@ StandardError=journal
 SyslogIdentifier=trashd
 
 [Install]
-WantedBy=default.target
+# The conventional target for system services. It is also what both
+# uninstallers' manual enablement cleanup removes (multi-user.target.wants),
+# so a disable-less uninstall cannot leave a dangling symlink (#426).
+WantedBy=multi-user.target

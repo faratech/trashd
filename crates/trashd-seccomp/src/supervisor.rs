@@ -157,8 +157,8 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         signal_ready(ready_fd, false);
         return Err(e);
     }
-    let store = match TrashStore::open() {
-        Ok(s) => s,
+    let mut session_state = match SessionState::open() {
+        Ok(state) => state,
         Err(e) => {
             report!("trashd-exec: supervisor: failed to open trash store: {e}");
             signal_ready(ready_fd, false);
@@ -170,7 +170,6 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         }
     };
 
-    let config = Config::load();
     let mut own = OwnComponents::new();
     // Only a privileged supervisor can outrank its targets (#311). An
     // unreadable own status leaves nothing to compare with: protect nobody
@@ -181,7 +180,6 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         None => CredentialGate::Unknown,
     };
     let session = SessionAncestry::discover();
-    store.defer_maintenance();
     signal_ready(ready_fd, true);
 
     loop {
@@ -205,6 +203,12 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
             }
         };
 
+        // The config the session launched with must not outlive its file
+        // forever: a wrapped login shell would keep trashing entries an
+        // edited policy excludes, and vice versa (#437). Two stats per
+        // notification; the store is reopened only on a real change.
+        session_state.refresh();
+
         // Handle this notification (fail-safe: any error → CONTINUE). A
         // panic must still answer it: neither the watchdog nor a respawned
         // supervisor can receive a notification already read, so its thread
@@ -213,8 +217,8 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
             handle_notification(
                 fd,
                 &notif,
-                &store,
-                &config,
+                session_state.store(),
+                session_state.store().config(),
                 own.ids(),
                 &credentials,
                 session.as_ref(),
@@ -225,8 +229,83 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
         }
         // Retention runs after the target has its answer, never while it
         // waits on its trapped syscall (#319).
-        store.run_deferred_maintenance();
+        session_state.store().run_deferred_maintenance();
     }
+}
+
+/// The store one supervised session serves with. It is opened once with the
+/// launch-time configuration, then reopened together with that configuration
+/// whenever a config file's mtime changes — the same change detection the
+/// preload applies inside its own process, for the same reason: a long-lived
+/// trashd-exec session must follow config edits, or removed never_trash
+/// entries keep permanently deleting (#437).
+struct SessionState {
+    /// `config_mtime()` observed at the last (re)load.
+    mtime: i64,
+    store: TrashStore,
+}
+
+impl SessionState {
+    fn open() -> Result<Self, trashd_common::store::TrashError> {
+        Ok(Self::from_parts(TrashStore::open()?))
+    }
+
+    fn from_parts(store: TrashStore) -> Self {
+        Self {
+            mtime: config_mtime(),
+            store,
+        }
+    }
+
+    fn store(&self) -> &TrashStore {
+        &self.store
+    }
+
+    /// Re-load the config and reopen the store when a config file changed
+    /// since the last load. A failed reload keeps the previous store serving
+    /// — the old layer's behavior — and reports once per change.
+    fn refresh(&mut self) {
+        self.refresh_with(config_mtime(), || {
+            TrashStore::open_with_config(Config::load()).ok()
+        });
+    }
+
+    /// `refresh` with the mtime sample and the loader injected, so a unit
+    /// test can drive both without the ambient configuration.
+    fn refresh_with(&mut self, now: i64, load: impl FnOnce() -> Option<TrashStore>) -> bool {
+        if now == self.mtime {
+            return false;
+        }
+        self.mtime = now;
+        match load() {
+            Some(store) => {
+                // Retention must keep waiting until the target is answered,
+                // exactly as at startup.
+                store.defer_maintenance();
+                self.store = store;
+                true
+            }
+            None => {
+                report!(
+                    "trashd-exec: supervisor: config reload failed; keeping the previous configuration"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// The pair of mtimes [`Config::load`] reads, combined as the preload combines
+/// them (a symmetric sum collides when the two files swap mtimes). A missing
+/// file contributes 0, so deleting a config counts as a change too.
+fn config_mtime() -> i64 {
+    config_mtime_of(&Config::global_config_path(), &Config::user_config_path())
+}
+
+fn config_mtime_of(global: &std::path::Path, user: &std::path::Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let mtime = |path: &std::path::Path| std::fs::metadata(path).map(|m| m.mtime()).unwrap_or(0);
+    mtime(global).wrapping_mul(1000003) ^ mtime(user)
 }
 
 pub(crate) fn signal_ready(fd: i32, ready: bool) {
@@ -1162,5 +1241,81 @@ pub(crate) mod tests {
     #[test]
     fn passthrough_ends_when_the_listener_is_finished() {
         exits_cleanly(|| run_passthrough(finished_listener()).unwrap());
+    }
+
+    // #437: the session keys on the same two files Config::load reads, in
+    // either order (a swap must not collide), and a removed file is a change.
+    #[test]
+    fn config_mtime_tracks_both_layers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (global, user) = (
+            fixture.path().join("global.toml"),
+            fixture.path().join("user.toml"),
+        );
+        let stamp = |path: &std::path::Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+                )
+                .unwrap();
+        };
+        let key = || config_mtime_of(&global, &user);
+        assert_eq!(key(), 0, "missing files contribute nothing");
+        std::fs::write(&global, "").unwrap();
+        stamp(&global, 1_000);
+        let with_global = key();
+        assert_ne!(with_global, 0);
+        std::fs::write(&user, "").unwrap();
+        stamp(&user, 2_000);
+        let with_both = key();
+        assert_ne!(with_both, with_global);
+        // global=2000/user=1000 must differ from global=1000/user=2000, which
+        // a symmetric sum would not catch (the preload's mtime key, #283).
+        stamp(&global, 2_000);
+        stamp(&user, 1_000);
+        assert_ne!(key(), with_both);
+        // A removed layer is a change, not the same key with a zero.
+        std::fs::remove_file(&global).unwrap();
+        assert_ne!(key(), with_both);
+        assert_ne!(key(), 0, "the surviving layer still counts");
+    }
+
+    // #437: a changed mtime swaps in the reloaded store, a failed load keeps
+    // the previous one serving, and an unchanged mtime never loads at all.
+    #[test]
+    fn session_refresh_swaps_stores_only_on_change() {
+        let fixture = tempfile::tempdir().unwrap();
+        let store = |name: &str| {
+            TrashStore::open_isolated(&fixture.path().join(name), trashd_common::Config::default())
+                .unwrap()
+        };
+        let mut session = SessionState::from_parts(store("one"));
+        assert_eq!(session.store().home_dir(), fixture.path().join("one"));
+
+        // `from_parts` sampled the ambient configuration's mtime; adopt a
+        // fixed baseline by reloading the same store at a known sample.
+        assert!(session.refresh_with(1_000, || Some(store("one"))));
+        // The same sample never loads.
+        assert!(!session.refresh_with(1_000, || panic!("unchanged mtime must not load")));
+        assert_eq!(session.store().home_dir(), fixture.path().join("one"));
+
+        // A change reloads config AND store, and the new store serves.
+        let loads = std::cell::Cell::new(0usize);
+        assert!(session.refresh_with(2_000, || {
+            loads.set(loads.get() + 1);
+            Some(store("two"))
+        }));
+        assert_eq!(loads.get(), 1);
+        assert_eq!(session.store().home_dir(), fixture.path().join("two"));
+
+        // A failed reload keeps the previous configuration serving.
+        assert!(!session.refresh_with(3_000, || None));
+        assert_eq!(session.store().home_dir(), fixture.path().join("two"));
+        // And the failed sample became the baseline again.
+        assert!(!session.refresh_with(3_000, || panic!("failed sample must be adopted")));
     }
 }

@@ -1269,7 +1269,15 @@ impl TrashStore {
             } == 0
             {
                 if moved_stat.st_ino != stat.st_ino || moved_stat.st_dev != stat.st_dev {
-                    info.size = Some(moved_stat.st_size as u64);
+                    // A raced directory replacement must not record the new
+                    // directory inode's st_size (~4 KiB) as the tree's size:
+                    // mirror trash() and re-survey what actually landed, or
+                    // retention accounting undercounts a large tree (#414).
+                    info.size = if is_dir {
+                        Some(tree_sizes(&files_dir.join(&id)).0)
+                    } else {
+                        Some(moved_stat.st_size as u64)
+                    };
                     info.sha256 = None;
                     persisted_refresh = true;
                 }
@@ -1682,9 +1690,33 @@ impl TrashStore {
     /// confirmed: re-listing purged items trashed while the prompt waited
     /// (#217). Each entry is identity-checked, so a reused ID is never hit.
     pub fn empty_entries(&self, entries: &[TrashEntry], max_age_days: Option<u32>) -> u64 {
+        self.empty_entries_reporting(entries, max_age_days).0
+    }
+
+    /// `empty_entries` that also reports how many selected entries could not
+    /// be deleted, so callers can report a partial empty as a failure
+    /// instead of success (#409). Entries that had already vanished are not
+    /// failures: the requested end state was reached.
+    pub fn empty_entries_reporting(
+        &self,
+        entries: &[TrashEntry],
+        max_age_days: Option<u32>,
+    ) -> (u64, u64) {
         let mut count = 0u64;
+        let mut failed = 0u64;
         let mut cache = CacheRefresh::default();
         for entry in entries {
+            // Isolation boundary (#428), matching purge_resolved and
+            // restore_resolved: an isolated store must not delete an entry
+            // that was resolved in another store's trash root.
+            if self.isolated && entry.trash_root != self.home {
+                failed += 1;
+                eprintln!(
+                    "trashd: warning: refusing to delete '{}': it belongs to another trash root",
+                    entry.trashed_path.display()
+                );
+                continue;
+            }
             match self.purge_reporting_kind(entry) {
                 Ok(was_directory) => cache.note_removal(entry, was_directory),
                 Err(e) => {
@@ -1693,6 +1725,7 @@ impl TrashStore {
                             "trashd: warning: could not delete '{}': {e}",
                             entry.trashed_path.display()
                         );
+                        failed += 1;
                     }
                     continue;
                 }
@@ -1705,7 +1738,7 @@ impl TrashStore {
         }
         // Only roots whose cache the removals affected (#336).
         cache.apply(self);
-        count
+        (count, failed)
     }
 
     /// Run auto_purge only if enough time has passed since the last run.
@@ -2160,6 +2193,17 @@ impl TrashStore {
         entry: &TrashEntry,
         maintain: bool,
     ) -> Result<(), TrashError> {
+        // Mirror restore_resolved's isolation boundary (#428): an isolated
+        // store is confined to its own root, so it must refuse an entry that
+        // was resolved through another store's trash — otherwise
+        // open_isolated (the destructive-test API) could permanently delete
+        // foreign roots' data. Listing can never yield such an entry (an
+        // isolated store scans only its own root), so this only guards
+        // callers handing in entries from elsewhere. Retention over roots
+        // given explicitly to auto_purge_in_roots still crosses roots.
+        if self.isolated && entry.trash_root != self.home {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
         let was_directory = self.purge_reporting_kind(entry)?;
         if maintain {
             self.refresh_cache_after_removal(entry, was_directory);
@@ -2910,95 +2954,110 @@ fn tree_survey(dir: RawFd, find_mounts: bool) -> TreeSurvey {
     } else {
         0
     };
-    survey_directory(dir, dev, 0, find_mounts, &mut PathBuf::new(), &mut survey);
+    survey_directory(dir, dev, find_mounts, &mut survey);
     survey
 }
 
-fn survey_directory(
-    dir: RawFd,
-    dev: u64,
-    depth: u32,
-    find_mounts: bool,
-    relative: &mut PathBuf,
-    survey: &mut TreeSurvey,
-) {
-    use std::ops::ControlFlow::{Break, Continue};
-    if depth > COPY_TREE_MAX_DEPTH {
-        survey.incomplete = true;
-        return;
+/// One directory on the survey worklist: the tree root (borrowed from the
+/// caller) or an opened descendant (owned; closed when popped).
+enum SurveyDir {
+    Root(RawFd),
+    Owned(fs::File),
+}
+
+impl SurveyDir {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Root(fd) => *fd,
+            Self::Owned(file) => file.as_raw_fd(),
+        }
     }
-    let own_mount = std::cell::OnceCell::new();
+}
+
+fn survey_directory(dir: RawFd, dev: u64, find_mounts: bool, survey: &mut TreeSurvey) {
+    use std::ops::ControlFlow::{Break, Continue};
     let unseen = |error: io::Error, survey: &mut TreeSurvey| {
         if error.raw_os_error() != Some(libc::ENOENT) {
             survey.incomplete = true;
         }
     };
-    let listed = for_each_entry(dir, |name, kind| {
-        if kind == libc::DT_LNK {
-            return Continue(());
-        }
-        // A directory needs a statx only to be told from a mount.
-        let info = if kind == libc::DT_DIR && !find_mounts {
-            None
-        } else {
-            let mask = if kind == libc::DT_DIR {
-                libc::STATX_TYPE
+    // An explicit worklist instead of recursion: no depth cap can truncate a
+    // real tree's size (#429). Depth stays self-limiting — each level holds
+    // one open directory descriptor — so a pathological tree exhausts the
+    // descriptor limit and degrades to `incomplete` exactly like an
+    // unreadable directory, without unbounded stack or memory.
+    let mut pending: Vec<(SurveyDir, u64, PathBuf)> =
+        vec![(SurveyDir::Root(dir), dev, PathBuf::new())];
+    while let Some((handle, dir_dev, relative)) = pending.pop() {
+        let dir = handle.as_raw_fd();
+        let own_mount = std::cell::OnceCell::new();
+        let mut descend: Vec<(SurveyDir, u64, PathBuf)> = Vec::new();
+        let listed = for_each_entry(dir, |name, kind| {
+            if kind == libc::DT_LNK {
+                return Continue(());
+            }
+            // A directory needs a statx only to be told from a mount.
+            let info = if kind == libc::DT_DIR && !find_mounts {
+                None
             } else {
-                libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_BLOCKS
+                let mask = if kind == libc::DT_DIR {
+                    libc::STATX_TYPE
+                } else {
+                    libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_BLOCKS
+                };
+                match mounts::entry_info_at(dir, name, mask) {
+                    Ok(info) => Some(info),
+                    Err(error) => {
+                        unseen(error, survey);
+                        return Continue(());
+                    }
+                }
             };
-            match mounts::entry_info_at(dir, name, mask) {
-                Ok(info) => Some(info),
+            let format = info
+                .as_ref()
+                .map_or(libc::S_IFDIR, |info| info.mode & libc::S_IFMT);
+            if format == libc::S_IFLNK {
+                return Continue(());
+            }
+            if let Some(info) = &info {
+                if find_mounts && survey_mount(dir, dir_dev, &own_mount, name, info) {
+                    survey.mount = Some(relative.join(OsStr::from_bytes(name.to_bytes())));
+                    return Break(());
+                }
+                if format != libc::S_IFDIR {
+                    survey.apparent = survey.apparent.saturating_add(info.size);
+                    survey.allocated = survey
+                        .allocated
+                        .saturating_add(info.blocks.saturating_mul(512));
+                    return Continue(());
+                }
+            }
+            let child = match open_directory_at(dir, name, true, false) {
+                Ok(child) => child,
                 Err(error) => {
                     unseen(error, survey);
                     return Continue(());
                 }
-            }
-        };
-        let format = info
-            .as_ref()
-            .map_or(libc::S_IFDIR, |info| info.mode & libc::S_IFMT);
-        if format == libc::S_IFLNK {
-            return Continue(());
-        }
-        if let Some(info) = &info {
-            if find_mounts && survey_mount(dir, dev, &own_mount, name, info) {
-                survey.mount = Some(relative.join(OsStr::from_bytes(name.to_bytes())));
-                return Break(());
-            }
-            if format != libc::S_IFDIR {
-                survey.apparent = survey.apparent.saturating_add(info.size);
-                survey.allocated = survey
-                    .allocated
-                    .saturating_add(info.blocks.saturating_mul(512));
-                return Continue(());
-            }
-        }
-        let child = match open_directory_at(dir, name, true, false) {
-            Ok(child) => child,
-            Err(error) => {
-                unseen(error, survey);
-                return Continue(());
-            }
-        };
-        relative.push(OsStr::from_bytes(name.to_bytes()));
-        let child_dev = info.map_or(0, |info| info.dev);
-        survey_directory(
-            child.as_raw_fd(),
-            child_dev,
-            depth + 1,
-            find_mounts,
-            relative,
-            survey,
-        );
-        relative.pop();
-        if survey.mount.is_some() {
-            Break(())
-        } else {
+            };
+            let child_dev = info.map_or(0, |info| info.dev);
+            descend.push((
+                SurveyDir::Owned(child),
+                child_dev,
+                relative.join(OsStr::from_bytes(name.to_bytes())),
+            ));
             Continue(())
+        });
+        if let Err(error) = listed {
+            unseen(error, survey);
         }
-    });
-    if let Err(error) = listed {
-        unseen(error, survey);
+        if survey.mount.is_some() {
+            // The tree's mount ended the walk (or the walk stopped inside
+            // this directory): nothing below the pending worklist counts.
+            return;
+        }
+        // Depth-first like the old recursion: the first-listed child's whole
+        // subtree completes before its siblings.
+        pending.extend(descend.into_iter().rev());
     }
 }
 
@@ -11080,6 +11139,169 @@ mod tests {
         assert_eq!(orphans.len(), 1, "the other root's orphan must be listed");
         assert_eq!(orphans[0].trash_root, other_trash);
         assert_eq!(entries.len(), 2);
+    }
+
+    // Regression (#428): an isolated store must refuse to purge an entry that
+    // belongs to a foreign trash root — the same boundary restore_resolved
+    // already enforces. open_isolated is the destructive-test API, so a hole
+    // here would let one store's tests delete another store's data.
+    #[test]
+    fn isolated_store_refuses_foreign_purge() {
+        let (store_a, _data, work, _lock) = test_store();
+        let doomed = create_file(work.path(), "foreign.txt", "keep me");
+        let id = store_a.trash(&doomed, None).unwrap();
+        let entry = store_a.find_entry(&id).unwrap();
+
+        let other_root = tempfile::tempdir().unwrap();
+        let store_b =
+            TrashStore::open_isolated(&other_root.path().join("Trash"), Config::default()).unwrap();
+        assert!(
+            store_b.purge_resolved(&entry).is_err(),
+            "isolated store must not purge a foreign entry"
+        );
+        assert_eq!(
+            fs::read_to_string(&entry.trashed_path).unwrap(),
+            "keep me",
+            "foreign data must survive untouched"
+        );
+        assert!(entry.info_path.exists(), "foreign sidecar must survive");
+        // The owning store can still purge its own entry.
+        store_a.purge_resolved(&entry).unwrap();
+        assert!(!entry.trashed_path.exists());
+    }
+
+    // Regression (#409): a selected entry that cannot be deleted must be
+    // reported as a failure, not silently swallowed into a success count. A
+    // vanished entry is different: the requested end state was reached.
+    #[test]
+    fn empty_entries_reports_undeletable_entries() {
+        let (store, _data, work, _lock) = test_store();
+        // A data path whose parent is a regular file fails every deletion
+        // attempt with ENOTDIR (and root cannot defeat that by permissions).
+        fs::write(work.path().join("blocker"), b"file").unwrap();
+        let stuck = TrashEntry {
+            identity: None,
+            sidecar_version: None,
+            id: "stuck".into(),
+            info: TrashInfo::new(work.path().join("stuck")),
+            trashed_path: work.path().join("blocker/stuck"),
+            info_path: work.path().join("stuck.trashinfo"),
+            trash_root: store.home.clone(),
+            orphaned: false,
+        };
+        let vanished = TrashEntry {
+            identity: None,
+            sidecar_version: None,
+            id: "vanished".into(),
+            info: TrashInfo::new(work.path().join("vanished")),
+            trashed_path: work.path().join("nowhere/vanished"),
+            info_path: work.path().join("vanished.trashinfo"),
+            trash_root: store.home.clone(),
+            orphaned: false,
+        };
+        let (purged, failed) = store.empty_entries_reporting(&[stuck, vanished], None);
+        assert_eq!((purged, failed), (0, 1), "ENOTDIR fails, ENOENT does not");
+    }
+
+    // Isolation boundary (#428) through empty: an isolated store must not
+    // delete an entry resolved in another store's root.
+    #[test]
+    fn isolated_store_refuses_foreign_entries_in_empty() {
+        let (store_a, _data, work, _lock) = test_store();
+        let doomed = create_file(work.path(), "foreign-empty.txt", "keep me");
+        let id = store_a.trash(&doomed, None).unwrap();
+        let entry = store_a.find_entry(&id).unwrap();
+
+        let other_root = tempfile::tempdir().unwrap();
+        let store_b =
+            TrashStore::open_isolated(&other_root.path().join("Trash"), Config::default()).unwrap();
+        let (purged, failed) = store_b.empty_entries_reporting(std::slice::from_ref(&entry), None);
+        assert_eq!((purged, failed), (0, 1));
+        assert_eq!(
+            fs::read_to_string(&entry.trashed_path).unwrap(),
+            "keep me",
+            "foreign data must survive untouched"
+        );
+    }
+
+    // Regression (#429): a tree nested deeper than the old survey depth cap
+    // was recorded with the truncated (zero) partial total, hiding its real
+    // size from status and retention. The worklist survey has no cap.
+    #[test]
+    fn deep_trees_record_their_real_size() {
+        let (store, _data, work, _lock) = test_store();
+        let mut deep = work.path().join("deep");
+        for _ in 0..105 {
+            deep = deep.join("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("payload"), vec![b'x'; 4096]).unwrap();
+
+        let root = work.path().join("deep");
+        let id = store.trash(&root, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        assert_eq!(
+            entry.info.size,
+            Some(4096),
+            "payload beyond the old cap must be counted"
+        );
+    }
+
+    // Regression (#403): a trash root with data but NO info/ directory must
+    // surface its stranded files as orphans, not read as an empty store —
+    // list and empty would otherwise strand the data forever.
+    #[test]
+    fn missing_info_dir_still_reports_orphans() {
+        let (store, _data, _work, _lock) = test_store();
+        let root = store.home.clone();
+        fs::create_dir_all(root.join("files")).unwrap();
+        fs::write(root.join("files/stranded"), b"data").unwrap();
+        // Simulate the damaged/foreign root: the store itself creates info/
+        // at open time, so remove it after the fact.
+        fs::remove_dir_all(root.join("info")).unwrap();
+        assert!(!root.join("info").exists());
+
+        let mut entries = Vec::new();
+        store.list_in_dir(&root, None, &mut entries).unwrap();
+        assert_eq!(entries.len(), 1, "stranded data must be listed");
+        assert!(entries[0].orphaned);
+        assert_eq!(entries[0].id, "stranded");
+        assert_eq!(fs::read(root.join("files/stranded")).unwrap(), b"data");
+    }
+
+    // Regression (#404): orphans must age. A synthetic "now" deletion date
+    // kept them forever outside age-based retention; the data's mtime gives
+    // them a meaningful age instead.
+    #[test]
+    fn orphan_deletion_date_falls_back_to_data_mtime() {
+        use std::fs::FileTimes;
+
+        let (store, _data, _work, _lock) = test_store();
+        let root = store.home.clone();
+        fs::create_dir_all(root.join("files")).unwrap();
+        let data_path = root.join("files/aged");
+        fs::write(&data_path, b"data").unwrap();
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&data_path)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_accessed(ten_days_ago)
+                    .set_modified(ten_days_ago),
+            )
+            .unwrap();
+
+        let mut entries = Vec::new();
+        store.list_in_dir(&root, None, &mut entries).unwrap();
+        assert_eq!(entries.len(), 1);
+        let age = chrono::Local::now() - entries[0].info.deletion_date;
+        assert!(
+            age > chrono::Duration::days(9),
+            "orphan must inherit the data mtime as its age, got {age:?}"
+        );
     }
 
     // Regression (#107): undo must restore the RESOLVED entry. Two roots can

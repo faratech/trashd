@@ -508,15 +508,23 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// only_trash whitelist that means nothing matches and EVERY delete becomes
 /// permanent (#4). Warn loudly so misconfiguration is visible.
 /// Whether the matcher can honour this pattern. Brace expansion is the
-/// one syntax it cannot; the loader drops such patterns (#259).
+/// one syntax it cannot; the loader drops such patterns (#259). The empty
+/// string matches no path at all, so in a whitelist it has the same
+/// everything-is-permanent effect (#402).
 pub fn pattern_is_supported(pattern: &str) -> bool {
-    !pattern.contains(['{', '}'])
+    !pattern.is_empty() && !pattern.contains(['{', '}'])
 }
 
 fn sanitize_patterns(list: &[String], what: &str) -> Vec<String> {
     list.iter()
         .filter(|p| {
-            if !pattern_is_supported(p) {
+            if p.is_empty() {
+                eprintln!(
+                    "trashd: WARNING: dropping empty {what} pattern '' \
+                     (it would match nothing and could real-delete everything)"
+                );
+                false
+            } else if !pattern_is_supported(p) {
                 eprintln!(
                     "trashd: WARNING: dropping unsupported {what} pattern '{p}' \
                      (brace expansion is not supported)"
@@ -746,6 +754,25 @@ mod tests {
         assert!(cfg.should_skip(Path::new("/home/user/main.rs")));
         // never_trash still wins over only_trash
         assert!(cfg.should_skip(Path::new("/tmp/script.py")));
+    }
+
+    // #402: an empty only_trash pattern matches no path, so a whitelist of
+    // `[""]` would make every delete permanent. Sanitizing must drop it,
+    // leaving the whitelist disabled (everything trashed).
+    #[test]
+    fn empty_only_trash_pattern_is_dropped() {
+        assert!(!pattern_is_supported(""));
+
+        let mut cfg = default_config();
+        cfg.only_trash = sanitize_patterns(&["".to_string()], "only_trash");
+        assert!(cfg.only_trash.is_empty());
+        assert!(!cfg.should_skip(Path::new("/home/user/important.txt")));
+        assert!(!cfg.should_skip(Path::new("/home/user/script.py")));
+        // A real pattern beside it still works.
+        cfg.only_trash = sanitize_patterns(&["".to_string(), "*.py".to_string()], "only_trash");
+        assert_eq!(cfg.only_trash, ["*.py"]);
+        assert!(cfg.should_skip(Path::new("/home/user/main.rs")));
+        assert!(!cfg.should_skip(Path::new("/home/user/script.py")));
     }
 
     #[test]

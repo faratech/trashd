@@ -13,6 +13,8 @@ pub fn run(
     let now = chrono::Local::now();
     let after = after.map(|spec| parse_time_spec(spec, &now));
     let before = before.map(|spec| parse_time_spec(spec, &now));
+    // A filter that excluded everything must not read as "Trash is empty." (#417).
+    let filtered = pattern.is_some() || after.is_some() || before.is_some();
 
     let progress = ScanProgress::start(!json);
     let entries = store.list_for_display_filtered(pattern, |entry| {
@@ -30,7 +32,7 @@ pub fn run(
             if json {
                 writeln!(out, "[]")
             } else {
-                writeln!(out, "{}", "Trash is empty.".dimmed())
+                writeln!(out, "{}", empty_listing_message(filtered).dimmed())
             }
         });
         return;
@@ -115,4 +117,31 @@ pub fn run(
 
         writeln!(out, "\n{} items in trash", entries.len())
     });
+}
+
+/// The message an empty listing gets: an unfiltered scan means the trash
+/// itself is empty, while a pattern or date filter may have excluded every
+/// entry of a non-empty trash (#417).
+fn empty_listing_message(filtered: bool) -> &'static str {
+    if filtered {
+        "No entries match the given filters."
+    } else {
+        "Trash is empty."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression (#417): a filter that excluded everything printed the same
+    // "Trash is empty." as a genuinely empty trash.
+    #[test]
+    fn filtered_and_unfiltered_empty_listings_differ() {
+        assert_eq!(empty_listing_message(false), "Trash is empty.");
+        assert_eq!(
+            empty_listing_message(true),
+            "No entries match the given filters."
+        );
+    }
 }

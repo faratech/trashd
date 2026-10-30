@@ -67,14 +67,37 @@ cargo build --release
 %{_datadir}/zsh/site-functions/_trash
 %{_datadir}/fish/vendor_completions.d/trash.fish
 
+# Layer 2 registration is owned by the package scriptlets: the Makefile
+# deliberately skips /etc/ld.so.preload when DESTDIR is set (#408). Mirror
+# install.sh exactly — a whole-token match on the flat entry (a single-arch
+# RPM build has no i686 library and thus no $LIB form), and on removal drop
+# only our entry, keeping other libraries that share a line (#229, #261).
+# NOTE: lines inside these scriptlets must not start with '#' — rpm strips
+# them as spec comments before the scriptlet runs.
 %post
 %systemd_post trashd.service
+trashd_entry=%{_prefix}/lib/trashd/libtrashd_preload.so
+if [ -f "%{_prefix}/lib/trashd/libtrashd_preload.so" ] \
+    && ! awk -v lib="$trashd_entry" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then
+    if [ -s /etc/ld.so.preload ] && [ "$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then
+        printf '\n' >> /etc/ld.so.preload || :
+    fi
+    printf '%s\n' "$trashd_entry" >> /etc/ld.so.preload || :
+fi
 
 %preun
 %systemd_preun trashd.service
 
 %postun
 %systemd_postun_with_restart trashd.service
+if [ "$1" -eq 0 ] && [ -f /etc/ld.so.preload ] \
+    && grep -qsF %{_prefix}/lib/trashd/ /etc/ld.so.preload; then
+    awk -v lib=%{_prefix}/lib/trashd/libtrashd_preload.so '{ line = $0; comment = ""; if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) } if (index(line, lib) == 0) { print $0; next } n = split(line, entry, /[ \t:]+/); out = ""; for (i = 1; i <= n; i++) if (entry[i] != "" && entry[i] != lib) out = out (out == "" ? "" : " ") entry[i]; if (comment != "") out = out (out == "" ? "" : " ") comment; if (out != "") print out }' \
+        /etc/ld.so.preload > /etc/ld.so.preload.trashd-rpmnew \
+        && chmod 0644 /etc/ld.so.preload.trashd-rpmnew \
+        && mv -f /etc/ld.so.preload.trashd-rpmnew /etc/ld.so.preload || :
+    [ -s /etc/ld.so.preload ] || rm -f /etc/ld.so.preload
+fi
 
 %changelog
 * Thu Mar 20 2026 Faratech <dev@faratech.com> - 0.1.0-1

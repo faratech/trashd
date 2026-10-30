@@ -37,7 +37,10 @@ fn update_check_marker_from(
     home: Option<OsString>,
 ) -> Option<PathBuf> {
     let cache_dir = xdg_cache_home
-        .filter(|value| !value.is_empty())
+        // The XDG spec requires absolute base directories; a relative value
+        // would put the marker under whatever directory the command happens
+        // to run in, so it is ignored like exec_capable_temp_base does (#418).
+        .filter(|value| !value.is_empty() && Path::new(value).is_absolute())
         .map(PathBuf::from)
         .or_else(|| {
             home.filter(|value| !value.is_empty())
@@ -952,6 +955,32 @@ mod tests {
                 Some(OsString::from("/home/alice")),
             ),
             Some(PathBuf::from("/var/cache/alice/trashd/last-update-check"))
+        );
+    }
+
+    // Regression (#418): a relative XDG_CACHE_HOME created the marker under
+    // whatever directory the command ran in. The XDG spec requires absolute
+    // base directories, so a relative value is ignored and the $HOME/.cache
+    // default applies, exactly as exec_capable_temp_base judges the variable.
+    #[test]
+    fn relative_xdg_cache_home_is_ignored() {
+        let home = Some(OsString::from("/home/alice"));
+        for relative in ["relcache", "./cache", "cache/trashd"] {
+            assert_eq!(
+                update_check_marker_from(Some(OsString::from(relative)), home.clone()),
+                Some(PathBuf::from("/home/alice/.cache/trashd/last-update-check")),
+                "{relative}"
+            );
+            assert_eq!(
+                update_check_marker_from(Some(OsString::from(relative)), None),
+                None,
+                "{relative}"
+            );
+        }
+        // An empty value keeps using the $HOME default, as before.
+        assert_eq!(
+            update_check_marker_from(Some(OsString::new()), home),
+            Some(PathBuf::from("/home/alice/.cache/trashd/last-update-check"))
         );
     }
 

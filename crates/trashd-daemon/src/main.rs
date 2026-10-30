@@ -794,7 +794,9 @@ fn resolve_handle_to_path(
 
         match decoded {
             Some((fd, None)) => {
-                let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
+                let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                    .ok()
+                    .map(strip_deleted_suffix);
                 unsafe { libc::close(fd as i32) };
                 return path;
             }
@@ -816,6 +818,22 @@ fn fsid_of_fd(fd: RawFd) -> Fsid {
     }
     let fsid: [i32; 2] = unsafe { std::mem::transmute(st.f_fsid) };
     Some((fsid[0], fsid[1]))
+}
+
+/// Strip the kernel's ` (deleted)` marker from a `/proc/self/fd` link
+/// (#438). d_path appends it when the entry or one of its parent directories
+/// was unlinked while the inode is still open — a shell whose cwd an
+/// `rm -rf` removed — and the marker would otherwise reach the audit log as
+/// a literal path component and poison the handle cache. The only
+/// false positive is a directory literally named `x (deleted)`, which the
+/// kernel cannot be distinguished from at this point.
+fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
+    const MARKER: &[u8] = b" (deleted)";
+    let bytes = path.as_os_str().as_bytes();
+    match bytes.strip_suffix(MARKER) {
+        Some(stripped) if !stripped.is_empty() => PathBuf::from(OsStr::from_bytes(stripped)),
+        _ => path,
+    }
 }
 
 /// Diff a fresh /proc/mounts scan against the marked set; mark anything new
@@ -934,6 +952,44 @@ fn fanotify_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #438: a resolved audit path must not keep the kernel's
+    // ` (deleted)` suffix from a /proc/self/fd readlink of an inode whose
+    // directory was unlinked while open. d_path appends the marker once at
+    // the end; the cached directory path must be clean before children are
+    // joined, or every entry below reads `<dir> (deleted)/child`.
+    #[test]
+    fn resolved_paths_lose_the_deleted_suffix() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/home/u/tree (deleted)")),
+            PathBuf::from("/home/u/tree"),
+            "suffix on the resolved directory is stripped"
+        );
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/home/u/tree/file (deleted)")),
+            PathBuf::from("/home/u/tree/file"),
+            "suffix on an entry inside the deleted directory is stripped"
+        );
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/home/u/normal")),
+            PathBuf::from("/home/u/normal"),
+            "clean paths pass through unchanged"
+        );
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from(OsString::from_vec(
+                b"/home/u/raw\xff (deleted)".to_vec()
+            ))),
+            PathBuf::from(OsString::from_vec(b"/home/u/raw\xff".to_vec())),
+            "raw bytes survive the strip"
+        );
+        // Only the marker itself would leave nothing — keep the original.
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from(" (deleted)")),
+            PathBuf::from(" (deleted)")
+        );
+    }
 
     // #381: mount discovery preserves raw Unix paths. Converting them to
     // lossy UTF-8 before statfs/fanotify_mark queried a different pathname,
