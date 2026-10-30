@@ -205,8 +205,8 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
 
         // The config the session launched with must not outlive its file
         // forever: a wrapped login shell would keep trashing entries an
-        // edited policy excludes, and vice versa (#437). Two stats per
-        // notification; the store is reopened only on a real change.
+        // edited policy excludes, and vice versa (#437). Sampling is
+        // cadence-limited inside refresh; the store reopens only on change.
         session_state.refresh();
 
         // Handle this notification (fail-safe: any error → CONTINUE). A
@@ -242,6 +242,11 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
 struct SessionState {
     /// `config_mtime()` observed at the last (re)load.
     mtime: i64,
+    /// Last wall-clock moment `refresh` sampled the config files. The
+    /// sample costs two stats; at bulk-delete rates that dominated the
+    /// per-notification budget, so sampling is cadence-limited and a
+    /// config edit lands within one cadence instead of instantly.
+    last_check: std::time::Instant,
     store: TrashStore,
 }
 
@@ -253,6 +258,7 @@ impl SessionState {
     fn from_parts(store: TrashStore) -> Self {
         Self {
             mtime: config_mtime(),
+            last_check: std::time::Instant::now(),
             store,
         }
     }
@@ -265,6 +271,14 @@ impl SessionState {
     /// since the last load. A failed reload keeps the previous store serving
     /// — the old layer's behavior — and reports once per change.
     fn refresh(&mut self) {
+        // At most one sample per cadence: two stats per notification made
+        // config polling a visible share of bulk-delete cost.
+        const CADENCE: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_check) < CADENCE {
+            return;
+        }
+        self.last_check = now;
         self.refresh_with(config_mtime(), || {
             TrashStore::open_with_config(Config::load()).ok()
         });
@@ -304,7 +318,13 @@ fn config_mtime() -> i64 {
 
 fn config_mtime_of(global: &std::path::Path, user: &std::path::Path) -> i64 {
     use std::os::unix::fs::MetadataExt;
-    let mtime = |path: &std::path::Path| std::fs::metadata(path).map(|m| m.mtime()).unwrap_or(0);
+    // Nanosecond resolution: a seconds-only key misses an edit made in the
+    // same second as the load, leaving stale policy in force indefinitely.
+    let mtime = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .map(|m| m.mtime().wrapping_mul(1_000_000_007) ^ m.mtime_nsec())
+            .unwrap_or(0)
+    };
     mtime(global).wrapping_mul(1000003) ^ mtime(user)
 }
 
@@ -1282,6 +1302,28 @@ pub(crate) mod tests {
         std::fs::remove_file(&global).unwrap();
         assert_ne!(key(), with_both);
         assert_ne!(key(), 0, "the surviving layer still counts");
+        // Same-second edits must still register: the key is nanosecond
+        // resolution, so two stamps one nanosecond apart differ.
+        std::fs::File::options()
+            .write(true)
+            .open(&user)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(1_000, 1)),
+            )
+            .unwrap();
+        let ns_one = key();
+        std::fs::File::options()
+            .write(true)
+            .open(&user)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(1_000, 2)),
+            )
+            .unwrap();
+        assert_ne!(key(), ns_one, "sub-second edit must change the key");
     }
 
     // #437: a changed mtime swaps in the reloaded store, a failed load keeps

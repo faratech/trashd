@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Performance
+
+- The recorded deleting command in each `.trashinfo` is capped at 256
+  bytes on write and on parse. A batch `rm` of 1,000 files previously
+  copied the full argv into every sidecar (43 MB of sidecars for 2 KB of
+  payload, and ~48 MB RSS to list them); it now writes ~0.5 MB total.
+- Age-based purge (`trash empty --older`, auto-purge) filters entries
+  from their sidecars before statting data inodes, so a mostly-young
+  trash no longer pays a stat and a retained entry per file.
+- Mount-table reads are cached per thread for one second (keyed by
+  mount-namespace identity); the fanotify daemon keeps uncached reads
+  for its own change detection.
+- `trash du` partitions for its top-N rows in O(N) instead of sorting
+  every entry; `trash log` and shim `-v` output are buffered instead of
+  one write syscall per entry; hashing uses a 64 KiB buffer.
+- The seccomp supervisor samples config mtimes at most every 250 ms
+  (was two stats per trapped delete) and keys them at nanosecond
+  resolution, so same-second config edits are no longer missed.
+- Release builds strip symbols and use thin LTO with one codegen unit:
+  installed binaries and the preload library shrink 25–36%.
+
 ### Fixed
 
 - The shim honors `--preserve-root`/`--no-preserve-root` in command-line

@@ -202,6 +202,9 @@ impl TrashInfo {
 
     /// Serialize to .trashinfo format (FreeDesktop.org Trash spec).
     pub fn to_trashinfo_string(&self) -> String {
+        // The recorded command is audit metadata, not payload: cap it so a
+        // batch delete cannot write O(N^2) sidecar bytes (full argv copied
+        // into every entry) or blow up listing RAM when parsed back.
         let encoded_path = encode_path(&self.original_path);
         let date_str = self.deletion_date.format("%Y-%m-%dT%H:%M:%S").to_string();
 
@@ -211,7 +214,7 @@ impl TrashInfo {
             // Strip control characters: a command containing a newline would
             // be parsed back as separate key=value lines (metadata injection).
             let sanitized: String = cmd.chars().filter(|c| !c.is_control()).collect();
-            s.push_str(&format!("X-Trashd-Command={sanitized}\n"));
+            s.push_str(&format!("X-Trashd-Command={}\n", cap_command(&sanitized)));
         }
         if let Some(pid) = self.pid {
             s.push_str(&format!("X-Trashd-PID={pid}\n"));
@@ -327,7 +330,7 @@ impl TrashInfo {
                     // marker recorded at trash time (#30). A malformed first
                     // value is consumed all the same (#413).
                     "X-Trashd-Command" if command.is_none() => {
-                        command = Some(value.trim().to_string())
+                        command = Some(cap_command(value.trim()).into_owned())
                     }
                     "X-Trashd-PID" if !pid_seen => {
                         pid_seen = true;
@@ -370,6 +373,21 @@ impl TrashInfo {
 /// Encodes the RAW byte representation (`OsStrExt::as_bytes`):
 /// `to_string_lossy()` would replace invalid-UTF-8 filename bytes with
 /// U+FFFD and the original name could never be reconstructed on restore (#15).
+/// Max bytes kept for the recorded deleting command. Audit display only;
+/// anything longer is truncated with an ellipsis marker.
+pub const MAX_COMMAND_BYTES: usize = 256;
+
+fn cap_command(cmd: &str) -> std::borrow::Cow<'_, str> {
+    if cmd.len() <= MAX_COMMAND_BYTES {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let mut end = MAX_COMMAND_BYTES;
+    while end > 0 && !cmd.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}…", &cmd[..end]))
+}
+
 fn encode_path(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let bytes = path.as_os_str().as_bytes();
@@ -752,6 +770,35 @@ X-Trashd-SHA256=deadbeef
         assert_eq!(info.pid, Some(42));
         assert_eq!(info.size, Some(1024));
         assert_eq!(info.sha256.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn long_command_is_capped_on_serialize_and_parse() {
+        // Batch `rm f1..f1000` records the full argv in every sidecar:
+        // uncapped this is O(N^2) disk + parse RAM (43MB per 1000 files).
+        let mut info = TrashInfo::new(PathBuf::from("/home/user/f1.txt"));
+        info.command = Some(format!("rm {}", "x".repeat(10_000)));
+        let serialized = info.to_trashinfo_string();
+        let line = serialized
+            .lines()
+            .find(|l| l.starts_with("X-Trashd-Command="))
+            .expect("command line");
+        assert!(
+            line.len() <= 300,
+            "serialized command capped, got {}",
+            line.len()
+        );
+        let parsed = TrashInfo::from_trashinfo(&serialized).unwrap();
+        let cmd = parsed.command.expect("command kept");
+        assert!(cmd.len() <= 300, "parsed command capped, got {}", cmd.len());
+        assert!(cmd.starts_with("rm xxx"));
+        // A legacy bloated sidecar must also parse bounded.
+        let legacy = format!(
+            "[Trash Info]\nPath=/tmp/x\nDeletionDate=2026-03-20T14:30:00\nX-Trashd-Command=rm {}\n",
+            "y".repeat(50_000)
+        );
+        let parsed = TrashInfo::from_trashinfo(&legacy).unwrap();
+        assert!(parsed.command.unwrap().len() <= 300);
     }
 
     #[test]

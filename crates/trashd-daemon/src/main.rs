@@ -160,7 +160,7 @@ fn run() -> io::Result<()> {
     let mount_table = std::fs::File::open("/proc/self/mounts").ok();
 
     // Mark all real mount points
-    let mount_list = mounts::list_mounts();
+    let mount_list = mounts::list_mounts_uncached();
     let mut marked = 0;
     // Each entry carries the filesystem identity (statfs f_fsid) it was
     // marked for: a remount at the same path is a NEW superblock whose old
@@ -845,7 +845,7 @@ fn refresh_mounts(
     marked: &mut Vec<(PathBuf, Fsid)>,
     watched: &mut Vec<WatchedMount>,
 ) {
-    let fresh = mounts::list_mounts();
+    let fresh = mounts::list_mounts_uncached();
     let live_paths: Vec<PathBuf> = fresh.iter().map(|m| m.path.clone()).collect();
 
     // Drop state for mounts that vanished entirely (the fanotify mark died

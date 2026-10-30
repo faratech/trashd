@@ -541,6 +541,7 @@ fn main() -> ExitCode {
                 for (path, was_dir) in &listed {
                     report_removed(path, *was_dir);
                 }
+                flush_removed();
                 notification.add(file);
             }
             Err(trashd_common::store::TrashError::Excluded(_)) => {
@@ -555,6 +556,7 @@ fn main() -> ExitCode {
                     for (path, was_dir) in &listed {
                         report_removed(path, *was_dir);
                     }
+                    flush_removed();
                 }
             }
             // Configured guards are REFUSALS, not fallbacks: a size cap or a
@@ -1585,6 +1587,7 @@ impl Walk<'_> {
                 for (path, was_dir) in &listed {
                     report_removed(path, *was_dir);
                 }
+                flush_removed();
                 self.notification.add(display);
                 Some(Outcome::Done)
             }
@@ -1615,6 +1618,7 @@ impl Walk<'_> {
                 for (path, was_dir) in &listed {
                     report_removed(path, *was_dir);
                 }
+                flush_removed();
             }
             Err(e) if is_reported(&e) => self.failures += 1,
             Err(e) => self.report_io(display, e),
@@ -1900,16 +1904,34 @@ fn write_protected_by_bits(mode: u32, uid: u32, gid: u32) -> bool {
     }
 }
 
+thread_local! {
+    /// Buffered `-v` output: line-buffered stdout cost one write syscall
+    /// per removed entry, which dominates a large tree's reporting.
+    /// Flushed per operand by `flush_removed`.
+    static REMOVED_OUT: std::cell::RefCell<std::io::BufWriter<std::io::Stdout>> =
+        std::cell::RefCell::new(std::io::BufWriter::new(std::io::stdout()));
+}
+
 /// GNU -v's stdout line for one removed entry (#435). Write errors are
 /// ignored (#436): GNU aborts through close_stdout when stdout fails, but a
 /// trash tool must never turn a completed removal into a reported failure.
 fn report_removed(path: &std::path::Path, is_dir: bool) {
+    use std::io::Write as _;
     let what = if is_dir {
         "removed directory"
     } else {
         "removed"
     };
-    rm_out!("{what} '{}'", path.display());
+    REMOVED_OUT.with(|out| {
+        let _ = writeln!(out.borrow_mut(), "{what} '{}'", path.display());
+    });
+}
+
+fn flush_removed() {
+    use std::io::Write as _;
+    REMOVED_OUT.with(|out| {
+        let _ = out.borrow_mut().flush();
+    });
 }
 
 /// Every entry `rm -v` names for one trashed operand (#435): depth-first

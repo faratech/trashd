@@ -9,6 +9,15 @@ members = [
     "crates/trashd-daemon",
 ]
 
+# Release binaries are installed system-wide and the preload library is
+# mapped into every process: strip symbols and link thinly so installed
+# size, page-in faults, and relocation cost stay low. Panic stays unwind:
+# the preload hooks rely on catch_unwind to never abort a host process.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 version = "0.1.14"
 edition = "2024"

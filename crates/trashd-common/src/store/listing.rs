@@ -16,6 +16,32 @@ impl TrashStore {
         self.list_with(pattern, ScanMetadata::DISPLAY)
     }
 
+    /// Mutation listing with an info-level prefilter applied BEFORE the
+    /// per-entry data stat: rejected entries never pay for (or retain) a
+    /// data identity they will not use. Accepted entries are full mutation
+    /// snapshots, identical to `list`.
+    pub fn list_mutation_filtered(
+        &self,
+        keep: impl Fn(&TrashInfo) -> bool,
+    ) -> Result<Vec<TrashEntry>, TrashError> {
+        let mut entries = Vec::new();
+        let roots: Vec<PathBuf> = self
+            .all_trash_dirs()
+            .into_iter()
+            .map(|(dir, _)| dir)
+            .collect();
+        self.visit_roots_for_id_filtered(
+            &roots,
+            None,
+            None,
+            ScanMetadata::MUTATION,
+            Some(&keep),
+            &mut |entry, _| entries.push(entry),
+        )?;
+        newest_first(&mut entries);
+        Ok(entries)
+    }
+
     /// A read-only query: preserve sidecar freshness checks, omit data
     /// identities, and retain/sort only the entries the predicate accepts.
     /// Mutation callers must use `list` or selected mutation snapshots.
@@ -118,12 +144,30 @@ impl TrashStore {
         metadata: ScanMetadata,
         visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
     ) -> Result<Vec<(PathBuf, TrashError)>, TrashError> {
+        self.visit_roots_for_id_filtered(roots, pattern, only_id, metadata, None, visitor)
+    }
+
+    fn visit_roots_for_id_filtered(
+        &self,
+        roots: &[PathBuf],
+        pattern: Option<&str>,
+        only_id: Option<&OsStr>,
+        metadata: ScanMetadata,
+        info_filter: Option<&dyn Fn(&TrashInfo) -> bool>,
+        visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
+    ) -> Result<Vec<(PathBuf, TrashError)>, TrashError> {
         let mut parser = crate::trashinfo::TrashInfoParser::default();
         let mut deferred_warnings: Vec<(PathBuf, TrashError)> = Vec::new();
         for root in roots {
-            if let Err(e) =
-                self.visit_in_dir(root, pattern, only_id, metadata, &mut parser, visitor)
-            {
+            if let Err(e) = self.visit_in_dir(
+                root,
+                pattern,
+                only_id,
+                metadata,
+                info_filter,
+                &mut parser,
+                visitor,
+            ) {
                 if *root == self.home {
                     for (root, error) in deferred_warnings {
                         Self::warn_unreadable_root(&root, error);
@@ -162,18 +206,21 @@ impl TrashStore {
             pattern,
             None,
             ScanMetadata::MUTATION,
+            None,
             &mut crate::trashinfo::TrashInfoParser::default(),
             &mut |entry, _| entries.push(entry),
         )
     }
 
     /// Visit items in a single trash directory.
+    #[allow(clippy::too_many_arguments)]
     fn visit_in_dir(
         &self,
         trash_dir: &Path,
         pattern: Option<&str>,
         only_id: Option<&OsStr>,
         metadata: ScanMetadata,
+        info_filter: Option<&dyn Fn(&TrashInfo) -> bool>,
         parser: &mut crate::trashinfo::TrashInfoParser,
         visitor: &mut impl FnMut(TrashEntry, Option<fs::Metadata>),
     ) -> Result<(), TrashError> {
@@ -269,6 +316,16 @@ impl TrashStore {
                 }
             }
 
+            // Info-level prefilter: skip the data stat (and identity) for
+            // entries the caller will discard anyway (e.g. too young for
+            // an age-based purge). seen_ids was already updated above, so
+            // orphan detection is unaffected.
+            if let Some(filter) = info_filter
+                && !filter(&info)
+            {
+                continue;
+            }
+
             let trashed_path = files_dir.join(&raw_stem);
             let data_metadata = self.scanned_data_metadata(&trashed_path, metadata);
             let identity = data_metadata
@@ -346,6 +403,11 @@ impl TrashStore {
                         } else {
                             TrashInfo::new(PathBuf::from(format!("(orphaned: {name})")))
                         };
+                        if let Some(filter) = info_filter
+                            && !filter(&info)
+                        {
+                            continue;
+                        }
                         visitor(
                             TrashEntry {
                                 identity,

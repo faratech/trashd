@@ -39,6 +39,48 @@ pub fn device_id_or_parent(path: &Path) -> Option<u64> {
 /// survives verbatim — a UTF-8 read of the whole file would fail on a single
 /// such mount point and silently empty the entire mount list.
 pub fn list_mounts() -> Vec<MountPoint> {
+    // Every trash/ls/status operation re-read and re-parsed the whole
+    // mount table (~150-600 allocations at 50-200 mounts). Cache it per
+    // thread for a second, keyed by mount-namespace identity: a namespace
+    // switch (unshare) misses immediately, and ordinary mount changes
+    // land within the TTL. Callers only derive trash-dir candidates from
+    // the table; a just-mounted filesystem briefly resolving to its
+    // parent mount still trashes correctly (cross-device copy fallback).
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(std::time::Instant, u64, Vec<MountPoint>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    fn mount_ns_id() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata("/proc/thread-self/ns/mnt")
+            .map(|m| m.ino())
+            .unwrap_or(0)
+    }
+    let ns = mount_ns_id();
+    let hit = CACHE.with(|cache| {
+        let cache = cache.borrow();
+        match cache.as_ref() {
+            Some((at, cached_ns, mounts))
+                if *cached_ns == ns && at.elapsed() < std::time::Duration::from_secs(1) =>
+            {
+                Some(mounts.clone())
+            }
+            _ => None,
+        }
+    });
+    if let Some(mounts) = hit {
+        return mounts;
+    }
+    let mounts = list_mounts_uncached();
+    CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((std::time::Instant::now(), ns, mounts.clone()));
+    });
+    mounts
+}
+
+/// `list_mounts` without the TTL cache, for callers that detect mount
+/// changes themselves (the fanotify daemon's refresh loop).
+pub fn list_mounts_uncached() -> Vec<MountPoint> {
     let content = match read_mount_table() {
         Ok(c) => c,
         Err(_) => return Vec::new(),

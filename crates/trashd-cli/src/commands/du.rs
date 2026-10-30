@@ -13,6 +13,16 @@ pub fn run(store: &TrashStore, top: usize) {
         return;
     }
 
+    let total_count = entries.len();
+    let total = saturating_total_size(entries.iter().filter_map(|e| e.info.size));
+    // Only the top-N rows are shown: partition in O(N) instead of a full
+    // O(N log N) sort, then sort just the shown prefix.
+    if top > 0 && entries.len() > top {
+        entries.select_nth_unstable_by(top - 1, |a, b| {
+            b.info.size.unwrap_or(0).cmp(&a.info.size.unwrap_or(0))
+        });
+        entries.truncate(top);
+    }
     entries.sort_by_key(|b| std::cmp::Reverse(b.info.size.unwrap_or(0)));
 
     with_buffered_stdout(|out| {
@@ -24,7 +34,6 @@ pub fn run(store: &TrashStore, top: usize) {
             "ID".bold(),
         )?;
 
-        let total = saturating_total_size(entries.iter().filter_map(|e| e.info.size));
         for entry in entries.iter().take(top) {
             let size = entry
                 .info
@@ -42,8 +51,8 @@ pub fn run(store: &TrashStore, top: usize) {
             )?;
         }
 
-        if entries.len() > top {
-            writeln!(out, "  ... and {} more items", entries.len() - top)?;
+        if total_count > entries.len() {
+            writeln!(out, "  ... and {} more items", total_count - entries.len())?;
         }
         writeln!(out, "\n{}: {}", "Total".bold(), format_size(total))
     });

@@ -1672,18 +1672,13 @@ impl TrashStore {
         max_age_days: Option<u32>,
     ) -> Result<Vec<TrashEntry>, TrashError> {
         let now = chrono::Local::now();
-        Ok(self
-            .list(None)?
-            .into_iter()
-            .filter(|entry| match max_age_days {
-                Some(days) => {
-                    now.signed_duration_since(entry.info.deletion_date)
-                        .num_days()
-                        >= days as i64
-                }
-                None => true,
-            })
-            .collect())
+        // Age is known from the sidecar alone: filter before the data stat
+        // so a mostly-young trash does not stat every data inode (and
+        // retain every entry) just to discard it.
+        self.list_mutation_filtered(|info| match max_age_days {
+            Some(days) => now.signed_duration_since(info.deletion_date).num_days() >= days as i64,
+            None => true,
+        })
     }
 
     /// Permanently delete exactly `entries`, e.g. the listing a user just
@@ -2858,7 +2853,9 @@ fn hash_file_verified(path: &Path, algorithm: &str, expect: (u64, u64)) -> io::R
 }
 
 fn hash_reader(mut file: impl Read, algorithm: &str) -> io::Result<String> {
-    const CHUNK: usize = 256 * 1024;
+    // 64KiB is past the point of read-syscall amortization for page-cache
+    // files; a 256KiB buffer only adds first-touch page faults per call.
+    const CHUNK: usize = 64 * 1024;
     let mut buf = vec![0u8; CHUNK];
     match algorithm {
         "sha256" => {
@@ -2871,7 +2868,13 @@ fn hash_reader(mut file: impl Read, algorithm: &str) -> io::Result<String> {
                 hasher.update(&buf[..n]);
             }
             let digest = hasher.finalize();
-            Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut out = String::with_capacity(digest.len() * 2);
+            for b in digest.iter() {
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+            Ok(out)
         }
         _ => {
             // Default: xxhash (XXH3-128)
@@ -6954,6 +6957,39 @@ mod tests {
         assert!(store.purge_entry(&selected[0]).is_err());
         assert_eq!(fs::read(&data).unwrap(), b"replacement");
         assert!(info_path.exists());
+    }
+
+    #[test]
+    fn entries_older_than_stats_only_selected_data() {
+        let (store, _data, work, _) = test_store();
+        for (id, date) in [
+            ("old", "2000-01-01T00:00:00"),
+            ("young", "2999-01-01T00:00:00"),
+        ] {
+            fs::write(store.home.join("files").join(id), b"data").unwrap();
+            fs::write(
+                store.home.join("info").join(format!("{id}.trashinfo")),
+                format!(
+                    "[Trash Info]\nPath={}\nDeletionDate={date}\n",
+                    work.path().join(id).display()
+                ),
+            )
+            .unwrap();
+        }
+        store.scan_data_stats.set(0);
+        let selected = store.entries_older_than(Some(30)).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "old");
+        assert!(selected[0].identity.is_some(), "mutation snapshot");
+        assert_eq!(
+            store.scan_data_stats.get(),
+            1,
+            "young entry must be rejected from its sidecar, without a data stat"
+        );
+        // Selected snapshots still purge for real.
+        assert_eq!(store.empty_entries(&selected, Some(30)), 1);
+        assert!(!store.home.join("files/old").exists());
+        assert!(store.home.join("files/young").exists());
     }
 
     #[test]
