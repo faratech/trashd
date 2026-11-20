@@ -77,6 +77,23 @@ pub fn metadata_nofollow_at(dir: RawFd, name: &CStr) -> io::Result<std::fs::Meta
     open_path_nofollow_at(dir, name)?.metadata()
 }
 
+/// Whether the filesystem of the open descriptor `fd` is mounted nosuid.
+/// There set-id bits and file capabilities have no effect, and on a FUSE
+/// mount (always nosuid when a user mounts it) the server, not the kernel,
+/// reports every owner and mode: a copy out of it keeps neither
+/// (security-2). Unknown is not nosuid.
+pub fn on_nosuid_filesystem(fd: RawFd) -> bool {
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstatvfs(fd, &mut stat) == 0 && stat.f_flag & libc::ST_NOSUID != 0 }
+}
+
+/// Whether an extended attribute copied from a nosuid filesystem would
+/// grant something there it could not: file capabilities, or `trusted.*`
+/// names only a privileged caller can set (security-2).
+pub fn privileged_xattr(name: &[u8]) -> bool {
+    name == b"security.capability" || name.starts_with(b"trusted.")
+}
+
 /// The (device, inode) pair of a `stat`.
 pub fn identity(stat: &libc::stat) -> (u64, u64) {
     (stat.st_dev, stat.st_ino)

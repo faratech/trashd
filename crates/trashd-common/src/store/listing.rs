@@ -230,15 +230,32 @@ impl TrashStore {
         // entry with the same id in root A.
         let info_dir = trash_dir.join("info");
         let files_dir = trash_dir.join("files");
+        // A topdir root (removable or network media, a FUSE mount) is read
+        // through descriptors of its files/ and info/ that follow no symlink
+        // and stay on the root's device: by path, a server could answer each
+        // lookup with a symlink to /etc, whose files were then listed as
+        // orphans and purged (security-1). Reads go through the descriptors'
+        // /proc/self/fd views; entries keep their real paths. The home trash
+        // is this user's alone.
+        let pinned = if trash_dir == self.home {
+            None
+        } else {
+            Some(PinnedStoreDirs::open(trash_dir)?)
+        };
+        let (read_info, read_files) = match &pinned {
+            Some(pinned) => (pinned.info_view(), pinned.files_view()),
+            None => (Some(info_dir.clone()), Some(files_dir.clone())),
+        };
 
         // A missing info/ directory must not hide the data: every files/
         // entry then has no readable sidecar and is reported as an orphan,
         // so list/empty/purge still see the stranded data (#403). Other
         // read failures still fail the scan loudly.
-        let info_entries = match fs::read_dir(&info_dir) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
+        let info_entries = match read_info.as_ref().map(fs::read_dir) {
+            Some(Ok(entries)) => Some(entries),
+            None => None,
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Some(Err(e)) => return Err(e.into()),
         };
 
         // IDs with a readable sidecar, recorded BEFORE the pattern filter:
@@ -269,6 +286,9 @@ impl TrashStore {
                 .file_stem()
                 .map(|s| s.to_os_string())
                 .unwrap_or_default();
+            // Read through the (pinned) directory; record the real path.
+            let sidecar_path = entry.path();
+            let info_path = info_dir.join(&raw_filename);
 
             let id = filename
                 .strip_suffix(".trashinfo")
@@ -277,7 +297,7 @@ impl TrashStore {
             #[cfg(test)]
             self.sidecar_reads.set(self.sidecar_reads.get() + 1);
             let (content, sidecar_metadata) =
-                match crate::trashinfo::read_sidecar_snapshot(&entry.path()) {
+                match crate::trashinfo::read_sidecar_snapshot(&sidecar_path) {
                     Ok(snapshot) => snapshot,
                     Err(_) => continue,
                 };
@@ -285,7 +305,7 @@ impl TrashStore {
             // Confirm the path still names what was read. A display listing
             // skips it: every mutation re-checks the version under the lock
             // (#354).
-            if metadata.verify_sidecar && sidecar_version != self::sidecar_version(&entry.path()) {
+            if metadata.verify_sidecar && sidecar_version != self::sidecar_version(&sidecar_path) {
                 continue;
             }
 
@@ -327,7 +347,9 @@ impl TrashStore {
             }
 
             let trashed_path = files_dir.join(&raw_stem);
-            let data_metadata = self.scanned_data_metadata(&trashed_path, metadata);
+            let data_metadata = read_files.as_ref().and_then(|read_files| {
+                self.scanned_data_metadata(&read_files.join(&raw_stem), metadata)
+            });
             let identity = data_metadata
                 .as_ref()
                 .map(|metadata| (metadata.dev(), metadata.ino()));
@@ -338,7 +360,7 @@ impl TrashStore {
                     id,
                     info,
                     trashed_path,
-                    info_path: entry.path(),
+                    info_path,
                     trash_root: trash_dir.to_path_buf(),
                     orphaned: false,
                 },
@@ -354,9 +376,9 @@ impl TrashStore {
         // Spec: "If info file corresponding to file in $trash/files is unavailable,
         // this is emergency case and MUST be presented as such."
         // Scan files/ for entries without matching .trashinfo.
-        if files_dir.exists() {
+        if let Some(read_files) = read_files.as_ref().filter(|read_files| read_files.exists()) {
             let known_ids = seen_ids;
-            if let Ok(file_entries) = fs::read_dir(&files_dir) {
+            if let Ok(file_entries) = fs::read_dir(read_files) {
                 for fe in file_entries.flatten() {
                     let raw_name = fe.file_name();
                     if let Some(id) = only_id
@@ -372,20 +394,25 @@ impl TrashStore {
                         {
                             continue;
                         }
-                        // Real on-disk paths in raw bytes (#247).
-                        let trashed_path = fe.path();
+                        // Real on-disk paths in raw bytes (#247); reads go
+                        // through the (pinned) directories.
+                        let trashed_path = files_dir.join(&raw_name);
+                        let data_path = fe.path();
                         let mut raw_info_name = raw_name.clone();
                         raw_info_name.push(".trashinfo");
                         let info_path = info_dir.join(&raw_info_name);
+                        let sidecar_path = read_info
+                            .as_ref()
+                            .map(|read_info| read_info.join(&raw_info_name));
                         // Writers publish the sidecar before the data, so one
                         // created after the info/ pass read past it (or
                         // rewritten while it was read) parses now: the entry
                         // is live, never an orphan (store-metadata-1). One
                         // that cannot be parsed is still listed.
-                        if sidecar_parses(&info_path) {
+                        if sidecar_path.as_deref().is_some_and(sidecar_parses) {
                             continue;
                         }
-                        let data_metadata = self.scanned_data_metadata(&trashed_path, metadata);
+                        let data_metadata = self.scanned_data_metadata(&data_path, metadata);
                         let identity = data_metadata
                             .as_ref()
                             .map(|metadata| (metadata.dev(), metadata.ino()));
@@ -402,7 +429,7 @@ impl TrashStore {
                         // correct.
                         let arrived = data_metadata
                             .clone()
-                            .or_else(|| fs::symlink_metadata(&trashed_path).ok())
+                            .or_else(|| fs::symlink_metadata(&data_path).ok())
                             .and_then(|metadata| {
                                 let changed = chrono::DateTime::from_timestamp(
                                     metadata.ctime(),
@@ -437,7 +464,7 @@ impl TrashStore {
                         visitor(
                             TrashEntry {
                                 identity,
-                                sidecar_version: sidecar_snapshot(&info_path),
+                                sidecar_version: sidecar_path.as_deref().and_then(sidecar_snapshot),
                                 id: name.clone(),
                                 info,
                                 trashed_path,
@@ -761,4 +788,42 @@ pub(super) fn newest_first(entries: &mut [TrashEntry]) {
         });
         std::cmp::Reverse((entry.info.deletion_date, stamp))
     });
+}
+
+/// A topdir root's files/ and info/, each opened following no symlink (in
+/// the root or the child) and checked to be on the root's device, for an
+/// unlocked listing (security-1). A missing child is None, as a missing
+/// path was.
+struct PinnedStoreDirs {
+    files: Option<fs::File>,
+    info: Option<fs::File>,
+}
+
+impl PinnedStoreDirs {
+    fn open(root: &Path) -> Result<Self, TrashError> {
+        let child = |name: &CStr| match open_store_child(root, name) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(TrashError::Io(e)),
+        };
+        Ok(Self {
+            files: child(c"files")?,
+            info: child(c"info")?,
+        })
+    }
+
+    /// The pinned directory's own `/proc/self/fd` path: every lookup below
+    /// it starts at the pinned inode, never at a name.
+    fn view(dir: &Option<fs::File>) -> Option<PathBuf> {
+        dir.as_ref()
+            .map(|dir| PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())))
+    }
+
+    fn files_view(&self) -> Option<PathBuf> {
+        Self::view(&self.files)
+    }
+
+    fn info_view(&self) -> Option<PathBuf> {
+        Self::view(&self.info)
+    }
 }

@@ -13,6 +13,11 @@ fn open_regular_metadata_file(path: &Path, limit: u64) -> io::Result<(fs::File, 
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    checked_metadata_file(file, limit)
+}
+
+/// `file` if it is a regular metadata file of at most `limit` bytes.
+fn checked_metadata_file(file: fs::File, limit: u64) -> io::Result<(fs::File, fs::Metadata)> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -70,7 +75,31 @@ pub(crate) fn read_sidecar_bytes(path: &Path) -> io::Result<Vec<u8>> {
 /// Read a .trashinfo sidecar. Special files and symlinks are invalid metadata,
 /// including ones substituted while a listing or integrity check is running.
 pub fn read_sidecar(path: &Path) -> io::Result<String> {
-    let (mut file, metadata) = open_regular_metadata_file(path, MAX_LEGACY_SIDECAR_BYTES)?;
+    read_opened_sidecar(open_regular_metadata_file(path, MAX_LEGACY_SIDECAR_BYTES)?)
+}
+
+/// `read_sidecar` of the entry `name` of the directory `dir`, following no
+/// symlink: a store's info/ descriptor (security-1).
+pub(crate) fn read_sidecar_at(
+    dir: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> io::Result<String> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    read_opened_sidecar(checked_metadata_file(file, MAX_LEGACY_SIDECAR_BYTES)?)
+}
+
+fn read_opened_sidecar((mut file, metadata): (fs::File, fs::Metadata)) -> io::Result<String> {
     if metadata.len() > MAX_SIDECAR_BYTES {
         return read_legacy_sidecar(&mut file, metadata.len());
     }

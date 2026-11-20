@@ -1036,12 +1036,19 @@ fn trash_dir_for(
         return prepared_home_trash(home_trash, uid, now);
     }
 
-    if let Some(mountpoint) = find_mount_point(path) {
+    if let Some((mountpoint, foreign_fuse)) = find_mount_point(path) {
         // A mount root cannot move, and its topdir store would be inside
         // it: preparing one left a .Trash-$UID on the mounted filesystem
         // before the real call failed busy anyway (#368).
         if mountpoint == path && is_mount_root(path) {
             return Err(StoreError::Unavailable);
+        }
+        // Never a store on another user's FUSE mount: its daemon answers
+        // every lookup as it likes, a private trash for the checks and
+        // /etc/sudoers.d for the copy (security-2). The copy goes to the
+        // home trash instead.
+        if foreign_fuse {
+            return prepared_home_trash(home_trash, uid, now);
         }
         // Only the mount the file is on: a nested subvolume's file went to a
         // store on its mount root, which listing skips when that root shares
@@ -1505,7 +1512,9 @@ fn mount_id(path: &std::ffi::CStr, flags: libc::c_int) -> Option<libc::c_int> {
     (ret == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EOVERFLOW)).then_some(id)
 }
 
-fn find_mount_point(path: &Path) -> Option<PathBuf> {
+/// The mount point `path` is on, and whether it is another user's FUSE
+/// mount (see `mounts::MountPoint::foreign_fuse`).
+fn find_mount_point(path: &Path) -> Option<(PathBuf, bool)> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1520,7 +1529,13 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
     let content = fs::read("/proc/thread-self/mounts")
         .or_else(|_| fs::read("/proc/mounts"))
         .ok()?;
-    let mut best: Option<PathBuf> = None;
+    mount_point_in(&content, &abs, unsafe { libc::geteuid() })
+}
+
+/// `find_mount_point` of the absolute `abs` in the mount table `content`,
+/// for the user `uid`.
+fn mount_point_in(content: &[u8], abs: &Path, uid: u32) -> Option<(PathBuf, bool)> {
+    let mut best: Option<(PathBuf, bool)> = None;
     let mut best_len = 0;
 
     for line in content.split(|&b| b == b'\n') {
@@ -1540,7 +1555,10 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
         let mp = PathBuf::from(unescape_octal(mpoint));
         if abs.starts_with(&mp) && mp.as_os_str().len() > best_len {
             best_len = mp.as_os_str().len();
-            best = Some(mp);
+            let fstype = String::from_utf8_lossy(parts.next().unwrap_or_default());
+            let foreign = mounts::is_fuse(&fstype)
+                && parts.next().and_then(mounts::fuse_user_in) != Some(uid);
+            best = Some((mp, foreign));
         }
     }
     best
@@ -1558,7 +1576,7 @@ fn find_mount_point(path: &Path) -> Option<PathBuf> {
 /// still-open destination, and a sync before the source is retired (#405).
 fn copy_regular_verified(
     src: &Path,
-    dst: &Path,
+    (files, id): (&fs::File, &CStr),
     expect_dev: u64,
     expect_ino: u64,
     created: &mut Option<(u64, u64)>,
@@ -1572,17 +1590,17 @@ fn copy_regular_verified(
     if !m.is_file() || m.dev() != expect_dev || m.ino() != expect_ino {
         return Err(io::Error::from_raw_os_error(libc::EBUSY));
     }
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .mode(0o600)
-        .open(dst)?;
+    // In the files/ the lock validated, never through its path (security-2).
+    let mut output = fdops::create_excl_at(files.as_raw_fd(), id, 0o600)?;
     let metadata = output.metadata()?;
     *created = Some((metadata.dev(), metadata.ino()));
     copy_checked_contents(&mut input, &mut output, &m)?;
-    apply_copy_metadata(&output, &m)?;
-    copy_xattrs(&input, &output);
+    // Set-id bits and capabilities copied off a nosuid filesystem (every
+    // user's FUSE mount, whose server reports owner and mode) would take
+    // effect in the trash (security-2).
+    let nosuid = fdops::on_nosuid_filesystem(input.as_raw_fd());
+    apply_copy_metadata(&output, &m, nosuid)?;
+    copy_xattrs(&input, &output, nosuid);
     apply_copy_times(&output, &m)?;
     output.sync_all()?;
     Ok(m)
@@ -1660,9 +1678,16 @@ fn copy_extents(source: &mut fs::File, destination: &mut fs::File, len: u64) -> 
 /// apply_fd_metadata: chown may clear set-id bits, so permissions are always
 /// applied last, and a set-id copy owned by someone else would grant that
 /// owner's privileges (#203).
-fn apply_copy_metadata(destination: &fs::File, source: &fs::Metadata) -> io::Result<()> {
+fn apply_copy_metadata(
+    destination: &fs::File,
+    source: &fs::Metadata,
+    nosuid_source: bool,
+) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let mut mode = (source.permissions().mode() & 0o7777) as libc::mode_t;
+    if nosuid_source {
+        mode &= !0o6000;
+    }
     if unsafe { libc::fchown(destination.as_raw_fd(), source.uid(), source.gid()) } != 0 {
         let error = io::Error::last_os_error();
         if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
@@ -1702,7 +1727,7 @@ fn apply_copy_times(destination: &fs::File, source: &fs::Metadata) -> io::Result
 /// Best-effort extended-attribute copy, mirroring trashd-common's
 /// copy_xattrs_fd: every namespace listxattr reports is carried over, and a
 /// failure (unsupported filesystem, permissions) never fails the move (#405).
-fn copy_xattrs(source: &fs::File, destination: &fs::File) {
+fn copy_xattrs(source: &fs::File, destination: &fs::File, nosuid_source: bool) {
     let src = source.as_raw_fd();
     let size = unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) };
     if size <= 0 {
@@ -1712,7 +1737,10 @@ fn copy_xattrs(source: &fs::File, destination: &fs::File) {
     if unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) } < 0 {
         return;
     }
-    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+    for name in names
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty() && !(nosuid_source && fdops::privileged_xattr(n)))
+    {
         let Ok(cname) = CString::new(name) else {
             continue;
         };
@@ -1751,10 +1779,23 @@ fn same_copy_source(before: &fs::Metadata, after: &fs::Metadata) -> bool {
         && before.ctime_nsec() == after.ctime_nsec()
 }
 
-fn remove_owned_copy(dest: &Path, created: Option<(u64, u64)>) {
-    if created.is_some() && fs::symlink_metadata(dest).ok().map(|m| (m.dev(), m.ino())) == created {
-        let _ = fs::remove_file(dest);
+/// Remove the copy this delete created as `id` in the locked files/
+/// (`files`), if it still is that copy.
+fn remove_owned_copy(files: &fs::File, id: &CStr, created: Option<(u64, u64)>) {
+    if created.is_some()
+        && fdops::stat_nofollow_at(files.as_raw_fd(), id)
+            .ok()
+            .map(|stat| fdops::identity(&stat))
+            == created
+    {
+        let _ = fdops::unlink_at(files.as_raw_fd(), id, 0);
     }
+}
+
+/// The last component of a store path, for a call relative to the store
+/// directory's descriptor.
+fn store_name(path: &Path) -> CString {
+    CString::new(path.file_name().map_or(&[][..], OsStr::as_bytes)).unwrap_or_default()
 }
 
 /// Consume the guard so publication stays locked through source retirement
@@ -1778,8 +1819,9 @@ fn retire_copied_source(
         Ok(()) => TrashAttempt::Trashed,
         Err(error) => {
             let errno = error.raw_os_error().unwrap_or(libc::EIO);
-            remove_owned_copy(dest, created);
-            let _ = fs::remove_file(info_path);
+            // Rolled back through the lock's descriptors (security-2).
+            remove_owned_copy(_guard.files(), &store_name(dest), created);
+            let _ = fdops::unlink_at(_guard.info().as_raw_fd(), &store_name(info_path), 0);
             TrashAttempt::Error(errno)
         }
     }
@@ -2060,21 +2102,30 @@ fn trash_entry(
     // Atomic unique ID via O_CREAT|O_EXCL. A FreeDesktop tool that ignores our
     // lock can still take files/<id> between the claim and the move; claim a
     // fresh id then, since unlink never fails with EEXIST (#225).
+    // Every step that touches the store goes through the descriptors the
+    // lock validated: by path, files/ or info/ could be a symlink a FUSE or
+    // NFS server answered once the lock had checked them, and root's copy
+    // landed in /etc/sudoers.d (security-2).
+    let (files, info) = (guard.files(), guard.info());
     let mut attempts = 0;
-    let (info_path, dest, rename_error) = loop {
+    let (info_path, dest, target, info_name, rename_error) = loop {
         let (id, info_path, mut info_file) =
-            match unique_id_atomic(&info_dir, &files_dir, &base_name, &date) {
+            match unique_id_atomic(&info_dir, info, files, &base_name, &date) {
                 Some(v) => v,
                 None => return (TrashAttempt::NotTrashed, None),
             };
         let dest = files_dir.join(&id);
+        let info_name = store_name(&info_path);
+        let release = || {
+            let _ = fdops::unlink_at(info.as_raw_fd(), &info_name, 0);
+        };
 
         // Write through the descriptor that claimed the name: reopening it
         // with O_TRUNC cost two syscalls (#305).
         let written = io::Write::write_all(&mut info_file, trashinfo.as_bytes());
         drop(info_file);
         if written.is_err() {
-            let _ = fs::remove_file(&info_path);
+            release();
             return (TrashAttempt::NotTrashed, None);
         }
 
@@ -2082,31 +2133,22 @@ fn trash_entry(
         match fs::symlink_metadata(path) {
             Ok(now) if now.dev() == expect_dev && now.ino() == expect_ino => {}
             Ok(_) => {
-                let _ = fs::remove_file(&info_path);
+                release();
                 return (TrashAttempt::NotTrashed, None); // replaced — let the real unlink handle the path
             }
             Err(_) => {} // vanished; rename below fails cleanly
         }
 
         // Move the file
-        let target = match CString::new(dest.as_os_str().as_bytes()) {
+        let target = match CString::new(id.as_bytes()) {
             Ok(s) => s,
             Err(_) => {
-                let _ = fs::remove_file(&info_path);
+                release();
                 return (TrashAttempt::Error(libc::EINVAL), None);
             }
         };
-        if unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                target.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } == 0
-        {
+        let moved = fdops::rename_noreplace_at(libc::AT_FDCWD, &source, files.as_raw_fd(), &target);
+        if moved.is_ok() {
             // A concurrent purge may have stripped the sidecar while the data was
             // absent mid-move; a completed move must never land as an orphan (#169).
             log_preload(&format!(
@@ -2119,16 +2161,21 @@ fn trash_entry(
                 Some((dest.clone(), info_path.clone())),
             );
         }
-        let rename_error = io::Error::last_os_error().raw_os_error();
-        if rename_error == Some(libc::EEXIST) || dest.symlink_metadata().is_ok() {
-            let _ = fs::remove_file(&info_path);
+        let rename_error = moved.err().and_then(|error| error.raw_os_error());
+        if rename_error == Some(libc::EEXIST)
+            || fdops::stat_nofollow_at(files.as_raw_fd(), &target).is_ok()
+        {
+            release();
             attempts += 1;
             if attempts < MAX_CLAIM_ATTEMPTS {
                 continue;
             }
             return (TrashAttempt::NotTrashed, None);
         }
-        break (info_path, dest, rename_error);
+        break (info_path, dest, target, info_name, rename_error);
+    };
+    let release = || {
+        let _ = fdops::unlink_at(info.as_raw_fd(), &info_name, 0);
     };
     // Only a cross-device move (or an unsupported RENAME_NOREPLACE) calls for
     // copying. Any other error (EACCES, EPERM, EROFS) makes the real unlink
@@ -2137,28 +2184,31 @@ fn trash_entry(
         rename_error,
         Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
     ) {
-        let _ = fs::remove_file(&info_path);
+        release();
         return (TrashAttempt::NotTrashed, None);
     }
     // Cross-device: copy preserving symlinks, then remove original
     let meta = match fs::symlink_metadata(path) {
         Ok(m) if m.dev() == expect_dev && m.ino() == expect_ino => m,
         Ok(_) => {
-            let _ = fs::remove_file(&info_path);
+            release();
             return (TrashAttempt::Error(libc::EBUSY), None);
         }
         Err(_) => {
-            let _ = fs::remove_file(&info_path);
+            release();
             return (TrashAttempt::NotTrashed, None);
         }
     };
 
     if meta.file_type().is_symlink() {
         // Re-create symlink
-        if let Ok(target) = fs::read_link(path)
-            && std::os::unix::fs::symlink(&target, &dest).is_ok()
+        if let Ok(link) = fs::read_link(path)
+            && let Ok(link) = CString::new(link.as_os_str().as_bytes())
+            && unsafe { libc::symlinkat(link.as_ptr(), files.as_raw_fd(), target.as_ptr()) } == 0
         {
-            let created = fs::symlink_metadata(&dest).ok().map(|m| (m.dev(), m.ino()));
+            let created = fdops::stat_nofollow_at(files.as_raw_fd(), &target)
+                .ok()
+                .map(|stat| fdops::identity(&stat));
             let result = retire_copied_source(
                 path,
                 &dest,
@@ -2174,16 +2224,16 @@ fn trash_entry(
         }
     } else if meta.is_dir() {
         // Cross-device dirs: best-effort. For preload, fall back to real delete.
-        let _ = fs::remove_file(&info_path);
+        release();
         return (TrashAttempt::NotTrashed, None);
     } else if meta.file_type().is_fifo() || meta.file_type().is_socket() {
         // fs::copy on a FIFO blocks forever waiting for a writer (#11);
         // sockets have no persistent data. Let the real unlink proceed.
-        let _ = fs::remove_file(&info_path);
+        release();
         return (TrashAttempt::NotTrashed, None);
     } else if meta.file_type().is_char_device() || meta.file_type().is_block_device() {
         // Copying a device node would read unbounded data from it.
-        let _ = fs::remove_file(&info_path);
+        release();
         return (TrashAttempt::NotTrashed, None);
     } else {
         // Regular file: copy + delete original. The copy opens the source
@@ -2193,12 +2243,17 @@ fn trash_entry(
         let mut created = None;
         // Losing the files/<id> race on the O_EXCL create falls back like any
         // other copy failure; unlink never fails with EEXIST (#225).
-        let copied = match copy_regular_verified(path, &dest, expect_dev, expect_ino, &mut created)
-        {
+        let copied = match copy_regular_verified(
+            path,
+            (files, &target),
+            expect_dev,
+            expect_ino,
+            &mut created,
+        ) {
             Ok(source) => source,
             Err(error) => {
-                remove_owned_copy(&dest, created);
-                let _ = fs::remove_file(&info_path);
+                remove_owned_copy(files, &target, created);
+                release();
                 if error.raw_os_error() == Some(libc::EBUSY)
                     || fs::symlink_metadata(path).is_ok_and(|now| !same_copy_source(&meta, &now))
                 {
@@ -2221,7 +2276,7 @@ fn trash_entry(
         return located(result, &dest, &info_path);
     }
 
-    let _ = fs::remove_file(&info_path);
+    release();
     (TrashAttempt::NotTrashed, None)
 }
 
@@ -2366,14 +2421,17 @@ fn rmdir_unreadable(abs: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> Opti
 /// The id is unique against BOTH `info_dir` and `files_dir`: an orphaned data
 /// file (in `files/` with no matching `.trashinfo`) is recoverable, so reusing
 /// its name would silently overwrite the user's data on the move into `files/`.
+/// The claim goes through the locked store's `info` and `files`
+/// descriptors (security-2); `info_dir` names the returned sidecar path.
 fn unique_id_atomic(
     info_dir: &Path,
-    files_dir: &Path,
+    info: &fs::File,
+    files: &fs::File,
     base_name: &str,
     date: &libc::tm,
 ) -> Option<(String, PathBuf, fs::File)> {
     let name_max = trash_id::name_max(info_dir);
-    unique_id_atomic_within(info_dir, files_dir, base_name, date, name_max)
+    unique_id_atomic_within(info_dir, (info, files), base_name, date, name_max)
 }
 
 /// `unique_id_atomic` with ids sized for a NAME_MAX of `name_max`. A name
@@ -2381,13 +2439,13 @@ fn unique_id_atomic(
 /// claimed again shorter (cross-layer-6).
 fn unique_id_atomic_within(
     info_dir: &Path,
-    files_dir: &Path,
+    dirs: (&fs::File, &fs::File),
     base_name: &str,
     date: &libc::tm,
     mut name_max: usize,
 ) -> Option<(String, PathBuf, fs::File)> {
     loop {
-        match claim_unique_id(info_dir, files_dir, base_name, date, name_max) {
+        match claim_unique_id(info_dir, dirs, base_name, date, name_max) {
             Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
                 name_max = trash_id::smaller_name_max(name_max)?;
             }
@@ -2398,13 +2456,11 @@ fn unique_id_atomic_within(
 
 fn claim_unique_id(
     info_dir: &Path,
-    files_dir: &Path,
+    (info, files): (&fs::File, &fs::File),
     base_name: &str,
     date: &libc::tm,
     name_max: usize,
 ) -> io::Result<(String, PathBuf, fs::File)> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     // Room for ".trashinfo" and a collision suffix within NAME_MAX.
     let base_name = trash_id::base_within(base_name, name_max);
 
@@ -2412,17 +2468,14 @@ fn claim_unique_id(
     // free. Some(path) = claimed; None = taken (try another); Err = an I/O
     // error (disk full, permission denied, a name too long).
     let try_claim = |candidate: &str| -> io::Result<Option<(PathBuf, fs::File)>> {
-        let path = info_dir.join(format!("{candidate}.trashinfo"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let sidecar = format!("{candidate}.trashinfo");
+        let sidecar_name = CString::new(sidecar.as_bytes())?;
+        let path = info_dir.join(&sidecar);
+        match fdops::create_excl_at(info.as_raw_fd(), &sidecar_name, 0o600) {
             Ok(file) => {
-                if fs::symlink_metadata(files_dir.join(candidate)).is_ok() {
+                if fdops::stat_nofollow_at(files.as_raw_fd(), &CString::new(candidate)?).is_ok() {
                     // info name free but an orphaned data file occupies files/.
-                    let _ = fs::remove_file(&path);
+                    let _ = fdops::unlink_at(info.as_raw_fd(), &sidecar_name, 0);
                     Ok(None)
                 } else {
                     Ok(Some((path, file)))
@@ -2990,6 +3043,29 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
 mod tests {
     use super::*;
 
+    /// A store directory's descriptor, as the lock holds it.
+    fn open(dir: &Path) -> fs::File {
+        fs::File::open(dir).unwrap()
+    }
+
+    /// `copy_regular_verified` into `dest`, through its parent's descriptor.
+    fn copy_to(
+        src: &Path,
+        dest: &Path,
+        expect_dev: u64,
+        expect_ino: u64,
+        created: &mut Option<(u64, u64)>,
+    ) -> io::Result<fs::Metadata> {
+        let parent = open(dest.parent().unwrap());
+        copy_regular_verified(
+            src,
+            (&parent, &store_name(dest)),
+            expect_dev,
+            expect_ino,
+            created,
+        )
+    }
+
     // security-3: the preload's store repair never chmods through a symlink
     // swapped in after its check, as a FUSE server answers the next lookup.
     #[test]
@@ -3045,7 +3121,7 @@ mod tests {
             };
             fs::write(info.join(format!("{id}.trashinfo")), b"existing").unwrap();
         }
-        let (id, path, claim) = unique_id_atomic(&info, &files, "same", &date)
+        let (id, path, claim) = unique_id_atomic(&info, &open(&info), &open(&files), "same", &date)
             .expect("occupied old IDs must not turn unlink into a permanent delete");
         assert!(id.starts_with("same.20260102030405."));
         assert!(path.exists());
@@ -3075,8 +3151,10 @@ mod tests {
         let name = "é".repeat(120);
         let truncated = &name[..name.floor_char_boundary(223)];
         fs::write(files.join(truncated), b"orphan").unwrap();
-        let (first, _, _) = unique_id_atomic(&info, &files, &name, &date).unwrap();
-        let (second, _, _) = unique_id_atomic(&info, &files, &name, &date).unwrap();
+        let (first, _, _) =
+            unique_id_atomic(&info, &open(&info), &open(&files), &name, &date).unwrap();
+        let (second, _, _) =
+            unique_id_atomic(&info, &open(&info), &open(&files), &name, &date).unwrap();
         assert_ne!(first, second);
         assert!(first.len() + 10 <= 255);
         assert!(second.len() + 10 <= 255);
@@ -3127,9 +3205,12 @@ mod tests {
             ..unsafe { std::mem::zeroed() }
         };
         let name = "n".repeat(254);
-        let (first, path, _) = unique_id_atomic_within(&info, &files, &name, &date, 400)
-            .expect("a long name is never a reason for a permanent delete");
-        let (second, _, _) = unique_id_atomic_within(&info, &files, &name, &date, 400).unwrap();
+        let (first, path, _) =
+            unique_id_atomic_within(&info, (&open(&info), &open(&files)), &name, &date, 400)
+                .expect("a long name is never a reason for a permanent delete");
+        let (second, _, _) =
+            unique_id_atomic_within(&info, (&open(&info), &open(&files)), &name, &date, 400)
+                .unwrap();
         assert_ne!(first, second);
         assert!(path.exists());
         for id in [first, second] {
@@ -3234,9 +3315,7 @@ mod tests {
         lock_store(&root, unsafe { libc::geteuid() }).unwrap();
         let dest = root.join("files/sparse");
         let mut created = None;
-        let copied =
-            copy_regular_verified(&source, &dest, original.dev(), original.ino(), &mut created)
-                .unwrap();
+        let copied = copy_to(&source, &dest, original.dev(), original.ino(), &mut created).unwrap();
         assert_eq!(copied.len(), 2 * GAP);
         // Stat BEFORE reading: a read updates the copy's own atime.
         let copy_meta = fs::symlink_metadata(&dest).unwrap();
@@ -3296,8 +3375,7 @@ mod tests {
         let meta = fs::symlink_metadata(&plain).unwrap();
         let dest = root.join("files/plain");
         let mut created = None;
-        let copied =
-            copy_regular_verified(&plain, &dest, meta.dev(), meta.ino(), &mut created).unwrap();
+        let copied = copy_to(&plain, &dest, meta.dev(), meta.ino(), &mut created).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"no xattrs");
         let copy_meta = fs::symlink_metadata(&dest).unwrap();
         assert_eq!(copy_meta.permissions().mode() & 0o7777, 0o640);
@@ -3324,8 +3402,7 @@ mod tests {
             let original = fs::symlink_metadata(&source).unwrap();
             let mut created = None;
             let copied =
-                copy_regular_verified(&source, &dest, original.dev(), original.ino(), &mut created)
-                    .unwrap();
+                copy_to(&source, &dest, original.dev(), original.ino(), &mut created).unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"older");
             if replace {
                 fs::rename(&source, fixture.path().join("old-source")).unwrap();
@@ -3375,16 +3452,13 @@ mod tests {
         let info = root.join("info/copy.trashinfo");
         let mut created = None;
         let error =
-            copy_regular_verified(&source, &dest, original.dev(), original.ino(), &mut created)
-                .unwrap_err();
+            copy_to(&source, &dest, original.dev(), original.ino(), &mut created).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
         assert_eq!(created, None);
         assert!(!dest.exists());
 
         let current = fs::symlink_metadata(&source).unwrap();
-        let copied =
-            copy_regular_verified(&source, &dest, current.dev(), current.ino(), &mut created)
-                .unwrap();
+        let copied = copy_to(&source, &dest, current.dev(), current.ino(), &mut created).unwrap();
         fs::write(&info, b"claimed").unwrap();
         fs::rename(&dest, fixture.path().join("our-copy")).unwrap();
         fs::write(&dest, b"someone else's entry").unwrap();
@@ -3417,8 +3491,7 @@ mod tests {
             let original = fs::symlink_metadata(&source).unwrap();
             let mut created = None;
             let copied =
-                copy_regular_verified(&source, &dest, original.dev(), original.ino(), &mut created)
-                    .unwrap();
+                copy_to(&source, &dest, original.dev(), original.ino(), &mut created).unwrap();
             assert_eq!(fs::metadata(&dest).unwrap().mode() & 0o777, 0o640);
             let result =
                 retire_copied_source(&source, &dest, &info, (&copied, created), guard, || {
@@ -3610,6 +3683,123 @@ mod tests {
             return;
         }
         assert_eq!(mounts::rerun_test(TEST, CHILD), Some(true));
+    }
+
+    // security-2: the preload claims, publishes and rolls back a new entry
+    // only through the descriptors its lock validated. Renamed into
+    // `root/files/<id>` by path, a root delete landed wherever a FUSE server
+    // pointed `files` once the lock had checked it (/etc/sudoers.d).
+    #[test]
+    fn trash_never_publishes_through_a_swapped_files_directory() {
+        const CHILD: &str = "TRASHD_PRELOAD_SWAPPED_FILES";
+        const TEST: &str = "tests::trash_never_publishes_through_a_swapped_files_directory";
+        if mounts::is_rerun_child(TEST, CHILD) {
+            let base = tempfile::tempdir().unwrap();
+            let data = base.path().join("data");
+            let work = base.path().join("work");
+            fs::create_dir_all(&work).unwrap();
+            // Safety: the re-run child runs this one test on its own.
+            unsafe {
+                std::env::set_var("HOME", base.path());
+                std::env::set_var("XDG_DATA_HOME", &data);
+            }
+            let victim = base.path().join("sudoers.d");
+            fs::create_dir(&victim).unwrap();
+            let trash = |name: &str| {
+                let path = work.join(name);
+                fs::write(&path, name).unwrap();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                trash_entry(&path, &meta, 1, 0)
+            };
+            // The first delete prepares the store.
+            let prepared = trash("first").0 == TrashAttempt::Trashed;
+            let root = data.join("Trash");
+            store_lock::validation_probe::serve_files_as_symlink(&root, &victim);
+            let (attempt, located) = trash("zz-alice");
+            store_lock::validation_probe::set(None);
+            let leaked: Vec<_> = fs::read_dir(&victim).unwrap().flatten().collect();
+            let landed = located.is_some_and(|(dest, _)| {
+                fs::read(
+                    store_lock::validation_probe::real_files(&root).join(dest.file_name().unwrap()),
+                )
+                .is_ok_and(|content| content == b"zz-alice")
+            });
+            eprintln!("prepared {prepared} attempt {attempt:?} leaked {leaked:?} landed {landed}");
+            mounts::report_test_verdict(Some(
+                prepared && leaked.is_empty() && attempt == TrashAttempt::Trashed && landed,
+            ));
+            return;
+        }
+        assert_eq!(mounts::rerun_test(TEST, CHILD), Some(true));
+    }
+
+    // security-2 (defense in depth): a copy off a nosuid filesystem, where a
+    // FUSE server reports owner and mode, keeps no set-id bits.
+    #[test]
+    fn copies_from_nosuid_filesystems_drop_set_id_bits() {
+        let base = tempfile::tempdir().unwrap();
+        let trash = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let verdict = mounts::in_private_mounts(
+            "tests::copies_from_nosuid_filesystems_drop_set_id_bits",
+            || {
+                let mount = base.path().join("m");
+                let target = CString::new(mount.as_os_str().as_bytes()).unwrap();
+                if fs::create_dir(&mount).is_err()
+                    || unsafe {
+                        libc::mount(
+                            c"none".as_ptr(),
+                            target.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            libc::MS_NOSUID,
+                            std::ptr::null(),
+                        )
+                    } != 0
+                {
+                    return false;
+                }
+                let tool = mount.join("tool");
+                let dest = trash.path().join("tool");
+                let mut created = None;
+                let copied = fs::write(&tool, b"#!/bin/sh\n").is_ok()
+                    && fs::set_permissions(&tool, fs::Permissions::from_mode(0o6755)).is_ok()
+                    && fs::symlink_metadata(&tool).is_ok_and(|meta| {
+                        copy_to(&tool, &dest, meta.dev(), meta.ino(), &mut created).is_ok()
+                    })
+                    && fs::symlink_metadata(&dest)
+                        .is_ok_and(|copy| copy.permissions().mode() & 0o7777 == 0o755);
+                unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+                copied
+            },
+        );
+        assert_ne!(verdict, Some(false));
+    }
+
+    // security-2: the preload never selects a topdir store on another
+    // user's FUSE mount, nor on one whose owner the table does not report.
+    #[test]
+    fn foreign_fuse_mounts_are_never_topdir_stores() {
+        let table = b"/dev/sda1 / ext4 rw 0 0\n\
+            sshfs#a /home/alice/mnt fuse.sshfs rw,nosuid,nodev,user_id=1000,group_id=1000,allow_other 0 0\n\
+            /dev/sdb1 /media/disk fuseblk rw,nosuid 0 0\n\
+            sshfs#b /home/bob/mnt fuse.sshfs rw,nosuid,user_id=0,group_id=0 0 0\n";
+        let at = |path: &str, uid| mount_point_in(table, Path::new(path), uid);
+        assert_eq!(
+            at("/home/alice/mnt/x", 0),
+            Some((PathBuf::from("/home/alice/mnt"), true))
+        );
+        assert_eq!(
+            at("/home/alice/mnt/x", 1000),
+            Some((PathBuf::from("/home/alice/mnt"), false))
+        );
+        assert_eq!(
+            at("/media/disk/x", 0),
+            Some((PathBuf::from("/media/disk"), true))
+        );
+        assert_eq!(
+            at("/home/bob/mnt/x", 0),
+            Some((PathBuf::from("/home/bob/mnt"), false))
+        );
+        assert_eq!(at("/etc/x", 0), Some((PathBuf::from("/"), false)));
     }
 
     // cross-layer-3: like trashd-common, a topdir store only on the file's

@@ -12,6 +12,48 @@ pub struct MountPoint {
     pub device: String,
     pub path: PathBuf,
     pub fstype: String,
+    /// For a FUSE filesystem, the `user_id=` of its mount options: the user
+    /// whose daemon answers every lookup on it. None elsewhere, or where the
+    /// table does not say.
+    pub fuse_user: Option<u32>,
+}
+
+impl MountPoint {
+    /// A FUSE filesystem whose daemon is not the caller's (`uid`). It can
+    /// answer each lookup differently (a private directory for a check, a
+    /// symlink to /etc for the next call), so no topdir trash on it is
+    /// trusted, or even probed: its stat may never return (security-1,
+    /// security-2, security-4). An owner the table does not report counts
+    /// as foreign.
+    pub fn foreign_fuse(&self, uid: u32) -> bool {
+        is_fuse(&self.fstype) && self.fuse_user != Some(uid)
+    }
+}
+
+/// Whether `fstype` is FUSE (`fuse`, `fuseblk`, `fuse.*`): a userspace
+/// server, not the kernel, answers every lookup. `fusectl` is not.
+pub fn is_fuse(fstype: &str) -> bool {
+    fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.")
+}
+
+/// Whether a stat on a filesystem of `fstype` waits on a server that may
+/// never answer: network filesystems and FUSE (security-4).
+pub fn served_remotely(fstype: &str) -> bool {
+    is_fuse(fstype)
+        || fstype.starts_with("nfs")
+        || matches!(
+            fstype,
+            "cifs" | "smb3" | "smbfs" | "9p" | "ceph" | "glusterfs" | "afs" | "lustre"
+        )
+}
+
+/// The `user_id=` of a mount options field (as /proc/mounts shows a FUSE
+/// mount's).
+pub fn fuse_user_in(options: &[u8]) -> Option<u32> {
+    options
+        .split(|&b| b == b',')
+        .find_map(|option| option.strip_prefix(b"user_id="))
+        .and_then(|id| std::str::from_utf8(id).ok()?.parse().ok())
 }
 
 /// Get the device ID (st_dev) for a path.
@@ -152,6 +194,11 @@ fn parse_mount_table(content: &[u8], virtual_too: bool) -> Vec<MountPoint> {
             Some(f) => String::from_utf8_lossy(f).to_string(),
             None => continue,
         };
+        let fuse_user = if is_fuse(&fstype) {
+            parts.next().and_then(fuse_user_in)
+        } else {
+            None
+        };
 
         // Skip virtual filesystems
         if !virtual_too
@@ -185,6 +232,7 @@ fn parse_mount_table(content: &[u8], virtual_too: bool) -> Vec<MountPoint> {
             device,
             path,
             fstype,
+            fuse_user,
         });
     }
 
@@ -231,7 +279,10 @@ pub fn trash_dir_for_device(
         return Some(home_trash.to_path_buf());
     }
     let uid = unsafe { libc::geteuid() };
+    // Never a topdir store on another user's FUSE mount: its daemon answers
+    // every lookup as it likes (security-1, security-2).
     if let Some(mount) = find_mount_point(display_path)
+        && !mount.foreign_fuse(uid)
         && device_id(&mount.path) == Some(file_dev)
     {
         if mount.path == display_path && is_mount_root(&mount.path) {
@@ -375,7 +426,9 @@ pub(crate) fn trash_dir_for_path_on(
     // Only the mount the file is on: a nested subvolume below a mount root
     // has its own device, and a store on that root may be one listing
     // skips (cross-layer-3), as `trash_dir_for_device` already checks.
+    // Never another user's FUSE mount (security-1, security-2).
     if let Some(mount) = find_mount_point(&abs)
+        && !mount.foreign_fuse(uid)
         && device.is_some()
         && device_id(&mount.path) == device
     {
@@ -411,8 +464,9 @@ pub(crate) fn existing_trash_dir_for_path_on(
         return home.to_path_buf();
     }
     let uid = unsafe { libc::geteuid() };
-    // As in `trash_dir_for_path_on` (cross-layer-3).
+    // As in `trash_dir_for_path_on` (cross-layer-3, security-1).
     if let Some(mount) = find_mount_point(path)
+        && !mount.foreign_fuse(uid)
         && device.is_some()
         && device_id(&mount.path) == device
     {
@@ -1053,6 +1107,34 @@ const PSEUDO_FILESYSTEMS: &[&str] = &[
 /// Discover all trash directories across all mount points.
 /// Returns (trash_dir, mount_description) pairs.
 pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
+    trash_dirs_in(home_trash, list_mounts(), false)
+}
+
+/// `all_trash_dirs` for automatic retention, which runs inside `rm` and the
+/// seccomp supervisor: network and FUSE mounts are not probed at all. A
+/// dead NFS server, or a FUSE daemon that never answers, made its stat wait
+/// forever and hung every delete. Explicit `trash ls` and `trash empty`
+/// still include them (security-4).
+pub fn retention_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
+    trash_dirs_in(home_trash, list_mounts(), true)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The mount points the last scan statted, for tests.
+    static PROBED_MOUNTS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The trash roots on `mounts`, the home trash first; `automatic` skips
+/// network and FUSE mounts without statting them.
+fn trash_dirs_in(
+    home_trash: &Path,
+    mounts: Vec<MountPoint>,
+    automatic: bool,
+) -> Vec<(PathBuf, String)> {
+    #[cfg(test)]
+    PROBED_MOUNTS.with_borrow_mut(Vec::clear);
     let uid = unsafe { libc::geteuid() };
     let mut dirs: HashMap<PathBuf, String> = HashMap::new();
     // A filesystem mounted at two paths (a bind mount) exposes the same trash
@@ -1071,12 +1153,19 @@ pub fn all_trash_dirs(home_trash: &Path) -> Vec<(PathBuf, String)> {
     // the same path for each mount. Every discovered root is still validated.
     let home_device = device_id_or_parent(home_trash);
     // Scan all mount points for trash directories
-    for mount in list_mounts() {
+    for mount in mounts {
         // Kernel pseudo-filesystems hold no user files, so no topdir trash;
         // statting an autofs point could even trigger a mount (#354).
-        if PSEUDO_FILESYSTEMS.contains(&mount.fstype.as_str()) {
+        if PSEUDO_FILESYSTEMS.contains(&mount.fstype.as_str())
+            // Another user's FUSE daemon could show a private trash to these
+            // checks and /etc to retention (security-1).
+            || mount.foreign_fuse(uid)
+            || (automatic && served_remotely(&mount.fstype))
+        {
             continue;
         }
+        #[cfg(test)]
+        PROBED_MOUNTS.with_borrow_mut(|probed| probed.push(mount.path.clone()));
         // One lstat of the mount point serves the home-device skip and both
         // topdir trust checks, which statted it twice more (#353). A mount
         // point that cannot be examined holds no usable topdir trash.
@@ -1243,6 +1332,82 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A private `.Trash-$UID` (files/, info/) on `topdir`.
+    fn topdir_store(topdir: &std::path::Path, uid: u32) -> std::path::PathBuf {
+        let root = topdir.join(format!(".Trash-{uid}"));
+        for dir in [
+            topdir.to_path_buf(),
+            root.clone(),
+            root.join("files"),
+            root.join("info"),
+        ] {
+            dir_with_mode(&dir, 0o700);
+        }
+        root
+    }
+
+    // security-1, security-4: another user's FUSE mount is never probed for
+    // a trash (its daemon answers each lookup as it likes, and its stat may
+    // never return); automatic retention probes no network or FUSE mount at
+    // all, while an explicit listing still includes the caller's own.
+    #[test]
+    fn untrusted_and_remote_mounts_are_skipped_without_a_stat() {
+        let fixture = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let other = uid.wrapping_add(1000);
+        let mut roots = std::collections::HashMap::new();
+        let mut table = String::new();
+        for (name, fstype, options) in [
+            ("disk", "ext4", "rw,relatime".to_string()),
+            ("nfs", "nfs4", "rw,relatime,vers=4.2".to_string()),
+            (
+                "own-fuse",
+                "fuse.sshfs",
+                format!("rw,nosuid,nodev,user_id={uid},group_id=0"),
+            ),
+            (
+                "foreign-fuse",
+                "fuse.sshfs",
+                format!("rw,nosuid,user_id={other},group_id=0,allow_other"),
+            ),
+            ("unowned-fuse", "fuseblk", "rw,nosuid".to_string()),
+        ] {
+            let topdir = fixture.path().join(name);
+            roots.insert(name, topdir_store(&topdir, uid));
+            table.push_str(&format!(
+                "server:/{name} {} {fstype} {options} 0 0\n",
+                topdir.display()
+            ));
+        }
+        let mounts = super::parse_mounts(table.as_bytes());
+        let foreign: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.foreign_fuse(uid))
+            .map(|m| m.path.clone())
+            .collect();
+        assert_eq!(foreign.len(), 2, "{mounts:?}");
+        // No home trash on any of them: a home path that does not exist.
+        let home = std::path::Path::new("/nonexistent/trashd-test/Trash");
+        let listed = |automatic: bool| {
+            let mut names: Vec<&str> = super::trash_dirs_in(home, mounts.clone(), automatic)
+                .into_iter()
+                .map(|(root, _)| *roots.iter().find(|(_, r)| **r == root).unwrap().0)
+                .collect();
+            names.sort();
+            let probed = super::PROBED_MOUNTS.with_borrow(Clone::clone);
+            (names, probed)
+        };
+        let (explicit, probed) = listed(false);
+        assert_eq!(explicit, ["disk", "nfs", "own-fuse"]);
+        assert!(
+            foreign.iter().all(|path| !probed.contains(path)),
+            "{probed:?}"
+        );
+        let (automatic, probed) = listed(true);
+        assert_eq!(automatic, ["disk"]);
+        assert_eq!(probed, [fixture.path().join("disk")]);
     }
 
     // security-3: repairing a trash directory's mode never follows a symlink

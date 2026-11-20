@@ -114,8 +114,9 @@ impl TrashStore {
         let uid = unsafe { libc::geteuid() };
         self.ensure_trusted_parent_recent(root, uid).ok()?;
         let guard = RootMutationGuard::try_acquire_as(root, uid).ok()??;
-        let state_dir = CString::new(root.join(".trashd").as_os_str().as_bytes()).ok()?;
-        let state = open_directory_at(libc::AT_FDCWD, &state_dir, true, false).ok()?;
+        // The state directory the lock validated, not `.trashd` by path
+        // (security-1).
+        let state = guard.state().try_clone().ok()?;
         let mut claimed = Vec::new();
         for name in candidates.iter().take(STAGES_PER_SWEEP) {
             if is_copy_stage(name) {
@@ -306,24 +307,21 @@ pub(super) struct Detached {
 }
 
 impl Detached {
-    pub(super) fn open(root: &Path) -> io::Result<Self> {
-        let state = CString::new(root.join(".trashd").as_os_str().as_bytes())?;
+    /// Detach into the state directory `guard` validated, never `.trashd`
+    /// by path (security-1).
+    pub(super) fn open_in(guard: &RootMutationGuard) -> io::Result<Self> {
         Ok(Self {
-            state: open_directory_at(libc::AT_FDCWD, &state, true, false)?,
+            state: guard.state().try_clone()?,
             names: Vec::new(),
         })
     }
 
-    /// Detach `dir/name`; call with the root lock held.
+    /// Detach `dir/name`; call with the root lock held, `dir` being one of
+    /// its descriptors.
     pub(super) fn take_at(&mut self, dir: RawFd, name: &CStr) -> io::Result<()> {
         let detached = detach_at(self.state.as_raw_fd(), dir, name)?;
         self.names.push(detached);
         Ok(())
-    }
-
-    /// `take_at` for an absolute path.
-    pub(super) fn take(&mut self, path: &Path) -> io::Result<()> {
-        self.take_at(libc::AT_FDCWD, &CString::new(path.as_os_str().as_bytes())?)
     }
 
     /// Delete everything detached; call after releasing the root lock. The
