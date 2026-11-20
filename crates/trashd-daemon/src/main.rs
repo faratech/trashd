@@ -15,6 +15,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use trashd_common::Config;
 use trashd_common::mounts;
 
@@ -279,7 +280,7 @@ fn run() -> io::Result<()> {
             if err.raw_os_error() == Some(libc::EAGAIN) {
                 // Drained: nothing still queued can name a held record's
                 // directory.
-                handles.new_batch();
+                begin_batch(&[], &deferred, &mount_fds, &mut handles);
                 for held in deferred.drain(..) {
                     let path = held.resolved.or_else(|| {
                         resolve_event_path(&held.record, &held.event, &mount_fds, &mut handles)
@@ -316,34 +317,7 @@ fn run() -> io::Result<()> {
         }
 
         let events = parse_events(&buf[..n as usize]);
-        handles.new_batch();
-        // rm -rf removes a directory right after its entries, so their
-        // records arrive with a parent handle that is already stale. The
-        // directory's own record carries that handle (FID) and a parent that
-        // still exists: learn each removed directory's path first, outermost
-        // first (the batch reversed), so its entries resolve below (#326).
-        // Records held from the previous batch are older: they follow this
-        // batch's, and their own directory records count too (#352).
-        let newest_first = events
-            .iter()
-            .rev()
-            .map(|(event, record)| (event, *record))
-            .chain(
-                deferred
-                    .iter()
-                    .rev()
-                    .map(|held| (&held.event, held.record.as_slice())),
-            );
-        for (event, record) in newest_first {
-            if event.mask & FAN_DELETE != 0
-                && event.mask & FAN_ONDIR != 0
-                && let Some(key) = deleted_object_key(record)
-                && let Some(path) = resolve_event_path(record, event, &mount_fds, &mut handles)
-                && path.is_absolute()
-            {
-                handles.remember(key, &path);
-            }
-        }
+        begin_batch(&events, &deferred, &mount_fds, &mut handles);
         // The previous batch's held records, now that this batch's
         // directories are known.
         for held in deferred.drain(..) {
@@ -427,6 +401,52 @@ struct Deferred {
     /// The path already resolved, kept: the next batch's decodes may no
     /// longer reach a directory removed since (#355).
     resolved: Option<PathBuf>,
+}
+
+/// Start a batch: the `events` just read, and the records `deferred` holds
+/// from the batch before, which are older and so follow them (#352).
+///
+/// rm -rf removes a directory right after its entries, so their records
+/// arrive with a parent handle that is already stale. The directory's own
+/// record carries that handle (FID) and a parent that still exists: learn
+/// each removed directory's path first, outermost first (the newest record
+/// first), so its entries resolve afterwards (#326).
+fn begin_batch(
+    events: &[(FanotifyEventMetadata, &[u8])],
+    deferred: &[Deferred],
+    mount_fds: &[WatchedMount],
+    handles: &mut HandleCache,
+) {
+    handles.new_batch();
+    let newest_first = events
+        .iter()
+        .rev()
+        .map(|(event, record)| (event, *record))
+        .chain(
+            deferred
+                .iter()
+                .rev()
+                .map(|held| (&held.event, held.record.as_slice())),
+        );
+    for (event, record) in newest_first {
+        if event.mask & FAN_DELETE != 0
+            && event.mask & FAN_ONDIR != 0
+            && let Some(key) = deleted_object_key(record)
+        {
+            // The directory is gone, so its handle no longer decodes: record
+            // that without trying, whether or not its path is known yet. A
+            // decode opens the handle's mount, and for that moment `umount`
+            // fails with EBUSY. A removal read behind tried once per removed
+            // directory in each batch, for its entries, so `rm -rf` of a
+            // large tree followed at once by `umount` could fail (daemon-7).
+            handles.record_decode(key.clone(), None);
+            if let Some(path) = resolve_event_path(record, event, mount_fds, handles)
+                && path.is_absolute()
+            {
+                handles.remember(key, &path);
+            }
+        }
+    }
 }
 
 /// Log one deletion; an unresolved path is logged with what is known
@@ -513,14 +533,17 @@ fn resolve_event_path(
     extract_dfid_name_path(event_buf, mount_fds, handles)
 }
 
+/// A handle's path, the batch that last remembered it and, when a decode
+/// gave the path, the time of that batch.
+type Remembered = (PathBuf, u64, Option<Instant>);
+
 /// Directory handle -> path last resolved for it. `rm -rf` removes a
 /// directory right after its entries, so by the time their events are read
 /// the parent's handle is stale (ESTALE): a third of a large removal's
 /// records lost their directory. A stale handle uses its last known path.
 #[derive(Default)]
 struct HandleCache {
-    /// Each handle's path and the batch that last remembered it.
-    paths: std::collections::HashMap<(Fsid, Vec<u8>), (PathBuf, u64)>,
+    paths: std::collections::HashMap<(Fsid, Vec<u8>), Remembered>,
     /// Handles in the order they were remembered, with that batch; an older
     /// batch than the handle's own marks a superseded position.
     order: std::collections::VecDeque<((Fsid, Vec<u8>), u64)>,
@@ -530,15 +553,40 @@ struct HandleCache {
     /// path at processing time for any record of the batch alike (#344).
     batch: std::collections::HashMap<(Fsid, Vec<u8>), Option<PathBuf>>,
     generation: u64,
+    /// When the current batch started.
+    now: Option<Instant>,
 }
 
 impl HandleCache {
     const CAPACITY: usize = 4096;
 
+    /// How long a decoded directory's path is used without decoding it
+    /// again. A decode opens the handle's mount, and until it is closed
+    /// again `umount` fails with EBUSY. A stream of deletions arrives as
+    /// thousands of small batches, and decoding their surviving directory
+    /// once in each had the mount open for much of the daemon's running
+    /// time: preempted there on a busy host, the daemon kept it busy for
+    /// milliseconds, and `rm -rf` followed at once by `umount` failed
+    /// (daemon-7). The price: a rename can take this long to show in the
+    /// paths logged for the renamed directory's entries.
+    const FRESH_FOR: Duration = Duration::from_millis(20);
+
     fn new_batch(&mut self) {
+        self.new_batch_at(Instant::now());
+    }
+
+    fn new_batch_at(&mut self, now: Instant) {
         self.batch.clear();
         self.generation += 1;
+        self.now = Some(now);
         self.evict();
+    }
+
+    /// The path a decode gave for this handle less than FRESH_FOR ago.
+    fn fresh(&self, key: &(Fsid, Vec<u8>)) -> Option<&PathBuf> {
+        let (path, _, decoded) = self.paths.get(key)?;
+        let age = self.now?.saturating_duration_since((*decoded)?);
+        (age < Self::FRESH_FOR).then_some(path)
     }
 
     fn decoded(&self, key: &(Fsid, Vec<u8>)) -> Option<&Option<PathBuf>> {
@@ -549,13 +597,23 @@ impl HandleCache {
         self.batch.insert(key, decoded);
     }
 
+    /// Remember a path learned from a removed directory's own record.
     fn remember(&mut self, key: (Fsid, Vec<u8>), path: &std::path::Path) {
+        self.store(key, path, None);
+    }
+
+    /// Remember the path this batch decoded for a directory.
+    fn remember_decoded(&mut self, key: (Fsid, Vec<u8>), path: &std::path::Path) {
+        self.store(key, path, self.now);
+    }
+
+    fn store(&mut self, key: (Fsid, Vec<u8>), path: &std::path::Path, decoded: Option<Instant>) {
         let generation = self.generation;
         match self
             .paths
-            .insert(key.clone(), (path.to_path_buf(), generation))
+            .insert(key.clone(), (path.to_path_buf(), generation, decoded))
         {
-            Some((_, previous)) if previous == generation => {}
+            Some((_, previous, _)) if previous == generation => {}
             _ => self.order.push_back((key, generation)),
         }
         self.evict();
@@ -577,7 +635,7 @@ impl HandleCache {
             if self
                 .paths
                 .get(&key)
-                .is_some_and(|(_, current)| *current == generation)
+                .is_some_and(|(_, current, _)| *current == generation)
             {
                 self.paths.remove(&key);
             }
@@ -585,7 +643,7 @@ impl HandleCache {
     }
 
     fn get(&self, key: &(Fsid, Vec<u8>)) -> Option<&PathBuf> {
-        self.paths.get(key).map(|(path, _)| path)
+        self.paths.get(key).map(|(path, _, _)| path)
     }
 }
 
@@ -781,11 +839,16 @@ fn extract_dfid_name_path(
                 Some(Some(dir)) => Some(dir.clone()),
                 Some(None) => handles.get(&key).cloned(),
                 None => {
-                    let decoded = resolve_handle_to_path(file_handle_ptr, fsid, mount_fds);
+                    let fresh = handles.fresh(&key).cloned();
+                    let known = fresh.is_some();
+                    let decoded =
+                        fresh.or_else(|| resolve_handle_to_path(file_handle_ptr, fsid, mount_fds));
                     handles.record_decode(key.clone(), decoded.clone());
                     match decoded {
                         Some(dir) => {
-                            handles.remember(key, &dir);
+                            if !known {
+                                handles.remember_decoded(key, &dir);
+                            }
                             Some(dir)
                         }
                         None => handles.get(&key).cloned(),
@@ -805,6 +868,12 @@ fn extract_dfid_name_path(
     }
 
     None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Mounts opened to decode a handle: each open pins its mount.
+    static MOUNT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Try to resolve a file_handle to a path via open_by_handle_at + /proc/self/fd.
@@ -834,6 +903,8 @@ fn resolve_handle_to_path(
         let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             continue;
         };
+        #[cfg(test)]
+        MOUNT_OPENS.with(|opens| opens.set(opens.get() + 1));
         let mount_fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
@@ -1533,6 +1604,288 @@ mod tests {
         assert_eq!(cache.paths.len(), HandleCache::CAPACITY);
         let (event, _) = entry_record(fsid, directories as u64 - 1, b"entry");
         assert!(extract_dfid_name_path(&event, &[], &mut cache).is_some_and(|p| p.is_absolute()));
+    }
+
+    /// The record of a removed directory: `name` under the directory with
+    /// handle `parent` (DFID_NAME), then its own handle `own` (FID), as a
+    /// FAN_REPORT_TARGET_FID group reads it.
+    fn removal_record(fsid: (i32, i32), parent: u64, name: &[u8], own: u64) -> Vec<u8> {
+        let (mut event, _) = entry_record(fsid, parent, name);
+        let mut record = vec![FAN_EVENT_INFO_TYPE_FID, 0, 0, 0];
+        record.extend_from_slice(&fsid.0.to_ne_bytes());
+        record.extend_from_slice(&fsid.1.to_ne_bytes());
+        record.extend_from_slice(&8u32.to_ne_bytes()); // handle_bytes
+        record.extend_from_slice(&1i32.to_ne_bytes()); // handle_type
+        record.extend_from_slice(&own.to_ne_bytes()); // f_handle
+        let len = record.len() as u16;
+        record[2..4].copy_from_slice(&len.to_ne_bytes());
+        event.extend(record);
+        let total = event.len() as u32;
+        event[..4].copy_from_slice(&total.to_ne_bytes());
+        event[8..16].copy_from_slice(&(FAN_DELETE | FAN_ONDIR).to_ne_bytes());
+        event
+    }
+
+    // Regression (daemon-7): decoding a handle opens its mount, and for that
+    // moment `umount` fails with EBUSY. A removal read behind (`rm -rf` of
+    // a large tree, then `umount` at once) decoded every removed directory
+    // once per batch for its entries, though the directory's own record in
+    // that batch had already given its path and its handle was stale: one
+    // such moment per directory instead of one per batch.
+    #[test]
+    fn a_batch_never_decodes_the_directories_it_removed() {
+        let fsid = (7, 9);
+        // Any directory stands in for the handles' mount: opens are counted.
+        let watched: Vec<WatchedMount> = vec![(PathBuf::from("/"), Some(fsid))];
+        let mut cache = HandleCache::default();
+        // An earlier batch resolved the directory that survives.
+        cache.new_batch();
+        let (_, tree) = entry_record(fsid, 1, b"");
+        cache.remember(tree, std::path::Path::new("/mnt/tree"));
+
+        // `rm -rf /mnt/tree/*`: each directory's entries, then the
+        // directory, and one of them holds a directory of its own.
+        let directories = 100u64;
+        let mut batch = entry_record(fsid, 1000, b"f0").0;
+        batch.extend(removal_record(fsid, 100, b"sub", 1000));
+        for d in 0..directories {
+            for name in [b"f0", b"f1"] {
+                batch.extend(entry_record(fsid, 100 + d, name).0);
+            }
+            batch.extend(removal_record(fsid, 1, format!("d{d}").as_bytes(), 100 + d));
+        }
+        let events = parse_events(&batch);
+        assert_eq!(events.len(), 2 + 3 * directories as usize);
+
+        MOUNT_OPENS.with(|opens| opens.set(0));
+        begin_batch(&events, &[], &watched, &mut cache);
+        let logged: Vec<PathBuf> = events
+            .iter()
+            .filter_map(|(event, record)| resolve_event_path(record, event, &watched, &mut cache))
+            .collect();
+        assert_eq!(logged[0], PathBuf::from("/mnt/tree/d0/sub/f0"));
+        assert_eq!(logged[1], PathBuf::from("/mnt/tree/d0/sub"));
+        for d in 0..directories as usize {
+            assert_eq!(
+                logged[2 + 3 * d],
+                PathBuf::from(format!("/mnt/tree/d{d}/f0"))
+            );
+            assert_eq!(logged[4 + 3 * d], PathBuf::from(format!("/mnt/tree/d{d}")));
+        }
+        assert_eq!(
+            MOUNT_OPENS.with(|opens| opens.get()),
+            1,
+            "only the surviving directory's handle needs its mount"
+        );
+
+        // The next batch decodes again: a handle is only known to be stale
+        // within the batch that removed its directory.
+        cache.new_batch();
+        let (event, _) = entry_record(fsid, 100, b"late");
+        assert_eq!(
+            extract_dfid_name_path(&event, &watched, &mut cache),
+            Some(PathBuf::from("/mnt/tree/d0/late"))
+        );
+        assert_eq!(MOUNT_OPENS.with(|opens| opens.get()), 2);
+    }
+
+    /// Hold `events` as the event loop does for the next batch.
+    fn held(events: &[(FanotifyEventMetadata, &[u8])]) -> Vec<Deferred> {
+        events
+            .iter()
+            .map(|(event, record)| Deferred {
+                event: *event,
+                record: record.to_vec(),
+                process: "rm".into(),
+                resolved: None,
+            })
+            .collect()
+    }
+
+    // Regression (daemon-7): a backlog longer than one read ends its first
+    // batch before the record of the tree's top directory, so no path in
+    // that batch is known yet. Its removed directories are known to be gone
+    // all the same; decoding each of them for its entries opened the mount
+    // once per directory, in that batch and again in the next.
+    #[test]
+    fn removed_directories_are_not_decoded_before_their_paths_are_known() {
+        let fsid = (7, 9);
+        let watched: Vec<WatchedMount> = vec![(PathBuf::from("/"), Some(fsid))];
+        let resolve = |record: &[u8], event: &FanotifyEventMetadata, cache: &mut HandleCache| {
+            resolve_event_path(record, event, &watched, cache).unwrap()
+        };
+        let mut cache = HandleCache::default();
+        cache.new_batch();
+        let (_, mount_root) = entry_record(fsid, 1, b"");
+        cache.remember(mount_root, std::path::Path::new("/mnt"));
+
+        // The first read: fifty directories of `tree` (handle 2), which is
+        // gone as well; its own record is still queued.
+        let mut first = Vec::new();
+        for d in 0..50u64 {
+            first.extend(entry_record(fsid, 100 + d, b"f0").0);
+            first.extend(removal_record(fsid, 2, format!("d{d}").as_bytes(), 100 + d));
+        }
+        let first = parse_events(&first);
+        MOUNT_OPENS.with(|opens| opens.set(0));
+        begin_batch(&first, &[], &watched, &mut cache);
+        for (event, record) in &first {
+            assert!(!resolve(record, event, &mut cache).is_absolute());
+        }
+        assert_eq!(
+            MOUNT_OPENS.with(|opens| opens.get()),
+            1,
+            "only `tree`, which no record has shown removed yet"
+        );
+
+        // The second read: the last directory, then `tree` itself.
+        let deferred = held(&first);
+        let mut second = entry_record(fsid, 150, b"f0").0;
+        second.extend(removal_record(fsid, 2, b"d50", 150));
+        second.extend(removal_record(fsid, 1, b"tree", 2));
+        let second = parse_events(&second);
+        begin_batch(&second, &deferred, &watched, &mut cache);
+        for (d, pair) in deferred.chunks(2).enumerate() {
+            assert_eq!(
+                resolve(&pair[0].record, &pair[0].event, &mut cache),
+                PathBuf::from(format!("/mnt/tree/d{d}/f0"))
+            );
+            assert_eq!(
+                resolve(&pair[1].record, &pair[1].event, &mut cache),
+                PathBuf::from(format!("/mnt/tree/d{d}"))
+            );
+        }
+        let logged: Vec<PathBuf> = second
+            .iter()
+            .map(|(event, record)| resolve(record, event, &mut cache))
+            .collect();
+        assert_eq!(
+            logged,
+            ["/mnt/tree/d50/f0", "/mnt/tree/d50", "/mnt/tree"].map(PathBuf::from)
+        );
+        assert_eq!(
+            MOUNT_OPENS.with(|opens| opens.get()),
+            2,
+            "and the mount's own directory, which survives"
+        );
+
+        // Drained with records still held: the record that would name their
+        // directory was lost (a queue overflow). They are logged by name,
+        // and their removed directory is not decoded then either.
+        let mut orphaned = entry_record(fsid, 900, b"f0").0;
+        orphaned.extend(removal_record(fsid, 800, b"lost", 900));
+        let deferred = held(&parse_events(&orphaned));
+        begin_batch(&[], &deferred, &watched, &mut cache);
+        let logged: Vec<PathBuf> = deferred
+            .iter()
+            .map(|held| resolve(&held.record, &held.event, &mut cache))
+            .collect();
+        assert_eq!(logged, ["f0", "lost"].map(PathBuf::from));
+        assert_eq!(MOUNT_OPENS.with(|opens| opens.get()), 3);
+    }
+
+    // Regression (daemon-7): a stream of deletions is read as thousands of
+    // small batches, and each of them decoded the directory that survives
+    // (`rm -rf` works under one), opening its mount every time. A path a
+    // decode gave moments ago is used as it is.
+    #[test]
+    fn a_directory_decoded_moments_ago_is_not_decoded_again() {
+        let fsid = (7, 9);
+        let watched: Vec<WatchedMount> = vec![(PathBuf::from("/"), Some(fsid))];
+        let (event, key) = entry_record(fsid, 1, b"f0");
+        let named = Some(PathBuf::from("/mnt/tree/f0"));
+        let mut cache = HandleCache::default();
+        let start = Instant::now();
+        cache.new_batch_at(start);
+        cache.remember_decoded(key, std::path::Path::new("/mnt/tree"));
+
+        MOUNT_OPENS.with(|opens| opens.set(0));
+        for batch in 1..50 {
+            cache.new_batch_at(start + HandleCache::FRESH_FOR / 50 * batch);
+            assert_eq!(extract_dfid_name_path(&event, &watched, &mut cache), named);
+        }
+        assert_eq!(MOUNT_OPENS.with(|opens| opens.get()), 0);
+
+        // Not for longer: the directory may have been renamed.
+        cache.new_batch_at(start + HandleCache::FRESH_FOR);
+        assert_eq!(extract_dfid_name_path(&event, &watched, &mut cache), named);
+        assert_eq!(MOUNT_OPENS.with(|opens| opens.get()), 1);
+    }
+
+    // The same with a real directory: the path a decode gave is kept for
+    // FRESH_FOR, through a rename, and decoded again after that.
+    #[test]
+    fn decoded_paths_follow_a_rename_once_they_are_stale() {
+        use std::os::unix::ffi::OsStrExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: open_by_handle_at needs CAP_DAC_READ_SEARCH");
+            return;
+        }
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("fresh-handle-{}", std::process::id()));
+        let dir = base.join("before");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let mut handle = vec![0u8; 8 + 128];
+        handle[..4].copy_from_slice(&128u32.to_ne_bytes());
+        let mut mount_id: libc::c_int = 0;
+        let name = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_name_to_handle_at,
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    handle.as_mut_ptr(),
+                    &mut mount_id,
+                    0,
+                )
+            },
+            0
+        );
+        let handle_bytes = u32::from_ne_bytes(handle[..4].try_into().unwrap()) as usize;
+        let mount = mounts::list_mounts()
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|path| base.starts_with(path))
+            .max_by_key(|path| path.as_os_str().len())
+            .unwrap();
+        let fsid = fsid_of_path(&mount);
+        let (a, b) = fsid.unwrap();
+        let mut record = vec![FAN_EVENT_INFO_TYPE_DFID_NAME, 0, 0, 0];
+        record.extend_from_slice(&a.to_ne_bytes());
+        record.extend_from_slice(&b.to_ne_bytes());
+        record.extend_from_slice(&handle[..8 + handle_bytes]);
+        record.extend_from_slice(b"entry\0");
+        while record.len() % 4 != 0 {
+            record.push(0);
+        }
+        let len = record.len() as u16;
+        record[2..4].copy_from_slice(&len.to_ne_bytes());
+        let mut event = event_header(0);
+        event.extend(record);
+        let total = event.len() as u32;
+        event[..4].copy_from_slice(&total.to_ne_bytes());
+        let watched: Vec<WatchedMount> = vec![(mount, fsid)];
+
+        let mut cache = HandleCache::default();
+        let start = Instant::now();
+        MOUNT_OPENS.with(|opens| opens.set(0));
+        cache.new_batch_at(start);
+        let first = extract_dfid_name_path(&event, &watched, &mut cache);
+        std::fs::rename(&dir, base.join("after")).unwrap();
+        cache.new_batch_at(start + HandleCache::FRESH_FOR / 2);
+        let fresh = extract_dfid_name_path(&event, &watched, &mut cache);
+        let opened_while_fresh = MOUNT_OPENS.with(|opens| opens.get());
+        cache.new_batch_at(start + HandleCache::FRESH_FOR);
+        let stale = extract_dfid_name_path(&event, &watched, &mut cache);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(first, Some(base.join("before/entry")));
+        assert_eq!(fresh, Some(base.join("before/entry")));
+        assert_eq!(opened_while_fresh, 1);
+        assert_eq!(stale, Some(base.join("after/entry")));
+        assert_eq!(MOUNT_OPENS.with(|opens| opens.get()), 2);
     }
 
     #[test]

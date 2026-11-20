@@ -8,10 +8,14 @@ and regression scripts under /tests. No installed trashd configuration is loaded
 
 import argparse
 import ctypes
+import errno
+import fcntl
 import os
 from pathlib import Path
 import secrets
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,6 +23,9 @@ import time
 
 
 MARKER = Path("/.trashd-test-sandbox")
+# With --loop-device, a block device no host filesystem uses: suites that need
+# a filesystem the daemon marks (it never marks tmpfs) mkfs and mount it.
+LOOP_NODE = Path("/dev/trashd-test-loop")
 ARTIFACTS = {
     "trash": "bin/trash",
     "trashd-rm": "bin/trashd-rm",
@@ -67,6 +74,58 @@ def unmount_tree(target):
             return
         time.sleep(0.25)
     subprocess.run(["/usr/bin/umount", "-R", str(target)], check=True)
+
+
+def attach_loop(image):
+    """Bind `image` to a free loop device; return (descriptor, device path).
+
+    LO_FLAGS_AUTOCLEAR has the kernel detach the device when its last user
+    closes it. The returned descriptor is that user while a suite runs, so
+    even a runner that is killed leaves no attached device behind.
+    """
+    LOOP_CTL_GET_FREE, LOOP_CONFIGURE, LO_FLAGS_AUTOCLEAR = 0x4C82, 0x4C0A, 4
+    backing = os.open(image, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        control = os.open("/dev/loop-control", os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        os.close(backing)
+        raise
+    try:
+        for _ in range(16):
+            path = f"/dev/loop{fcntl.ioctl(control, LOOP_CTL_GET_FREE)}"
+            device = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+            # struct loop_config { u32 fd; u32 block_size; struct loop_info64
+            # info; u64 reserved[8]; }, with info.lo_flags at byte 52.
+            config = bytearray(8 + 232 + 64)
+            struct.pack_into("=I", config, 0, backing)
+            struct.pack_into("=I", config, 8 + 52, LO_FLAGS_AUTOCLEAR)
+            try:
+                fcntl.ioctl(device, LOOP_CONFIGURE, bytes(config))
+                return device, path
+            except OSError as error:
+                os.close(device)
+                if error.errno != errno.EBUSY:  # EBUSY: another process took it first
+                    raise
+        raise OSError(errno.EBUSY, "no free loop device")
+    finally:
+        os.close(control)
+        os.close(backing)
+
+
+def release_loop(device, path):
+    """Close the runner's descriptor and require the device to be detached."""
+    LOOP_GET_STATUS64 = 0x4C05
+    os.close(device)
+    for _ in range(40):
+        with open(path, "rb") as probe:
+            try:
+                fcntl.ioctl(probe, LOOP_GET_STATUS64, bytes(232))
+            except OSError as error:
+                if error.errno == errno.ENXIO:  # no backing file: detached
+                    return
+                raise
+        time.sleep(0.25)
+    raise RuntimeError(f"loop device {path} is still attached")
 
 
 def enter(root, command):
@@ -126,6 +185,14 @@ def run(args, command):
         raise SystemExit(f"Mount namespace unavailable: {os.strerror(ctypes.get_errno())}; no tests ran")
     mount("--make-rprivate", "/")
 
+    # A terminated runner (a timeout, a closed terminal) cleans up as an
+    # interrupted one does, instead of leaving its sandbox running.
+    def terminated(number, _frame):
+        raise SystemExit(128 + number)
+
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, terminated)
+
     scratch = Path(tempfile.mkdtemp(prefix="trashd-sandbox-"))
     # The UID 65534 sentinel must be traversable before chroot, so its
     # protection is demonstrated by containment rather than host permissions.
@@ -134,6 +201,7 @@ def run(args, command):
     external = scratch / "external"
     root.mkdir()
     external.mkdir()
+    loop = None
     try:
         mount("-t", "tmpfs", "-o", "mode=755", "trashd-test-root", root)
         mount("-t", "tmpfs", "-o", "mode=755", "trashd-test-external", external)
@@ -171,6 +239,16 @@ def run(args, command):
         for name in ("null", "zero", "full", "random", "urandom"):
             (root / "dev" / name).touch()
             mount("--bind", Path("/dev") / name, root / "dev" / name)
+        if args.loop_device:
+            image = scratch / "loop.img"
+            with open(image, "wb") as backing:
+                backing.truncate(args.loop_device << 20)
+            loop = attach_loop(image)
+            # The device keeps the image open; unnamed, it is freed with the
+            # device even when this runner is killed.
+            image.unlink()
+            (root / LOOP_NODE.relative_to("/")).touch()
+            mount("--bind", loop[1], root / LOOP_NODE.relative_to("/"))
         (root / "dev/fd").symlink_to("/proc/self/fd")
         for name, fd in (("stdin", 0), ("stdout", 1), ("stderr", 2)):
             (root / "dev" / name).symlink_to(f"/proc/self/fd/{fd}")
@@ -223,11 +301,14 @@ def run(args, command):
         token = secrets.token_hex(24)
         (root / MARKER.name).write_text(token)
         os.environ["TRASHD_TEST_SANDBOX_TOKEN"] = token
+        # PR_SET_PDEATHSIG: a runner that is killed outright takes the
+        # sandbox with it (unshare, then --kill-child, then the PID
+        # namespace), and with it the mounts and the loop device.
         result = subprocess.run([
             "/usr/bin/unshare", "--pid", "--fork", "--kill-child",
             "/usr/bin/python3", str(Path(__file__).resolve()),
             "--enter", str(root), "--", *command,
-        ])
+        ], preexec_fn=lambda: libc.prctl(1, signal.SIGKILL))
         for sentinel in sentinels:
             if (sentinel / "files/KEEP").read_bytes() != b"external trash must survive\n" or (sentinel / "info/KEEP.trashinfo").read_bytes() != sidecar:
                 raise RuntimeError(f"external mounted trash sentinel was changed: {sentinel.name}")
@@ -239,6 +320,10 @@ def run(args, command):
         for target in (root, external):
             if os.path.ismount(target):
                 unmount_tree(target)
+        # After the unmount: a filesystem the suite left mounted on the
+        # device went with the tree, so nothing else holds it.
+        if loop:
+            release_loop(*loop)
         shutil.rmtree(scratch)
 
 
@@ -246,6 +331,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir")
     parser.add_argument("--binary", action="append", default=[])
+    parser.add_argument(
+        "--loop-device", type=int, metavar="MIB",
+        help=f"expose an empty loop device of this size as {LOOP_NODE}",
+    )
     parser.add_argument("--enter", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()

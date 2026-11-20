@@ -688,6 +688,26 @@
   on its device, and a purge reads the age of a sidecar without data
   through the `info/` its lock validated. (#508)
 
+- The audit daemon opens a filesystem for far fewer handle lookups. Each
+  lookup opens the mount for a few microseconds, and an `umount` at that
+  instant fails with `target is busy`. The daemon no longer decodes a
+  directory that the same read of events shows removed (thousands of
+  lookups for the backlog of one `rm -rf`), and it reuses a decoded
+  directory path for 20 ms instead of decoding it again in every batch,
+  so a rename can take that long to show in logged paths. With the
+  daemon stopped during an `rm -rf` of 15,000 entries, the `umount` that
+  followed failed in 50 of 130 runs before and 1 of 130 after; without
+  the daemon it never failed. A directory is still looked up once when
+  it is first seen, so on a busy host an `umount` right after removing a
+  tree of many small directories can still fail. (#467)
+
+- `tests/sandbox.py --loop-device MIB` gives a suite an empty loop
+  device as `/dev/trashd-test-loop`. A terminated runner (SIGTERM,
+  SIGHUP) now cleans up like an interrupted one, and a killed runner
+  takes its sandbox with it, so neither leaves a loop device, mount or
+  image behind. `tests/daemon_umount_race.py` is the opt-in experiment
+  behind #467; no CI job runs it. (#467)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start
