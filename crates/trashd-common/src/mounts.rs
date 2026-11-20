@@ -483,7 +483,10 @@ fn shared_trash_in(topdir: &Path, uid: u32, create: bool) -> Option<PathBuf> {
         // Re-enforce privacy on reuse: an older version could have left the
         // dir group/other-readable.
         if create && m.permissions().mode() & 0o777 != 0o700 {
-            fs::set_permissions(&uid_dir, fs::Permissions::from_mode(0o700)).ok()?;
+            #[cfg(test)]
+            crate::fdops::repair_probe::run(&uid_dir);
+            // Through the directory just checked (security-3).
+            repair_private_dir(&uid_dir, &m).ok()?;
             let after = fs::symlink_metadata(&uid_dir).ok()?;
             if after.uid() != uid
                 || !after.is_dir()
@@ -544,6 +547,20 @@ pub(crate) fn validate_private_dir(path: &Path, uid: u32, repair_mode: bool) -> 
     private_dir_metadata(path, uid, repair_mode).is_some()
 }
 
+/// Make the directory `checked` describes private (0700) through a
+/// descriptor of that very directory, never by path: chmod(2) follows a
+/// symlink that a FUSE or NFS server can answer for the next lookup, which
+/// made the caller chmod any file it can, `/` or a setuid binary included
+/// (security-3).
+fn repair_private_dir(path: &Path, checked: &fs::Metadata) -> io::Result<()> {
+    crate::fdops::fchmod_pinned_dir(
+        libc::AT_FDCWD,
+        &std::ffi::CString::new(path.as_os_str().as_bytes())?,
+        (checked.dev(), checked.ino()),
+        0o700,
+    )
+}
+
 /// Keep the validated identity and permissions in the same metadata snapshot.
 fn private_dir_metadata(path: &Path, uid: u32, repair_mode: bool) -> Option<fs::Metadata> {
     let mut meta = fs::symlink_metadata(path).ok()?;
@@ -551,7 +568,12 @@ fn private_dir_metadata(path: &Path, uid: u32, repair_mode: bool) -> Option<fs::
         return None;
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
-        if !repair_mode || fs::set_permissions(path, fs::Permissions::from_mode(0o700)).is_err() {
+        if !repair_mode {
+            return None;
+        }
+        #[cfg(test)]
+        crate::fdops::repair_probe::run(path);
+        if repair_private_dir(path, &meta).is_err() {
             return None;
         }
         meta = fs::symlink_metadata(path).ok()?;
@@ -1202,6 +1224,77 @@ pub(crate) fn in_private_mounts(test: &str, case: impl FnOnce() -> bool) -> Opti
 #[cfg(test)]
 mod tests {
     use super::in_private_mounts;
+
+    /// A 0644 sentinel file in `dir`.
+    fn sentinel_file(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let sentinel = dir.join("sentinel");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o644)).unwrap();
+        sentinel
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    fn dir_with_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    // security-3: repairing a trash directory's mode never follows a symlink
+    // swapped in after its owner and type were checked, as a FUSE server
+    // answers the next lookup: chmod(2) of the path made the caller chmod
+    // any file (/, /usr/bin/sudo) to 0700.
+    #[test]
+    fn private_dir_repair_never_follows_a_swapped_symlink() {
+        let fixture = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let sentinel = sentinel_file(fixture.path());
+
+        let private = fixture.path().join(format!(".Trash-{uid}"));
+        dir_with_mode(&private, 0o755);
+        crate::fdops::repair_probe::swap_for_symlink(&private, &sentinel);
+        let repaired = super::private_dir_metadata(&private, uid, true);
+        crate::fdops::repair_probe::set(None);
+        assert!(repaired.is_none());
+        assert_eq!(
+            mode_of(&sentinel),
+            0o644,
+            "private_dir_metadata chmodded the victim"
+        );
+
+        let topdir = fixture.path().join("top");
+        dir_with_mode(&topdir, 0o755);
+        dir_with_mode(&topdir.join(".Trash"), 0o1777);
+        let uid_dir = topdir.join(".Trash").join(uid.to_string());
+        dir_with_mode(&uid_dir, 0o755);
+        crate::fdops::repair_probe::swap_for_symlink(&uid_dir, &sentinel);
+        let shared = super::shared_trash_in(&topdir, uid, true);
+        crate::fdops::repair_probe::set(None);
+        assert!(shared.is_none());
+        assert_eq!(
+            mode_of(&sentinel),
+            0o644,
+            "shared_trash_in chmodded the victim"
+        );
+
+        // Without a swap, both still repair.
+        std::fs::remove_file(&private).unwrap();
+        dir_with_mode(&private, 0o755);
+        assert!(super::private_dir_metadata(&private, uid, true).is_some());
+        assert_eq!(mode_of(&private), 0o700);
+        std::fs::remove_file(&uid_dir).unwrap();
+        dir_with_mode(&uid_dir, 0o755);
+        assert_eq!(
+            super::shared_trash_in(&topdir, uid, true),
+            Some(uid_dir.clone())
+        );
+        assert_eq!(mode_of(&uid_dir), 0o700);
+    }
 
     // #365: the fdinfo fallback tells a mount from a plain directory, and
     // statx's availability is probed once.

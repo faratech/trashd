@@ -17,6 +17,9 @@
 #[allow(dead_code)]
 #[path = "../../trashd-common/src/config_file.rs"]
 mod config_file;
+#[allow(dead_code)]
+#[path = "../../trashd-common/src/fdops.rs"]
+mod fdops;
 #[path = "../../trashd-common/src/legacy_config.rs"]
 mod legacy_config;
 #[allow(dead_code)]
@@ -1206,7 +1209,17 @@ fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
         ));
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        #[cfg(test)]
+        crate::fdops::repair_probe::run(path);
+        // Through the directory just checked, never by path: chmod(2)
+        // follows a symlink that a FUSE or NFS server can answer for the
+        // next lookup, which made the caller chmod any file (security-3).
+        fdops::fchmod_pinned_dir(
+            libc::AT_FDCWD,
+            &CString::new(path.as_os_str().as_bytes())?,
+            (meta.dev(), meta.ino()),
+            0o700,
+        )?;
         meta = fs::symlink_metadata(path)?;
     }
     if meta.uid() != uid
@@ -2976,6 +2989,34 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // security-3: the preload's store repair never chmods through a symlink
+    // swapped in after its check, as a FUSE server answers the next lookup.
+    #[test]
+    fn private_dir_repair_never_follows_a_swapped_symlink() {
+        let fixture = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let sentinel = fixture.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = fixture.path().join("Trash");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fdops::repair_probe::swap_for_symlink(&dir, &sentinel);
+        let repaired = ensure_private_dir(&dir, uid, false);
+        crate::fdops::repair_probe::set(None);
+        assert!(repaired.is_err());
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().mode() & 0o7777,
+            0o644,
+            "the repair chmodded the symlink's target"
+        );
+        fs::remove_file(&dir).unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir, uid, false).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+    }
 
     #[test]
     fn occupied_legacy_id_range_still_claims_recoverable_entries() {

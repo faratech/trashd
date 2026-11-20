@@ -2820,7 +2820,17 @@ fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
         ));
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        #[cfg(test)]
+        crate::fdops::repair_probe::run(path);
+        // Through the directory just checked, never by path: chmod(2)
+        // follows a symlink that a FUSE or NFS server can answer for the
+        // next lookup, which made the caller chmod any file (security-3).
+        crate::fdops::fchmod_pinned_dir(
+            libc::AT_FDCWD,
+            &CString::new(path.as_os_str().as_bytes())?,
+            (meta.dev(), meta.ino()),
+            0o700,
+        )?;
         meta = fs::symlink_metadata(path)?;
     }
     if !meta.is_dir()
@@ -3892,14 +3902,15 @@ fn prepare_tree_removal(
         Some(libc::ENOENT) => Ok(None),
         _ => Err(error),
     };
+    // Through a descriptor of the directory just statted, never by name: a
+    // process that kept a descriptor in a group-writable directory of a
+    // trashed tree can still swap entries there, and the path-following
+    // retry this replaced chmodded whatever a swapped-in symlink named
+    // (store-fs-2). A swapped entry fails here; the next sweep unlinks it.
     if mode & 0o700 != 0o700
-        && unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        && let Err(error) = crate::fdops::fchmod_pinned_dir(parent, name, identity, 0o700)
     {
-        // Linux rejects AT_SYMLINK_NOFOLLOW for fchmodat; lstat proved this
-        // is a directory, which nobody else can swap inside a private root.
-        if unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, 0) } != 0 {
-            return gone(io::Error::last_os_error());
-        }
+        return gone(error);
     }
     let directory = match open_directory_at(parent, name, true, false) {
         Ok(directory) => directory,
@@ -6638,6 +6649,36 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // security-3: repairing a store directory's mode never follows a symlink
+    // swapped in after its owner and type were checked: chmod(2) of the path
+    // made the caller chmod any file to 0700.
+    #[test]
+    fn private_dir_repair_never_follows_a_swapped_symlink() {
+        let fixture = TempDir::new().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let sentinel = fixture.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = fixture.path().join("Trash");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fdops::repair_probe::swap_for_symlink(&dir, &sentinel);
+        let repaired = ensure_private_dir(&dir, uid, false);
+        crate::fdops::repair_probe::set(None);
+        assert!(repaired.is_err());
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().mode() & 0o7777,
+            0o644,
+            "the repair chmodded the symlink's target"
+        );
+        // Without a swap the repair still happens.
+        fs::remove_file(&dir).unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir, uid, false).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+    }
 
     fn test_store() -> (TrashStore, TempDir, TempDir, ()) {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
@@ -13972,6 +14013,48 @@ mod tests {
             violations.is_empty(),
             "unlinked while holding the root lock: {violations:#?}"
         );
+    }
+
+    // store-fs-2: a directory without u+rwx is opened up through a
+    // descriptor of the directory just statted. A process that kept a
+    // descriptor inside a group-writable directory of a trashed tree can
+    // still swap entries there; one swapped for a symlink between the status
+    // read and the chmod made the purger's path-following retry chmod the
+    // symlink's target (/etc/passwd, /usr/bin/sudo) to 0700.
+    #[test]
+    fn tree_removal_never_chmods_through_a_swapped_symlink() {
+        let fixture = TempDir::new().unwrap();
+        let sentinel = fixture.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        let job = fixture.path().join("job");
+        fs::create_dir_all(job.join("locked")).unwrap();
+        fs::set_permissions(job.join("locked"), fs::Permissions::from_mode(0o500)).unwrap();
+        let (raced, victim) = (job.clone(), sentinel.clone());
+        TREE_STATUS_PROBE.set(Some(Box::new(move |name: &CStr| {
+            if name.to_bytes() == b"locked" {
+                fs::rename(raced.join("locked"), raced.join("aside")).unwrap();
+                std::os::unix::fs::symlink(&victim, raced.join("locked")).unwrap();
+            }
+        })));
+        let parent = fs::File::open(fixture.path()).unwrap();
+        let removed = remove_tree_at(parent.as_raw_fd(), c"job", 0);
+        TREE_STATUS_PROBE.set(None);
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().mode() & 0o7777,
+            0o644,
+            "the purge chmodded the symlink's target"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert!(
+            removed.is_err(),
+            "a swapped directory must not pass as removed"
+        );
+        // The next sweep finishes the job: the symlink is unlinked, the
+        // directory it replaced removed.
+        remove_tree_at(parent.as_raw_fd(), c"job", 0).unwrap();
+        assert!(!job.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
     }
 
     // store-metadata-10: the unlocked sweep of detached jobs can walk a tree
