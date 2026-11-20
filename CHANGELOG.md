@@ -645,6 +645,18 @@
   cannot be created. `unlink` used to fail with an errno it never
   returns, which also kept a user from freeing a full disk. (#486)
 
+- The scan grant for `rmdir` of an unreadable directory (#410 in the
+  preload, #411 in the seccomp supervisor) is made, used and undone
+  through a pinned descriptor of the directory that was examined. Both
+  layers changed the mode by name, which follows a symlink: whoever
+  could rename entries in the parent swapped the directory for a link to
+  one of the caller's own files, which was then chmodded to the
+  directory's mode. The supervisor also left the grant on a directory
+  that policy excluded or that it declined to trash. Where the preload
+  cannot change the mode through a descriptor, `rmdir` now fails with
+  `EACCES` instead of removing the directory for real. (#552, #491,
+  #502, #504)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start
