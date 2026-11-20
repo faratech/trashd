@@ -578,7 +578,7 @@ After a default `install.sh` install: Layers 1 and 2 are active for everyone (sh
 | `python3 -c "import os; os.remove('x')"` | Layer 2 (preload) | Library call hooked inside the Python process |
 | A systemd service calling `unlink()` | Layer 2 | Services inherit `/etc/ld.so.preload` (unless the unit explicitly bypasses trashd) |
 | Statically-linked binary deleting files | Layer 4 only, and only under `trashd-exec` | No `rm`, no library calls — only the kernel sees it |
-| setuid program deleting files | Layer 4 only, and only under `trashd-exec` | The loader strips `LD_PRELOAD` from setuid binaries |
+| setuid program deleting files | Layer 2, in a restricted mode | `/etc/ld.so.preload` loads the library there too (an `LD_PRELOAD` variable alone is ignored). It then trusts only `/etc/trashd/config.toml` and trashes into the home of the user the program runs as |
 | `rm --permanent …`, `TRASH_BYPASS=1 …` | Nothing — on purpose | You asked for a real delete |
 | `git clean`, `make clean`, package managers | Nothing — on purpose | Listed in `bypass_processes` by default; their deletions are real deletes |
 
@@ -811,7 +811,7 @@ Work through these in order:
 
 ### "My program's deletions are not trashed, but `rm` works"
 
-Almost always one of: the program is statically linked (use `trashd-exec ./your-program`), it runs setuid (same answer), it is — or descends from — a `bypass_processes` entry, or the preload library is not listed in `/etc/ld.so.preload` (or that file is not readable by the user running the program). `TRASHD_PRELOAD_LOG=1 ./your-program` confirms whether the hooks fire at all.
+Almost always one of: the program is statically linked (use `trashd-exec ./your-program`), it runs setuid (its deletions went to the trash of the user it runs as, see *Privileged programs* in the Layer 2 deep dive), it is — or descends from — a `bypass_processes` entry, or the preload library is not listed in `/etc/ld.so.preload` (or that file is not readable by the user running the program). `TRASHD_PRELOAD_LOG=1 ./your-program` confirms whether the hooks fire at all.
 
 ### "How do I see why the seccomp layer is or is not active?"
 
