@@ -82,6 +82,13 @@ pub struct TrashStore {
     scan_data_stats: std::cell::Cell<usize>,
     #[cfg(test)]
     accounting_walks: std::cell::Cell<usize>,
+    /// Runs once between a scan's info/ and files/ passes, as a writer
+    /// racing the unlocked listing would.
+    #[cfg(test)]
+    between_scan_passes: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
+    /// The cross-device move's durability steps, in order.
+    #[cfg(test)]
+    durability_events: std::cell::RefCell<Vec<&'static str>>,
     /// Trash roots whose parent chain this store validated recently, with
     /// the validating UID and time (#307).
     trusted_parents: std::cell::RefCell<Vec<(PathBuf, u32, std::time::Instant)>>,
@@ -288,6 +295,16 @@ impl TrashStore {
         if identity != entry.identity || version != entry.sidecar_version {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
+        // An orphan snapshot whose sidecar now parses came from a listing
+        // that raced the entry's publication. Writers publish the sidecar
+        // and then the data under this lock, so the sidecar is complete here
+        // and the entry is live (store-core-1).
+        if entry.orphaned
+            && sidecar.as_ref().is_some_and(fs::Metadata::is_file)
+            && sidecar_parses(&entry.info_path)
+        {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
         Ok((data, sidecar))
     }
 
@@ -340,6 +357,10 @@ impl TrashStore {
             scan_data_stats: std::cell::Cell::new(0),
             #[cfg(test)]
             accounting_walks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            between_scan_passes: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            durability_events: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -584,8 +605,65 @@ impl TrashStore {
         {
             return Err(TrashError::Refused(abs_path));
         }
+        // A directory is checked once its tree has been surveyed.
+        if meta.is_file() {
+            self.check_retention_cap(&abs_path, meta.size(), &trash_dir)?;
+        }
 
         Ok((abs_path, meta, trash_dir))
+    }
+
+    /// Make a new entry's sidecar and its info/ entry durable before a
+    /// cross-device source is retired, after which the trash copy is the
+    /// only copy: torn by a crash, it came back an orphan without its
+    /// original path (store-core-5). A same-device rename skips this; every
+    /// trapped unlink of an `rm -rf` would pay two more fsyncs.
+    fn sync_new_sidecar(&self, claim: &fs::File, trash_dir: &Path) -> io::Result<()> {
+        claim.sync_data()?;
+        #[cfg(test)]
+        self.durability_events.borrow_mut().push("sidecar");
+        let info =
+            CString::new(trash_dir.join("info").as_os_str().as_bytes()).map_err(io::Error::from)?;
+        open_directory_at(libc::AT_FDCWD, &info, true, false)?.sync_all()?;
+        #[cfg(test)]
+        self.durability_events.borrow_mut().push("info");
+        Ok(())
+    }
+
+    /// retention.max_size_gb in bytes; 0 means no size limit.
+    fn retention_size_cap(&self) -> u64 {
+        (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64
+    }
+
+    /// Whether `root` is on the home trash's filesystem: the only trash the
+    /// size cap governs (store-core-3).
+    fn on_home_filesystem(&self, root: &Path) -> bool {
+        if root == self.home {
+            return true;
+        }
+        let home = mounts::device_id_or_parent(&self.home);
+        home.is_some() && mounts::device_id_or_parent(root) == home
+    }
+
+    /// Refuse an operand larger than the size cap of the trash it would land
+    /// in. Retention could only fit it by purging it, and first every other
+    /// entry; the delete that just succeeded became permanent (store-core-2).
+    /// Like the other size caps, this is a refusal: nothing moves (#10).
+    fn check_retention_cap(
+        &self,
+        path: &Path,
+        size: u64,
+        trash_dir: &Path,
+    ) -> Result<(), TrashError> {
+        let cap = self.retention_size_cap();
+        if cap == 0 || size <= cap || !self.on_home_filesystem(trash_dir) {
+            return Ok(());
+        }
+        Err(TrashError::TooLarge {
+            path: path.to_path_buf(),
+            size_mb: size / (1024 * 1024),
+            limit_mb: cap / (1024 * 1024),
+        })
     }
 
     /// Move a file or directory to the trash. Returns the trash entry ID.
@@ -613,6 +691,7 @@ impl TrashStore {
             if let Some(mount) = survey.mount_in(&abs_path) {
                 return Err(TrashError::HoldsMount(mount));
             }
+            self.check_retention_cap(&abs_path, survey.apparent, &trash_dir)?;
             (survey.apparent, survey.allocated)
         } else {
             (meta.size(), 0)
@@ -644,14 +723,14 @@ impl TrashStore {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unnamed".into());
-        let (id, info_file, claim) = unique_id_atomic(&trash_dir, &file_name)?;
+        let (id, info_file, mut claim) = unique_id_atomic(&trash_dir, &file_name)?;
 
         let dest = trash_dir.join("files").join(&id);
 
         // Write .trashinfo content through the descriptor that claimed it.
         // On failure, release the claim so an ENOSPC cannot strand an
         // invisible 0-byte sidecar that also reserves the id stem (#109).
-        if let Err(e) = write_claimed_sidecar(claim, &info) {
+        if let Err(e) = write_claimed_sidecar(&mut claim, &info) {
             let _ = raw_unlink_path(&info_file);
             return Err(TrashError::Io(e));
         }
@@ -726,6 +805,9 @@ impl TrashStore {
                 // The copy's data is synced; make its directory entry durable
                 // before the source can disappear.
                 files.sync_all()?;
+                #[cfg(test)]
+                self.durability_events.borrow_mut().push("files");
+                self.sync_new_sidecar(&claim, &trash_dir)?;
                 copy_done = true;
                 // Source retirement can trap into a seccomp supervisor that
                 // needs this same root lock, so only under an active seccomp
@@ -738,6 +820,8 @@ impl TrashStore {
                 }
                 // Raw syscalls throughout: the system-wide preload would
                 // otherwise trash the source a second time (#104).
+                #[cfg(test)]
+                self.durability_events.borrow_mut().push("retire");
                 let complete = match &snapshot {
                     Some(before) => retire_directory_snapshot_at(
                         source_parent.as_raw_fd(),
@@ -1021,6 +1105,10 @@ impl TrashStore {
         {
             return Err(TrashError::Refused(display_path.clone()));
         }
+        // The retention size cap, as in trash(); a tree after its survey.
+        if fmt == libc::S_IFREG {
+            self.check_retention_cap(&display_path, stat.st_size as u64, &trash_dir)?;
+        }
 
         // A trash on another filesystem cannot take a rename; the copy
         // fallback below handles it instead of continuing the target's
@@ -1068,6 +1156,11 @@ impl TrashStore {
             if let Some(mount) = survey.mount_in(&display_path) {
                 unsafe { libc::close(files_fd) };
                 return Err(TrashError::HoldsMount(mount));
+            }
+            if let Err(error) = self.check_retention_cap(&display_path, survey.apparent, &trash_dir)
+            {
+                unsafe { libc::close(files_fd) };
+                return Err(error);
             }
             (survey.apparent, survey.allocated)
         };
@@ -1121,7 +1214,7 @@ impl TrashStore {
         // data fidelity comes from the move itself and the raw-bytes
         // percent-encoding in the .trashinfo).
         let base_name = name.to_string_lossy();
-        let (id, info_file, claim) = match unique_id_atomic(&trash_dir, &base_name) {
+        let (id, info_file, mut claim) = match unique_id_atomic(&trash_dir, &base_name) {
             Ok(v) => v,
             Err(e) => {
                 unsafe { libc::close(files_fd) };
@@ -1140,7 +1233,7 @@ impl TrashStore {
         // Write .trashinfo BEFORE opening files_fd / moving — same ordering
         // as trash(). On write failure release the claimed sidecar so we do
         // not strand an empty orphan in info/ (review finding).
-        if let Err(e) = write_claimed_sidecar(claim, &info) {
+        if let Err(e) = write_claimed_sidecar(&mut claim, &info) {
             let _ = raw_unlink_path(&info_file);
             unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(e));
@@ -1207,7 +1300,9 @@ impl TrashStore {
                 if unsafe { libc::fsync(files_fd) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                Ok(())
+                #[cfg(test)]
+                self.durability_events.borrow_mut().push("files");
+                self.sync_new_sidecar(&claim, &trash_dir)
             })();
             if let Err(e) = copy {
                 unsafe { libc::close(files_fd) };
@@ -1218,6 +1313,8 @@ impl TrashStore {
             // The entry is complete from here on. A failed or partial source
             // removal keeps it: the target's own syscall then decides, and at
             // worst a duplicate remains in the trash.
+            #[cfg(test)]
+            self.durability_events.borrow_mut().push("retire");
             let retired = match &snapshot {
                 Some(before) => retire_directory_snapshot_at(
                     parent_fd,
@@ -1675,10 +1772,16 @@ impl TrashStore {
         // Age is known from the sidecar alone: filter before the data stat
         // so a mostly-young trash does not stat every data inode (and
         // retain every entry) just to discard it.
-        self.list_mutation_filtered(|info| match max_age_days {
+        let mut entries = self.list_mutation_filtered(|info| match max_age_days {
             Some(days) => now.signed_duration_since(info.deletion_date).num_days() >= days as i64,
             None => true,
-        })
+        })?;
+        // Data whose metadata cannot be parsed has no known age; the purge
+        // refuses it too, so the preview matches what is deleted.
+        if max_age_days.is_some() {
+            entries.retain(|entry| !has_unparsed_sidecar(entry));
+        }
+        Ok(entries)
     }
 
     /// Permanently delete exactly `entries`, e.g. the listing a user just
@@ -1712,7 +1815,7 @@ impl TrashStore {
                 );
                 continue;
             }
-            match self.purge_reporting_kind(entry) {
+            match self.purge_reporting_kind(entry, max_age_days.is_some()) {
                 Ok(was_directory) => cache.note_removal(entry, was_directory),
                 Err(e) => {
                     if !matches!(e, TrashError::EntryNotFound(_)) {
@@ -1852,7 +1955,7 @@ impl TrashStore {
 
     fn auto_purge_in_roots(&self, roots: &[PathBuf]) -> Result<(), TrashError> {
         let max_age = self.config.retention.max_age_days;
-        let max_size_bytes = (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        let max_size_bytes = self.retention_size_cap();
         let pressure_pct = self.config.retention.disk_pressure_percent;
         // Failure to finish earlier cleanup must not prevent retention of
         // ordinary entries. Explicit cleanup reports these failures instead.
@@ -1860,15 +1963,21 @@ impl TrashStore {
 
         let mut entries = Vec::new();
         self.list_roots(roots, None, &mut entries)?;
+        let now = chrono::Local::now();
+        // A DeletionDate in the future (clock skew, or media whose author
+        // chose it) orders as "just deleted", never as newer than every real
+        // entry (store-core-3). Only this pass's snapshots change.
+        for entry in &mut entries {
+            entry.info.deletion_date = entry.info.deletion_date.min(now);
+        }
         newest_first(&mut entries);
         if entries.is_empty() {
             return Ok(());
         }
 
-        let now = chrono::Local::now();
         let cache = std::cell::RefCell::new(CacheRefresh::default());
         let purge = |entry: &TrashEntry| {
-            let was_directory = self.purge_reporting_kind(entry)?;
+            let was_directory = self.purge_reporting_kind(entry, true)?;
             cache.borrow_mut().note_removal(entry, was_directory);
             Ok::<(), TrashError>(())
         };
@@ -1896,14 +2005,17 @@ impl TrashStore {
         }
 
         // Phase 2a: auto-compress old uncompressed items before purging by size.
+        // Opt-in: other file managers restore files/<id> byte for byte, so a
+        // compressed entry came back from them as zstd data (store-metadata-5).
         // Cap how much we slurp into RAM — this runs (throttled) on routine
         // deletions, and reading a multi-hundred-MB trashed file fully into a
         // Vec could OOM the process (and a killed supervisor degrades to
         // passthrough). Skip anything above the cap.
         const COMPRESS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+        let auto_compress = self.config.retention.auto_compress;
         let mut incompressible = IncompressibleData::load(&self.home);
         for i in (0..entries.len()).rev() {
-            if purged[i] || entries[i].orphaned {
+            if !auto_compress || purged[i] || entries[i].orphaned {
                 continue;
             }
             let age = now.signed_duration_since(entries[i].info.deletion_date);
@@ -1993,99 +2105,117 @@ impl TrashStore {
             }
         }
 
-        incompressible.save();
+        if auto_compress {
+            incompressible.save();
+        }
 
-        // Phase 2b: trim by total size (purge oldest surviving until under limit)
+        // Size and pressure trimming act only on roots on the home
+        // filesystem. Pressure is measured there, so only those entries can
+        // relieve it (#113); and bytes in a root elsewhere (removable media,
+        // whose author controls sizes and dates) must never justify purging
+        // the home trash (store-core-3). One device lookup per root.
+        let home_device = mounts::device_id_or_parent(&self.home);
+        let root_devices = std::cell::RefCell::new(std::collections::HashMap::new());
+        let on_home_filesystem = |root: &Path| {
+            home_device.is_some()
+                && *root_devices
+                    .borrow_mut()
+                    .entry(root.to_path_buf())
+                    .or_insert_with(|| mounts::device_id_or_parent(root))
+                    == home_device
+        };
+        // Recent entries are never eligible: moving a file into the trash
+        // frees nothing, and purging the entry an `rm` just created turned it
+        // into a permanent delete (#201, store-core-2). Nor is data whose
+        // metadata cannot be parsed: its age is unknown.
+        let eligible = |entry: &TrashEntry| {
+            now.signed_duration_since(entry.info.deletion_date) >= PRESSURE_MIN_AGE
+                && on_home_filesystem(&entry.trash_root)
+                && !has_unparsed_sidecar(entry)
+        };
+
+        // Phase 2b: trim by total size (purge oldest eligible until under limit)
         // max_size_gb == 0 means "no size limit", not "trim everything to 0";
         // without a limit nothing needs sizing (foreign trees are walked).
         // Keep these measurements for this pass only. Foreign trees may need
         // a full walk; measuring them again when choosing victims doubled
         // that work without providing a coherent newer snapshot (#384).
-        let mut sizes = if max_size_bytes > 0 {
-            vec![0; entries.len()]
-        } else {
-            Vec::new()
-        };
-        let mut total_size = 0u64;
         if max_size_bytes > 0 {
+            let mut sizes = vec![0; entries.len()];
+            let mut total_size = 0u64;
             for (i, entry) in entries.iter().enumerate() {
-                if !purged[i] {
+                if !purged[i] && on_home_filesystem(&entry.trash_root) {
                     sizes[i] = self.entry_disk_size(entry);
-                    total_size = total_size.saturating_add(sizes[i]);
+                    // An entry larger than the whole cap could only fit by
+                    // purging it alone: counting it purged every other entry
+                    // and then it too (store-core-2). Trashing one is refused;
+                    // one already here (a lowered cap, another tool's) is
+                    // left to age-based retention.
+                    if sizes[i] <= max_size_bytes {
+                        total_size = total_size.saturating_add(sizes[i]);
+                    }
                 }
             }
-        }
-        if max_size_bytes > 0 && total_size > max_size_bytes {
-            let mut freed = 0u64;
-            let excess = total_size - max_size_bytes;
-            for i in (0..entries.len()).rev() {
-                if purged[i] {
-                    continue;
-                }
-                if freed >= excess {
-                    break;
-                }
-                // Only count a purge that actually happened: a failed removal
-                // must stay in the accounting (and out of the freed total), or
-                // the trash silently exceeds max_size_gb (#106).
-                if purge(&entries[i]).is_ok() {
-                    freed = freed.saturating_add(sizes[i]);
-                    purged[i] = true;
-                    purge_count += 1;
+            let excess = total_size.saturating_sub(max_size_bytes);
+            let victims: Vec<usize> = if excess > 0 {
+                (0..entries.len())
+                    .rev()
+                    .filter(|&i| !purged[i] && sizes[i] <= max_size_bytes && eligible(&entries[i]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Purging older entries that cannot bring the trash under the cap
+            // only loses them; wait until enough entries are old enough.
+            let available = victims
+                .iter()
+                .fold(0u64, |sum, &i| sum.saturating_add(sizes[i]));
+            if excess > 0 && available >= excess {
+                let mut freed = 0u64;
+                for i in victims {
+                    if freed >= excess {
+                        break;
+                    }
+                    // Only count a purge that actually happened: a failed
+                    // removal must stay in the accounting (and out of the
+                    // freed total), or the trash silently exceeds
+                    // max_size_gb (#106).
+                    if purge(&entries[i]).is_ok() {
+                        freed = freed.saturating_add(sizes[i]);
+                        purged[i] = true;
+                        purge_count += 1;
+                    }
                 }
             }
         }
 
         // Phase 3: disk pressure — purge oldest 10% of surviving items.
-        // Pressure is measured on the HOME filesystem, so only entries on that
-        // same filesystem can relieve it; purging other partitions' entries
-        // would delete data without fixing the pressure (#113).
-        if pressure_pct > 0 {
-            let home = self.home.clone();
-            if let Some(usage_pct) = disk_usage_percent(&home)
-                && usage_pct >= pressure_pct as f64
-            {
-                // Recent entries are never eligible: moving a file into the
-                // trash frees nothing, and purging the entry an `rm` just
-                // created turned it into a permanent delete (#201).
-                // One device lookup per root, not two lstats per entry and pass.
-                let home_device = mounts::device_id_or_parent(&home);
-                let root_devices = std::cell::RefCell::new(std::collections::HashMap::new());
-                let on_home_filesystem = |root: &Path| {
-                    home_device.is_some()
-                        && *root_devices
-                            .borrow_mut()
-                            .entry(root.to_path_buf())
-                            .or_insert_with(|| mounts::device_id_or_parent(root))
-                            == home_device
-                };
-                let eligible = |entry: &TrashEntry| {
-                    now.signed_duration_since(entry.info.deletion_date) >= PRESSURE_MIN_AGE
-                        && on_home_filesystem(&entry.trash_root)
-                };
-                let candidates = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, entry)| !purged[*i] && eligible(entry))
-                    .count();
-                let to_purge = if candidates == 0 {
-                    0
-                } else {
-                    std::cmp::max(1, candidates / 10)
-                };
-                let mut purged_count = 0;
-                for i in (0..entries.len()).rev() {
-                    if purged_count >= to_purge {
-                        break;
-                    }
-                    if purged[i] || !eligible(&entries[i]) {
-                        continue;
-                    }
-                    if purge(&entries[i]).is_ok() {
-                        purged[i] = true;
-                        purge_count += 1;
-                        purged_count += 1;
-                    }
+        if pressure_pct > 0
+            && let Some(usage_pct) = disk_usage_percent(&self.home)
+            && usage_pct >= pressure_pct as f64
+        {
+            let candidates = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, entry)| !purged[*i] && eligible(entry))
+                .count();
+            let to_purge = if candidates == 0 {
+                0
+            } else {
+                std::cmp::max(1, candidates / 10)
+            };
+            let mut purged_count = 0;
+            for i in (0..entries.len()).rev() {
+                if purged_count >= to_purge {
+                    break;
+                }
+                if purged[i] || !eligible(&entries[i]) {
+                    continue;
+                }
+                if purge(&entries[i]).is_ok() {
+                    purged[i] = true;
+                    purge_count += 1;
+                    purged_count += 1;
                 }
             }
         }
@@ -2199,15 +2329,17 @@ impl TrashStore {
         if self.isolated && entry.trash_root != self.home {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        let was_directory = self.purge_reporting_kind(entry)?;
+        let was_directory = self.purge_reporting_kind(entry, false)?;
         if maintain {
             self.refresh_cache_after_removal(entry, was_directory);
         }
         Ok(())
     }
 
-    /// Purge one validated entry; true when its data was a directory.
-    fn purge_reporting_kind(&self, entry: &TrashEntry) -> Result<bool, TrashError> {
+    /// Purge one validated entry; true when its data was a directory. A purge
+    /// `by_age` (retention, `empty --older`) never takes data whose sidecar
+    /// exists but cannot be parsed: its age is unknown (`has_unparsed_sidecar`).
+    fn purge_reporting_kind(&self, entry: &TrashEntry, by_age: bool) -> Result<bool, TrashError> {
         let _data_lock = match lock_entry_file(&entry.trashed_path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -2215,6 +2347,9 @@ impl TrashStore {
         };
         let guard = self.lock_trash_root(&entry.trash_root)?;
         let (data, sidecar) = self.validated_entry_metadata_locked(entry, &guard)?;
+        if by_age && entry.orphaned && sidecar.as_ref().is_some_and(fs::Metadata::is_file) {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
         // A phantom entry (neither data nor sidecar on disk) must not
         // report a successful purge of nothing (#247).
         if data.is_none() && sidecar.is_none() {
@@ -2351,8 +2486,16 @@ impl TrashStore {
                 }
                 #[cfg(test)]
                 self.accounting_walks.set(self.accounting_walks.get() + 1);
-                directory_accounted_size(&entry.trashed_path, entry.info.size)
+                directory_accounted_size(
+                    &entry.trashed_path,
+                    entry.info.size,
+                    entry.trash_root != self.home,
+                )
             }
+            // A sparse file claims any apparent size while occupying nothing:
+            // in a root others may write, count no more than its allocated
+            // blocks (store-core-3).
+            Some(m) if entry.trash_root != self.home => m.len().min(m.blocks().saturating_mul(512)),
             Some(m) => m.len(),
             // No data, nothing occupies the disk.
             None => 0,
@@ -2411,7 +2554,7 @@ pub struct PartitionStatus {
 /// data when the new file is renamed into `files/<id>`.
 /// Write a new entry's record into the sidecar its id claim created,
 /// instead of closing the claim and reopening it with O_TRUNC (#307).
-fn write_claimed_sidecar(mut claim: fs::File, info: &TrashInfo) -> io::Result<()> {
+fn write_claimed_sidecar(claim: &mut fs::File, info: &TrashInfo) -> io::Result<()> {
     claim.write_all(info.to_trashinfo_string().as_bytes())
 }
 
@@ -2819,6 +2962,23 @@ fn sidecar_snapshot(path: &Path) -> Option<SidecarVersion> {
     Some(SidecarVersion::from_metadata(&m))
 }
 
+/// Whether `path` is a regular sidecar that parses as trash metadata.
+fn sidecar_parses(path: &Path) -> bool {
+    crate::trashinfo::read_sidecar(path)
+        .ok()
+        .and_then(|content| TrashInfo::from_trashinfo(&content))
+        .is_some()
+}
+
+/// An orphan whose sidecar path holds a regular file: its metadata exists
+/// but could not be parsed (a corrupt file, a claim torn by a crash), so its
+/// age is unknown and the data may be recoverable by hand. Retention never
+/// purges it, matching fsck; an explicit purge still may.
+fn has_unparsed_sidecar(entry: &TrashEntry) -> bool {
+    entry.orphaned
+        && fs::symlink_metadata(&entry.info_path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Hash a file using the configured algorithm.
 /// "xxhash" (default): XXH3-128 — extremely fast, non-cryptographic.
 /// "sha256": SHA-256 — cryptographic, slower.
@@ -3099,7 +3259,9 @@ fn survey_mount(
 /// Descriptor-relative lookups avoid repeatedly resolving every ancestor;
 /// batched directory reads and an explicit stack bound memory by depth.
 /// Symlinks and mounted subtrees are excluded, as for a tree we can purge.
-fn directory_accounted_size(path: &Path, ceiling: Option<u64>) -> u64 {
+/// With `allocated`, a file counts no more than its allocated blocks, so
+/// sparse files in a root others may write cannot inflate it (store-core-3).
+fn directory_accounted_size(path: &Path, ceiling: Option<u64>, allocated: bool) -> u64 {
     let limit = ceiling.unwrap_or(u64::MAX);
     if limit == 0 {
         return 0;
@@ -3149,7 +3311,7 @@ fn directory_accounted_size(path: &Path, ceiling: Option<u64>) -> u64 {
         let Ok(info) = mounts::entry_info_at(
             directory,
             &name,
-            libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_INO,
+            libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_INO | libc::STATX_BLOCKS,
         ) else {
             continue;
         };
@@ -3159,7 +3321,12 @@ fn directory_accounted_size(path: &Path, ceiling: Option<u64>) -> u64 {
             continue;
         }
         if format != libc::S_IFDIR {
-            total = total.saturating_add(info.size);
+            let size = if allocated {
+                info.size.min(info.blocks.saturating_mul(512))
+            } else {
+                info.size
+            };
+            total = total.saturating_add(size);
             if total >= limit {
                 return limit;
             }
@@ -6086,7 +6253,8 @@ fn class_match(p: &[char], start: usize, c: char) -> ClassMatch {
     ClassMatch::Unterminated
 }
 
-/// Minimum age before disk pressure may purge an entry (#201).
+/// Minimum age before size or disk-pressure trimming may purge an entry
+/// (#201, store-core-2).
 const PRESSURE_MIN_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// Get disk usage percentage for the filesystem containing the given path.
@@ -8098,7 +8266,9 @@ mod tests {
             // TrashStore is !Sync (internal caches): the compressor runs on
             // its own store instance over the same isolated trash root.
             let handle = scope.spawn(|| {
-                let store2 = TrashStore::open_isolated(&trash, Config::default()).unwrap();
+                let mut config = Config::default();
+                config.retention.auto_compress = true;
+                let store2 = TrashStore::open_isolated(&trash, config).unwrap();
                 store2.maybe_auto_purge()
             });
 
@@ -10352,7 +10522,9 @@ mod tests {
     fn retention_compression_keeps_original_times() {
         let base = tempfile::tempdir().unwrap();
         let trash = base.path().join("Trash");
-        let store = TrashStore::open_isolated(&trash, Config::default()).unwrap();
+        let mut config = Config::default();
+        config.retention.auto_compress = true;
+        let store = TrashStore::open_isolated(&trash, config).unwrap();
         let data = trash.join("files/old.txt");
         fs::write(&data, "compressible ".repeat(1000)).unwrap();
         let mut info = TrashInfo::new(base.path().join("old.txt"));
@@ -11306,10 +11478,12 @@ mod tests {
     }
 
     // Regression (#404): orphans must age. A synthetic "now" deletion date
-    // kept them forever outside age-based retention; the data's mtime gives
-    // them a meaningful age instead.
+    // kept them forever outside age-based retention. Their age starts when
+    // the data arrived in files/ (rename and copy both set its ctime), not
+    // at its content's last edit: an old file trashed just now was purged
+    // at once as a long-deleted orphan (store-metadata-1, store-core-5).
     #[test]
-    fn orphan_deletion_date_falls_back_to_data_mtime() {
+    fn orphan_deletion_date_is_when_its_data_arrived() {
         use std::fs::FileTimes;
 
         let (store, _data, _work, _lock) = test_store();
@@ -11333,10 +11507,16 @@ mod tests {
         let mut entries = Vec::new();
         store.list_in_dir(&root, None, &mut entries).unwrap();
         assert_eq!(entries.len(), 1);
+        // A fixed instant from the inode, so the orphan keeps aging.
+        let metadata = fs::symlink_metadata(&data_path).unwrap();
+        let arrived =
+            chrono::DateTime::from_timestamp(metadata.ctime(), metadata.ctime_nsec() as u32)
+                .unwrap();
+        assert_eq!(entries[0].info.deletion_date, arrived);
         let age = chrono::Local::now() - entries[0].info.deletion_date;
         assert!(
-            age > chrono::Duration::days(9),
-            "orphan must inherit the data mtime as its age, got {age:?}"
+            age < chrono::Duration::days(1),
+            "orphan aged by its content mtime: {age:?}"
         );
     }
 
@@ -12148,7 +12328,8 @@ mod tests {
     // tools created; restoring those elsewhere yields zstd bytes.
     #[test]
     fn auto_compression_leaves_foreign_entries_alone() {
-        let (store, _data, _work, _) = test_store();
+        let (mut store, _data, _work, _) = test_store();
+        store.config.retention.auto_compress = true;
         let (data, info) = seed_old_entry(&store, "foreign.txt", "");
         let sidecar = fs::read(&info).unwrap();
         store.auto_purge().unwrap();
@@ -12162,7 +12343,8 @@ mod tests {
     // the drive was mounted elsewhere.
     #[test]
     fn auto_compression_preserves_mtime_and_sidecar_text() {
-        let (store, _data, _work, _) = test_store();
+        let (mut store, _data, _work, _) = test_store();
+        store.config.retention.auto_compress = true;
         let (data, info) = seed_old_entry(&store, "ours.txt", "X-Trashd-Size=13000\n");
         let mtime = fs::metadata(&data).unwrap().modified().unwrap();
         store.auto_purge().unwrap();
@@ -12570,9 +12752,10 @@ mod tests {
                 "recorded={recorded}"
             );
             // The old capped measurement plus the new file is below this
-            // limit; the complete foreign tree is above it.
-            store.config.retention.max_size_gb =
-                ((DIR_SIZE_MAX_FILES + 8) * 4) as f64 / (1024.0 * 1024.0 * 1024.0);
+            // limit; the complete foreign tree plus the new file is above
+            // it. The tree alone still fits: an entry larger than the whole
+            // cap is never size-trimmed (store-core-2).
+            store.config.retention.max_size_gb = (size + 2) as f64 / (1024.0 * 1024.0 * 1024.0);
             store.accounting_walks.set(0);
             let paths: Vec<_> = roots.iter().map(|(path, _)| path.clone()).collect();
             store.auto_purge_in_roots(&paths).unwrap();
@@ -12600,10 +12783,10 @@ mod tests {
         fs::write(deepest.join("data"), b"deep payload").unwrap();
         let target = create_file(work.path(), "EXTERNAL", &"x".repeat(10_000));
         std::os::unix::fs::symlink(&target, tree.join("link")).unwrap();
-        assert_eq!(directory_accounted_size(&tree, None), 12);
-        assert_eq!(directory_accounted_size(&tree, Some(u64::MAX)), 12);
-        assert_eq!(directory_accounted_size(&tree, Some(5)), 5);
-        assert_eq!(directory_accounted_size(&tree, Some(0)), 0);
+        assert_eq!(directory_accounted_size(&tree, None, false), 12);
+        assert_eq!(directory_accounted_size(&tree, Some(u64::MAX), false), 12);
+        assert_eq!(directory_accounted_size(&tree, Some(5), false), 5);
+        assert_eq!(directory_accounted_size(&tree, Some(0), false), 0);
         assert_eq!(fs::metadata(target).unwrap().len(), 10_000);
     }
 
@@ -12627,7 +12810,7 @@ mod tests {
                     unmount(&tree.join("mount"));
                     return false;
                 }
-                let measured = directory_accounted_size(&tree, None);
+                let measured = directory_accounted_size(&tree, None, false);
                 unmount(&tree.join("file-mount"));
                 unmount(&tree.join("mount"));
                 measured == 5 && fs::read(keep).unwrap() == b"external payload"
@@ -12700,5 +12883,429 @@ mod tests {
             size >= 50_000,
             "foreign directory tree must be accounted at its real size, got {size}"
         );
+    }
+
+    // ---- WS-A: retention must never destroy live or legitimate entries ----
+
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    /// Set a path's mtime `age` into the past. Its ctime stays "now".
+    fn backdate_mtime(path: &Path, age: std::time::Duration) {
+        fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// Rewrite an entry's sidecar as if it had been trashed `age` ago.
+    fn backdate_entry(store: &TrashStore, id: &str, age: chrono::Duration) {
+        let entry = store.find_entry(id).unwrap();
+        let mut info = entry.info.clone();
+        info.deletion_date -= age;
+        info.deletion_ns = info
+            .deletion_date
+            .timestamp_nanos_opt()
+            .and_then(|ns| u64::try_from(ns).ok());
+        fs::write(&entry.info_path, info.to_trashinfo_string()).unwrap();
+    }
+
+    fn retention_off() -> Config {
+        let mut config = Config::default();
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        config
+    }
+
+    // store-metadata-1 / store-core-1: an entry published between the info/
+    // and files/ passes of an unlocked listing was synthesized as an orphan
+    // dated by its data's old mtime, and retention then deleted its data and
+    // its valid sidecar.
+    #[test]
+    fn entry_published_between_listing_passes_survives_retention() {
+        for via_empty in [false, true] {
+            let (mut store, _data, work, _) = test_store();
+            store.config.retention.max_age_days = 30;
+            let source = create_file(work.path(), "report-2023.pdf", "old report");
+            backdate_mtime(&source, std::time::Duration::from_secs(60 * 86400));
+            let root = store.home.clone();
+            let (published_tx, published_rx) = std::sync::mpsc::channel();
+            *store.between_scan_passes.borrow_mut() = Some(Box::new(move || {
+                let writer = TrashStore::open_isolated(&root, retention_off()).unwrap();
+                writer.defer_maintenance();
+                published_tx
+                    .send(writer.trash(&source, None).unwrap())
+                    .unwrap();
+            }));
+            if via_empty {
+                let selected = store.entries_older_than(Some(30)).unwrap();
+                assert!(
+                    selected.iter().all(|entry| !entry.orphaned),
+                    "a live entry was selected as an aged orphan"
+                );
+                store.empty_entries(&selected, Some(30));
+            } else {
+                let listed = store.list(None).unwrap();
+                assert!(
+                    listed.iter().all(|entry| !entry.orphaned),
+                    "a live entry was listed as an orphan"
+                );
+                store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+            }
+            let id = published_rx.recv().unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            assert!(!entry.orphaned, "via_empty={via_empty}");
+            assert_eq!(fs::read(&entry.trashed_path).unwrap(), b"old report");
+            assert!(entry.info_path.exists());
+        }
+    }
+
+    // store-core-1: the purge revalidates an orphan snapshot under the root
+    // lock. Writers publish under that lock, so a sidecar that now parses
+    // means the snapshot came from a racing listing: the entry is live.
+    #[test]
+    fn orphan_snapshot_is_not_purged_once_its_sidecar_parses() {
+        let (store, _data, work, _) = test_store();
+        let data = store.home.join("files/X");
+        fs::write(&data, b"live").unwrap();
+        let mut entry = store.find_entry("X").unwrap();
+        assert!(entry.orphaned);
+        let info_path = store.home.join("info/X.trashinfo");
+        fs::write(
+            &info_path,
+            TrashInfo::new(work.path().join("X")).to_trashinfo_string(),
+        )
+        .unwrap();
+        // The snapshot a listing records after the writer has finished.
+        entry.sidecar_version = sidecar_snapshot(&info_path);
+        entry.info.deletion_date = chrono::Local::now() - chrono::Duration::days(60);
+        assert!(matches!(
+            store.purge_resolved(&entry),
+            Err(TrashError::EntryNotFound(_))
+        ));
+        assert_eq!(
+            store.empty_entries_reporting(std::slice::from_ref(&entry), Some(30)),
+            (0, 0)
+        );
+        assert_eq!(fs::read(&data).unwrap(), b"live");
+        assert!(info_path.exists());
+        assert!(!store.find_entry("X").unwrap().orphaned);
+    }
+
+    // store-metadata-1 / store-core-5: a sidecar that exists but cannot be
+    // parsed (a claim torn by a crash, a corrupt file) leaves the data's age
+    // unknown. Age-based retention keeps it, as fsck does; an explicit purge
+    // of that one entry still works (the spec's emergency case).
+    #[test]
+    fn age_based_retention_never_purges_data_whose_sidecar_cannot_be_parsed() {
+        let (store, _data, _work, _) = test_store();
+        let data = store.home.join("files/torn");
+        fs::write(&data, b"recoverable").unwrap();
+        let info = store.home.join("info/torn.trashinfo");
+        fs::write(&info, b"").unwrap();
+        let mut entry = store.find_entry("torn").unwrap();
+        assert!(entry.orphaned);
+        assert!(
+            store.entries_older_than(Some(0)).unwrap().is_empty(),
+            "data with an unparseable sidecar was selected by age"
+        );
+        entry.info.deletion_date = chrono::Local::now() - chrono::Duration::days(60);
+        assert_eq!(
+            store.empty_entries_reporting(std::slice::from_ref(&entry), Some(30)),
+            (0, 0)
+        );
+        assert_eq!(fs::read(&data).unwrap(), b"recoverable");
+        assert!(info.exists());
+        store.purge_resolved(&entry).unwrap();
+        assert!(data.symlink_metadata().is_err());
+        assert!(info.symlink_metadata().is_err());
+    }
+
+    // store-core-5: after a crash the new sidecar can be empty while the data
+    // rename is durable. That orphan arrived just now (ctime), whatever its
+    // content's mtime says, and must not expire by age.
+    #[test]
+    fn torn_sidecar_after_a_crash_does_not_expire_old_data() {
+        let (mut store, _data, _work, _) = test_store();
+        store.config.retention.max_age_days = 30;
+        let data = store.home.join("files/old.pdf");
+        fs::write(&data, b"report").unwrap();
+        backdate_mtime(&data, std::time::Duration::from_secs(60 * 86400));
+        fs::write(store.home.join("info/old.pdf.trashinfo"), b"").unwrap();
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        assert_eq!(fs::read(&data).unwrap(), b"report");
+        let entry = store.find_entry("old.pdf").unwrap();
+        assert!(entry.orphaned);
+        assert!(chrono::Local::now() - entry.info.deletion_date < chrono::Duration::days(30));
+    }
+
+    // store-metadata-2: a legacy sidecar over the 64 KiB read cap (the full
+    // argv of a large `rm`) was treated as missing, so its data became an
+    // orphan dated by mtime and retention deleted both.
+    #[test]
+    fn legacy_oversized_sidecar_survives_retention_and_restores() {
+        let (mut store, _data, work, _) = test_store();
+        store.config.retention.max_age_days = 30;
+        let original = work.path().join("IMG_0001.jpg");
+        let data = store.home.join("files/IMG_0001.jpg");
+        fs::write(&data, b"photo").unwrap();
+        backdate_mtime(&data, std::time::Duration::from_secs(60 * 86400));
+        let mut info = TrashInfo::new(original.clone());
+        info.pid = Some(1);
+        let sidecar = info.to_trashinfo_string()
+            + &format!("X-Trashd-Command=rm {}\n", "IMG_9999.jpg ".repeat(8_000));
+        assert!(sidecar.len() > 100 * 1024);
+        fs::write(store.home.join("info/IMG_0001.jpg.trashinfo"), sidecar).unwrap();
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        assert!(store.entries_older_than(Some(30)).unwrap().is_empty());
+        let entry = store.find_entry("IMG_0001.jpg").unwrap();
+        assert!(!entry.orphaned);
+        assert_eq!(entry.info.original_path, original);
+        assert!(chrono::Local::now() - entry.info.deletion_date < chrono::Duration::hours(1));
+        let restored = store.restore("IMG_0001.jpg", None).unwrap();
+        assert_eq!(restored, original);
+        assert_eq!(fs::read(&original).unwrap(), b"photo");
+    }
+
+    // store-core-2: an operand larger than the retention size cap was trashed
+    // and then purged by the same rm's retention pass, taking every older
+    // entry with it. Caps are refusals: nothing moves.
+    #[test]
+    fn operand_larger_than_the_retention_cap_is_refused_before_moving() {
+        let (mut store, _data, work, _) = test_store();
+        let old = create_file(work.path(), "old", &"x".repeat(100));
+        let old_id = store.trash(&old, None).unwrap();
+        store.config.retention.max_size_gb = 4096.0 / GIB;
+        store.config.auto_purge_interval_secs = 0;
+        let tree = work.path().join("big");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("payload"), vec![b'x'; 8192]).unwrap();
+        let file = create_file(work.path(), "bigfile", &"y".repeat(8192));
+        let parent = fs::File::open(work.path()).unwrap();
+        for operand in [&tree, &file] {
+            assert!(
+                matches!(store.trash(operand, None), Err(TrashError::TooLarge { .. })),
+                "{operand:?}"
+            );
+            assert!(
+                matches!(
+                    store.trash_at(
+                        parent.as_raw_fd(),
+                        operand.file_name().unwrap(),
+                        operand,
+                        None
+                    ),
+                    Err(TrashError::TooLarge { .. })
+                ),
+                "{operand:?}"
+            );
+        }
+        assert_eq!(fs::read(tree.join("payload")).unwrap().len(), 8192);
+        assert_eq!(fs::read(&file).unwrap().len(), 8192);
+        let kept = store.find_entry(&old_id).unwrap();
+        assert_eq!(fs::read(kept.trashed_path).unwrap().len(), 100);
+        let small = create_file(work.path(), "small", "fits");
+        store.trash(&small, None).unwrap();
+        assert_eq!(store.list(None).unwrap().len(), 2);
+    }
+
+    // store-core-2: like disk pressure (#201), size trimming must never turn
+    // the delete that just happened into a permanent one.
+    #[test]
+    fn size_trimming_never_purges_just_trashed_entries() {
+        let (mut store, _data, work, _) = test_store();
+        let ids: Vec<String> = ["first", "second"]
+            .iter()
+            .map(|name| {
+                let file = create_file(work.path(), name, &"x".repeat(100));
+                store.trash(&file, None).unwrap()
+            })
+            .collect();
+        store.config.retention.max_size_gb = 150.0 / GIB;
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        for id in &ids {
+            assert!(store.find_entry(id).is_ok(), "{id} was purged by size");
+        }
+        // Once old enough, the oldest is trimmed as before.
+        backdate_entry(&store, &ids[0], chrono::Duration::hours(3));
+        backdate_entry(&store, &ids[1], chrono::Duration::hours(2));
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        assert!(store.find_entry(&ids[0]).is_err());
+        assert!(store.find_entry(&ids[1]).is_ok());
+    }
+
+    // store-core-2: an entry larger than the whole cap made the excess larger
+    // than every older entry together, so trimming purged all of them and
+    // then the oversized entry too.
+    #[test]
+    fn an_entry_larger_than_the_size_cap_never_drives_other_purges() {
+        let (mut store, _data, work, _) = test_store();
+        let mut ids = Vec::new();
+        for name in ["old", "mid"] {
+            let file = create_file(work.path(), name, &"x".repeat(100));
+            ids.push(store.trash(&file, None).unwrap());
+        }
+        let tree = work.path().join("big");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("payload"), vec![b'x'; 8192]).unwrap();
+        ids.push(store.trash(&tree, None).unwrap());
+        for (id, hours) in ids.iter().zip([4, 3, 2]) {
+            backdate_entry(&store, id, chrono::Duration::hours(hours));
+        }
+        // The cap was lowered after the tree was trashed.
+        store.config.retention.max_size_gb = 4096.0 / GIB;
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        for id in &ids {
+            assert!(store.find_entry(id).is_ok(), "{id} was purged by size");
+        }
+    }
+
+    // store-core-3: a foreign (topdir) root on the home filesystem was
+    // measured by apparent size, so sparse files there made the size cap
+    // purge the home trash.
+    #[test]
+    fn sparse_foreign_entries_cannot_make_the_size_cap_purge_the_home_trash() {
+        let (mut store, _data, work, _) = test_store();
+        let mut ids = Vec::new();
+        for (name, days) in [("older", 10), ("newer", 1)] {
+            let file = create_file(work.path(), name, &"h".repeat(20 * 1024));
+            let id = store.trash(&file, None).unwrap();
+            backdate_entry(&store, &id, chrono::Duration::days(days));
+            ids.push(id);
+        }
+        let foreign =
+            TrashStore::open_isolated(&work.path().join("foreign-trash"), retention_off()).unwrap();
+        for name in ["a", "b"] {
+            let file = fs::File::create(foreign.home.join("files").join(name)).unwrap();
+            file.set_len(30 * 1024).unwrap();
+            fs::write(
+                foreign.home.join("info").join(format!("{name}.trashinfo")),
+                format!("[Trash Info]\nPath={name}\nDeletionDate=2099-01-01T00:00:00\n"),
+            )
+            .unwrap();
+        }
+        store.config.retention.max_size_gb = (64 * 1024) as f64 / GIB;
+        store
+            .auto_purge_in_roots(&[store.home.clone(), foreign.home.clone()])
+            .unwrap();
+        for id in &ids {
+            let entry = store.find_entry(id).unwrap();
+            assert_eq!(fs::read(entry.trashed_path).unwrap().len(), 20 * 1024);
+        }
+    }
+
+    // store-core-3: bytes in a root on another filesystem (removable media,
+    // whose author controls sizes and dates) never justify purging the home
+    // trash. That root's entries are not size-capped at all.
+    #[test]
+    fn foreign_filesystem_roots_never_drive_size_purges_in_the_home_trash() {
+        let Some(dir) = cross_device_dir("foreign-root") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let (mut store, _data, work, _) = test_store();
+        let mut ids = Vec::new();
+        for (name, days) in [("older", 10), ("newer", 1)] {
+            let file = create_file(work.path(), name, &"h".repeat(20 * 1024));
+            let id = store.trash(&file, None).unwrap();
+            backdate_entry(&store, &id, chrono::Duration::days(days));
+            ids.push(id);
+        }
+        let foreign = dir.join(".Trash-1000");
+        for sub in ["files", "info"] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(foreign.join(sub))
+                .unwrap();
+        }
+        fs::write(foreign.join("files/a"), vec![b'f'; 30 * 1024]).unwrap();
+        fs::write(
+            foreign.join("info/a.trashinfo"),
+            "[Trash Info]\nPath=a\nDeletionDate=2099-01-01T00:00:00\n",
+        )
+        .unwrap();
+        // An orphan dated by an mtime the media author chose (2099).
+        let orphan = foreign.join("files/b");
+        fs::write(&orphan, vec![b'f'; 30 * 1024]).unwrap();
+        fs::File::options()
+            .append(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_070_908_800))
+            .unwrap();
+        store.config.retention.max_size_gb = (64 * 1024) as f64 / GIB;
+        let result = store.auto_purge_in_roots(&[store.home.clone(), foreign.clone()]);
+        let survivors: Vec<bool> = ids.iter().map(|id| store.find_entry(id).is_ok()).collect();
+        let _ = fs::remove_dir_all(&dir);
+        result.unwrap();
+        assert_eq!(survivors, [true, true], "home entries were purged");
+    }
+
+    // store-core-5: on the cross-device path the trash copy becomes the only
+    // copy once the source is retired, so its sidecar and info/ must be
+    // durable first. Same-device renames stay unsynced.
+    #[test]
+    fn cross_device_trash_makes_the_sidecar_durable_before_retiring_the_source() {
+        let Some(dir) = cross_device_dir("durable-sidecar") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let (store, _data) = cross_device_store();
+        fs::write(dir.join("file"), "payload").unwrap();
+        fs::create_dir(dir.join("tree")).unwrap();
+        fs::write(dir.join("tree/inner"), "payload").unwrap();
+        fs::write(dir.join("pinned"), "payload").unwrap();
+        let parent = fs::File::open(&dir).unwrap();
+        let mut outcomes = Vec::new();
+        for (name, pinned) in [("file", false), ("tree", false), ("pinned", true)] {
+            store.durability_events.borrow_mut().clear();
+            let result = if pinned {
+                store.trash_at(parent.as_raw_fd(), OsStr::new(name), &dir.join(name), None)
+            } else {
+                store.trash(&dir.join(name), None)
+            };
+            let events = store.durability_events.borrow().clone();
+            outcomes.push((name, result.is_ok(), events));
+        }
+        let same_device = {
+            let (store, _data, work, _) = test_store();
+            let file = create_file(work.path(), "local", "payload");
+            store.trash(&file, None).unwrap();
+            store.durability_events.borrow().clone()
+        };
+        let _ = fs::remove_dir_all(&dir);
+        for (name, ok, events) in outcomes {
+            assert!(ok, "{name}");
+            assert_eq!(events, ["files", "sidecar", "info", "retire"], "{name}");
+        }
+        assert!(same_device.is_empty(), "{same_device:?}");
+    }
+
+    // store-metadata-5: automatic compression rewrote trashd's entries to
+    // zstd in place, and other file managers restore those bytes verbatim.
+    // It is opt-in; explicit `trash compress` is unaffected.
+    #[test]
+    fn retention_compresses_only_when_auto_compress_is_enabled() {
+        for enabled in [false, true] {
+            let (mut store, _data, work, _) = test_store();
+            store.config.retention.auto_compress = enabled;
+            let text = "a line of ordinary text\n".repeat(200);
+            let file = create_file(work.path(), "notes.txt", &text);
+            let id = store.trash(&file, None).unwrap();
+            backdate_entry(&store, &id, chrono::Duration::days(8));
+            store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            let stored = fs::read(&entry.trashed_path).unwrap();
+            let sidecar = fs::read_to_string(&entry.info_path).unwrap();
+            assert_eq!(stored == text.as_bytes(), !enabled, "enabled={enabled}");
+            assert_eq!(
+                sidecar.contains("X-Trashd-Compressed=zstd"),
+                enabled,
+                "enabled={enabled}"
+            );
+        }
     }
 }

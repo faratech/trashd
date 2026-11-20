@@ -135,6 +135,7 @@ const CONFIG_KEYS: &[&str] = &[
     "retention.max_age_days",
     "retention.max_size_gb",
     "retention.disk_pressure_percent",
+    "retention.auto_compress",
     "max_file_size_mb",
     "max_dir_size_mb",
     "sha256_max_size_mb",
@@ -151,6 +152,7 @@ fn config_get(config: &Config, key: &str) -> Option<String> {
         "retention.max_age_days" => config.retention.max_age_days.to_string(),
         "retention.max_size_gb" => config.retention.max_size_gb.to_string(),
         "retention.disk_pressure_percent" => config.retention.disk_pressure_percent.to_string(),
+        "retention.auto_compress" => config.retention.auto_compress.to_string(),
         "max_file_size_mb" => config.max_file_size_mb.to_string(),
         "max_dir_size_mb" => config.max_dir_size_mb.to_string(),
         "sha256_max_size_mb" => config.sha256_max_size_mb.to_string(),
@@ -307,6 +309,10 @@ fn config_set_scalar(table: &mut toml::Table, key: &str, value: &str) -> Result<
                 "disk_pressure_percent".into(),
                 toml::Value::Integer(v.into()),
             );
+        }
+        "retention.auto_compress" => {
+            let v: bool = value.parse().map_err(|_| "expected true or false")?;
+            retention_table(table)?.insert("auto_compress".into(), toml::Value::Boolean(v));
         }
         "max_file_size_mb"
         | "max_dir_size_mb"
@@ -537,6 +543,24 @@ mod tests {
             config_set_scalar(&mut table, "retention.max_size_gb", "1.5"),
             Ok(true)
         );
+    }
+
+    // store-metadata-5: automatic compression is an opt-in boolean.
+    #[test]
+    fn auto_compress_is_a_validated_boolean_key() {
+        assert!(CONFIG_KEYS.contains(&"retention.auto_compress"));
+        assert_eq!(
+            config_get(&Config::default(), "retention.auto_compress").as_deref(),
+            Some("false")
+        );
+        let mut table = toml::Table::new();
+        assert!(config_set_scalar(&mut table, "retention.auto_compress", "yes").is_err());
+        assert!(table.is_empty(), "{table:?}");
+        assert_eq!(
+            config_set_scalar(&mut table, "retention.auto_compress", "true"),
+            Ok(true)
+        );
+        assert_eq!(table["retention"]["auto_compress"].as_bool(), Some(true));
     }
 
     // Regression (#230): EDITOR="code --wait" was run as one program name.

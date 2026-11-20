@@ -53,6 +53,11 @@ pub struct RetentionConfig {
     /// Purge the oldest items once disk usage reaches this percent. `0` disables.
     #[serde(default = "default_disk_pressure")]
     pub disk_pressure_percent: u8,
+    /// Compress trashd's own entries older than 7 days with zstd during
+    /// retention. Off by default: other file managers restore the stored
+    /// bytes as they are, so a compressed entry comes back as zstd data.
+    #[serde(default)]
+    pub auto_compress: bool,
 }
 
 fn default_retention() -> RetentionConfig {
@@ -60,6 +65,7 @@ fn default_retention() -> RetentionConfig {
         max_age_days: default_max_age(),
         max_size_gb: default_max_size(),
         disk_pressure_percent: default_disk_pressure(),
+        auto_compress: false,
     }
 }
 
@@ -171,6 +177,7 @@ struct PartialRetention {
     max_age_days: Option<u32>,
     max_size_gb: Option<f64>,
     disk_pressure_percent: Option<u8>,
+    auto_compress: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -236,6 +243,9 @@ impl Config {
             }
             if let Some(v) = ret.disk_pressure_percent {
                 self.retention.disk_pressure_percent = v;
+            }
+            if let Some(v) = ret.auto_compress {
+                self.retention.auto_compress = v;
             }
         }
         if let Some(v) = partial.max_file_size_mb {
@@ -684,6 +694,22 @@ mod tests {
         let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert!(Config::load_partial(&path).is_none());
+    }
+
+    // store-metadata-5: automatic compression is opt-in, set like any other
+    // retention key.
+    #[test]
+    fn auto_compress_is_off_by_default_and_layers_like_other_retention_keys() {
+        assert!(!Config::default().retention.auto_compress);
+        let mut config = Config::default();
+        config
+            .merge(toml::from_str::<PartialConfig>("[retention]\nauto_compress = true\n").unwrap());
+        assert!(config.retention.auto_compress);
+        config.merge(toml::from_str::<PartialConfig>("[retention]\nmax_age_days = 3\n").unwrap());
+        assert!(
+            config.retention.auto_compress,
+            "a later layer without it reset it"
+        );
     }
 
     #[test]

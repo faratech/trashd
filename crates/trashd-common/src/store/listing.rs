@@ -346,6 +346,11 @@ impl TrashStore {
             );
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self.between_scan_passes.borrow_mut().take() {
+            hook();
+        }
+
         // Spec: "If info file corresponding to file in $trash/files is unavailable,
         // this is emergency case and MUST be presented as such."
         // Scan files/ for entries without matching .trashinfo.
@@ -372,6 +377,14 @@ impl TrashStore {
                         let mut raw_info_name = raw_name.clone();
                         raw_info_name.push(".trashinfo");
                         let info_path = info_dir.join(&raw_info_name);
+                        // Writers publish the sidecar before the data, so one
+                        // created after the info/ pass read past it (or
+                        // rewritten while it was read) parses now: the entry
+                        // is live, never an orphan (store-metadata-1). One
+                        // that cannot be parsed is still listed.
+                        if sidecar_parses(&info_path) {
+                            continue;
+                        }
                         let data_metadata = self.scanned_data_metadata(&trashed_path, metadata);
                         let identity = data_metadata
                             .as_ref()
@@ -379,17 +392,30 @@ impl TrashStore {
                         // An orphan's true deletion time is unknowable without
                         // its sidecar, but a synthetic "now" would make it age
                         // zero forever and never expire by retention (#404).
-                        // Fall back to the data's own mtime — the last time
-                        // its content changed — so age-based purge and
-                        // retention see a meaningful age. Stat even display
-                        // scans here: orphans are the spec's emergency case,
-                        // and one stat per orphan keeps aging correct.
-                        let mtime = data_metadata
+                        // Age it from when the data arrived in files/: rename
+                        // and the cross-device copy both set its ctime. Its
+                        // mtime alone (the last content edit) made an old file
+                        // trashed just now look long deleted, and retention
+                        // purged it (store-metadata-1, store-core-5). Stat
+                        // even display scans here: orphans are the spec's
+                        // emergency case, and one stat per orphan keeps aging
+                        // correct.
+                        let arrived = data_metadata
                             .clone()
                             .or_else(|| fs::symlink_metadata(&trashed_path).ok())
-                            .and_then(|metadata| metadata.modified().ok())
-                            .map(chrono::DateTime::<chrono::Local>::from);
-                        let info = if let Some(deletion_date) = mtime {
+                            .and_then(|metadata| {
+                                let changed = chrono::DateTime::from_timestamp(
+                                    metadata.ctime(),
+                                    metadata.ctime_nsec() as u32,
+                                );
+                                let modified = metadata
+                                    .modified()
+                                    .ok()
+                                    .map(chrono::DateTime::<chrono::Utc>::from);
+                                changed.max(modified)
+                            })
+                            .map(|time| time.with_timezone(&chrono::Local));
+                        let info = if let Some(deletion_date) = arrived {
                             TrashInfo {
                                 original_path: PathBuf::from(format!("(orphaned: {name})")),
                                 deletion_date,

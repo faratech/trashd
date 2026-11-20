@@ -446,6 +446,51 @@ fi
 trash empty -y >/dev/null 2>&1
 
 # -----------------------------------------------------------------------
+# Automatic compression is opt-in (store-metadata-5): after a retention pass
+# over a week-old entry, a spec-style restore (moving files/<id> back, as
+# GNOME Files does) still yields the original bytes.
+# -----------------------------------------------------------------------
+TRASH_ROOT="$XDG_DATA_HOME/Trash"
+for i in $(seq 1 200); do echo "line $i of ordinary text that compresses well"; done > /home/test/trashd_it_autocomp.txt
+cp /home/test/trashd_it_autocomp.txt /work/trashd_it_autocomp.orig
+rm /home/test/trashd_it_autocomp.txt
+sed -i "s/^DeletionDate=.*/DeletionDate=$(date -d '10 days ago' +%Y-%m-%dT%H:%M:%S)/" \
+    "$TRASH_ROOT/info/trashd_it_autocomp.txt.trashinfo"
+/usr/bin/rm -f "$TRASH_ROOT/.trashd/last_purge"
+echo "trigger" > /home/test/trashd_it_autocomp_trigger.txt
+rm /home/test/trashd_it_autocomp_trigger.txt
+if mv "$TRASH_ROOT/files/trashd_it_autocomp.txt" /home/test/trashd_it_autocomp.txt 2>/dev/null \
+    && cmp -s /home/test/trashd_it_autocomp.txt /work/trashd_it_autocomp.orig; then
+    pass "Retention leaves entries uncompressed by default"
+else
+    fail "Retention leaves entries uncompressed by default" "spec-style restore yielded other bytes"
+fi
+/usr/bin/rm -f "$TRASH_ROOT/info/trashd_it_autocomp.txt.trashinfo"
+rm -f --permanent /home/test/trashd_it_autocomp.txt 2>/dev/null
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# An operand larger than retention.max_size_gb is refused and kept, never
+# trashed and then purged with every older entry (store-core-2).
+# -----------------------------------------------------------------------
+trash config set retention.max_size_gb 0.000001 >/dev/null 2>&1   # ~1 KiB
+echo "older" > /home/test/trashd_it_cap_old.txt
+rm /home/test/trashd_it_cap_old.txt
+mkdir -p /home/test/trashd_it_cap_dir
+head -c 8192 /dev/zero > /home/test/trashd_it_cap_dir/payload
+CAP_STATUS=0
+rm -r /home/test/trashd_it_cap_dir 2>/dev/null || CAP_STATUS=$?
+if [ "$CAP_STATUS" -ne 0 ] && [ "$(stat -c %s /home/test/trashd_it_cap_dir/payload 2>/dev/null)" = 8192 ] \
+    && trash ls 2>&1 | grep >/dev/null "trashd_it_cap_old"; then
+    pass "Retention cap refuses an oversized operand and keeps older entries"
+else
+    fail "Retention cap refuses an oversized operand and keeps older entries" "exit $CAP_STATUS"
+fi
+rm -rf --permanent /home/test/trashd_it_cap_dir 2>/dev/null
+trash config reset -y >/dev/null 2>&1
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
 # Permissions preserved
 # -----------------------------------------------------------------------
 echo "secret" > /home/test/trashd_it_perms.txt

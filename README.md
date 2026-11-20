@@ -295,7 +295,7 @@ Trash Status
 | `trash empty --older <dur>` | With `empty`: only entries older than the duration. Still retries interrupted-cleanup jobs. |
 | `trash empty --dry-run` | Preview the selection (and any pending cleanup retries) without deleting anything. |
 | `trash empty -y` / `--yes` | Skip the confirmation prompt. Intended for scripts and the cleanup timer. |
-| `trash compress [--older <dur>]` | Compress entries older than the duration in place with zstd (default `7d`). Restoring a compressed entry decompresses it transparently. |
+| `trash compress [--older <dur>]` | Compress entries older than the duration in place with zstd (default `7d`). `trash restore` decompresses them transparently; other file managers restore the compressed bytes as they are. |
 | `trash compress --dry-run` | Preview what would be compressed. |
 | `trash fsck` | Check every trash directory for orphaned metadata, orphaned files, and corrupt `.trashinfo` files. Exits non-zero if any problem (or an unreadable trash root) is found, so scripts can gate on it. |
 | `trash fsck --fix` | Repair: removes orphaned `.trashinfo` files; asks before removing each orphaned data file. Corrupt metadata is never auto-deleted — the data file is preserved for manual recovery. Exits non-zero if anything remains broken afterwards. |
@@ -304,7 +304,7 @@ Notes that save surprises:
 
 - **`trash purge` and `trash empty` are permanent.** There is no undo for an undo. `empty` asks first (unless `-y`); `purge` does not, because you named a single item.
 - **Orphaned files** (data in trash with no metadata, shown by `trash ls` as `? (orphaned: name)`) can happen if a trash operation was interrupted or another tool wrote to the trash. `trash fsck` explains them; `trash fsck --fix` offers to clean them up.
-- **Compressed files restore normally.** trashd detects compression by the zstd magic bytes, decompresses on restore, and verifies the integrity hash against the *decompressed* bytes. You never handle `.zst` files yourself.
+- **Compressed files restore normally.** trashd records compression in the entry's metadata (`X-Trashd-Compressed`), decompresses on restore, and verifies the integrity hash against the *decompressed* bytes. You never handle `.zst` files yourself with `trash restore`; other file managers ignore that metadata and restore the compressed bytes.
 - **`trash ls` performance:** listings stream output and only retain matches when filtering or sorting, so a very large trash stays responsive. `find` and `du` avoid filesystem stats they do not need.
 
 ### Configuring and updating from the CLI
@@ -324,7 +324,7 @@ Notes that save surprises:
 
 `trash self-update` only manages installs in a root-owned prefix (the normal `install.sh` layout). If trashd came from your distribution's package manager (paths under `/usr`), it leaves the install alone and tells you to use the package manager. `trash config …`, `trash log`, and `trash self-update` never create or require a usable trash directory, so they keep working even if your trash is broken — `self-update` is deliberately usable as a recovery path.
 
-Valid keys for `get`/`set`/`add`/`remove`: `retention.max_age_days`, `retention.max_size_gb`, `retention.disk_pressure_percent`, `max_file_size_mb`, `max_dir_size_mb`, `sha256_max_size_mb`, `auto_purge_interval_secs`, `hash_algorithm`, plus the list keys `never_trash`, `only_trash`, `bypass_processes`, `bypass_paths`. Scalars use `set`; lists use `add`/`remove` (each command tells you if you pick the wrong one). Values are validated before they are written — an out-of-range number is rejected rather than saved into a config that would then fail to load. Config writes are atomic (temporary file + rename), preserve symlinked dotfile targets, and keep the existing file mode.
+Valid keys for `get`/`set`/`add`/`remove`: `retention.max_age_days`, `retention.max_size_gb`, `retention.disk_pressure_percent`, `retention.auto_compress`, `max_file_size_mb`, `max_dir_size_mb`, `sha256_max_size_mb`, `auto_purge_interval_secs`, `hash_algorithm`, plus the list keys `never_trash`, `only_trash`, `bypass_processes`, `bypass_paths`. Scalars use `set`; lists use `add`/`remove` (each command tells you if you pick the wrong one). Values are validated before they are written — an out-of-range number is rejected rather than saved into a config that would then fail to load. Config writes are atomic (temporary file + rename), preserve symlinked dotfile targets, and keep the existing file mode.
 
 ---
 
@@ -454,8 +454,9 @@ auto_purge_interval_secs = 60  # minimum seconds between automatic retention sca
 
 [retention]
 max_age_days = 30              # auto-purge items older than this
-max_size_gb = 10.0             # auto-purge oldest items beyond this total size
+max_size_gb = 10.0             # auto-purge oldest items beyond this total size (home filesystem)
 disk_pressure_percent = 90     # when the trash disk is fuller than this, purge oldest items
+auto_compress = false          # zstd-compress items older than 7 days (other file managers restore them compressed)
 ```
 
 The shipped template at [`config/trashd.toml`](config/trashd.toml) carries the same defaults with explanatory comments, and `install.sh` installs it to `/etc/trashd/config.toml` without overwriting an existing admin config on reinstall.
@@ -691,8 +692,8 @@ A trash that grows forever is just a second disk-full problem. trashd keeps it b
 After each trash operation, trashd runs a retention pass — throttled to at most once per `auto_purge_interval_secs` (default 60s, tracked via the `last_purge` marker) so a script deleting 10,000 files does not scan the trash 10,000 times. Each pass runs four phases, gentlest first:
 
 1. **Age:** permanently delete entries older than `retention.max_age_days` (default 30).
-2. **Compress:** shrink surviving entries older than 7 days with zstd (level 3) *before* deleting anything for space — reclaiming room without losing data often makes phase 3 unnecessary. Only trashd's own entries are compressed (entries other tools created stay readable by them). Already-compressed data (zstd magic), files under 1 KB, files with extended attributes, and directories are skipped; a file is only replaced when compression actually shrank it, keeping its original timestamps.
-3. **Size:** if the trash still exceeds `retention.max_size_gb` (default 10 GB), purge the oldest survivors until it fits. Sizes claimed by metadata on removable media are never trusted beyond what is actually on disk.
+2. **Compress (off by default):** with `retention.auto_compress = true`, shrink surviving entries older than 7 days with zstd (level 3) *before* deleting anything for space — reclaiming room without losing data often makes phase 3 unnecessary. It is opt-in because other file managers restore an entry's stored bytes as they are, so a compressed entry would come back from them as zstd data. Only trashd's own entries are compressed (entries other tools created stay readable by them). Already-compressed data (zstd magic), files under 1 KB, files with extended attributes, and directories are skipped; a file is only replaced when compression actually shrank it, keeping its original timestamps.
+3. **Size:** if the trash on your home filesystem still exceeds `retention.max_size_gb` (default 10 GB), purge the oldest survivors that are at least an hour old until it fits — and only when that can make it fit. Trash on other filesystems (removable media, whose sizes and dates whoever wrote it controls) is not counted, and foreign trash is measured by the space its files actually occupy. A single item larger than the cap is refused at deletion time (`rm` keeps it; use `rm --permanent`), and one already in the trash is left to the age limit rather than trimmed along with everything else.
 4. **Disk pressure:** if the home-trash filesystem is fuller than `retention.disk_pressure_percent` (default 90%), purge the oldest 10% of survivors that are at least an hour old. The one-hour grace means a file you *just* deleted is never pressure-purged — `trash undo` right after a delete always works.
 
 ### Scheduled cleanup (optional)
@@ -759,6 +760,7 @@ trashd is engineered so that *trashd's own bugs should not become your data loss
 | Path matches `never_trash` (yours, admin's, or a project's) | Real delete | `trash config show` to see the merged list; user entries via `trash config remove` |
 | `only_trash` is set and the path does not match | Real delete | Add the pattern, or clear the whitelist |
 | File larger than `max_file_size_mb` / directory larger than `max_dir_size_mb` | Real delete (directories whose size cannot be fully checked — the walk caps at 10,000 entries — are refused rather than guessed at when `max_dir_size_mb` is set) | Raise or zero (`0` = unlimited) the limit |
+| Single item larger than `retention.max_size_gb` whose trash is on your home filesystem | The `rm` shim refuses and keeps it; under `trashd-exec` the kernel deletes it, as for the other size caps | `rm --permanent`, or raise the cap |
 | Deleting process (or an ancestor) is in `bypass_processes`, or its executable matches `bypass_paths` | Real delete | Remove the entry, or exempt one invocation with an explicit `trash`-side workflow |
 | Deletion by a statically-linked binary *not* run under `trashd-exec` | Real delete (Layers 1–2 cannot see it) | Run it as `trashd-exec <cmd>` |
 | Deletion inside a wrapped session after a Landlock restriction attempt | Preload trashes in-process where loaded; static/raw-syscall deletions proceed to the kernel and may permanently delete what policy permits | Expected: the kernel enforces the target's own Landlock policy; trashd never overrides it |
@@ -816,7 +818,7 @@ Automatic wrapping applies to interactive **root** login shells only; non-root s
 
 ### "Does trashd work with my desktop's trash?"
 
-Yes — same folders, same spec. Files trashed from the terminal appear in GNOME Files / Dolphin / Thunar / Nemo and can be restored there; files trashed from the desktop appear in `trash ls` and can be restored with `trash restore`. trashd-only metadata (`X-Trashd-*` fields) is ignored by other implementations, as the spec requires, and auto-compression only touches trashd's own entries so other tools' files stay byte-identical.
+Yes — same folders, same spec. Files trashed from the terminal appear in GNOME Files / Dolphin / Thunar / Nemo and can be restored there; files trashed from the desktop appear in `trash ls` and can be restored with `trash restore`. trashd-only metadata (`X-Trashd-*` fields) is ignored by other implementations, as the spec requires. For the same reason automatic compression is off by default (`retention.auto_compress`): another file manager would restore a compressed entry as zstd data. When enabled, it only touches trashd's own entries, so other tools' files stay byte-identical.
 
 ### "Will `trash empty` in a script hang waiting for input?"
 

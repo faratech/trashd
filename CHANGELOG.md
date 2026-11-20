@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- Automatic zstd compression during retention is opt-in
+  (`retention.auto_compress`, default `false`). GNOME Files, Dolphin and
+  other spec implementations restore an entry's stored bytes as they
+  are, so an auto-compressed entry came back from them as zstd data.
+  `trash compress` and `trash restore` are unchanged. (#538)
+
 ### Performance
 
 - The recorded deleting command in each `.trashinfo` is capped at 256
@@ -116,6 +124,37 @@
   symlinks per home; and uninstall/purge enumerate homes from
   `getent passwd` instead of only `/home/*` and `/root`.
   (#406, #407, #408, #420, #421, #422, #423, #424, #425, #426, #427)
+
+- Retention no longer purges an entry published while a listing ran
+  between its `info/` and `files/` passes. The entry looked like an
+  orphan dated by its data's old mtime, and auto-purge deleted it along
+  with its valid sidecar. Orphans now age from their arrival in `files/`
+  (`max(mtime, ctime)`), the orphan pass skips data whose sidecar parses
+  by then, and a purge under the root lock refuses an orphan whose
+  sidecar parses. Entries torn by a crash are kept the same way. (#534,
+  #554, #522)
+
+- Legacy sidecars larger than the 64 KiB read cap (a full argv in
+  `X-Trashd-Command`) are read line by line with the command capped, so
+  they keep their real path and date instead of turning their data into
+  an orphan that retention purged. A sidecar that still cannot be parsed
+  keeps its data listed, and neither retention nor `empty --older`
+  purges it. (#556)
+
+- An operand larger than `retention.max_size_gb` whose trash is on the
+  home filesystem is refused (`rm` keeps it; use `rm --permanent`).
+  Before, it was trashed and size trimming then purged every older entry
+  to make room. Trimming purges only entries at least an hour old,
+  leaves an entry larger than the whole cap out of the excess, and
+  purges nothing when the eligible entries cannot bring the trash under
+  the cap. (#519)
+
+- Size trimming counts and purges only trashes on the home filesystem,
+  measures other trashes by allocated size, and orders future
+  `DeletionDate`s as now, so a sparse file or a forged date on removable
+  media can no longer empty the home trash. Cross-device trashing
+  fdatasyncs the new sidecar and fsyncs `info/` before retiring the
+  source, where the trash copy becomes the only copy. (#520, #522)
 
 ### Documentation
 

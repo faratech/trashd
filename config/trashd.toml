@@ -109,7 +109,15 @@ auto_purge_interval_secs = 60
 [retention]
 # Auto-purge items older than this
 max_age_days = 30
-# Maximum total trash size
+# Maximum total size of the trash on your home filesystem. Items at least an
+# hour old are trimmed, oldest first. A single item larger than this is
+# refused (rm keeps it; use rm --permanent). Trash on other filesystems,
+# such as removable media, is not size-capped.
 max_size_gb = 10.0
 # Purge oldest items when disk usage exceeds this
 disk_pressure_percent = 90
+# Compress trashd's own items older than 7 days with zstd. Off by default:
+# GNOME Files, Dolphin and other file managers restore the stored bytes as
+# they are, so a compressed item comes back from them as zstd data.
+# `trash restore` decompresses either way.
+auto_compress = false

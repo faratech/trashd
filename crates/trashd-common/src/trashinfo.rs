@@ -35,6 +35,10 @@ fn open_regular_metadata_file(path: &Path, limit: u64) -> io::Result<(fs::File, 
 /// Largest .trashinfo sidecar accepted as metadata.
 pub(crate) const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
 
+/// Largest legacy sidecar read at all. Releases before 0e37a45 copied the
+/// whole argv into X-Trashd-Command, which ARG_MAX bounds at 6 MiB.
+const MAX_LEGACY_SIDECAR_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Read a regular metadata file of at most `limit` bytes.
 pub(crate) fn read_regular_text_file(path: &Path, limit: u64) -> io::Result<String> {
     let (file, _) = open_regular_metadata_file(path, limit)?;
@@ -66,7 +70,19 @@ pub(crate) fn read_sidecar_bytes(path: &Path) -> io::Result<Vec<u8>> {
 /// Read a .trashinfo sidecar. Special files and symlinks are invalid metadata,
 /// including ones substituted while a listing or integrity check is running.
 pub fn read_sidecar(path: &Path) -> io::Result<String> {
-    read_regular_text_file(path, MAX_SIDECAR_BYTES)
+    let (mut file, metadata) = open_regular_metadata_file(path, MAX_LEGACY_SIDECAR_BYTES)?;
+    if metadata.len() > MAX_SIDECAR_BYTES {
+        return read_legacy_sidecar(&mut file, metadata.len());
+    }
+    let mut text = String::new();
+    // Growth after the size check is bounded too.
+    if file.take(MAX_SIDECAR_BYTES + 1).read_to_string(&mut text)? as u64 > MAX_SIDECAR_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is too large",
+        ));
+    }
+    Ok(text)
 }
 
 /// Read exactly the opened sidecar's observed length and return that inode's
@@ -76,9 +92,75 @@ pub fn read_sidecar(path: &Path) -> io::Result<String> {
 /// Unlike File::read_to_string, this needs no extra metadata query, seek, or
 /// EOF probe for every small sidecar in a large trash.
 pub(crate) fn read_sidecar_snapshot(path: &Path) -> io::Result<(String, fs::Metadata)> {
-    let (mut file, metadata) = open_regular_metadata_file(path, MAX_SIDECAR_BYTES)?;
-    let text = read_text_exact(&mut file, metadata.len())?;
+    let (mut file, metadata) = open_regular_metadata_file(path, MAX_LEGACY_SIDECAR_BYTES)?;
+    let text = if metadata.len() > MAX_SIDECAR_BYTES {
+        read_legacy_sidecar(&mut file, metadata.len())?
+    } else {
+        read_text_exact(&mut file, metadata.len())?
+    };
     Ok((text, metadata))
+}
+
+/// Read a sidecar over MAX_SIDECAR_BYTES, keeping memory bounded. Releases
+/// before 0e37a45 wrote the whole argv into X-Trashd-Command, so a large
+/// `rm` left sidecars far over the cap; treated as missing, their data was
+/// listed as orphans and purged by retention (store-metadata-2). Only that
+/// line may be long, and it is cut to what parsing keeps anyway. Any other
+/// long line, or a result still over MAX_SIDECAR_BYTES, is not metadata.
+fn read_legacy_sidecar(file: &mut fs::File, len: u64) -> io::Result<String> {
+    use std::io::BufRead;
+    const COMMAND: &[u8] = b"X-Trashd-Command=";
+    // Room for the capped value plus a partial character to cut back.
+    const KEEP: usize = COMMAND.len() + MAX_COMMAND_BYTES + 4;
+    let too_large = || io::Error::new(io::ErrorKind::InvalidData, "trash metadata is too large");
+    let mut reader = io::BufReader::new(file.take(len));
+    let mut text = Vec::new();
+    let mut line = Vec::new();
+    let mut read = 0u64;
+    loop {
+        line.clear();
+        let mut overflowed = false;
+        let mut ended = false;
+        while !ended {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                break;
+            }
+            let (chunk, newline) = match buffer.iter().position(|&byte| byte == b'\n') {
+                Some(end) => (&buffer[..=end], true),
+                None => (buffer, false),
+            };
+            let room = (MAX_SIDECAR_BYTES as usize).saturating_sub(line.len());
+            line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            overflowed |= chunk.len() > room;
+            let consumed = chunk.len();
+            reader.consume(consumed);
+            read += consumed as u64;
+            ended = newline;
+        }
+        if line.is_empty() && !overflowed {
+            break;
+        }
+        if line.starts_with(COMMAND) && line.len() > KEEP {
+            line.truncate(KEEP);
+            let valid = std::str::from_utf8(&line).map_or_else(|e| e.valid_up_to(), str::len);
+            line.truncate(valid);
+            line.push(b'\n');
+        } else if overflowed {
+            return Err(too_large());
+        }
+        text.extend_from_slice(&line);
+        if text.len() as u64 > MAX_SIDECAR_BYTES {
+            return Err(too_large());
+        }
+    }
+    if read != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "trash metadata was truncated while reading",
+        ));
+    }
+    String::from_utf8(text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn read_text_exact(file: &mut fs::File, len: u64) -> io::Result<String> {
@@ -655,6 +737,58 @@ mod tests {
         );
         assert!(read_sidecar_snapshot(&path).is_err());
         assert!(read_sidecar_bytes(&path).is_err());
+    }
+
+    // store-metadata-2: releases before 0e37a45 copied the whole argv into
+    // X-Trashd-Command, so `rm` of thousands of operands wrote sidecars far
+    // over the 64 KiB read cap. They must still parse, with their real path
+    // and date, and the command capped as for any other sidecar.
+    #[test]
+    fn legacy_sidecar_over_the_read_cap_parses_with_its_command_capped() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("legacy.trashinfo");
+        let command = format!("rm {}", "ä".repeat(60_000));
+        fs::write(
+            &path,
+            format!(
+                "[Trash Info]\nPath=/home/u/photo%20001.jpg\nDeletionDate=2026-03-20T14:30:00\n\
+                 X-Trashd-Command={command}\nX-Trashd-PID=42\nX-Trashd-Size=7\n"
+            ),
+        )
+        .unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MAX_SIDECAR_BYTES);
+        for content in [
+            read_sidecar_snapshot(&path).unwrap().0,
+            read_sidecar(&path).unwrap(),
+        ] {
+            assert!(content.len() as u64 <= MAX_SIDECAR_BYTES);
+            let info = TrashInfo::from_trashinfo(&content).expect("legacy sidecar parses");
+            assert_eq!(info.original_path, Path::new("/home/u/photo 001.jpg"));
+            assert_eq!(
+                info.deletion_date.naive_local().to_string(),
+                "2026-03-20 14:30:00"
+            );
+            assert_eq!(info.pid, Some(42));
+            assert_eq!(info.size, Some(7));
+            let command = info.command.unwrap();
+            assert!(command.starts_with("rm ää") && command.ends_with('…'));
+            assert!(command.len() <= MAX_COMMAND_BYTES + '…'.len_utf8());
+        }
+        // Only the command may be long: any other oversized line is not
+        // metadata, and neither is a file past the legacy bound.
+        fs::write(
+            &path,
+            format!(
+                "[Trash Info]\nPath=/x\nDeletionDate=2026-03-20T14:30:00\nX-Other={}\n",
+                "y".repeat(MAX_SIDECAR_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        assert!(read_sidecar_snapshot(&path).is_err());
+        assert!(read_sidecar(&path).is_err());
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_LEGACY_SIDECAR_BYTES + 1).unwrap();
+        assert!(read_sidecar_snapshot(&path).is_err());
     }
 
     // Regression (#223): from_str_radix accepts a sign ("%+F" decoded as

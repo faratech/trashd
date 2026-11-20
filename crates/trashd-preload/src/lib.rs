@@ -97,6 +97,8 @@ struct RetentionConfig {
     _max_size_gb: Option<f64>,
     #[serde(rename = "disk_pressure_percent")]
     _disk_pressure_percent: Option<u8>,
+    #[serde(rename = "auto_compress")]
+    _auto_compress: Option<bool>,
 }
 
 /// Per-directory `.trashd.toml` overrides (mirrors trashd-common's LocalConfig)
@@ -3330,6 +3332,22 @@ mod tests {
         config.merge(load_partial_config(&path).expect("legacy config must load"));
         assert_eq!(config.only_trash, ["*.txt"]);
         assert_eq!(config.max_file_size_mb, 9);
+    }
+
+    // store-metadata-5: `retention.auto_compress` is a valid key. Rejecting
+    // it as unknown dropped the whole file, and with it the user's policy.
+    #[test]
+    fn loader_accepts_every_retention_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "max_file_size_mb = 9\n[retention]\nmax_age_days = 7\nmax_size_gb = 1.5\n\
+             disk_pressure_percent = 80\nauto_compress = true\n",
+        )
+        .unwrap();
+        let partial = load_partial_config(&path).expect("retention keys must load");
+        assert_eq!(partial.max_file_size_mb, Some(9));
     }
 
     #[test]
