@@ -194,10 +194,7 @@ fn run() -> io::Result<()> {
     // btrfs subvolume mounts the kernel refused, named once in one warning.
     let mut subvolumes: Vec<PathBuf> = Vec::new();
     for mount in &mount_list {
-        if matches!(
-            mount.fstype.as_str(),
-            "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
-        ) {
+        if never_marked(&mount.fstype) {
             continue;
         }
 
@@ -242,16 +239,10 @@ fn run() -> io::Result<()> {
     // open_by_handle_at requires a mount fd on the same filesystem as the
     // handle; the fsid recorded beside each fd is what events are matched
     // against so a handle is never decoded against the WRONG filesystem (#97).
-    let mut mount_fds: Vec<WatchedMount> = Vec::new();
-    for mount in &mount_list {
-        if matches!(
-            mount.fstype.as_str(),
-            "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
-        ) {
-            continue;
-        }
-        mount_fds.push((mount.path.clone(), fsid_of_path(&mount.path)));
-    }
+    // Only marked mounts carry events, and their fsids are already known:
+    // statfs'ing every other mount again could block on a dead server
+    // (daemon-2), as refresh_mounts already avoids.
+    let mut mount_fds: Vec<WatchedMount> = marked_paths.clone();
     order_for_resolution(&mut mount_fds);
 
     eprintln!("{}", monitoring_status(marked, subvolumes.len()));
@@ -670,6 +661,18 @@ fn order_for_resolution(watched: &mut [WatchedMount]) {
     watched.sort_by_key(|(path, _)| priorities.get(path).copied().unwrap_or((true, u64::MAX)));
 }
 
+/// Filesystem types the daemon never marks or statfs's. FUSE reports no
+/// fsid, so a whole-filesystem mark of it always fails, but only after the
+/// kernel asked its server for statfs: a server that never answers
+/// (another user's allow_other mount, a dead sshfs) blocked the
+/// single-threaded event loop for good on every mount change (daemon-2).
+fn never_marked(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
+    ) || mounts::is_fuse(fstype)
+}
+
 /// statfs f_fsid of the filesystem at `path` — the identity fanotify events
 /// carry, used to decode file handles against the RIGHT mount (#97).
 fn fsid_of_path(path: &std::path::Path) -> Fsid {
@@ -826,6 +829,7 @@ fn resolve_handle_to_path(
     // may have been remounted since the last refresh. Not O_PATH: current
     // kernels reject O_PATH mount descriptors here with EBADF, which left
     // every audited path unresolved (#240).
+    let mut opened: Vec<(std::os::fd::OwnedFd, u64)> = Vec::new();
     for (path, fsid) in candidates {
         let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             continue;
@@ -839,36 +843,82 @@ fn resolve_handle_to_path(
         if mount_fd < 0 {
             continue;
         }
-        // Only an attempted decode has an errno worth reading (#344).
-        let decoded = (fsid.is_none() || fsid_of_fd(mount_fd) == *fsid).then(|| {
-            let fd = unsafe {
-                libc::syscall(
-                    libc::SYS_open_by_handle_at,
-                    mount_fd as libc::c_long,
-                    file_handle_ptr as libc::c_long,
-                    libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
-                )
-            };
-            (fd, (fd < 0).then(io::Error::last_os_error))
-        });
-        unsafe { libc::close(mount_fd) };
+        let mount_fd =
+            unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(mount_fd) };
+        if fsid.is_some() && fsid_of_fd(mount_fd.as_raw_fd()) != *fsid {
+            continue;
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(mount_fd.as_raw_fd(), &mut stat) } != 0 {
+            continue;
+        }
+        opened.push((mount_fd, stat.st_dev));
+    }
+    decode_among(file_handle_ptr, expected_fsid, &opened)
+}
 
-        match decoded {
-            Some((fd, None)) => {
-                let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
-                    .ok()
-                    .map(strip_deleted_suffix);
-                unsafe { libc::close(fd as i32) };
-                return path;
-            }
-            // The handle's object is gone from its filesystem: every other
-            // mount of that filesystem would fail the same way (#326).
-            Some((_, Some(error))) if error.raw_os_error() == Some(libc::ESTALE) => break,
-            _ => {}
+/// Decode a handle on the first of `opened` (mount descriptors whose fsid
+/// matched the event's, each with its device) that knows it.
+///
+/// Filesystems can share an fsid: an ext4 clone or snapshot keeps its
+/// UUID, and a user can mount an image made with another's. A handle is
+/// just an inode and generation, so decoding it on the wrong one of them
+/// logged a path there (an image could forge `/etc/shadow`), and that one's
+/// ESTALE ended the search before the right one. Events carry no device,
+/// so an fsid on two devices is not decoded at all: the event keeps its
+/// bare name, and the ambiguity is reported once (daemon-6).
+fn decode_among(
+    file_handle_ptr: *const u8,
+    expected_fsid: Fsid,
+    opened: &[(std::os::fd::OwnedFd, u64)],
+) -> Option<PathBuf> {
+    if expected_fsid.is_some()
+        && let Some((_, first)) = opened.first()
+        && opened.iter().any(|(_, device)| device != first)
+    {
+        warn_ambiguous_fsid(expected_fsid);
+        return None;
+    }
+    for (mount_fd, _) in opened {
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_open_by_handle_at,
+                mount_fd.as_raw_fd() as libc::c_long,
+                file_handle_ptr as libc::c_long,
+                libc::O_RDONLY as libc::c_long | libc::O_PATH as libc::c_long,
+            )
+        };
+        if fd >= 0 {
+            let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                .ok()
+                .map(strip_deleted_suffix);
+            unsafe { libc::close(fd as i32) };
+            return path;
+        }
+        // The handle's object is gone from its filesystem: every other
+        // mount of that filesystem would fail the same way (#326). Only an
+        // attempted decode has an errno worth reading (#344).
+        if io::Error::last_os_error().raw_os_error() == Some(libc::ESTALE) {
+            break;
         }
     }
-
     None
+}
+
+/// Report once per fsid that several mounted filesystems share it.
+fn warn_ambiguous_fsid(fsid: Fsid) {
+    static WARNED: std::sync::Mutex<Vec<Fsid>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.contains(&fsid) {
+        return;
+    }
+    warned.push(fsid);
+    eprintln!(
+        "trashd: WARNING: several mounted filesystems share fsid {fsid:?} (a cloned or \
+         snapshotted filesystem keeps its UUID); deletions on them are logged by name only"
+    );
 }
 
 /// fstatfs f_fsid of an open descriptor (see `fsid_of_path`).
@@ -954,10 +1004,7 @@ fn refresh_mounts(
     subvolumes.retain(|p| live_paths.contains(p));
 
     for mount in &fresh {
-        if matches!(
-            mount.fstype.as_str(),
-            "tmpfs" | "ramfs" | "devtmpfs" | "overlay" | "squashfs"
-        ) {
+        if never_marked(&mount.fstype) {
             continue;
         }
 
@@ -1501,6 +1548,93 @@ mod tests {
             cache
                 .get(&(None, (HandleCache::CAPACITY + 9).to_ne_bytes().to_vec()))
                 .is_some()
+        );
+    }
+
+    // daemon-2: FUSE filesystems are never marked or statfs'ed. A FUSE
+    // filesystem reports no fsid, so a mark always failed, yet the kernel
+    // asked its server for statfs first, and a server that never answers
+    // (another user's allow_other mount) stalled the event loop for good.
+    #[test]
+    fn fuse_filesystems_are_never_marked() {
+        for fstype in [
+            "fuse",
+            "fuseblk",
+            "fuse.sshfs",
+            "fuse.rclone",
+            "tmpfs",
+            "overlay",
+        ] {
+            assert!(never_marked(fstype), "{fstype}");
+        }
+        for fstype in ["ext4", "xfs", "btrfs", "fusectl"] {
+            assert!(!never_marked(fstype), "{fstype}");
+        }
+    }
+
+    // daemon-6: two filesystems sharing an fsid (an ext4 clone or snapshot
+    // keeps its UUID; a user can mount an image made with another's) make a
+    // handle ambiguous. It was decoded on whichever sorted first, logging a
+    // path on the wrong filesystem, or that one's ESTALE ended the search.
+    // Such an event now keeps its bare name.
+    #[test]
+    fn handles_shared_by_two_filesystems_are_not_decoded() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let dir = std::env::temp_dir().join(format!("trashd-ambiguous-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("victim");
+        std::fs::write(&file, b"x").unwrap();
+        let mut handle = vec![0u8; 8 + 128];
+        handle[..4].copy_from_slice(&128u32.to_ne_bytes());
+        let mut mount_id: libc::c_int = 0;
+        let name = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let encoded = unsafe {
+            libc::syscall(
+                libc::SYS_name_to_handle_at,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                handle.as_mut_ptr(),
+                &mut mount_id,
+                0,
+            )
+        };
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let mount = mounts::list_mounts()
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|path| canonical.starts_with(path))
+            .max_by_key(|path| path.as_os_str().len())
+            .unwrap();
+        let open = |path: &std::path::Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0);
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            (unsafe { OwnedFd::from_raw_fd(fd) }, stat.st_dev)
+        };
+        let fsid = fsid_of_path(&mount);
+        let here = || open(&mount);
+        // Another filesystem, standing in for one that shares the fsid.
+        let elsewhere = || open(std::path::Path::new("/proc"));
+        let alone = decode_among(handle.as_ptr(), fsid, &[here()]);
+        let first = decode_among(handle.as_ptr(), fsid, &[here(), elsewhere()]);
+        let second = decode_among(handle.as_ptr(), fsid, &[elsewhere(), here()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(encoded, 0, "{}", io::Error::last_os_error());
+        assert_eq!(alone, Some(canonical));
+        assert_eq!(
+            first, None,
+            "decoded on one of two filesystems sharing an fsid"
+        );
+        assert_eq!(
+            second, None,
+            "decoded on one of two filesystems sharing an fsid"
         );
     }
 
