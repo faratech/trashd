@@ -4,6 +4,7 @@ pub mod directorysizes;
 pub(crate) mod local_trust;
 pub mod mounts;
 pub mod oplog;
+pub(crate) mod pattern_policy;
 pub mod proc_stat;
 pub mod store;
 pub mod store_lock;

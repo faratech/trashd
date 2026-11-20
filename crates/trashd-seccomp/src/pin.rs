@@ -672,7 +672,7 @@ pub fn try_pinned(
 
     // Type checks against the PINNED parent (symlinks NOT followed for the
     // final component — matches unlink/rmdir semantics).
-    let (mode, _dev, _size, owner) = match stat_nofollow(parent, name) {
+    let (mode, dev, _size, owner) = match stat_nofollow(parent, name) {
         Ok(v) => v,
         Err(_) => return Ok(Decision::Continue),
     };
@@ -754,9 +754,17 @@ pub fn try_pinned(
             }
             Ok(Decision::Trashed)
         }
+        // The trash itself, its files/ and info/, and its ancestors stay,
+        // busy, as the shim refuses them: continuing let a removal of an
+        // ancestor (`rm -rf ~/.local/share`) delete the trash. An entry
+        // inside is the kernel's to delete, as emptying tools do
+        // (cross-layer-5).
+        Err(TrashError::Refused(path)) if holds_trash(store, dev, &path) => {
+            Ok(Decision::Errno(libc::EBUSY))
+        }
         // Policy: the preload would decide the same, so declining only
         // cost a second round trip (#357).
-        Err(TrashError::Excluded(_) | TrashError::Refused(_) | TrashError::TooLarge { .. }) => {
+        Err(TrashError::Excluded { .. } | TrashError::Refused(_) | TrashError::TooLarge { .. }) => {
             Ok(Decision::Continue)
         }
         // EXDEV (namespaced/cross-device target), hash/store hiccups, and
@@ -771,6 +779,14 @@ pub fn try_pinned(
             Ok(Decision::Decline)
         }
     }
+}
+
+/// Whether `path` is the trash an entry on `dev` goes to, its files/ or
+/// info/, or an ancestor of that trash.
+fn holds_trash(store: &TrashStore, dev: u64, path: &std::path::Path) -> bool {
+    trashd_common::mounts::trash_dir_for_device(dev, path, store.home_dir()).is_some_and(|root| {
+        root.starts_with(path) || path == root.join("files") || path == root.join("info")
+    })
 }
 
 /// Put the entry's own mode back after a scan grant lasted through the pin:
@@ -1854,6 +1870,47 @@ time.sleep(60)
         assert!(!empty.exists());
         child.kill().unwrap();
         let _ = child.wait();
+    }
+
+    // cross-layer-5: like the shim, the supervisor keeps the trash itself,
+    // its files/ and info/ (busy); continuing let a removal of an ancestor
+    // (`rm -rf ~/.local/share`) delete them. An entry inside stays the
+    // kernel's to delete, as emptying tools do.
+    #[test]
+    fn trash_structure_is_busy_but_its_entries_are_not() {
+        let (store, _work, fixture) = setup("trash-structure");
+        let trash = fixture.path().join("trash");
+        std::fs::create_dir(trash.join("files/emptied")).unwrap();
+        std::fs::write(trash.join("files/entry"), b"x").unwrap();
+        let mut child = spawn_with_cwd(&trash);
+        let nr = if cfg!(target_arch = "x86_64") {
+            NR_UNLINKAT_X86_64
+        } else {
+            NR_UNLINKAT_AARCH64
+        };
+        let attempt = |raw: &str, remove_dir: bool| {
+            let flags = if remove_dir { libc::AT_REMOVEDIR } else { 0 };
+            try_pinned(
+                child.id(),
+                nr,
+                &[libc::AT_FDCWD as u64, 0, flags as u64, 0, 0, 0],
+                OsStr::new(raw),
+                &trash.join(raw),
+                remove_dir,
+                -1,
+                0,
+                &store,
+            )
+            .unwrap()
+        };
+        let info = attempt("info", true);
+        let emptied = attempt("files/emptied", true);
+        let entry = attempt("files/entry", false);
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(matches!(info, Decision::Errno(libc::EBUSY)), "got {info:?}");
+        assert!(matches!(emptied, Decision::Continue), "got {emptied:?}");
+        assert!(matches!(entry, Decision::Continue), "got {entry:?}");
     }
 
     // Regression (review, HIGH): ABSOLUTE pathnames must resolve against the

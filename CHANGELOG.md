@@ -10,6 +10,14 @@
   are, so an auto-compressed entry came back from them as zstd data.
   `trash compress` and `trash restore` are unchanged. (#538)
 
+- The preload limits each file by `max_file_size_mb` alone, as the shim
+  and the supervisor do; `max_dir_size_mb` bounds directories. A
+  standalone file between the two caps was deleted for real by the
+  preload and trashed by the other layers. A tree removed through the
+  preload is therefore trashed file by file even when it exceeds
+  `max_dir_size_mb`; the #412 entry above overstated what its per-file
+  check did. (#454, #548, #487)
+
 ### Performance
 
 - The recorded deleting command in each `.trashinfo` is capped at 256
@@ -263,6 +271,69 @@
   trashing it exits 0 silently, and plain `rm` reports GNU's "No such
   file or directory"; neither prints the misleading "refusing permanent
   removal; use --permanent" hint any more. (#518)
+
+- The shim no longer deletes a directory tree for real because of the
+  directory's own name. A directory excluded by an `only_trash` miss
+  (`rm -r src` with `only_trash = ["src/*"]`, any project directory with
+  `only_trash = ["*.rs"]`) or by a `never_trash` suffix (`rm -rf
+  thesis~`, `export.tmp/`) is emptied entry by entry: entries that may
+  be trashed are trashed, entries excluded themselves are deleted for
+  real, and the emptied directories are removed, as `rm -ri`, the
+  preload and the supervisor already judged each entry. Whitelisted
+  files inside were destroyed with exit 0. The store now says why it
+  excludes a path (`TrashError::Excluded { path, kind }`). (#448, #553,
+  #544)
+
+- The preload drops an empty `only_trash` pattern like the other layers:
+  the #402 fix had not reached it, so `only_trash = [""]` still made
+  every delete it handled permanent. Both layers now share one set of
+  pattern rules. (#455, #547)
+
+- Patterns written for a directory or relative to `.` are normalized at
+  load time and by `trash config add`: `src/` means `src/*`, and
+  `./build/*` means `build/*`. Patterns that can never match a path
+  (`a//b`, `a/./b`) and `/` or `~/` on their own are rejected with a
+  warning; as a whitelist's only entry such a pattern made every delete
+  permanent. (#450)
+
+- `~/` patterns match the home directory both as written and with its
+  symlinks resolved. With a home reached through a symlink, `only_trash
+  = ["~/projects/*"]` matched nothing and every delete was permanent.
+  (#451)
+
+- Without any configuration directory (no usable `XDG_CONFIG_HOME` or
+  `HOME` and no passwd entry), the user config is no longer read from or
+  written to `./~/.config/trashd/config.toml` under the current
+  directory. (#452)
+
+- A config value of the wrong type drops only that key, with a warning,
+  in trashd-common and the preload alike. trashd-common used to drop the
+  whole layer over a key the preload does not read (`sha256_max_size_mb
+  = 0.5`), so the layers ran different policies. (#460)
+
+- Trash ids fit the trash filesystem's own name limit (143 bytes on
+  eCryptfs, not an assumed 255), and a name the filesystem still refuses
+  as too long is claimed again shorter. The preload turned that refusal
+  into a permanent delete. (#459)
+
+- The shim and the preload use a mount's topdir trash only for files on
+  that mount's own filesystem, as the supervisor already did. A file in
+  a nested btrfs subvolume went to a topdir trash that `trash ls`,
+  `restore`, `undo` and retention never list. (#456)
+
+- `bypass_paths` is matched against the program that ran `rm`, not
+  against the shim itself: a prefix covering trashd's install directory
+  (`/usr/local/`) made every shim delete permanent. (#457)
+
+- A recursive removal of an ancestor of the trash no longer destroys it.
+  Once a process has trashed into a trash, the preload refuses (`EBUSY`)
+  to delete anything in that trash for real, so `rm -rf ~/.local/share`
+  keeps both the entries it just moved there and the older ones. The
+  supervisor answers `EBUSY` for the trash root, its `files/` and
+  `info/`, and their ancestors instead of letting the kernel delete
+  them. The store refuses the trash and its ancestors even where policy
+  excludes them (`rm -rf ~/.local` under a whitelist). Emptying tools
+  run as their own processes and keep working. (#458)
 
 ### Documentation
 

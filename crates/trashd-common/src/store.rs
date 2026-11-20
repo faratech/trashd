@@ -1,4 +1,5 @@
 use crate::config::Config;
+pub use crate::config::ExclusionKind;
 use crate::mounts;
 use crate::store_lock::RootMutationGuard;
 use crate::trashinfo::TrashInfo;
@@ -26,8 +27,10 @@ pub enum TrashError {
     Io(#[from] io::Error),
     #[error("path does not exist: {0}")]
     NotFound(PathBuf),
-    #[error("path is in never-trash list: {0}")]
-    Excluded(PathBuf),
+    /// Configured to be deleted for real, for `kind`: a verdict for this
+    /// path alone, never for what a directory holds (common-policy-1).
+    #[error("path is {kind}: {path}")]
+    Excluded { path: PathBuf, kind: ExclusionKind },
     #[error("file too large ({size_mb} MB > {limit_mb} MB limit): {path}")]
     TooLarge {
         path: PathBuf,
@@ -520,9 +523,17 @@ impl TrashStore {
         let meta =
             fs::symlink_metadata(&abs_path).map_err(|_| TrashError::NotFound(abs_path.clone()))?;
 
-        // Check never-trash list
-        if self.should_skip(&abs_path) {
-            return Err(TrashError::Excluded(abs_path));
+        // Check never-trash list. The trash itself, anything in it and its
+        // ancestors stay refused even so: excluded first, a whitelist miss
+        // on `~/.local` deleted the trash for real (cross-layer-5).
+        if let Some(kind) = self.exclusion(&abs_path) {
+            let trash_dir = self.existing_trash_dir(&abs_path, meta.dev());
+            let identity = meta.is_dir().then(|| (meta.dev(), meta.ino()));
+            self.refuse_trash_itself(&abs_path, identity, &trash_dir)?;
+            return Err(TrashError::Excluded {
+                path: abs_path,
+                kind,
+            });
         }
 
         // Check size limit (for files only)
@@ -557,20 +568,11 @@ impl TrashStore {
             }
         }
 
-        // Check bypass_paths — if the calling process exe matches, skip trash
-        if !self.config.bypass_paths.is_empty()
-            && let Ok(exe) = fs::read_link("/proc/self/exe")
-        {
-            let exe_str = exe.to_string_lossy();
-            if self
-                .config
-                .bypass_paths
-                .iter()
-                .any(|p| exe_str.starts_with(p))
-            {
-                return Err(TrashError::Excluded(abs_path));
-            }
-        }
+        // bypass_paths names the deleting program, which only the caller
+        // knows: matched here against /proc/self/exe, inside the shim it
+        // named the shim, and a prefix covering trashd's install directory
+        // made every rm a real delete (cross-layer-4). The shim checks its
+        // caller instead, before opening the store.
 
         // Pick the right trash directory (same-device preferred). The
         // operand's device is already known; selection need not stat it.
@@ -583,34 +585,48 @@ impl TrashStore {
             mounts::existing_trash_dir_for_path_on(&abs_path, Some(meta.dev()), &self.home)
         };
 
-        // Refuse to trash the trash directory itself, anything inside it, or
-        // any ancestor of it: rename would fail (dest inside src), the
-        // cross-device fallback would copy the store into itself until the
-        // depth cap. `rm -rf ~/.local/share/Trash` must
-        // never destroy the trash. Callers treat Refused as a hard stop —
-        // NOT Excluded, which means "real-delete on purpose".
-        if abs_path == trash_dir
-            || abs_path.starts_with(&trash_dir)
-            || trash_dir.starts_with(&abs_path)
-        {
-            return Err(TrashError::Refused(abs_path));
-        }
-        // The same directory reached under another name (a bind mount of
-        // ~/.local/share, say) compares by identity: moving it would carry
-        // the trash, or its info/ into its files/ (#362).
-        if meta.is_dir()
-            && self
-                .trash_ancestry(&trash_dir)
-                .contains(&(meta.dev(), meta.ino()))
-        {
-            return Err(TrashError::Refused(abs_path));
-        }
+        let identity = meta.is_dir().then(|| (meta.dev(), meta.ino()));
+        self.refuse_trash_itself(&abs_path, identity, &trash_dir)?;
         // A directory is checked once its tree has been surveyed.
         if meta.is_file() {
             self.check_retention_cap(&abs_path, meta.size(), &trash_dir)?;
         }
 
         Ok((abs_path, meta, trash_dir))
+    }
+
+    /// The trash `path` (on `dev`) would go to, without preparing one.
+    fn existing_trash_dir(&self, path: &Path, dev: u64) -> PathBuf {
+        if self.isolated {
+            self.home.clone()
+        } else {
+            mounts::existing_trash_dir_for_path_on(path, Some(dev), &self.home)
+        }
+    }
+
+    /// Refuse to trash the trash directory itself, anything inside it, or
+    /// any ancestor of it: rename would fail (dest inside src), the
+    /// cross-device fallback would copy the store into itself until the
+    /// depth cap. `rm -rf ~/.local/share/Trash` must never destroy the
+    /// trash. Callers treat Refused as a hard stop — NOT Excluded, which
+    /// means "real-delete on purpose". A directory's `identity` is compared
+    /// too: the same directory reached under another name (a bind mount of
+    /// ~/.local/share, say) would carry the trash, or its info/ into its
+    /// files/ (#362).
+    fn refuse_trash_itself(
+        &self,
+        path: &Path,
+        identity: Option<(u64, u64)>,
+        trash_dir: &Path,
+    ) -> Result<(), TrashError> {
+        if path == trash_dir
+            || path.starts_with(trash_dir)
+            || trash_dir.starts_with(path)
+            || identity.is_some_and(|identity| self.trash_ancestry(trash_dir).contains(&identity))
+        {
+            return Err(TrashError::Refused(path.to_path_buf()));
+        }
+        Ok(())
     }
 
     /// Make a new entry's sidecar and its info/ entry durable before a
@@ -1046,8 +1062,15 @@ impl TrashStore {
         let file_dev = stat.st_dev as u64;
 
         // Eligibility on the display path (config semantics are path-based).
-        if self.should_skip(&display_path) {
-            return Err(TrashError::Excluded(display_path.clone()));
+        // The trash, anything in it and its ancestors stay refused even
+        // where excluded, as in prepare_source (cross-layer-5).
+        if let Some(kind) = self.exclusion(&display_path) {
+            let trash_dir = self.existing_trash_dir(&display_path, file_dev);
+            self.refuse_trash_itself(&display_path, None, &trash_dir)?;
+            return Err(TrashError::Excluded {
+                path: display_path,
+                kind,
+            });
         }
 
         // Size limits — parity with trash().
@@ -2511,11 +2534,11 @@ impl TrashStore {
         }
     }
 
-    fn should_skip(&self, path: &Path) -> bool {
+    fn exclusion(&self, path: &Path) -> Option<ExclusionKind> {
         if self.isolated {
-            self.config.should_skip_configured(path)
+            self.config.exclusion_configured(path)
         } else {
-            self.config.should_skip(path)
+            self.config.exclusion(path)
         }
     }
 
@@ -2562,20 +2585,41 @@ fn unique_id_atomic(
     trash_dir: &Path,
     base_name: &str,
 ) -> Result<(String, PathBuf, fs::File), TrashError> {
+    let name_max = crate::trash_id::name_max(&trash_dir.join("info"));
+    unique_id_atomic_within(trash_dir, base_name, name_max)
+}
+
+/// `unique_id_atomic` with ids sized for a NAME_MAX of `name_max`. A name
+/// the filesystem still refuses as too long is claimed again shorter: it is
+/// no storage failure (cross-layer-6).
+fn unique_id_atomic_within(
+    trash_dir: &Path,
+    base_name: &str,
+    mut name_max: usize,
+) -> Result<(String, PathBuf, fs::File), TrashError> {
+    loop {
+        match claim_unique_id(trash_dir, base_name, name_max) {
+            Err(TrashError::Io(error)) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                name_max =
+                    crate::trash_id::smaller_name_max(name_max).ok_or(TrashError::Io(error))?;
+            }
+            claimed => return claimed,
+        }
+    }
+}
+
+fn claim_unique_id(
+    trash_dir: &Path,
+    base_name: &str,
+    name_max: usize,
+) -> Result<(String, PathBuf, fs::File), TrashError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let info_dir = trash_dir.join("info");
     let files_dir = trash_dir.join("files");
 
-    // Truncate base_name if it would exceed filesystem filename limits.
-    // ".trashinfo" = 10 chars, ".YYYYMMDDHHMMSS.NNNNN" = 21 chars max.
-    // Most filesystems cap at 255 bytes. Reserve 32 for suffix.
-    let max_base = 223;
-    let base_name = if base_name.len() > max_base {
-        &base_name[..base_name.floor_char_boundary(max_base)]
-    } else {
-        base_name
-    };
+    // Room for ".trashinfo" and a collision suffix within NAME_MAX.
+    let base_name = crate::trash_id::base_within(base_name, name_max);
 
     // Claim `candidate`: create info/<candidate>.trashinfo with O_EXCL AND
     // verify files/<candidate> is free. Ok(Some) = claimed; Ok(None) = taken,
@@ -2612,7 +2656,7 @@ fn unique_id_atomic(
     // Keep the first timestamped ID, then advance without rescanning the
     // existing counter range or exhausting a fixed naming namespace (#399).
     let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
-    let mut names = crate::trash_id::CollisionNames::new(base_name, &ts);
+    let mut names = crate::trash_id::CollisionNames::new(base_name, &ts, name_max);
     loop {
         let candidate = names.next();
         if let Some((info_path, claim)) = try_claim(&candidate)? {
@@ -8625,6 +8669,23 @@ mod tests {
         assert_eq!(fs::read(root.join("files/same")).unwrap(), b"orphan");
     }
 
+    // cross-layer-6: a sidecar name the filesystem refuses as too long is a
+    // naming problem, not a storage failure: a shorter id is claimed. The
+    // budget here is above what the filesystem takes, as a filesystem may
+    // report one.
+    #[test]
+    fn ids_shrink_to_what_the_filesystem_takes() {
+        let (store, _data, _workdir, _lock) = test_store();
+        let name = "n".repeat(254);
+        let (first, info, _claim) = unique_id_atomic_within(&store.home, &name, 400).unwrap();
+        let (second, _, _) = unique_id_atomic_within(&store.home, &name, 400).unwrap();
+        assert_ne!(first, second);
+        assert!(info.exists());
+        for id in [first, second] {
+            assert!(id.len() + ".trashinfo".len() <= 255, "{}", id.len());
+        }
+    }
+
     #[test]
     fn status_reports_size_and_count() {
         let (store, _data, workdir, _lock) = test_store();
@@ -8856,9 +8917,110 @@ mod tests {
         let file = create_file(workdir.path(), "temp.tmp", "data");
         let result = store.trash(&file, None);
         assert!(
-            matches!(result, Err(TrashError::Excluded(_))),
+            matches!(result, Err(TrashError::Excluded { .. })),
             "*.tmp should be excluded by never_trash"
         );
+    }
+
+    /// `test_store` with its own configuration.
+    fn configured_store(config: impl FnOnce(&mut Config)) -> (TrashStore, TempDir, TempDir) {
+        let (_, data, work, _) = test_store();
+        let mut configured = Config::default();
+        configured.retention.max_age_days = 0;
+        configured.retention.max_size_gb = 0.0;
+        configured.retention.disk_pressure_percent = 0;
+        config(&mut configured);
+        let store = TrashStore::open_isolated(&data.path().join("Trash"), configured).unwrap();
+        (store, data, work)
+    }
+
+    // common-policy-1/2, shim-1: the store says why a path stays out of the
+    // trash. A directory excluded by its own name (a whitelist miss, or a
+    // `*~` backup) is then judged entry by entry by the shim, instead of
+    // deleted for real as a whole tree.
+    #[test]
+    fn exclusions_say_why() {
+        use std::ffi::OsStr;
+        use std::os::fd::AsRawFd;
+        let (store, _data, work) = configured_store(|config| {
+            config.never_trash = vec!["*~".into()];
+            config.only_trash = vec!["src/*".into()];
+        });
+        let src = work.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("main.rs"), b"fn main() {}").unwrap();
+        let backup = work.path().join("thesis~");
+        fs::create_dir(&backup).unwrap();
+        let kind = |result: Result<String, TrashError>| match result {
+            Err(TrashError::Excluded { kind, .. }) => Some(kind),
+            other => panic!("not excluded: {other:?}"),
+        };
+        assert_eq!(
+            kind(store.trash(&src, None)),
+            Some(ExclusionKind::NotWhitelisted)
+        );
+        assert_eq!(
+            kind(store.trash(&backup, None)),
+            Some(ExclusionKind::NeverTrash)
+        );
+        let parent = fs::File::open(work.path()).unwrap();
+        assert_eq!(
+            kind(store.trash_at(parent.as_raw_fd(), OsStr::new("src"), &src, None)),
+            Some(ExclusionKind::NotWhitelisted)
+        );
+        // What the whitelist names inside it is trashed.
+        store.trash(&src.join("main.rs"), None).unwrap();
+    }
+
+    // cross-layer-5: the trash, anything in it and its ancestors are refused
+    // even where policy excludes them. Excluded first, `rm -rf ~/.local`
+    // under a whitelist deleted the trash for real with everything else.
+    #[test]
+    fn excluded_trash_and_its_ancestors_are_still_refused() {
+        use std::ffi::OsStr;
+        use std::os::fd::AsRawFd;
+        let (_, data, work, _) = test_store();
+        let share = work.path().join("share");
+        let mut config = Config {
+            only_trash: vec!["*.rs".into()],
+            ..Config::default()
+        };
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        let store = TrashStore::open_isolated(&share.join("Trash"), config).unwrap();
+        drop(data);
+        let refused =
+            |result: Result<String, TrashError>| matches!(result, Err(TrashError::Refused(_)));
+        assert!(refused(store.trash(&share, None)));
+        assert!(refused(store.trash(&share.join("Trash/files"), None)));
+        let parent = fs::File::open(work.path()).unwrap();
+        assert!(refused(store.trash_at(
+            parent.as_raw_fd(),
+            OsStr::new("share"),
+            &share,
+            None
+        )));
+        // Elsewhere the whitelist still decides.
+        let other = create_file(work.path(), "notes.txt", "x");
+        assert!(matches!(
+            store.trash(&other, None),
+            Err(TrashError::Excluded { .. })
+        ));
+    }
+
+    // cross-layer-4: bypass_paths names the deleting process. The store
+    // matched its own executable, which inside the shim is the shim: a
+    // prefix covering trashd's install directory made every shim operand a
+    // real delete while the other layers trashed it.
+    #[test]
+    fn bypass_paths_never_match_the_stores_own_executable() {
+        let exe = fs::read_link("/proc/self/exe").unwrap();
+        let prefix = format!("{}/", exe.parent().unwrap().display());
+        let (store, _data, work) = configured_store(|config| config.bypass_paths = vec![prefix]);
+        let file = create_file(work.path(), "kept.txt", "data");
+        store.trash(&file, None).expect("trashed, not excluded");
+        assert!(!file.exists());
     }
 
     // --- List pattern filter with time ---
@@ -10587,7 +10749,7 @@ mod tests {
         let err = store
             .trash_at(parent.as_raw_fd(), OsStr::new("skipme.tmp"), &tmp, None)
             .unwrap_err();
-        assert!(matches!(err, TrashError::Excluded(_)), "got {err:?}");
+        assert!(matches!(err, TrashError::Excluded { .. }), "got {err:?}");
 
         // unknown final component → NotFound (kernel would ENOENT)
         let err = store

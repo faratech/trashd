@@ -366,12 +366,19 @@ pub(crate) fn trash_dir_for_path_on(
     };
 
     // If on the same filesystem as home trash, use home trash
-    if same_device(device.or_else(|| device_id_or_parent(&abs)), home_trash) {
+    let device = device.or_else(|| device_id_or_parent(&abs));
+    if same_device(device, home_trash) {
         return Some(home_trash.to_path_buf());
     }
 
     let uid = unsafe { libc::geteuid() };
-    if let Some(mount) = find_mount_point(&abs) {
+    // Only the mount the file is on: a nested subvolume below a mount root
+    // has its own device, and a store on that root may be one listing
+    // skips (cross-layer-3), as `trash_dir_for_device` already checks.
+    if let Some(mount) = find_mount_point(&abs)
+        && device.is_some()
+        && device_id(&mount.path) == device
+    {
         if mount.path == abs && is_mount_root(&mount.path) {
             return None;
         }
@@ -399,11 +406,16 @@ pub(crate) fn existing_trash_dir_for_path_on(
     device: Option<u64>,
     home: &Path,
 ) -> PathBuf {
-    if same_device(device.or_else(|| device_id_or_parent(path)), home) {
+    let device = device.or_else(|| device_id_or_parent(path));
+    if same_device(device, home) {
         return home.to_path_buf();
     }
     let uid = unsafe { libc::geteuid() };
-    if let Some(mount) = find_mount_point(path) {
+    // As in `trash_dir_for_path_on` (cross-layer-3).
+    if let Some(mount) = find_mount_point(path)
+        && device.is_some()
+        && device_id(&mount.path) == device
+    {
         if let Some(root) = check_shared_trash(&mount.path, uid, false)
             .or_else(|| check_private_topdir_trash(&mount.path, uid, false))
         {
@@ -1262,6 +1274,54 @@ mod tests {
     }
 
     use super::*;
+
+    // cross-layer-3: a topdir store is chosen only on the file's own
+    // filesystem. A file whose device differs from its mount root's (a
+    // nested btrfs subvolume) got a store on the mount root, which listing
+    // skips when it shares the home trash's device: an entry nothing could
+    // list, restore or purge. The device here stands in for a subvolume's.
+    #[test]
+    fn topdir_store_needs_the_files_own_device() {
+        let base = tempfile::tempdir().unwrap();
+        let verdict = in_private_mounts(
+            "mounts::tests::topdir_store_needs_the_files_own_device",
+            || {
+                let mount = base.path().join("m");
+                let target = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()).unwrap();
+                if fs::create_dir(&mount).is_err()
+                    || unsafe {
+                        libc::mount(
+                            c"none".as_ptr(),
+                            target.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    } != 0
+                {
+                    return false;
+                }
+                let file = mount.join("nested/file");
+                let checked = (|| {
+                    fs::create_dir(mount.join("nested")).ok()?;
+                    fs::write(&file, b"x").ok()?;
+                    let home = base.path().join("home/Trash");
+                    let own = device_id(&mount)?;
+                    let nested = own.wrapping_add(1);
+                    Some(
+                        trash_dir_for_path_on(&file, Some(nested), &home).as_deref()
+                            == Some(&*home)
+                            && existing_trash_dir_for_path_on(&file, Some(nested), &home) == home
+                            && trash_dir_for_path_on(&file, Some(own), &home)
+                                .is_some_and(|root| root.starts_with(&mount)),
+                    )
+                })();
+                unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+                checked == Some(true)
+            },
+        );
+        assert_ne!(verdict, Some(false));
+    }
 
     // #379: a successful but partial statx must not fabricate a snapshot
     // version from zero or missing fields. Re-stat it in full, without

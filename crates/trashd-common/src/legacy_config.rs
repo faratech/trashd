@@ -1,4 +1,6 @@
-//! Compatibility with releases that shipped root settings under [retention].
+//! How a configuration layer is read, shared with the standalone preload:
+//! compatibility with releases that shipped root settings under
+//! [retention], and keys of the wrong type dropped one by one.
 
 pub fn normalize(contents: &str) -> Result<toml::Value, toml::de::Error> {
     let mut value: toml::Value = toml::from_str(contents)?;
@@ -37,6 +39,36 @@ pub fn normalize(contents: &str) -> Result<toml::Value, toml::de::Error> {
         }
     }
     Ok(value)
+}
+
+/// A normalized configuration layer as `T`, without each top-level key
+/// whose value has the wrong type: `dropped` reports it, and the rest of
+/// the layer still applies. Rejecting the whole layer over one key that
+/// only some loaders read (`sha256_max_size_mb = 0.5`) left the layers on
+/// different policies: the preload applied the layer's never_trash,
+/// whitelist and size caps, trashd-common used none of them
+/// (cross-layer-7). Both loaders read their layers through this.
+pub fn layer<T: serde::de::DeserializeOwned>(
+    mut value: toml::Value,
+    mut dropped: impl FnMut(&str, &toml::de::Error),
+) -> Result<T, toml::de::Error> {
+    let error = match value.clone().try_into::<T>() {
+        Ok(layer) => return Ok(layer),
+        Err(error) => error,
+    };
+    let Some(table) = value.as_table_mut() else {
+        return Err(error);
+    };
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        let mut alone = toml::Table::new();
+        alone.insert(key.clone(), table[&key].clone());
+        if let Err(error) = toml::Value::Table(alone).try_into::<T>() {
+            dropped(&key, &error);
+            table.remove(&key);
+        }
+    }
+    value.try_into::<T>()
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ pub fn run(cmd: ConfigCmd) {
             // Refuse values the loader would drop or that can never do what
             // they promise, instead of reporting success for a no-op write
             // (#259, #419).
-            validate_list_value(&key, &value).unwrap_or_else(|e| fatal(e));
+            let value = validate_list_value(&key, &value).unwrap_or_else(|e| fatal(e));
             let mut table = load_user_config_table();
             config_list_add(&mut table, &key, &value, &Config::load().only_trash);
             write_user_config_table(&table);
@@ -354,16 +354,16 @@ fn seed_inherited_whitelist(table: &mut toml::Table, key: &str, inherited: &[Str
 /// braces and other glob characters are ordinary characters there and are
 /// accepted as-is. No list accepts an empty value: an empty `bypass_paths`
 /// prefix matches every executable, and an empty glob pattern is a no-op the
-/// user cannot have meant.
-fn validate_list_value(key: &str, value: &str) -> Result<(), String> {
+/// user cannot have meant. A glob is stored as the loader normalizes it
+/// (`src/` as `src/*`, common-policy-5); the value to store is returned.
+fn validate_list_value(key: &str, value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err(format!("refusing to add an empty value to '{key}'"));
     }
     match key {
-        "never_trash" | "only_trash" if !trashd_common::config::pattern_is_supported(value) => Err(
-            format!("unsupported pattern '{value}' (brace expansion is not supported)"),
-        ),
-        _ => Ok(()),
+        "never_trash" | "only_trash" => trashd_common::config::normalize_pattern(value)
+            .map_err(|reason| format!("unsupported pattern '{value}': {reason}")),
+        _ => Ok(value.to_owned()),
     }
 }
 
@@ -583,6 +583,31 @@ mod tests {
             assert!(validate_list_value(key, "*.py").is_ok(), "{key}");
             assert!(validate_list_value(key, "*.[ch]").is_ok(), "{key}");
         }
+    }
+
+    // common-policy-5: a directory-style or `./`-relative pattern was
+    // stored as written and matched nothing; `add` stores what the loader
+    // matches, and refuses `~/` alone instead of reading it as the home.
+    #[test]
+    fn glob_patterns_are_stored_normalized() {
+        for key in ["never_trash", "only_trash"] {
+            assert_eq!(validate_list_value(key, "src/").as_deref(), Ok("src/*"));
+            assert_eq!(
+                validate_list_value(key, "./build/*").as_deref(),
+                Ok("build/*")
+            );
+            assert_eq!(
+                validate_list_value(key, "~/projects/").as_deref(),
+                Ok("~/projects/*")
+            );
+            assert!(validate_list_value(key, "~/").is_err(), "{key}");
+            assert!(validate_list_value(key, "a//b").is_err(), "{key}");
+        }
+        // Literal prefixes are not globs: stored exactly as given.
+        assert_eq!(
+            validate_list_value("bypass_paths", "/opt/tools/").as_deref(),
+            Ok("/opt/tools/")
+        );
     }
 
     // Regression (#419): the glob validator ran for every list, so literal

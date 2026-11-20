@@ -403,7 +403,7 @@ trash config add only_trash '*.py'
 trash config add bypass_processes 'my-build-tool'
 ```
 
-A note on quoting: `trash config add` stores the value you pass as one pattern. Quote it so your shell does not expand `*` into filenames first (`'*.iso'`, not `*.iso`). Patterns are validated on add — a pattern the loader would ignore (for example one using unsupported `{a,b}` brace expansion) is rejected with an explanation instead of being saved as a silent no-op.
+A note on quoting: `trash config add` stores the value you pass as one pattern. Quote it so your shell does not expand `*` into filenames first (`'*.iso'`, not `*.iso`). Patterns are validated on add — a pattern the loader would ignore (for example one using unsupported `{a,b}` brace expansion) is rejected with an explanation instead of being saved as a silent no-op — and stored as the loader matches them (`src/` is saved as `src/*`). In a hand-edited config, a value of the wrong type is ignored for that one key, with a warning; the rest of the file still applies.
 
 ### Full configuration reference
 
@@ -443,11 +443,13 @@ bypass_processes = [
 ]
 
 # Executables whose deletions bypass trash, matched by path prefix
-# against /proc/self/exe. More precise than bypass_processes.
+# against the deleting program's executable (for `rm`, the program that
+# ran it). More precise than bypass_processes.
 bypass_paths = []
 
 max_file_size_mb = 1024        # single files larger than this skip trash (0 = no limit)
-max_dir_size_mb = 0            # directories larger than this skip trash (0 = no limit, default)
+max_dir_size_mb = 0            # directories larger than this skip trash (0 = no limit, default);
+                               # the preload sees a tree file by file and caps each file by max_file_size_mb only
 hash_algorithm = "xxhash"      # "xxhash" (XXH3-128, fast) or "sha256" (cryptographic)
 sha256_max_size_mb = 1         # only files up to this size get an integrity hash (0 = no hashing)
 auto_purge_interval_secs = 60  # minimum seconds between automatic retention scans
@@ -480,6 +482,8 @@ Fine print worth knowing:
 
 - Relative patterns such as `src/*` can begin matching at any path-component boundary, so they work wherever the project sits on disk.
 - A single `*` already spans `/` in this syntax; `**` is accepted for familiarity and behaves the same way.
+- A pattern written as a directory, `dir/`, means everything under it (`dir/*`), and a leading `./` is dropped. Patterns that can never match a path (`a//b`, `a/./b`) and `/` or `~/` on their own are rejected like brace patterns.
+- `~/` patterns match your home both as written and with its symlinks resolved, so a home reached through a symlink still matches.
 - Brace expansion (`*.{jpg,png}`) is **not** supported. `trash config add` rejects such patterns, and hand-edited configs log a warning and ignore them — they never silently match nothing while looking correct.
 - Matching is on the absolute path with symlinks in parent components resolved for policy checks, so a symlinked directory cannot smuggle an excluded path past `never_trash`.
 
@@ -748,7 +752,7 @@ trashd is engineered so that *trashd's own bugs should not become your data loss
 
 - **Interception preserves your permissions.** Trashing happens with the deleting process's own kernel credentials. A file you could not delete, trashd cannot delete for you — and (for the seccomp supervisor) a privileged supervisor never spends credentials the caller lacks: when the target's filesystem UID/GID, groups, or capabilities differ from the supervisor's, the supervisor declines and the target's own layers and kernel decide.
 - **Symlinks are never followed for metadata.** Trashing a symlink trashes the link, not its target. Dangling symlinks trash normally. In cross-filesystem copies, symlinks are recreated as symlinks.
-- **No silent overwrites.** Trash IDs are claimed atomically (`O_CREAT|O_EXCL` on the `.trashinfo` file — simultaneous deletes of the same name each get a unique ID, with file names truncated to 223 bytes to stay within filesystem limits). Restores refuse to overwrite an existing destination unless you pass `--force`. The `directorysizes` cache is replaced by atomic rename; config writes are atomic too.
+- **No silent overwrites.** Trash IDs are claimed atomically (`O_CREAT|O_EXCL` on the `.trashinfo` file — simultaneous deletes of the same name each get a unique ID, with file names truncated to fit the trash filesystem's own name limit: 223 bytes where it takes 255, less on eCryptfs). Restores refuse to overwrite an existing destination unless you pass `--force`. The `directorysizes` cache is replaced by atomic rename; config writes are atomic too.
 - **Prompts mean what they say.** Confirmation answers apply only to the exact entries confirmed (see Layer 1 deep dive); nothing created afterwards is swept up.
 - **Corruption is surfaced, not hidden.** Hash mismatches warn on restore; `trash fsck` exits non-zero on any problem (orphaned `.trashinfo`, orphaned data file, corrupt metadata, unreadable trash root) so scripts notice; corrupt metadata is never auto-deleted because the data file may still be recoverable by hand.
 
@@ -757,8 +761,8 @@ trashd is engineered so that *trashd's own bugs should not become your data loss
 | Situation | What happens | How to change it |
 | --- | --- | --- |
 | `rm --permanent`, `--no-trash`, or `TRASH_BYPASS=1` | Real delete | That is the request — no change needed |
-| Path matches `never_trash` (yours, admin's, or a project's) | Real delete | `trash config show` to see the merged list; user entries via `trash config remove` |
-| `only_trash` is set and the path does not match | Real delete | Add the pattern, or clear the whitelist |
+| Path matches `never_trash` (yours, admin's, or a project's) | Real delete. For a directory, that is its entries the patterns also name (`/tmp/*`, `*/.git/*`); the rest of a `backup~` directory is trashed | `trash config show` to see the merged list; user entries via `trash config remove` |
+| `only_trash` is set and the path does not match | Real delete. A directory is judged entry by entry: whatever inside it matches is still trashed | Add the pattern, or clear the whitelist |
 | File larger than `max_file_size_mb` / directory larger than `max_dir_size_mb` | Real delete (directories whose size cannot be fully checked — the walk caps at 10,000 entries — are refused rather than guessed at when `max_dir_size_mb` is set) | Raise or zero (`0` = unlimited) the limit |
 | Single item larger than `retention.max_size_gb` whose trash is on your home filesystem | The `rm` shim refuses and keeps it; under `trashd-exec` the kernel deletes it, as for the other size caps | `rm --permanent`, or raise the cap |
 | Deleting process (or an ancestor) is in `bypass_processes`, or its executable matches `bypass_paths` | Real delete | Remove the entry, or exempt one invocation with an explicit `trash`-side workflow |

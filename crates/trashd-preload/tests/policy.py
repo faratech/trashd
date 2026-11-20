@@ -181,6 +181,19 @@ def run():
         # A genuinely malformed config keeps the loud "bad config" diagnostic
         # and falls back to the default (trash everything) policy.
         case("malformed-config", 'only_trash = ["*.txt"\n', warning=b"bad config")
+        # The rules trashd-common applies to patterns (cross-layer-2, #402,
+        # common-policy-5): an empty whitelist pattern matches nothing and
+        # is dropped, and `dir/` names everything below dir.
+        case("empty-whitelist-pattern", 'only_trash = [""]\n')
+        case("empty-local-whitelist-pattern", "", local='only_trash = [""]\n')
+        case("directory-whitelist-pattern", 'only_trash = ["directory-whitelist-pattern/"]\n')
+        # max_dir_size_mb bounds directories, never a file, as in the shim
+        # and the supervisor (cross-layer-1).
+        case("file-over-dir-cap", "max_dir_size_mb = 1\n", size=2 * 1024 * 1024)
+        # A mistyped key drops only itself, as in trashd-common: the layer's
+        # whitelist still applies (cross-layer-7).
+        case("mistyped-key", 'only_trash = ["*.keep"]\nmax_file_size_mb = "big"\n', trashed=False,
+             warning=b"ignoring 'max_file_size_mb'")
 
         # A PRESENT-but-broken nearest .trashd.toml stops the ancestor walk
         # (#136): the deletion must follow the DEFAULT policy (trashed), not
@@ -800,6 +813,29 @@ def run():
         assert len(own_records) == 1, own_records
         assert not Path("/home/nobody/.local").exists(), "wrote into another user's home"
         print("PASS: root with a foreign HOME trashes into its own home")
+
+        # A recursive removal that reached the trash after trashing entries
+        # into it destroyed them, and every older entry with them. The trash
+        # a process filled is refused to it instead (cross-layer-5).
+        fixture, data, environment = focused_fixture("trash-ancestor")
+        share = fixture / ".local/share"
+        share.mkdir(parents=True)
+        environment["XDG_DATA_HOME"] = str(share)
+        older = share / "older"
+        older.write_bytes(b"an earlier delete")
+        result = subprocess.run(["/usr/bin/unlink", str(older)], env=environment, capture_output=True)
+        assert result.returncode == 0 and not older.exists(), result.stderr
+        (share / "app").mkdir()
+        (share / "app/state").write_bytes(b"trashed by the same command")
+        rm = next(path for path in ("/usr/bin/gnurm", "/usr/bin/rm") if os.path.exists(path))
+        result = subprocess.run([rm, "-rf", str(share / "app"), str(share)], env=environment, capture_output=True)
+        assert result.returncode != 0 and b"Device or resource busy" in result.stderr, result.stderr
+        trash = share / "Trash"
+        assert (trash / "files/older").read_bytes() == b"an earlier delete"
+        assert (trash / "files/state").read_bytes() == b"trashed by the same command"
+        recorded = {path.name for path in (trash / "info").glob("*.trashinfo")}
+        assert {"older.trashinfo", "state.trashinfo"} <= recorded, recorded
+        print("PASS: a recursive removal never destroys the trash it filled")
     return 0
 
 

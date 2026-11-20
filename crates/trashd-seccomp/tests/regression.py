@@ -140,6 +140,14 @@ for row in sys.stdin:
         fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
         try: os.unlink(os.path.basename(path), dir_fd=fd)
         finally: os.close(fd)
+    elif mode == "rmdir":
+        import errno
+        try:
+            os.rmdir(path)
+            print(json.dumps("removed"), flush=True)
+        except OSError as error:
+            print(json.dumps(errno.errorcode[error.errno]), flush=True)
+        continue
     elif mode == "invalid-flags":
         libc = ctypes.CDLL(None, use_errno=True)
         result = libc.unlinkat(-100, ctypes.c_char_p(os.fsencode(path)), 1024)
@@ -616,6 +624,28 @@ def run():
                 assert process.wait(timeout=5) == 0
             finally: stop(process)
         print("PASS: denied pidfd_getfd retains exact-task proc interception", flush=True)
+
+        # The trash's own directories stay, busy, as the shim refuses them:
+        # continuing let a removal of an ancestor (`rm -rf ~/.local/share`)
+        # delete the trash (cross-layer-5).
+        structure = fixture / "structure-data"
+        for directory in (structure / "Trash", structure / "Trash/files", structure / "Trash/info"):
+            directory.mkdir(parents=True, mode=0o700)
+        with (fixture / "trash-structure.log").open("w") as log:
+            process = launch(dict(protected_env, XDG_DATA_HOME=str(structure)), log)
+            try:
+                _, active = line(process)
+                assert active == "1", "trash structure case lost listener"
+                for name in ("files", "info"):
+                    process.stdin.write(json.dumps(["rmdir", str(structure / "Trash" / name)]) + "\n")
+                    process.stdin.flush()
+                    assert line(process) == "EBUSY"
+                    assert (structure / "Trash" / name).is_dir()
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: the trash's own directories are busy under protection", flush=True)
 
         for sig in [signal.SIGHUP, signal.SIGINT]:
             with (fixture / f"protected-signal-{sig}.log").open("w") as log:

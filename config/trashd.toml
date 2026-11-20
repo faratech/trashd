@@ -79,7 +79,8 @@ bypass_processes = [
 ]
 
 # Executable paths that bypass trash. More precise than bypass_processes —
-# matches the exe path prefix instead of just the binary name.
+# matches the deleting program's exe path prefix (for `rm`, the program
+# that ran it) instead of just the binary name.
 # Example: bypass_paths = ["/opt/myapp/", "/usr/lib/systemd/"]
 bypass_paths = []
 
@@ -88,7 +89,8 @@ bypass_paths = []
 max_file_size_mb = 1024
 
 # Directories larger than this (in MB) skip trash (real-deleted).
-# Set to 0 (default) to disable the limit.
+# Set to 0 (default) to disable the limit. The LD_PRELOAD layer sees a tree
+# removed file by file and limits each file by max_file_size_mb alone.
 max_dir_size_mb = 0
 
 # Hash algorithm for file integrity: "xxhash" (fast, default) or "sha256" (cryptographic).

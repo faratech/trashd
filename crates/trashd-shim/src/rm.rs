@@ -306,7 +306,7 @@ fn main() -> ExitCode {
     // A bypassed caller (make, git, package managers) passes through before
     // any store work: it must not depend on, or pay for, a usable trash.
     let config = trashd_common::Config::load();
-    if is_parent_bypassed(&config.bypass_processes) {
+    if is_parent_bypassed(&config.bypass_processes) || caller_exe_bypassed(&config.bypass_paths) {
         return passthrough();
     }
 
@@ -548,7 +548,26 @@ fn main() -> ExitCode {
                 flush_removed();
                 notification.add(file);
             }
-            Err(trashd_common::store::TrashError::Excluded(_)) => {
+            // A directory's own name is no verdict on what it holds: its
+            // entries are judged one by one, never deleted for real as a
+            // tree (shim-1, common-policy-1, common-policy-2).
+            Err(trashd_common::store::TrashError::Excluded { .. }) if is_dir && args.recursive => {
+                let mut walk = Walk {
+                    store: &store,
+                    device: None,
+                    behavior: &behavior,
+                    args: &args,
+                    command: &cmd_str,
+                    notification: &mut notification,
+                    failures: 0,
+                    budget: PlanBudget::new(),
+                };
+                walk.sweep(file, file);
+                if walk.failures > 0 {
+                    exit_code = ExitCode::FAILURE;
+                }
+            }
+            Err(trashd_common::store::TrashError::Excluded { .. }) => {
                 // -d excluded empty directories fall back to rmdir semantics
                 // (not real rm's blanket "Is a directory" error) (#149).
                 if let Err(e) = real_rm(file, args.recursive, args.dir) {
@@ -617,6 +636,24 @@ fn main() -> ExitCode {
 
     notification.send();
     exit_code
+}
+
+/// Whether the program that ran rm is one bypass_paths names. The list
+/// names the deleting program's executable, as the preload and the
+/// supervisor read it; for rm that is its caller, never the shim itself,
+/// whose install directory a prefix such as `/usr/local/` covers
+/// (cross-layer-4).
+fn caller_exe_bypassed(bypass_paths: &[String]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if bypass_paths.is_empty() {
+        return false;
+    }
+    let caller = unsafe { libc::getppid() };
+    std::fs::read_link(format!("/proc/{caller}/exe")).is_ok_and(|exe| {
+        bypass_paths
+            .iter()
+            .any(|prefix| exe.as_os_str().as_bytes().starts_with(prefix.as_bytes()))
+    })
 }
 
 /// The lstat error of an operand that vanished while it was being trashed,
@@ -1310,7 +1347,7 @@ impl Walk<'_> {
             self.store.check_trash_eligibility(access)
         };
         match eligible {
-            Ok(()) | Err(TrashError::Excluded(_)) => {}
+            Ok(()) | Err(TrashError::Excluded { .. }) => {}
             Err(e) => {
                 self.report(display, e);
                 return (Walked::Held, identity);
@@ -1509,13 +1546,14 @@ impl Walk<'_> {
                     Some(Outcome::Excluded) => {
                         // A confirmed entry is never a directory (those are
                         // descended), so whatever replaced it cannot be
-                        // removed recursively (#355). Without prompts, not
-                        // descended means nothing under it needed confirming.
-                        let is_dir = !self.interactive()
-                            && access
-                                .symlink_metadata()
-                                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink());
-                        self.real_remove(access, display, is_dir);
+                        // removed recursively (#355). Without prompts, a
+                        // directory not descended is judged entry by entry
+                        // now, never deleted for real whole (shim-1).
+                        if !self.interactive() && was_directory(access) {
+                            self.sweep(access, display);
+                        } else {
+                            self.real_remove(access, display, false);
+                        }
                     }
                     Some(Outcome::Done) | None => {}
                 }
@@ -1680,7 +1718,7 @@ impl Walk<'_> {
                 self.notification.add(display);
                 Some(Outcome::Done)
             }
-            Err(TrashError::Excluded(_)) => Some(Outcome::Excluded),
+            Err(TrashError::Excluded { .. }) => Some(Outcome::Excluded),
             Err(e @ TrashError::HoldsMount(_)) => Some(Outcome::HoldsMount(e)),
             Err(TrashError::Io(e)) => {
                 self.report_io(display, e);
@@ -1691,6 +1729,140 @@ impl Walk<'_> {
                 self.report(display, e);
                 None
             }
+        }
+    }
+
+    /// Remove the excluded directory `access` entry by entry, without
+    /// prompts. Its own name kept it out of the trash, which says nothing
+    /// about what it holds: like the preload and the supervisor, which judge
+    /// each unlink, every entry is judged by its own path. What may be
+    /// trashed is; what is excluded itself goes for real, a directory again
+    /// entry by entry; and each emptied directory is removed with rmdir(2).
+    /// A whitelist miss or a `*~` name deleted whole trees for real, the
+    /// whitelisted files in them too (shim-1, common-policy-1,
+    /// common-policy-2). Mounts and other filesystems stay, as in the walk.
+    /// The levels are kept on a stack of their own, one descriptor each.
+    fn sweep(&mut self, access: &std::path::Path, display: &std::path::Path) {
+        use std::os::fd::AsRawFd;
+        struct Level {
+            dir: std::fs::File,
+            names: Vec<std::ffi::OsString>,
+            access: PathBuf,
+            display: PathBuf,
+            failures: usize,
+        }
+        let open = |walk: &mut Self, access: &std::path::Path, display: &std::path::Path| {
+            let listed = open_walk_dir(access).and_then(|dir| {
+                let pinned = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+                let names = std::fs::read_dir(&pinned)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                Ok((dir, names))
+            });
+            let (dir, names) = match listed {
+                Ok(listed) => listed,
+                // Like rm, rmdir(2) still removes one it cannot list if it
+                // is empty (#370).
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                    if real_rmdir(access).is_err() {
+                        walk.report_io(display, e);
+                    } else if walk.args.verbose {
+                        report_removed(display, true);
+                        flush_removed();
+                    }
+                    return None;
+                }
+                Err(e) => {
+                    walk.report_io(display, e);
+                    return None;
+                }
+            };
+            Some(Level {
+                dir,
+                names,
+                access: access.to_path_buf(),
+                display: display.to_path_buf(),
+                failures: walk.failures,
+            })
+        };
+        let mut stack: Vec<Level> = open(self, access, display).into_iter().collect();
+        while let Some(level) = stack.last_mut() {
+            let Some(name) = level.names.pop() else {
+                let level = stack.pop().expect("the level was just seen");
+                drop(level.dir);
+                // Like rm, the directories of what stays stay without
+                // another message.
+                if self.failures == level.failures {
+                    self.real_rmdir_shown(&level.access, &level.display);
+                }
+                continue;
+            };
+            let parent = level.dir.as_raw_fd();
+            let entry_access = PathBuf::from(format!("/proc/self/fd/{parent}")).join(&name);
+            let entry_display = level.display.join(&name);
+            if self.sweep_entry(parent, &name, &entry_access, &entry_display)
+                && let Some(below) = open(self, &entry_access, &entry_display)
+            {
+                stack.push(below);
+            }
+        }
+    }
+
+    /// Remove one entry of a swept directory; true when it is an excluded
+    /// directory to sweep in turn.
+    fn sweep_entry(
+        &mut self,
+        parent: std::os::fd::RawFd,
+        name: &std::ffi::OsStr,
+        access: &std::path::Path,
+        display: &std::path::Path,
+    ) -> bool {
+        let busy = || std::io::Error::from_raw_os_error(libc::EBUSY);
+        let entry = match EntryStat::of(access) {
+            Ok(entry) => entry,
+            Err(e) => {
+                self.report_io(display, e);
+                return false;
+            }
+        };
+        // A mount stays where it is mounted, busy, as in the walk (#358,
+        // #368); --one-file-system skips another filesystem's directory.
+        if entry.mount(access) {
+            self.report(display, busy());
+            return false;
+        }
+        if entry.is_dir() && self.device.is_some_and(|device| entry.dev != device) {
+            self.skip_device(display);
+            return false;
+        }
+        match self.trash(parent, name, access, display) {
+            Some(Outcome::Excluded) if entry.is_dir() => true,
+            Some(Outcome::Excluded) => {
+                self.real_remove(access, display, false);
+                false
+            }
+            Some(Outcome::Confined) => {
+                self.report(display, busy());
+                false
+            }
+            Some(Outcome::HoldsMount(error)) => {
+                self.report(display, error);
+                false
+            }
+            Some(Outcome::Done) | None => false,
+        }
+    }
+
+    /// rmdir(2) of an emptied directory for real, named under -v.
+    fn real_rmdir_shown(&mut self, access: &std::path::Path, display: &std::path::Path) {
+        match real_rmdir(access) {
+            Ok(()) => {
+                if self.args.verbose {
+                    report_removed(display, true);
+                    flush_removed();
+                }
+            }
+            Err(e) => self.report_io(display, e),
         }
     }
 

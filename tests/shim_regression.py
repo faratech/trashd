@@ -1382,6 +1382,113 @@ def main():
         assert bypassed.returncode == 0 and not victim.exists(), bypassed.stderr
         print("PASS: bypassed callers pass through without opening the store")
 
+        # A directory's own name is no verdict on what it holds. Excluded by
+        # a whitelist miss or a `*~` name, rm -r deleted the whole tree for
+        # real, the whitelisted files in it too; its entries are judged one
+        # by one, as -ri and the preload judge them (shim-1, common-policy-1,
+        # common-policy-2).
+        from urllib.parse import unquote
+        user_config = root / "config/trashd/config.toml"
+        user_config.parent.mkdir(parents=True, exist_ok=True)
+        records = root / "data/Trash/info"
+
+        def trashed_since(before):
+            return {unquote(line.removeprefix("Path=")) for record in set(records.glob("*.trashinfo")) - before
+                    for line in record.read_text().splitlines() if line.startswith("Path=")}
+
+        def whitelisted_tree(name):
+            tree = root / name
+            (tree / "sub").mkdir(parents=True)
+            (tree / "main.rs").write_bytes(b"fn main() {}")
+            (tree / "notes.txt").write_bytes(b"not whitelisted")
+            (tree / "sub/lib.rs").write_bytes(b"pub fn lib() {}")
+            return tree, {str(tree / "main.rs"), str(tree / "sub/lib.rs")}
+
+        try:
+            user_config.write_text('only_trash = ["*.rs"]\n')
+            for flags in (["-r"], ["-rf"], ["-r", "--one-file-system"]):
+                tree, expected = whitelisted_tree("whitelist" + "".join(flags))
+                before = set(records.glob("*.trashinfo"))
+                result = run([*flags, tree])
+                assert result.returncode == 0 and not tree.exists(), (flags, result.stderr)
+                assert trashed_since(before) == expected, (flags, trashed_since(before))
+            # -ri answered yes throughout comes to the same.
+            tree, expected = whitelisted_tree("whitelist-ri")
+            before = set(records.glob("*.trashinfo"))
+            status, transcript = drive(tree, None)
+            assert status == 0 and not tree.exists(), transcript
+            assert trashed_since(before) == expected, trashed_since(before)
+
+            # A project's own whitelist, from inside the project.
+            user_config.write_text("")
+            for index, (policy, trashed) in enumerate([
+                ('only_trash = ["src/*"]\n', {"src/lib.rs", "src/notes.txt", "src/nested"}),
+                ('only_trash = ["*.rs"]\n', {"src/lib.rs", "src/nested/mod.rs"}),
+            ]):
+                project = root / f"local-whitelist-{index}"
+                (project / "src/nested").mkdir(parents=True)
+                (project / ".trashd.toml").write_text(policy)
+                (project / "src/lib.rs").write_bytes(b"pub fn lib() {}")
+                (project / "src/notes.txt").write_bytes(b"not whitelisted")
+                (project / "src/nested/mod.rs").write_bytes(b"mod nested;")
+                before = set(records.glob("*.trashinfo"))
+                result = subprocess.run([str(binary), "-rf", "src"], text=True, capture_output=True,
+                                        env=env, cwd=project, timeout=10)
+                assert result.returncode == 0 and not (project / "src").exists(), (policy, result.stderr)
+                assert trashed_since(before) == {str(project / name) for name in trashed}, (policy, trashed_since(before))
+
+            # The default never_trash names `*~` backups and `*.tmp` files, not
+            # what a directory so named holds.
+            for name in ("thesis~", "export.tmp"):
+                backup = root / name
+                (backup / "chapters").mkdir(parents=True)
+                (backup / "ch1.txt").write_bytes(b"chapter one")
+                (backup / "chapters/ch2.txt").write_bytes(b"chapter two")
+                (backup / "scratch.tmp").write_bytes(b"excluded itself")
+                before = set(records.glob("*.trashinfo"))
+                result = run(["-rf", backup])
+                assert result.returncode == 0 and not backup.exists(), (name, result.stderr)
+                assert trashed_since(before) == {str(backup / "ch1.txt"), str(backup / "chapters")}, (name, trashed_since(before))
+
+            # A pattern naming everything below a directory still deletes it
+            # all for real.
+            user_config.write_text('never_trash = ["*/old"]\n')
+            old = root / "control/old"
+            (old / "sub").mkdir(parents=True)
+            (old / "a.txt").write_bytes(b"x")
+            (old / "sub/b.txt").write_bytes(b"x")
+            before = set(records.glob("*.trashinfo"))
+            result = run(["-r", old])
+            assert result.returncode == 0 and not old.exists(), result.stderr
+            assert trashed_since(before) == set(), trashed_since(before)
+            print("PASS: excluded directories are judged entry by entry; whitelisted and ordinary entries are trashed")
+
+            # bypass_paths names the program that ran rm, never the shim: a
+            # prefix covering the shim's own directory made every rm a real
+            # delete (cross-layer-4).
+            user_config.write_text(f'bypass_paths = [{json.dumps(str(binary.parent) + "/")}]\n')
+            victim = root / "own-directory-bypass.txt"
+            victim.write_bytes(b"x")
+            before = set(records.glob("*.trashinfo"))
+            result = run([victim])
+            assert result.returncode == 0 and not victim.exists(), result.stderr
+            assert trashed_since(before) == {str(victim)}, trashed_since(before)
+            caller_dir = root / "bypassed-caller"
+            caller_dir.mkdir()
+            caller = caller_dir / "sh"
+            caller.write_bytes(Path("/bin/sh").read_bytes())
+            caller.chmod(0o755)
+            user_config.write_text(f'bypass_paths = [{json.dumps(str(caller_dir) + "/")}]\n')
+            victim.write_bytes(b"x")
+            before = set(records.glob("*.trashinfo"))
+            result = subprocess.run([str(caller), "-c", f'{binary} "$1"; exit $?', "sh", str(victim)],
+                                    env=env, cwd=root, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0 and not victim.exists(), result.stderr
+            assert trashed_since(before) == set(), trashed_since(before)
+            print("PASS: bypass_paths is matched against rm's caller, not the shim")
+        finally:
+            user_config.unlink(missing_ok=True)
+
         # -v names every removed entry on stdout, children before the
         # directory holding them and the operand last, like GNU rm; the old
         # stderr annotation is gone (#435).

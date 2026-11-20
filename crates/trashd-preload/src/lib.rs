@@ -26,6 +26,9 @@ mod local_trust;
 #[path = "../../trashd-common/src/mounts.rs"]
 mod mounts;
 #[allow(dead_code)]
+#[path = "../../trashd-common/src/pattern_policy.rs"]
+mod pattern_policy;
+#[allow(dead_code)]
 #[path = "../../trashd-common/src/proc_stat.rs"]
 mod proc_stat;
 #[path = "../../trashd-common/src/seccomp_identity.rs"]
@@ -302,8 +305,15 @@ fn load_partial_config_with_mtime(path: &Path) -> (Option<PartialPreloadConfig>,
 }
 
 fn parse_partial_config(path: &Path, content: &str) -> Option<PartialPreloadConfig> {
+    let dropped = |key: &str, error: &toml::de::Error| {
+        host_stderr(&format!(
+            "trashd-preload: bad config {}: ignoring '{key}': {}",
+            path.display(),
+            error.message()
+        ));
+    };
     match legacy_config::normalize(content)
-        .and_then(|value| value.try_into::<PartialPreloadConfig>())
+        .and_then(|value| legacy_config::layer::<PartialPreloadConfig>(value, dropped))
     {
         Ok(partial) => Some(partial),
         Err(error) => {
@@ -607,16 +617,20 @@ fn dir_size_capped(path: &Path) -> (u64, bool) {
 /// Match a single never_trash/only_trash pattern against a path string.
 /// Mirrors trashd-common's `pattern_matches_any` so every layer agrees.
 fn pattern_matches(pattern: &str, path: &str) -> bool {
-    let expanded;
-    let pattern = if let Some(rest) = pattern.strip_prefix("~/") {
-        let Some(home) = home_dir() else {
-            return false;
-        };
-        expanded = home.join(rest).to_string_lossy().into_owned();
-        expanded.as_str()
-    } else {
-        pattern
+    let Some(rest) = pattern.strip_prefix("~/") else {
+        return expanded_pattern_matches(pattern, path);
     };
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    // The canonical home too: policy paths are canonical (common-policy-6).
+    let (raw, canonical) = pattern_policy::expand_home(rest, &home);
+    expanded_pattern_matches(&raw, path)
+        || canonical.is_some_and(|canonical| expanded_pattern_matches(&canonical, path))
+}
+
+/// `pattern_matches` for a pattern whose `~/` is already expanded.
+fn expanded_pattern_matches(pattern: &str, path: &str) -> bool {
     // Keep common literal prefix/suffix rules allocation-free, but only
     // after excluding interior wildcard syntax (#4).
     if let Some(prefix) = pattern.strip_suffix('*')
@@ -759,21 +773,15 @@ fn class_match(p: &[char], start: usize, c: char) -> ClassMatch {
     ClassMatch::Unterminated
 }
 
-/// Drop patterns with syntax we cannot honor ({a,b}) — in an only_trash
-/// whitelist a never-matching pattern real-deletes everything (#4).
+/// Normalize patterns by the rules trashd-common applies, dropping what the
+/// matcher cannot honour with a warning: in an only_trash whitelist a
+/// never-matching pattern real-deletes everything (#4). The preload kept
+/// its own copy of these rules, and it missed the empty pattern (#402,
+/// cross-layer-2).
 fn sanitize_patterns(list: Vec<String>, what: &str) -> Vec<String> {
-    list.into_iter()
-        .filter(|p| {
-            if p.contains('{') || p.contains('}') {
-                host_stderr(&format!(
-                    "trashd-preload: WARNING: dropping unsupported {what} pattern '{p}'"
-                ));
-                false
-            } else {
-                true
-            }
-        })
-        .collect()
+    pattern_policy::sanitize_patterns(&list, what, |warning| {
+        host_stderr(&format!("trashd-preload: WARNING: {warning}"));
+    })
 }
 
 /// Find the nearest `.trashd.toml` walking up from `path` to the filesystem
@@ -1031,6 +1039,12 @@ fn trash_dir_for(
         // before the real call failed busy anyway (#368).
         if mountpoint == path && is_mount_root(path) {
             return Err(StoreError::Unavailable);
+        }
+        // Only the mount the file is on: a nested subvolume's file went to a
+        // store on its mount root, which listing skips when that root shares
+        // the home trash's device (cross-layer-3).
+        if fs::metadata(&mountpoint).map(|meta| meta.dev()).ok() != Some(file_dev) {
+            return prepared_home_trash(home_trash, uid, now);
         }
         let topdir = |root: PathBuf| match lock_store(&root, uid) {
             Ok(guard) => Ok(Some(SelectedStore {
@@ -1759,19 +1773,22 @@ fn retire_copied_source(
 }
 
 /// Whether a trashed item exceeds a configured size cap. Mirrors trashd-common
-/// store.rs's limits (prepare_source :508 and trash_at_display :969): every
-/// knob is an EXACT-byte comparison — `len > mb.saturating_mul(1 MiB)`, which
-/// whole-MiB truncation let ~1 MiB slip past (#245) — and a zero value
-/// disables the knob. max_file_size_mb bounds a regular file and
-/// max_dir_size_mb a directory tree; a file the preload trashes piece by piece
-/// inside an `rm -rf` tree is a degenerate one-entry tree, so it must satisfy
-/// BOTH caps and the smaller configured one is the effective limit (#412).
+/// store.rs's limits (prepare_source and trash_at_display): every knob is an
+/// EXACT-byte comparison — `len > mb.saturating_mul(1 MiB)`, which whole-MiB
+/// truncation let ~1 MiB slip past (#245) — and a zero value disables the
+/// knob. max_file_size_mb bounds a regular file; max_dir_size_mb bounds a
+/// directory, through the bounded walk in `trash_entry`. Applying the tree
+/// cap to every file (#412) made a standalone file between the two caps a
+/// permanent delete here while every other layer trashed it
+/// (cross-layer-1). The hook cannot tell a file inside an `rm -rf` from a
+/// standalone one, so an oversized tree removed through the preload is
+/// trashed file by file (preload-8).
 fn exceeds_size_limit(cfg: &PreloadConfig, meta: &fs::Metadata) -> bool {
     exceeds_size_limit_mb(cfg, meta.is_file(), meta.len())
 }
 
 fn exceeds_size_limit_mb(cfg: &PreloadConfig, is_file: bool, len: u64) -> bool {
-    is_file && (over_size_cap(cfg.max_file_size_mb, len) || over_size_cap(cfg.max_dir_size_mb, len))
+    is_file && over_size_cap(cfg.max_file_size_mb, len)
 }
 
 fn over_size_cap(cap_mb: u64, len: u64) -> bool {
@@ -1798,7 +1815,109 @@ enum TrashAttempt {
 const MAX_CLAIM_ATTEMPTS: u32 = 8;
 
 fn try_trash(path: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> TrashAttempt {
-    trash_entry(path, meta, pid, now).0
+    remembered(trash_entry(path, meta, pid, now)).0
+}
+
+/// The trash roots this process moved entries into: (PID, roots). A
+/// recursive removal of an ancestor of the trash (`rm -rf ~/.local/share`)
+/// first trashed what it met into the trash, then reached the trash and
+/// deleted every entry for real, the ones it had just moved there too
+/// (cross-layer-5). While a process has trashed into a root, it may not
+/// delete anything in that root for real: the hooks answer EBUSY. Emptying
+/// tools run as processes of their own and are unaffected. The PID drops a
+/// forked child's inherited record; the lock is only tried and never held
+/// across a syscall, so a fork cannot leave a child waiting on it.
+static TRASHED_ROOTS: std::sync::Mutex<(u32, Vec<TrashedRoot>)> =
+    std::sync::Mutex::new((0, Vec::new()));
+/// The PID of the last record, so a hook of a process that trashed nothing
+/// skips the check without a lock or a syscall.
+static TRASHED_ROOTS_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Roots one process keeps a record of: one per filesystem it trashed on.
+const MAX_TRASHED_ROOTS: usize = 16;
+
+struct TrashedRoot {
+    /// As selected, to find it again without resolving it.
+    selected: PathBuf,
+    /// Resolved, as the hooks' canonical paths name it.
+    canonical: PathBuf,
+    identity: (u64, u64),
+}
+
+/// Record the root of an entry this process just trashed.
+fn remembered(
+    trashed: (TrashAttempt, Option<(PathBuf, PathBuf)>),
+) -> (TrashAttempt, Option<(PathBuf, PathBuf)>) {
+    if let (TrashAttempt::Trashed, Some((dest, _))) = &trashed
+        && let Some(root) = dest.parent().and_then(Path::parent)
+    {
+        remember_trashed_root(root);
+    }
+    trashed
+}
+
+fn remember_trashed_root(root: &Path) {
+    use std::sync::atomic::Ordering;
+    let pid = std::process::id();
+    let known = TRASHED_ROOTS
+        .try_lock()
+        .is_ok_and(|record| record.0 == pid && record.1.iter().any(|known| known.selected == root));
+    if known {
+        return;
+    }
+    let Ok(canonical) = fs::canonicalize(root) else {
+        return;
+    };
+    let Ok(meta) = fs::metadata(&canonical) else {
+        return;
+    };
+    let Ok(mut record) = TRASHED_ROOTS.try_lock() else {
+        return;
+    };
+    if record.0 != pid {
+        *record = (pid, Vec::new());
+    }
+    if record.1.len() < MAX_TRASHED_ROOTS {
+        record.1.push(TrashedRoot {
+            selected: root.to_path_buf(),
+            canonical,
+            identity: (meta.dev(), meta.ino()),
+        });
+    }
+    TRASHED_ROOTS_PID.store(pid, Ordering::Release);
+}
+
+/// Whether `abs` (a hook's canonical path) is in, or is, a trash root this
+/// process trashed into.
+fn in_trashed_root(abs: &Path) -> bool {
+    use std::sync::atomic::Ordering;
+    let recorded = TRASHED_ROOTS_PID.load(Ordering::Acquire);
+    if recorded == 0 || recorded != std::process::id() {
+        return false;
+    }
+    // The record is this process's own, so its lock was free when this
+    // process last took it: only another thread's brief update can hold it
+    // (a fork child, whose copy may be held forever, returned above).
+    let roots: Vec<(PathBuf, (u64, u64))> = TRASHED_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .1
+        .iter()
+        .filter(|root| abs.starts_with(&root.canonical))
+        .map(|root| (root.canonical.clone(), root.identity))
+        .collect();
+    roots.into_iter().any(|(root, identity)| {
+        fs::symlink_metadata(&root).is_ok_and(|meta| (meta.dev(), meta.ino()) == identity)
+    })
+}
+
+/// A hook's answer for a real delete inside a trash this process filled:
+/// EBUSY, as the shim refuses to remove a trash (cross-layer-5).
+fn keep_trashed_root(abs: &Path) -> Option<libc::c_int> {
+    if !in_trashed_root(abs) {
+        return None;
+    }
+    unsafe { *libc::__errno_location() = libc::EBUSY };
+    Some(-1)
 }
 
 /// `try_trash`, plus the published entry's data and sidecar paths: an rmdir
@@ -2201,7 +2320,7 @@ fn rmdir_unreadable(abs: &Path, meta: &fs::Metadata, pid: u32, now: u64) -> Opti
         }
         return Some(TrashAttempt::Error(libc::ENOTEMPTY));
     }
-    let (attempt, located) = trash_entry(abs, meta, pid, now);
+    let (attempt, located) = remembered(trash_entry(abs, meta, pid, now));
     match located {
         // The entry moved under the granted mode: put its own mode back on
         // the copy in the trash.
@@ -2240,19 +2359,46 @@ fn unique_id_atomic(
     base_name: &str,
     date: &libc::tm,
 ) -> Option<(String, PathBuf, fs::File)> {
+    let name_max = trash_id::name_max(info_dir);
+    unique_id_atomic_within(info_dir, files_dir, base_name, date, name_max)
+}
+
+/// `unique_id_atomic` with ids sized for a NAME_MAX of `name_max`. A name
+/// the filesystem refuses as too long made the delete permanent; it is
+/// claimed again shorter (cross-layer-6).
+fn unique_id_atomic_within(
+    info_dir: &Path,
+    files_dir: &Path,
+    base_name: &str,
+    date: &libc::tm,
+    mut name_max: usize,
+) -> Option<(String, PathBuf, fs::File)> {
+    loop {
+        match claim_unique_id(info_dir, files_dir, base_name, date, name_max) {
+            Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                name_max = trash_id::smaller_name_max(name_max)?;
+            }
+            claimed => return claimed.ok(),
+        }
+    }
+}
+
+fn claim_unique_id(
+    info_dir: &Path,
+    files_dir: &Path,
+    base_name: &str,
+    date: &libc::tm,
+    name_max: usize,
+) -> io::Result<(String, PathBuf, fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Truncate to avoid exceeding filesystem filename limits (255 bytes).
-    let max_base = 223; // reserve 32 for ".YYYYMMDDHHMMSS.NNNNN.trashinfo"
-    let base_name = if base_name.len() > max_base {
-        &base_name[..base_name.floor_char_boundary(max_base)]
-    } else {
-        base_name
-    };
+    // Room for ".trashinfo" and a collision suffix within NAME_MAX.
+    let base_name = trash_id::base_within(base_name, name_max);
 
     // Claim `candidate`: O_EXCL the .trashinfo AND ensure files/<candidate> is
-    // free. Some(path) = claimed; None = taken (try another) or fatal IO error.
-    let try_claim = |candidate: &str| -> Result<Option<(PathBuf, fs::File)>, ()> {
+    // free. Some(path) = claimed; None = taken (try another); Err = an I/O
+    // error (disk full, permission denied, a name too long).
+    let try_claim = |candidate: &str| -> io::Result<Option<(PathBuf, fs::File)>> {
         let path = info_dir.join(format!("{candidate}.trashinfo"));
         match fs::OpenOptions::new()
             .write(true)
@@ -2270,15 +2416,13 @@ fn unique_id_atomic(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-            Err(_) => Err(()), // real I/O error (disk full, permission denied)
+            Err(e) => Err(e),
         }
     };
 
     // Try base name
-    match try_claim(base_name) {
-        Ok(Some((path, file))) => return Some((base_name.to_string(), path, file)),
-        Ok(None) => {}
-        Err(()) => return None,
+    if let Some((path, file)) = try_claim(base_name)? {
+        return Ok((base_name.to_string(), path, file));
     }
 
     // Keep the first timestamped ID, then advance without rescanning the
@@ -2292,13 +2436,11 @@ fn unique_id_atomic(
         date.tm_min,
         date.tm_sec
     );
-    let mut names = trash_id::CollisionNames::new(base_name, &ts);
+    let mut names = trash_id::CollisionNames::new(base_name, &ts, name_max);
     loop {
         let candidate = names.next();
-        match try_claim(&candidate) {
-            Ok(Some((path, file))) => return Some((candidate, path, file)),
-            Ok(None) => continue,
-            Err(()) => return None,
+        if let Some((path, file)) = try_claim(&candidate)? {
+            return Ok((candidate, path, file));
         }
     }
 }
@@ -2607,7 +2749,13 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
                 return Some(ret);
             }
 
-            if let Some((abs, _)) = resolve_at_path(libc::AT_FDCWD, pathname)
+            let resolved = resolve_at_path(libc::AT_FDCWD, pathname);
+            if let Some((abs, _)) = &resolved
+                && let Some(refused) = keep_trashed_root(abs)
+            {
+                return Some(refused);
+            }
+            if let Some((abs, _)) = resolved
                 && !globally_excluded(&abs)
             {
                 // Use symlink_metadata to not follow symlinks — dangling symlinks
@@ -2661,7 +2809,13 @@ pub unsafe extern "C" fn unlinkat(
             }
             let is_removedir = (flags & libc::AT_REMOVEDIR) != 0;
 
-            if let Some((abs, identity)) = resolve_at_path(dirfd, pathname)
+            let resolved = resolve_at_path(dirfd, pathname);
+            if let Some((abs, _)) = &resolved
+                && let Some(refused) = keep_trashed_root(abs)
+            {
+                return Some(refused);
+            }
+            if let Some((abs, identity)) = resolved
                 && !globally_excluded(&abs)
             {
                 // Use symlink_metadata to not follow symlinks
@@ -2724,7 +2878,13 @@ pub unsafe extern "C" fn rmdir(pathname: *const libc::c_char) -> libc::c_int {
                 return Some(ret);
             }
 
-            if let Some((abs, _)) = resolve_at_path(libc::AT_FDCWD, pathname)
+            let resolved = resolve_at_path(libc::AT_FDCWD, pathname);
+            if let Some((abs, _)) = &resolved
+                && let Some(refused) = keep_trashed_root(abs)
+            {
+                return Some(refused);
+            }
+            if let Some((abs, _)) = resolved
                 && !globally_excluded(&abs)
             {
                 // Use symlink_metadata — rmdir only applies to real directories, not symlinks
@@ -2771,7 +2931,13 @@ pub unsafe extern "C" fn remove(pathname: *const libc::c_char) -> libc::c_int {
                 return Some(ret);
             }
 
-            if let Some((abs, _)) = resolve_at_path(libc::AT_FDCWD, pathname)
+            let resolved = resolve_at_path(libc::AT_FDCWD, pathname);
+            if let Some((abs, _)) = &resolved
+                && let Some(refused) = keep_trashed_root(abs)
+            {
+                return Some(refused);
+            }
+            if let Some((abs, _)) = resolved
                 && !globally_excluded(&abs)
             {
                 // remove() == unlink() for non-directories and rmdir() for
@@ -2875,6 +3041,59 @@ mod tests {
         assert!(second.len() + 10 <= 255);
         assert_eq!(fs::read(files.join(truncated)).unwrap(), b"orphan");
         assert!(!info.join(format!("{truncated}.trashinfo")).exists());
+    }
+
+    // cross-layer-5: once a process trashed into a root, its hooks refuse
+    // to delete anything in that root for real, so `rm -rf ~/.local/share`
+    // cannot destroy the entries it just moved there.
+    #[test]
+    fn a_trash_this_process_filled_is_kept_whole() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("Trash");
+        fs::create_dir_all(root.join("files")).unwrap();
+        fs::create_dir_all(root.join("info")).unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        let inside = [
+            canonical.clone(),
+            canonical.join("files"),
+            canonical.join("files/dir/y"),
+            canonical.join("info/x.trashinfo"),
+        ];
+        assert!(inside.iter().all(|path| !in_trashed_root(path)));
+        remember_trashed_root(&root);
+        assert!(inside.iter().all(|path| in_trashed_root(path)));
+        let beside = canonical.parent().unwrap().join("Trash-notes/x");
+        assert!(!in_trashed_root(&beside));
+        assert_eq!(keep_trashed_root(&canonical.join("files/x")), Some(-1));
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(keep_trashed_root(&beside), None);
+    }
+
+    // cross-layer-6: a sidecar name the filesystem refuses as too long made
+    // the delete permanent; a shorter id is claimed instead. The budget is
+    // above what the filesystem takes, as a filesystem may report one.
+    #[test]
+    fn ids_shrink_to_what_the_filesystem_takes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let info = fixture.path().join("info");
+        let files = fixture.path().join("files");
+        fs::create_dir(&info).unwrap();
+        fs::create_dir(&files).unwrap();
+        let date = libc::tm {
+            tm_year: 126,
+            tm_mon: 0,
+            tm_mday: 2,
+            ..unsafe { std::mem::zeroed() }
+        };
+        let name = "n".repeat(254);
+        let (first, path, _) = unique_id_atomic_within(&info, &files, &name, &date, 400)
+            .expect("a long name is never a reason for a permanent delete");
+        let (second, _, _) = unique_id_atomic_within(&info, &files, &name, &date, 400).unwrap();
+        assert_ne!(first, second);
+        assert!(path.exists());
+        for id in [first, second] {
+            assert!(id.len() + ".trashinfo".len() <= 255, "{}", id.len());
+        }
     }
 
     // #405: the copy reads exactly the selected version. Data appended past
@@ -3305,6 +3524,112 @@ mod tests {
         }
     }
 
+    // cross-layer-2 (#402): the preload kept an empty only_trash pattern,
+    // which matches nothing, so every delete it handled became permanent
+    // while the other layers trashed. common-policy-5: `dir/` and `./dir/*`
+    // matched nothing either. Both layers now share one rule set.
+    #[test]
+    fn patterns_follow_the_rules_shared_with_trashd_common() {
+        let mut cfg = PreloadConfig::default();
+        cfg.merge(toml::from_str::<PartialPreloadConfig>("only_trash = [\"\"]").unwrap());
+        assert!(cfg.only_trash.is_empty(), "{:?}", cfg.only_trash);
+        let local: LocalConfig = toml::from_str("only_trash = [\"\"]\n").unwrap();
+        assert!(sanitize_patterns(local.only_trash, "only_trash").is_empty());
+        cfg.merge(
+            toml::from_str::<PartialPreloadConfig>("only_trash = [\"src/\", \"./build/*\"]")
+                .unwrap(),
+        );
+        for path in ["/h/p/src/x", "/h/p/build/y"] {
+            assert!(
+                cfg.only_trash.iter().any(|p| pattern_matches(p, path)),
+                "{path}: {:?}",
+                cfg.only_trash
+            );
+        }
+    }
+
+    // common-policy-6: policy paths are canonical, so a HOME reached
+    // through a symlink never matched its `~/` patterns.
+    #[test]
+    fn home_patterns_match_through_a_symlinked_home() {
+        const CHILD: &str = "TRASHD_PRELOAD_SYMLINKED_HOME";
+        const TEST: &str = "tests::home_patterns_match_through_a_symlinked_home";
+        if mounts::is_rerun_child(TEST, CHILD) {
+            let base = tempfile::tempdir().unwrap();
+            let real = base.path().join("real");
+            fs::create_dir_all(real.join("docs")).unwrap();
+            let link = base.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            // Safety: the re-run child runs this one test on its own.
+            unsafe { std::env::set_var("HOME", &link) };
+            let canonical = fs::canonicalize(&real).unwrap();
+            let verdict = pattern_matches("~/docs/*", &canonical.join("docs/x").to_string_lossy())
+                && pattern_matches("~/docs/*", &link.join("docs/x").to_string_lossy());
+            mounts::report_test_verdict(Some(verdict));
+            return;
+        }
+        assert_eq!(mounts::rerun_test(TEST, CHILD), Some(true));
+    }
+
+    // cross-layer-3: like trashd-common, a topdir store only on the file's
+    // own filesystem: a nested subvolume's file went to a store on its mount
+    // root, which listing skips when that root shares the home device.
+    #[test]
+    fn topdir_store_needs_the_files_own_device() {
+        let base = tempfile::tempdir().unwrap();
+        let verdict =
+            mounts::in_private_mounts("tests::topdir_store_needs_the_files_own_device", || {
+                let mount = base.path().join("m");
+                let target = CString::new(mount.as_os_str().as_bytes()).unwrap();
+                if fs::create_dir(&mount).is_err()
+                    || unsafe {
+                        libc::mount(
+                            c"none".as_ptr(),
+                            target.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    } != 0
+                {
+                    return false;
+                }
+                // Safety: the re-run child runs this one test on its own.
+                unsafe { std::env::set_var("XDG_DATA_HOME", base.path().join("data")) };
+                let file = mount.join("file");
+                let uid = unsafe { libc::geteuid() };
+                // Each selection holds its store's lock: drop it before the
+                // next one.
+                let home =
+                    |dev| matches!(trash_dir_for(&file, dev, uid, 0), Ok(store) if store.home);
+                let checked = fs::write(&file, b"x").is_ok()
+                    && fs::metadata(&mount)
+                        .is_ok_and(|own| home(own.dev().wrapping_add(1)) && !home(own.dev()));
+                unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+                checked
+            });
+        assert_ne!(verdict, Some(false));
+    }
+
+    // cross-layer-7: one mistyped key drops only itself, in both loaders, so
+    // they apply the same layer.
+    #[test]
+    fn a_mistyped_key_drops_only_itself() {
+        let path = Path::new("/nonexistent/config.toml");
+        let partial = parse_partial_config(
+            path,
+            "only_trash = [\"*.rs\"]\nmax_file_size_mb = \"big\"\nmax_dir_size_mb = 4\n",
+        )
+        .expect("the valid keys still load");
+        assert_eq!(
+            partial.only_trash.as_deref(),
+            Some(&["*.rs".to_string()][..])
+        );
+        assert_eq!(partial.max_file_size_mb, None);
+        assert_eq!(partial.max_dir_size_mb, Some(4));
+        assert!(parse_partial_config(path, "only_trash = [\"*.rs\"\n").is_none());
+    }
+
     #[test]
     fn shipped_template_loads_preload_policy() {
         let edited = include_str!("../../../config/trashd.toml")
@@ -3542,10 +3867,12 @@ mod tests {
         assert_eq!(cfg.max_dir_size_mb, 5);
     }
 
-    // #412: the caps compare exact bytes, and every item is checked — a file
-    // is a degenerate one-entry tree, so the tree cap binds for it too.
+    // #245: the caps compare exact bytes. cross-layer-1: a file is limited by
+    // max_file_size_mb alone, as in every other layer; the tree cap applying
+    // to each file made a standalone file between the two caps a permanent
+    // delete here while the shim and the supervisor trashed it.
     #[test]
-    fn size_limits_compare_exact_bytes_and_degenerate_trees() {
+    fn size_limits_compare_exact_bytes_and_bind_files_by_the_file_cap() {
         const MIB: u64 = 1024 * 1024;
         let mut cfg = PreloadConfig::default();
         assert_eq!(cfg.max_file_size_mb, 1024);
@@ -3566,15 +3893,19 @@ mod tests {
         assert!(!over_size_cap(0, u64::MAX));
         // The default dir cap is unlimited, so only the file cap can refuse.
         assert!(!exceeds_size_limit_mb(&cfg, true, 2 * MIB));
-        // A degenerate tree: with max_dir_size_mb = 1, a 2 MiB file inside an
-        // rm -rf'd tree must not be trashed file-by-file (#412).
+        // The tree cap never binds a file: a 2 MiB file with
+        // max_dir_size_mb = 1 is trashed, as the shim and supervisor trash
+        // it. An oversized tree removed through the preload is therefore
+        // trashed file by file (preload-8).
         cfg.max_dir_size_mb = 1;
-        assert!(exceeds_size_limit_mb(&cfg, true, 2 * MIB));
-        assert!(exceeds_size_limit_mb(&cfg, true, MIB + 1));
-        assert!(!exceeds_size_limit_mb(&cfg, true, MIB));
-        // The file cap alone disabled still leaves the tree cap binding.
+        assert!(!exceeds_size_limit_mb(&cfg, true, 2 * MIB));
+        assert!(exceeds_size_limit_mb(
+            &cfg,
+            true,
+            cfg.max_file_size_mb * MIB + 1
+        ));
         cfg.max_file_size_mb = 0;
-        assert!(exceeds_size_limit_mb(&cfg, true, MIB + 1));
+        assert!(!exceeds_size_limit_mb(&cfg, true, 2 * MIB));
         // Both disabled: unlimited.
         cfg.max_dir_size_mb = 0;
         assert!(!exceeds_size_limit_mb(&cfg, true, u64::MAX));
