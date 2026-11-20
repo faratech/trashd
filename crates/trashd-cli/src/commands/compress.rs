@@ -45,16 +45,11 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
             continue;
         }
         // Keep the invariant "anything compress accepts is restorable":
-        // restore refuses to decompress beyond min(max_file_size_mb, 4 GiB),
-        // so a larger entry would be permanently stuck if swapped here.
-        let configured = store.config().max_file_size_mb.saturating_mul(1024 * 1024);
-        const HARD_DECOMPRESS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
-        let restore_limit = if configured == 0 {
-            HARD_DECOMPRESS_LIMIT
-        } else {
-            configured.min(HARD_DECOMPRESS_LIMIT)
-        };
-        if size_before > restore_limit {
+        // restore decompresses up to the entry's recorded size (at most
+        // 4 GiB), so larger data would be stuck if swapped here. Not up to
+        // max_file_size_mb as it is today: once lowered, every larger entry
+        // compressed before stayed unrestorable (cli-4).
+        if size_before > trashd_common::store::decompress_limit(entry.info.size) {
             continue;
         }
         // --dry-run performs the real compression, counting its output, so
@@ -1063,5 +1058,56 @@ mod tests {
         fs::write(&fresh.info_path, b"changed metadata").unwrap();
         assert!(compress_file_zstd(&store, &fresh, 8192, CommitMode::Publish).is_err());
         assert_eq!(fs::read(&fresh.info_path).unwrap(), b"changed metadata");
+    }
+
+    // Regression (cli-4): compress kept "anything it accepts is restorable"
+    // against max_file_size_mb as configured that day, and restore bounded
+    // decompression by the one configured later. Lowering the limit left
+    // compressed entries unrestorable. Both go by the entry's recorded size.
+    #[test]
+    fn compressed_entries_restore_under_a_lowered_file_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |max_file_size_mb| {
+            let mut config = trashd_common::Config::default();
+            config.never_trash.clear();
+            config.max_file_size_mb = max_file_size_mb;
+            TrashStore::open_isolated(&dir.path().join("Trash"), config).unwrap()
+        };
+        let store = open(1024);
+        let original = b"compressible ".repeat(200_000);
+        let file = dir.path().join("app.log");
+        fs::write(&file, &original).unwrap();
+        let id = store.trash(&file, None).unwrap();
+        run(&store, "0", false);
+        assert!(is_zstd(&store.find_entry(&id).unwrap().trashed_path));
+        let store = open(1);
+        let restored = store.restore(&id, None).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), original);
+    }
+
+    // cli-4: data larger than the entry's recorded size allows (and than
+    // the floor of restore's bound) is not compressed, whatever the file
+    // size limit is today: a lower one tomorrow would strand it.
+    #[test]
+    fn compress_skips_data_restore_could_refuse_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            TrashStore::open_isolated(&dir.path().join("Trash"), trashd_common::Config::default())
+                .unwrap();
+        let data = store.home_dir().join("files/grown");
+        // Sparse: only its length matters.
+        fs::File::create(&data)
+            .unwrap()
+            .set_len(trashd_common::store::decompress_limit(Some(1024)) + 1)
+            .unwrap();
+        let mut info = TrashInfo::new(dir.path().join("grown"));
+        info.size = Some(1024);
+        fs::write(
+            store.home_dir().join("info/grown.trashinfo"),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+        run(&store, "0", false);
+        assert!(!is_zstd(&data), "restore refuses what it decompresses to");
     }
 }

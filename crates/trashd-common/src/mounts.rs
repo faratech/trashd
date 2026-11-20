@@ -647,6 +647,20 @@ pub(crate) fn is_safe_trash_root(path: &Path, uid: u32) -> bool {
         && validate_private_dir(&path.join("info"), uid, false)
 }
 
+/// `is_safe_trash_root` for enumeration: a root whose info/ is missing is
+/// still listed. What its files/ hold is described by nothing any more;
+/// the listing shows it as orphans and a purge puts info/ back (#403).
+/// Skipped, that data stayed on the medium where no command saw it
+/// (store-metadata-4). An info/ that is there must be private like the rest.
+fn is_listable_trash_root(path: &Path, uid: u32) -> bool {
+    validate_private_dir(path, uid, false)
+        && validate_private_dir(&path.join("files"), uid, false)
+        && match fs::symlink_metadata(path.join("info")) {
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+            Ok(_) => validate_private_dir(&path.join("info"), uid, false),
+        }
+}
+
 /// Classify authenticated stores without creating or repairing directories.
 /// Remember each authenticated root's identity so removing files/info during
 /// cleanup does not invalidate it, and a replacement inode cannot inherit it.
@@ -1145,7 +1159,7 @@ fn trash_dirs_in(
         |root: &Path| fs::metadata(root).is_ok_and(|meta| seen.insert((meta.dev(), meta.ino())));
 
     // Always include home trash
-    if is_safe_trash_root(home_trash, uid) && first_sighting(home_trash) {
+    if is_listable_trash_root(home_trash, uid) && first_sighting(home_trash) {
         dirs.insert(home_trash.to_path_buf(), "home".into());
     }
 
@@ -1182,7 +1196,7 @@ fn trash_dirs_in(
         // Check shared .Trash/$UID first (spec §1.2.2a) — PROBE only: a
         // read-only enumeration must not create trash dirs on every mount (#38).
         if let Some(shared) = shared_trash_in(&mount.path, uid, false)
-            && is_safe_trash_root(&shared, uid)
+            && is_listable_trash_root(&shared, uid)
             && first_sighting(&shared)
         {
             dirs.entry(shared).or_insert(label.clone());
@@ -1191,7 +1205,7 @@ fn trash_dirs_in(
         // Also check .Trash-$UID (spec §1.2.2b)
         let topdir = mount.path.join(format!(".Trash-{uid}"));
         if private_trash_in(&mount.path, uid, false)
-            .is_some_and(|path| is_safe_trash_root(&path, uid))
+            .is_some_and(|path| is_listable_trash_root(&path, uid))
             && first_sighting(&topdir)
         {
             dirs.entry(topdir).or_insert(label);
@@ -1408,6 +1422,57 @@ mod tests {
         let (automatic, probed) = listed(true);
         assert_eq!(automatic, ["disk"]);
         assert_eq!(probed, [fixture.path().join("disk")]);
+    }
+
+    // store-metadata-4: a topdir root that lost its info/ was never
+    // enumerated, so the data stranded in its files/ stayed invisible to
+    // `trash ls` and `trash empty` (#403). It is listed; one whose info/ is
+    // there but not private, or whose files/ is missing, still is not.
+    #[test]
+    fn a_root_without_info_is_enumerated_for_its_stranded_data() {
+        let fixture = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let mut roots = std::collections::HashMap::new();
+        let mut table = String::new();
+        for name in [
+            "complete",
+            "no-info",
+            "open-info",
+            "linked-info",
+            "no-files",
+        ] {
+            let topdir = fixture.path().join(name);
+            let root = topdir_store(&topdir, uid);
+            match name {
+                "no-info" => fs::remove_dir(root.join("info")).unwrap(),
+                "open-info" => {
+                    fs::set_permissions(root.join("info"), fs::Permissions::from_mode(0o755))
+                        .unwrap()
+                }
+                "linked-info" => {
+                    fs::remove_dir(root.join("info")).unwrap();
+                    std::os::unix::fs::symlink(root.join("files"), root.join("info")).unwrap();
+                }
+                "no-files" => fs::remove_dir(root.join("files")).unwrap(),
+                _ => {}
+            }
+            roots.insert(name, root);
+            table.push_str(&format!(
+                "/dev/{name} {} ext4 rw,relatime 0 0\n",
+                topdir.display()
+            ));
+        }
+        let home = std::path::Path::new("/nonexistent/trashd-test/Trash");
+        let mut listed: Vec<&str> =
+            super::trash_dirs_in(home, super::parse_mounts(table.as_bytes()), false)
+                .into_iter()
+                .map(|(root, _)| *roots.iter().find(|(_, r)| **r == root).unwrap().0)
+                .collect();
+        listed.sort();
+        assert_eq!(listed, ["complete", "no-info"]);
+        // Listing created and repaired nothing.
+        assert!(!roots["no-info"].join("info").exists());
+        assert!(!roots["no-files"].join("files").exists());
     }
 
     // security-3: repairing a trash directory's mode never follows a symlink

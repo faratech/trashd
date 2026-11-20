@@ -774,20 +774,39 @@ impl TrashStore {
     }
 }
 
-/// Newest first. DeletionDate has one-second precision, so entries trashed
-/// within one second kept directory-listing (hash) order and `undo` picked an
-/// arbitrary one (#329). The recorded nanosecond deletion stamp orders them,
-/// or for older entries the sidecar's mtime from when it was published: the
+/// Newest first, by the instant of deletion (`deletion_instant`).
+/// DeletionDate has one-second precision, so entries trashed within one
+/// second kept directory-listing (hash) order and `undo` picked an arbitrary
+/// one (#329). The recorded nanosecond deletion stamp orders them, or for
+/// older entries the sidecar's mtime from when it was published: the
 /// filesystem's coarse clock can tie those (#345).
 pub(super) fn newest_first(entries: &mut [TrashEntry]) {
     entries.sort_by_key(|entry| {
-        let stamp = entry.info.deletion_ns.map(i128::from).or_else(|| {
-            entry.sidecar_version.map(|version| {
-                i128::from(version.modified.0) * 1_000_000_000 + i128::from(version.modified.1)
-            })
+        let published = entry.sidecar_version.map(|version| {
+            i128::from(version.modified.0) * 1_000_000_000 + i128::from(version.modified.1)
         });
-        std::cmp::Reverse((entry.info.deletion_date, stamp))
+        std::cmp::Reverse((deletion_instant(&entry.info), published))
     });
+}
+
+/// When an entry was deleted, in nanoseconds since the epoch: the instant
+/// `X-Trashd-DeletedNs` records, where there is one. DeletionDate is local
+/// time without an offset, so read back after the system's time zone
+/// changed, or inside the hour a DST fall-back repeats, it names another
+/// instant; ordered by it first, with the stamp only breaking ties, `undo`
+/// restored an entry that was not the last one deleted (store-metadata-7).
+/// The stamp counts only close to the date it was written with (zones are
+/// at most 26 hours apart): a sidecar whose date another tool rewrote, or a
+/// forged stamp, is ordered by its date, as an entry without a stamp is.
+fn deletion_instant(info: &TrashInfo) -> i128 {
+    const SECOND: i128 = 1_000_000_000;
+    const ZONE_SPREAD: i128 = 26 * 60 * 60 * SECOND;
+    let dated = i128::from(info.deletion_date.timestamp()) * SECOND;
+    match info.deletion_ns.map(i128::from) {
+        // The date drops the stamp's fraction of a second.
+        Some(stamp) if (stamp - dated).abs() <= ZONE_SPREAD + SECOND => stamp,
+        _ => dated,
+    }
 }
 
 /// A topdir root's files/ and info/, each opened following no symlink (in

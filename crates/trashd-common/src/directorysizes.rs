@@ -311,39 +311,13 @@ pub(crate) fn record_directory(trash_dir: &Path, name: &OsStr, size: u64) -> io:
     Ok(())
 }
 
-/// Compute directory size recursively (bytes, like `du -B1`).
+/// Compute directory size recursively (bytes, like `du -B1`): the walk that
+/// sizes a directory when it is trashed, so a rebuilt row equals the one
+/// `record_directory` got. A walk of its own here stopped 100 levels down
+/// and wrote a row of 0 for a deeper tree, and neither counted the
+/// directories' own blocks (store-metadata-9). Symlinks are never followed.
 fn dir_size_bytes(path: &Path) -> u64 {
-    dir_size_bytes_inner(path, 0)
-}
-
-/// Depth cap mirrors `copy_tree`'s, so a pathological deep tree can't exhaust
-/// the stack (returns a partial total once the cap is hit).
-const DIR_SIZE_MAX_DEPTH: u32 = 100;
-
-fn dir_size_bytes_inner(path: &Path, depth: u32) -> u64 {
-    if depth > DIR_SIZE_MAX_DEPTH {
-        return 0;
-    }
-    let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            // symlink_metadata / file_type(): never follow symlinks —
-            // following made the walk escape into external (possibly huge or
-            // cyclic) trees and count foreign data.
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                total = total.saturating_add(dir_size_bytes_inner(&entry.path(), depth + 1));
-            } else if !ft.is_symlink() {
-                // Count blocks * 512 for actual disk usage (like du)
-                if let Ok(meta) = entry.metadata() {
-                    total = total.saturating_add(meta.blocks().saturating_mul(512));
-                }
-            }
-        }
-    }
-    total
+    crate::store::tree_allocated_bytes(path)
 }
 
 /// Percent-encode a directory name for the cache.

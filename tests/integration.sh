@@ -397,6 +397,25 @@ fi
 umount /work/dedup-b /work/dedup-a
 
 # -----------------------------------------------------------------------
+# A topdir trash that lost its info/ still shows the data stranded in its
+# files/ and can be emptied (#403, store-metadata-4): such a root was never
+# enumerated, and the root lock refused it.
+# -----------------------------------------------------------------------
+mkdir -p /work/no-info
+mount -t tmpfs -o mode=755 trashd-no-info /work/no-info
+NO_INFO_ROOT="/work/no-info/.Trash-$(id -u)"
+mkdir -m 700 "$NO_INFO_ROOT" "$NO_INFO_ROOT/files"
+echo "stranded" > "$NO_INFO_ROOT/files/trashd_it_stranded"
+NO_INFO_LISTED=$(trash ls 2>&1 | grep -c "trashd_it_stranded" || true)
+if [[ "$NO_INFO_LISTED" -ge 1 ]] && trash empty -y >/dev/null 2>&1 \
+        && [[ ! -e "$NO_INFO_ROOT/files/trashd_it_stranded" ]]; then
+    pass "Topdir trash without info/ is listed and emptied"
+else
+    fail "Topdir trash without info/ is listed and emptied" "listed $NO_INFO_LISTED times, or not emptied"
+fi
+umount /work/no-info
+
+# -----------------------------------------------------------------------
 # trash config show
 # -----------------------------------------------------------------------
 if trash config show 2>&1 | grep >/dev/null "never_trash"; then

@@ -525,6 +525,72 @@
   supervisor's unlink/rmdir checks gets the kernel's
   EISDIR/ENOTDIR/ENOTEMPTY instead of being trashed with success. (#507)
 
+- The walk that sizes a directory when it is trashed holds one
+  descriptor per level instead of one per subdirectory. A directory with
+  more subdirectories than the descriptor limit (a cargo registry, a
+  photo library) recorded a fraction of its size in `X-Trashd-Size` and
+  `directorysizes` for the life of the entry, which hid it from the size
+  cap, `trash du` and `trash status`. A walk that still runs out of
+  descriptors records no size, and accounting measures the tree itself.
+  (#527)
+
+- Directories can be trashed when the trash is on a filesystem without
+  `RENAME_NOREPLACE` (NFS, 9p, FUSE without rename2). The copy fallback
+  published into `files/` with the same flag and then refused every
+  directory, each time after a full copy. The staged copy is now renamed
+  over an empty directory created exclusively for it in the private
+  `files/`. Restoring a directory onto such a filesystem is still
+  refused. (#529)
+
+- A compressed entry restores whatever `max_file_size_mb` is set to
+  later. Restore bounded decompression by the current setting, which
+  only limits what may enter the trash: lowering it left larger
+  compressed entries unrestorable, and automatic compression never
+  looked at it. The bound is now the size the entry recorded when it was
+  trashed (at least 64 MiB, at most 4 GiB), and `trash compress` leaves
+  alone data larger than that. (#524, #555, #444)
+
+- `trash restore --force` keeps a recorded path's confinement when it
+  retries under a `.N` name: the retry stays below the entry's topdir
+  and follows no symlinked ancestor. The retry was treated as a
+  destination the user chose, so a crafted sidecar with an empty `Path=`
+  on removable media restored its data beside the mount point
+  (`<topdir>.1`). A recorded path that names the topdir itself is
+  refused. (#525, #445)
+
+- A failed cross-device copy removes everything it copied, read-only
+  directories included (0555 trees such as Go module caches). A failed
+  restore left a hidden `.trashd-copy-*` tree beside the destination on
+  every attempt. (#530)
+
+- Cross-device copies keep the `user.*` extended attributes of read-only
+  files and directories: attributes are copied before the mode is
+  applied. (#531)
+
+- A restore that has to copy makes its destination durable (an fsync of
+  the directory, a syncfs for a tree) before it removes the trash copy,
+  and keeps the trash copy if that fails. A crash could keep the removal
+  and lose the restored name. (#533)
+
+- A trash root whose `info/` is missing is enumerated on every mount,
+  and `trash empty`, retention and `trash fsck --fix` put `info/` back
+  before purging. The #403 fix listed the stranded data, but the root
+  lock refused the root, so it could never be removed, and such roots on
+  other mounts were not listed at all. (#537)
+
+- `trash undo` and `trash ls` order entries by the exact deletion
+  instant (`X-Trashd-DeletedNs`) before the local-time `DeletionDate`,
+  so entries deleted across a DST fall-back or a time zone change keep
+  their real order and `undo` restores the one deleted last. (#540)
+
+- A `directorysizes` rebuild measures trees deeper than 100 levels (it
+  wrote a size of 0 for them), and rows count the directories' own
+  blocks, as `du -B1` does. (#542)
+
+- When an operand is replaced by one of another type between sizing and
+  the move, the entry records the size of what landed, and gets a
+  `directorysizes` row only if a directory landed. (#492)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start
