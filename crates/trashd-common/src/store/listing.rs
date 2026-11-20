@@ -188,10 +188,10 @@ impl TrashStore {
     }
 
     pub(super) fn warn_unreadable_root(root: &Path, error: TrashError) {
-        eprintln!(
+        crate::report_note(&format!(
             "trashd: warning: skipping unreadable trash {}: {error}",
             root.display()
-        );
+        ));
     }
 
     #[cfg(test)]

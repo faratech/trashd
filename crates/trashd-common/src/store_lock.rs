@@ -6,6 +6,50 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long a writer waits for a trash root's lock before it reports the
+/// trash busy (EBUSY). Holders keep it for one publication, sidecar write
+/// or detach, never for a copy; a longer hold is a holder that was stopped
+/// (Ctrl-Z, SIGSTOP) or hangs on its filesystem. Waiting without a bound
+/// hung every delete of the user behind it, the preload's inside arbitrary
+/// processes' unlink() included (store-metadata-6).
+pub const ROOT_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The wait once a lock has timed out in this process, until an
+/// acquisition of it succeeds again or `STUCK_MEMORY` passes: long enough
+/// for ordinary contention, short enough that a process deleting many
+/// files behind a stuck holder does not wait the full bound for each.
+const STUCK_LOCK_WAIT: Duration = Duration::from_millis(250);
+const STUCK_MEMORY: Duration = Duration::from_secs(60);
+
+/// The lock that last timed out here (device and inode folded into one
+/// word, 0 for none) and until when that is remembered, in milliseconds on
+/// `clock()`. Two words that are not updated together: a race only makes
+/// one wait longer or shorter than intended.
+static STUCK_LOCK: AtomicU64 = AtomicU64::new(0);
+static STUCK_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds on the monotonic clock.
+fn clock() -> u64 {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    (now.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add(now.tv_nsec as u64 / 1_000_000)
+}
+
+fn lock_key(lock: &std::fs::Metadata) -> u64 {
+    (lock.dev().rotate_left(32) ^ lock.ino()).max(1)
+}
+
+/// The error of a root lock that stayed held for the whole wait: EBUSY,
+/// which unlink(2) and rmdir(2) document and every layer reports without
+/// deleting anything.
+fn busy() -> io::Error {
+    io::Error::from_raw_os_error(libc::EBUSY)
+}
 
 /// A locked trash root and the descriptors it was validated through.
 ///
@@ -97,6 +141,80 @@ fn open_lock(root: i32, uid: u32, device: Option<u64>) -> io::Result<(File, File
     Ok((state, lock))
 }
 
+/// flock(LOCK_EX) on a root's lock file within `wait` (None: one attempt);
+/// false when it stayed held. Polled, never blocking: flock(2) has no
+/// timeout, and a blocking one waited for as long as its holder lived or
+/// stayed stopped (store-metadata-6). The first pauses are short, so a
+/// writer behind an ordinary holder loses microseconds, not a timer tick.
+fn lock_within(lock: &File, key: u64, wait: Option<Duration>) -> io::Result<bool> {
+    let remembered =
+        STUCK_LOCK.load(Ordering::Relaxed) == key && clock() < STUCK_UNTIL.load(Ordering::Relaxed);
+    let wait = wait.map(|wait| {
+        if remembered {
+            wait.min(STUCK_LOCK_WAIT)
+        } else {
+            wait
+        }
+    });
+    let deadline = wait.map(|wait| Instant::now() + wait);
+    let mut pause = Duration::from_micros(50);
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            if remembered {
+                STUCK_UNTIL.store(0, Ordering::Relaxed);
+            }
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        let Some(deadline) = deadline else {
+            return Ok(false);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            STUCK_LOCK.store(key, Ordering::Relaxed);
+            STUCK_UNTIL.store(
+                clock().saturating_add(STUCK_MEMORY.as_millis() as u64),
+                Ordering::Relaxed,
+            );
+            return Ok(false);
+        }
+        sleep(pause.min(left));
+        pause = (pause * 2).min(Duration::from_millis(20));
+    }
+}
+
+/// Sleep for about `duration`. Not `std::thread::sleep`, which asserts
+/// that the call can only be interrupted: this runs inside arbitrary
+/// processes (the preload), and one whose seccomp filter answers the sleep
+/// with an errno must not be aborted by it. A sleep that ends early, or
+/// does not happen, only makes the next attempt come sooner.
+fn sleep(duration: Duration) {
+    let request = libc::timespec {
+        tv_sec: duration.as_secs() as libc::time_t,
+        tv_nsec: duration.subsec_nanos() as libc::c_long,
+    };
+    unsafe { libc::nanosleep(&request, std::ptr::null_mut()) };
+}
+
+/// A hold on `.trashd/copy.lock`: shared by every writer with a copy staged
+/// in the state directory, exclusive for the sweep that claims abandoned
+/// stages. A copy is staged without the root lock (store-metadata-6), so
+/// the root lock no longer says whether a stage's writer is alive; this
+/// does, and it dies with the writer. Unlocked explicitly on drop, as the
+/// root lock is: a forked child may hold a descriptor of it too.
+pub struct StageLease(File);
+
+impl Drop for StageLease {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl RootMutationGuard {
     pub fn acquire(root: &Path) -> io::Result<Self> {
         Self::acquire_as(root, unsafe { libc::geteuid() })
@@ -104,17 +222,24 @@ impl RootMutationGuard {
 
     /// `acquire` for a caller that already knows its effective UID.
     pub fn acquire_as(root: &Path, uid: u32) -> io::Result<Self> {
-        Self::acquire_with(root, uid, false)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))
+        Self::acquire_within(root, uid, ROOT_LOCK_WAIT)
+    }
+
+    /// `acquire_as` that reports the root busy (EBUSY) once its lock stayed
+    /// held for `wait`.
+    pub fn acquire_within(root: &Path, uid: u32, wait: Duration) -> io::Result<Self> {
+        Self::acquire_with(root, uid, Some(wait))?.ok_or_else(busy)
     }
 
     /// Try the same validated lock without waiting for an active writer.
     /// Maintenance uses this to leave live copy stages alone (#383).
     pub(crate) fn try_acquire_as(root: &Path, uid: u32) -> io::Result<Option<Self>> {
-        Self::acquire_with(root, uid, true)
+        Self::acquire_with(root, uid, None)
     }
 
-    fn acquire_with(root: &Path, uid: u32, nonblocking: bool) -> io::Result<Option<Self>> {
+    /// `wait` None: one attempt, Ok(None) when the lock is held. Some: until
+    /// the wait is over, then Ok(None) as well.
+    fn acquire_with(root: &Path, uid: u32, wait: Option<Duration>) -> io::Result<Option<Self>> {
         let name = CString::new(root.as_os_str().as_bytes())?;
         #[cfg(test)]
         validation_probe::run(root, false);
@@ -147,18 +272,8 @@ impl RootMutationGuard {
         if !m.is_file() || m.uid() != uid || m.nlink() != 1 || m.mode() & 0o777 != 0o600 {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
-        loop {
-            let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
-            if unsafe { libc::flock(lock.as_raw_fd(), flags) } == 0 {
-                break;
-            }
-            let e = io::Error::last_os_error();
-            if nonblocking && e.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(e);
-            }
+        if !lock_within(&lock, lock_key(&m), wait)? {
+            return Ok(None);
         }
         #[cfg(test)]
         validation_probe::run(root, true);
@@ -196,6 +311,48 @@ impl RootMutationGuard {
     /// The validated private state directory, `.trashd/`.
     pub fn state(&self) -> &File {
         &self.state
+    }
+
+    /// `.trashd/copy.lock`, locked with `operation` without waiting; None
+    /// when another holder excludes it.
+    fn stage_lock(&self, operation: libc::c_int) -> io::Result<Option<StageLease>> {
+        // Read-write: NFS takes a shared lock only on a readable descriptor
+        // and an exclusive one only on a writable one.
+        let lock = open_at(
+            self.state.as_raw_fd(),
+            c"copy.lock",
+            libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+            0o600,
+        )?;
+        let m = lock.metadata()?;
+        if !m.is_file() || m.uid() != self.state.metadata()?.uid() || m.nlink() != 1 {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        loop {
+            if unsafe { libc::flock(lock.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+                return Ok(Some(StageLease(lock)));
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(None),
+                _ => return Err(error),
+            }
+        }
+    }
+
+    /// Announce a copy this writer stages in the state directory and goes
+    /// on with after releasing the root lock: until the lease is dropped no
+    /// sweep takes a copy stage of this root for abandoned. Taken under the
+    /// root lock, where only a sweep that also holds it could exclude it.
+    pub fn lease_stages(&self) -> io::Result<StageLease> {
+        self.stage_lock(libc::LOCK_SH)?.ok_or_else(busy)
+    }
+
+    /// The sweep's side: Some while no writer has a copy staged, and for as
+    /// long as the result is held none can start one.
+    pub fn claim_idle_stages(&self) -> io::Result<Option<StageLease>> {
+        self.stage_lock(libc::LOCK_EX)
     }
 }
 
@@ -425,6 +582,106 @@ mod tests {
         }
         eprintln!("held {held} unlocked {unlocked}");
         crate::mounts::report_test_verdict(Some(held && unlocked));
+    }
+
+    fn private_root(fixture: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = fixture.join("Trash");
+        for p in [&root, &root.join("files"), &root.join("info")] {
+            std::fs::DirBuilder::new().mode(0o700).create(p).unwrap();
+        }
+        root
+    }
+
+    // store-metadata-6: every writer waited for the root lock in a blocking
+    // flock, for as long as its holder lived or stayed stopped. The wait
+    // ends busy, and a process that has just waited it out for a lock waits
+    // only briefly for the same one until it gets it again.
+    #[test]
+    fn a_held_lock_ends_the_wait_busy_and_is_remembered() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "TRASHD_TEST_STUCK_LOCK";
+        const TEST: &str = "store_lock::tests::a_held_lock_ends_the_wait_busy_and_is_remembered";
+        // The memory of a stuck lock is one per process: alone in a child.
+        if !crate::mounts::is_rerun_child(TEST, CHILD) {
+            assert_eq!(crate::mounts::rerun_test(TEST, CHILD), Some(true));
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = private_root(fixture.path());
+        let uid = unsafe { libc::geteuid() };
+        // Another open file description, as another process has.
+        let holder = super::RootMutationGuard::acquire_as(&root, uid).unwrap();
+        let started = Instant::now();
+        let first =
+            super::RootMutationGuard::acquire_within(&root, uid, Duration::from_millis(150))
+                .err()
+                .and_then(|error| error.raw_os_error());
+        let first_wait = started.elapsed();
+        // Asked to wait half a minute, it gives up after the short wait.
+        let started = Instant::now();
+        let second = super::RootMutationGuard::acquire_within(&root, uid, Duration::from_secs(30))
+            .err()
+            .and_then(|error| error.raw_os_error());
+        let second_wait = started.elapsed();
+        let try_lock = matches!(
+            super::RootMutationGuard::try_acquire_as(&root, uid),
+            Ok(None)
+        );
+        drop(holder);
+        // Free again: taken at once, and nothing is remembered.
+        let free = super::RootMutationGuard::acquire_within(&root, uid, Duration::from_secs(30));
+        let forgotten = super::STUCK_UNTIL.load(Ordering::Relaxed) == 0;
+        eprintln!(
+            "first {first:?} after {first_wait:?}, second {second:?} after {second_wait:?}, \
+             try_lock {try_lock}, free {}, forgotten {forgotten}",
+            free.is_ok()
+        );
+        crate::mounts::report_test_verdict(Some(
+            first == Some(libc::EBUSY)
+                && first_wait >= Duration::from_millis(150)
+                && first_wait < Duration::from_secs(5)
+                && second == Some(libc::EBUSY)
+                && second_wait < Duration::from_secs(5)
+                && try_lock
+                && free.is_ok()
+                && forgotten,
+        ));
+    }
+
+    // store-metadata-6: a copy is staged without the root lock, so the
+    // sweep of abandoned stages asks the stage lock whether a writer is
+    // still copying.
+    #[test]
+    fn a_leased_stage_excludes_the_sweep_until_it_is_dropped() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = private_root(fixture.path());
+        let guard = super::RootMutationGuard::acquire(&root).unwrap();
+        assert!(guard.claim_idle_stages().unwrap().is_some());
+        // Leases are shared: every copier of the root holds one.
+        let first = guard.lease_stages().unwrap();
+        let second = guard.lease_stages().unwrap();
+        assert!(guard.claim_idle_stages().unwrap().is_none());
+        drop(first);
+        assert!(guard.claim_idle_stages().unwrap().is_none());
+        drop(second);
+        // While a sweep claims the stages, no copy starts.
+        let claim = guard.claim_idle_stages().unwrap();
+        assert!(claim.is_some());
+        assert_eq!(
+            guard.lease_stages().err().and_then(|e| e.raw_os_error()),
+            Some(libc::EBUSY)
+        );
+        drop(claim);
+        drop(guard.lease_stages().unwrap());
+        // The lock file is opened like store.lock: no symlink is followed.
+        let victim = fixture.path().join("victim");
+        std::fs::remove_file(root.join(".trashd/copy.lock")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".trashd/copy.lock")).unwrap();
+        assert!(guard.lease_stages().is_err());
+        assert!(guard.claim_idle_stages().is_err());
+        assert!(!victim.exists());
     }
 
     #[test]

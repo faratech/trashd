@@ -857,6 +857,14 @@ pub fn try_pinned(
         Err(TrashError::Excluded { .. } | TrashError::Refused(_) | TrashError::TooLarge { .. }) => {
             Ok(Decision::Continue)
         }
+        // A trash whose lock stayed held for the whole wait is busy, and
+        // so is the delete: it fails as unlink(2) of a busy file does and
+        // nothing is removed. Declined, a target without the preload had
+        // the kernel delete the entry for good, behind a holder that was
+        // only stopped (store-metadata-6).
+        Err(TrashError::Io(error)) if error.raw_os_error() == Some(libc::EBUSY) => {
+            Ok(Decision::Errno(libc::EBUSY))
+        }
         // EXDEV (namespaced/cross-device target), hash/store hiccups, and
         // unsafe stores all defer to the target's own layer. Re-resolving
         // `display` in the supervisor could mutate an unrelated host path.
@@ -2208,6 +2216,57 @@ time.sleep(60)
         assert!(matches!(info, Decision::Errno(libc::EBUSY)), "got {info:?}");
         assert!(matches!(emptied, Decision::Continue), "got {emptied:?}");
         assert!(matches!(entry, Decision::Continue), "got {entry:?}");
+    }
+
+    // store-metadata-6: the wait for a trash root's lock is bounded, and a
+    // trash that stays locked is busy. Declined like any store failure, a
+    // target without the preload had the kernel run its delete: permanent,
+    // behind a holder that was only stopped.
+    #[test]
+    fn a_busy_trash_fails_the_delete_instead_of_running_it() {
+        let (mut store, work, fixture) = setup("busy-trash");
+        store.set_root_lock_wait(std::time::Duration::from_millis(200));
+        std::fs::write(work.join("kept"), b"payload").unwrap();
+        std::fs::create_dir(work.join("empty")).unwrap();
+        let mut child = spawn_with_cwd(&work);
+        let nr = if cfg!(target_arch = "x86_64") {
+            NR_UNLINKAT_X86_64
+        } else {
+            NR_UNLINKAT_AARCH64
+        };
+        let attempt = |raw: &str, remove_dir: bool| {
+            let flags = if remove_dir { libc::AT_REMOVEDIR } else { 0 };
+            try_pinned(
+                child.id(),
+                nr,
+                &[libc::AT_FDCWD as u64, 0, flags as u64, 0, 0, 0],
+                OsStr::new(raw),
+                &work.join(raw),
+                remove_dir,
+                -1,
+                0,
+                &store,
+            )
+            .unwrap()
+        };
+        // Another open file description, as another process has.
+        let holder =
+            trashd_common::store_lock::RootMutationGuard::acquire(&fixture.path().join("trash"))
+                .unwrap();
+        let busy = [attempt("kept", false), attempt("empty", true)];
+        drop(holder);
+        let freed = attempt("kept", false);
+        child.kill().unwrap();
+        let _ = child.wait();
+        for decision in busy {
+            assert!(
+                matches!(decision, Decision::Errno(libc::EBUSY)),
+                "got {decision:?}"
+            );
+        }
+        assert!(work.join("empty").is_dir());
+        assert!(matches!(freed, Decision::Trashed), "got {freed:?}");
+        assert!(!work.join("kept").exists());
     }
 
     // Regression (review, HIGH): ABSOLUTE pathnames must resolve against the

@@ -243,7 +243,7 @@ fn write_log(home: &Path, message: &str) {
     let result = open_log_for_append(&path).and_then(|f| append_record(&path, f, &line));
 
     if let Err(e) = result {
-        eprintln!("trashd: failed to write operation log: {e}");
+        crate::report_note(&format!("trashd: failed to write operation log: {e}"));
     }
 }
 
@@ -300,7 +300,9 @@ fn rotate_oversized_log(path: &Path, projected_len: u64) {
     let mut rotated = path.as_os_str().to_os_string();
     rotated.push(".1");
     if let Err(e) = fs::rename(path, Path::new(&rotated)) {
-        eprintln!("trashd: warning: could not rotate operation log: {e}");
+        crate::report_note(&format!(
+            "trashd: warning: could not rotate operation log: {e}"
+        ));
     }
 }
 

@@ -412,9 +412,18 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 proc = subprocess.Popen([str(binary), *flags, str(victim)], env=env, cwd=root,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                # The wait for the store's lock is a poll: flock(LOCK_NB),
+                # then a sleep (nanosleep or clock_nanosleep).
+                waiting = {"x86_64": {"73", "35", "230"}, "aarch64": {"32", "101", "115"}}[os.uname().machine]
                 deadline = time.monotonic() + 10
-                while not any(line.split()[1] == "->" and str(proc.pid) in line.split()
-                              for line in Path("/proc/locks").read_text().splitlines()):
+
+                def waits_for_lock():
+                    try:
+                        return Path(f"/proc/{proc.pid}/syscall").read_text().split()[0] in waiting
+                    except (OSError, IndexError):
+                        return False
+
+                while not waits_for_lock():
                     assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()
                     time.sleep(0.01)
                 victim.unlink()

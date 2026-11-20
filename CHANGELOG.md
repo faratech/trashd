@@ -657,6 +657,37 @@
   `EACCES` instead of removing the directory for real. (#552, #491,
   #502, #504)
 
+- A delete that has to copy its operand into the trash (another
+  filesystem, or one without `RENAME_NOREPLACE`) no longer holds the
+  trash's lock while it copies. One large tree, or a copy stopped with
+  Ctrl-Z, made every other delete of the user wait: `rm` in another
+  terminal, a wrapped root shell, the preload inside any program's
+  `unlink()`. The copy is staged without the lock and published under
+  it, in the store (shim, CLI, supervisor) and in the preload's file
+  copy. Until then the entry's `.trashinfo` is locked, so `trash empty`,
+  retention and `trash fsck` leave the entry alone however long the copy
+  takes, and `.trashd/copy.lock` keeps cleanup from taking the staged
+  copy for an abandoned one. (#539)
+
+- Nothing waits for a trash's lock without end. A writer that finds it
+  held for 10 seconds reports the trash busy and deletes nothing: `rm`
+  says `Device or resource busy`, the preload fails the delete with
+  `EBUSY`, and the seccomp supervisor answers `EBUSY` instead of
+  declining, which lets the kernel delete for good. Every layer used to
+  block in `flock` for as long as the holder lived or stayed stopped. A
+  process that has waited the 10 seconds once waits 250 ms for the same
+  lock until it gets it again. (#539)
+
+- The store's remaining warnings (a source that could not be removed
+  after its copy, restore and purge notes, operation-log failures) are
+  written without `eprintln!`, which panics when stderr fails; in the
+  seccomp supervisor that panic ended the session's protection. (#500)
+
+- The unlocked cleanup sweep opens a trash's `.trashd` like the store's
+  other directories, following no symlink in the trash root and staying
+  on its device, and a purge reads the age of a sidecar without data
+  through the `info/` its lock validated. (#508)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

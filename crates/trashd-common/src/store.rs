@@ -115,6 +115,9 @@ pub struct TrashStore {
     /// How long an explicit purge, empty or restore waits for an entry lock
     /// before it reports the entry busy ([`ENTRY_LOCK_WAIT`]).
     entry_lock_wait: std::time::Duration,
+    /// How long this store waits for a trash root's lock before it reports
+    /// the root busy.
+    root_lock_wait: std::time::Duration,
 }
 
 /// A single entry in the trash.
@@ -248,6 +251,12 @@ impl TrashStore {
         &self.home
     }
 
+    /// Wait at most `wait` for a trash root's lock before reporting the
+    /// root busy, instead of `store_lock::ROOT_LOCK_WAIT`.
+    pub fn set_root_lock_wait(&mut self, wait: std::time::Duration) {
+        self.root_lock_wait = wait;
+    }
+
     /// Stop running retention inside mutations: the caller runs it with
     /// `run_deferred_maintenance` once its own client has been answered.
     pub fn defer_maintenance(&self) {
@@ -276,7 +285,9 @@ impl TrashStore {
         // The guard validates the root, files/ and info/ through descriptors;
         // path checks first only repeated that (#307). They still classify a
         // failure: an unsafe or incomplete root is refused, as before.
-        RootMutationGuard::acquire_as(root, uid).map_err(|error| {
+        // A root whose lock stays held is busy (EBUSY), never waited for
+        // without end (store-metadata-6).
+        RootMutationGuard::acquire_within(root, uid, self.root_lock_wait).map_err(|error| {
             if mounts::is_safe_trash_root(root, uid) {
                 TrashError::Io(error)
             } else {
@@ -437,6 +448,7 @@ impl TrashStore {
             purge_not_due_until: std::cell::Cell::new(None),
             trash_ancestry: std::cell::RefCell::new(Vec::new()),
             entry_lock_wait: ENTRY_LOCK_WAIT,
+            root_lock_wait: crate::store_lock::ROOT_LOCK_WAIT,
             home,
             isolated,
             #[cfg(test)]
@@ -735,6 +747,113 @@ impl TrashStore {
         Ok(())
     }
 
+    /// The copy fallback of `trash` and `trash_at`: bring `src_parent/name`
+    /// (lstat `source`) into the locked root as `files/<id>`, the entry
+    /// whose sidecar `claim` is `info/<info_name>`. Returns the copy's
+    /// identity, with the root locked.
+    ///
+    /// A file or tree is staged in the state directory WITHOUT the root
+    /// lock, which is taken again only to publish it. Held through the copy,
+    /// it made every other delete of the user wait for a large tree, and
+    /// without end for a copier that was stopped (store-metadata-6). Two
+    /// things protect the copy meanwhile, and both end with this process:
+    /// the claimed sidecar is locked (`claim_in_flight`), so a purge or an
+    /// `fsck --fix` that finds it without data leaves it alone, and the
+    /// stage is leased, so no sweep takes it for abandoned.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_into_claim(
+        &self,
+        trash_dir: &Path,
+        guard: &mut Option<RootMutationGuard>,
+        files: RawFd,
+        info: RawFd,
+        info_name: &CStr,
+        claim: &fs::File,
+        src_parent: RawFd,
+        name: &CStr,
+        id: &CStr,
+        source: &libc::stat,
+    ) -> io::Result<(u64, u64)> {
+        let locked = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        if !matches!(source.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
+            // A symlink or a FIFO is made in place: there is no copy to
+            // wait for.
+            return copy_source_at(
+                src_parent,
+                name,
+                files,
+                id,
+                locked.state().as_raw_fd(),
+                source,
+            );
+        }
+        // Staged in the root's private state directory, never in files/, so
+        // an interrupted copy cannot pose as an entry.
+        let state = locked.state().try_clone()?;
+        let _lease = locked.lease_stages()?;
+        claim_in_flight(claim)?;
+        drop(guard.take());
+        let (stage, identity) = stage_copy_at(src_parent, name, state.as_raw_fd(), source)?;
+        let published = (|| {
+            let relocked = self
+                .lock_trash_root(trash_dir)
+                .map_err(|error| match error {
+                    TrashError::Io(error) => error,
+                    other => io::Error::other(other.to_string()),
+                })?;
+            // This lock covers the copy only if it validated the very
+            // directories the entry was claimed and staged in.
+            for (pinned, validated) in [
+                (files, relocked.files()),
+                (info, relocked.info()),
+                (state.as_raw_fd(), relocked.state()),
+            ] {
+                if stat_identity(&stat_fd(pinned)?)
+                    != stat_identity(&stat_fd(validated.as_raw_fd())?)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "the trash was replaced during the copy",
+                    ));
+                }
+            }
+            // The id is this entry's only while the claim is still its
+            // sidecar: a trashd older than the in-flight lock strips one
+            // whose data it cannot see yet, and the id may be claimed again.
+            if !claim_is_current(info, info_name, claim) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the trash entry's record was removed during the copy",
+                ));
+            }
+            publish_staged_at(
+                state.as_raw_fd(),
+                &stage,
+                files,
+                id,
+                source,
+                identity,
+                Publication::PrivateRoot,
+                rename_noreplace_at,
+            )?;
+            Ok(relocked)
+        })();
+        match published {
+            Ok(relocked) => {
+                *guard = Some(relocked);
+                // With its data the entry is an ordinary one.
+                unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_UN) };
+                Ok(identity)
+            }
+            Err(error) => {
+                let _ = remove_created_tree_at(state.as_raw_fd(), &stage, identity);
+                Err(error)
+            }
+        }
+    }
+
     /// retention.max_size_gb in bytes; 0 means no size limit.
     fn retention_size_cap(&self) -> u64 {
         (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64
@@ -833,18 +952,16 @@ impl TrashStore {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unnamed".into());
-        let (id, _, mut claim) = unique_id_atomic(&trash_dir, &locked, &file_name)?;
+        let (id, _, claim) = unique_id_atomic(&trash_dir, &locked, &file_name)?;
         let mut guard = Some(locked);
         let id_name = CString::new(id.as_bytes()).map_err(io::Error::from)?;
         let info_name = CString::new(format!("{id}.trashinfo")).map_err(io::Error::from)?;
-        let release_claim = || {
-            let _ = raw_unlinkat(info_dir.as_raw_fd(), &info_name, 0);
-        };
+        let release_claim = || release_claim_at(info_dir.as_raw_fd(), &info_name, &claim);
 
         // Write .trashinfo content through the descriptor that claimed it.
         // On failure, release the claim so an ENOSPC cannot strand an
         // invisible 0-byte sidecar that also reserves the id stem (#109).
-        if let Err(e) = write_claimed_sidecar(&mut claim, &info) {
+        if let Err(e) = write_claimed_sidecar(&claim, &info) {
             release_claim();
             return Err(TrashError::Io(e));
         }
@@ -903,18 +1020,18 @@ impl TrashStore {
                     &name,
                     stat_identity(&source),
                 )?;
-                // Staged in the root's private state directory, never in
-                // files/, so an interrupted copy cannot pose as an entry.
-                let staging = guard
-                    .as_ref()
-                    .map(|locked| locked.state().as_raw_fd())
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-                created_identity = Some(copy_source_at(
+                // Staged without the root lock, published under it
+                // (store-metadata-6).
+                created_identity = Some(self.copy_into_claim(
+                    &trash_dir,
+                    &mut guard,
+                    files.as_raw_fd(),
+                    info_dir.as_raw_fd(),
+                    &info_name,
+                    &claim,
                     source_parent.as_raw_fd(),
                     &name,
-                    files.as_raw_fd(),
                     &id_name,
-                    staging,
                     &source,
                 )?);
                 // The copy's data is synced; make its directory entry durable
@@ -969,12 +1086,12 @@ impl TrashStore {
                 // copy of that data. Keep the entry (data + .trashinfo) fully
                 // intact and surface the error; the caller can clean up the
                 // leftover source once the underlying problem is fixed.
-                eprintln!(
+                crate::report_note(&format!(
                     "trashd: warning: copied '{p}' to the trash but could not remove the \
                      original ({e}); keeping the complete trashed copy — the leftover \
                      source can be removed manually",
                     p = abs_path.display()
-                );
+                ));
                 // The kept copy is only "complete" with its sidecar: the copy
                 // spanned the same data-absence window as a normal move, so a
                 // concurrent purge may have stripped the sidecar mid-copy
@@ -1360,7 +1477,7 @@ impl TrashStore {
             Some(locked) => unique_id_atomic(&trash_dir, locked, &base_name),
             None => Err(TrashError::Io(io::Error::from_raw_os_error(libc::EBADF))),
         };
-        let (id, mut claim) = match claimed {
+        let (id, claim) = match claimed {
             Ok((id, _, claim)) => (id, claim),
             Err(e) => {
                 unsafe { libc::close(files_fd) };
@@ -1374,9 +1491,7 @@ impl TrashStore {
                 return Err(TrashError::NotFound(display_path.clone()));
             }
         };
-        let release_claim = || {
-            let _ = raw_unlinkat(info_dir.as_raw_fd(), &info_name, 0);
-        };
+        let release_claim = || release_claim_at(info_dir.as_raw_fd(), &info_name, &claim);
 
         let cid = match std::ffi::CString::new(id.as_bytes()) {
             Ok(c) => c,
@@ -1389,7 +1504,7 @@ impl TrashStore {
         // Write .trashinfo BEFORE opening files_fd / moving — same ordering
         // as trash(). On write failure release the claimed sidecar so we do
         // not strand an empty orphan in info/ (review finding).
-        if let Err(e) = write_claimed_sidecar(&mut claim, &info) {
+        if let Err(e) = write_claimed_sidecar(&claim, &info) {
             release_claim();
             unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(e));
@@ -1434,12 +1549,20 @@ impl TrashStore {
                 }
             };
             let copy = (|| {
-                // Staged in the state directory the lock validated.
-                let staging = guard
-                    .as_ref()
-                    .map(|locked| locked.state().as_raw_fd())
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-                copy_source_at(parent_fd, &cname, files_fd, &cid, staging, &stat)?;
+                // Staged in the state directory the lock validated, without
+                // the lock, and published under it (store-metadata-6).
+                self.copy_into_claim(
+                    &trash_dir,
+                    &mut guard,
+                    files_fd,
+                    info_dir.as_raw_fd(),
+                    &info_name,
+                    &claim,
+                    parent_fd,
+                    &cname,
+                    &cid,
+                    &stat,
+                )?;
                 if unsafe { libc::fsync(files_fd) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -1474,10 +1597,10 @@ impl TrashStore {
             };
             match retired {
                 Ok(true) => {}
-                Ok(false) => eprintln!(
+                Ok(false) => crate::report_note(&format!(
                     "trashd: warning: parts of '{}' changed while being moved and were left in place",
                     display_path.display()
-                ),
+                )),
                 Err(e) => {
                     unsafe { libc::close(files_fd) };
                     return Err(TrashError::Io(io::Error::other(format!(
@@ -1953,13 +2076,16 @@ impl TrashStore {
         // Report hash mismatch as a warning after successful restore. The
         // path and digest come from the sidecar: escape them (cli-2).
         if let Some((expected, actual)) = hash_warning {
-            eprintln!(
+            crate::report_note(&format!(
                 "trashd: warning: hash mismatch for restored file {}",
                 crate::display::printable_path(&restore_to)
-            );
-            eprintln!("  expected: {}", crate::display::printable(&expected));
-            eprintln!("  actual:   {actual}");
-            eprintln!("  file may be corrupted — verify contents before use");
+            ));
+            crate::report_note(&format!(
+                "  expected: {}",
+                crate::display::printable(&expected)
+            ));
+            crate::report_note(&format!("  actual:   {actual}"));
+            crate::report_note("  file may be corrupted — verify contents before use");
         }
 
         Ok(restore_to)
@@ -2073,10 +2199,10 @@ impl TrashStore {
             // that was resolved in another store's trash root.
             if self.isolated && entry.trash_root != self.home {
                 failed += 1;
-                eprintln!(
+                crate::report_note(&format!(
                     "trashd: warning: refusing to delete '{}': it belongs to another trash root",
                     crate::display::printable_path(&entry.trashed_path)
-                );
+                ));
                 continue;
             }
             let deadline = self.entry_lock_deadline();
@@ -2095,11 +2221,11 @@ impl TrashStore {
                         }
                         e => e.to_string(),
                     };
-                    eprintln!(
+                    crate::report_note(&format!(
                         "trashd: warning: could not delete '{}': {}",
                         crate::display::printable_path(&entry.trashed_path),
                         crate::display::printable(&reason)
-                    );
+                    ));
                     failed += 1;
                     continue;
                 }
@@ -2695,8 +2821,14 @@ impl TrashStore {
         let mut detached = Detached::open_in(&guard)?;
         match data {
             Some(_) => detached.take_at(guard.files().as_raw_fd(), &data_name)?,
-            None if data_absence_is_retired(&entry.info_path) => {}
-            None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
+            None if data_absence_is_retired_at(guard.info().as_raw_fd(), &info_name) => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "it is still being moved into the trash",
+                )
+                .into());
+            }
         }
         let sidecar = match detached.take_at(guard.info().as_raw_fd(), &info_name) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -2706,10 +2838,10 @@ impl TrashStore {
         drop(_data_lock);
         if let Err(error) = detached.remove() {
             // Retention retries it; the entry itself is gone.
-            eprintln!(
+            crate::report_note(&format!(
                 "trashd: warning: purged '{}' but could not delete all of its data yet ({error}); it is retried later",
                 crate::display::printable(&entry.id)
-            );
+            ));
         }
         sidecar?;
         Ok(was_directory)
@@ -2879,8 +3011,46 @@ pub struct PartitionStatus {
 /// data when the new file is renamed into `files/<id>`.
 /// Write a new entry's record into the sidecar its id claim created,
 /// instead of closing the claim and reopening it with O_TRUNC (#307).
-fn write_claimed_sidecar(claim: &mut fs::File, info: &TrashInfo) -> io::Result<()> {
+fn write_claimed_sidecar(mut claim: &fs::File, info: &TrashInfo) -> io::Result<()> {
     claim.write_all(info.to_trashinfo_string().as_bytes())
+}
+
+/// Mark a claimed sidecar's entry as in flight: its data is being copied
+/// in without the root lock, so a purge finds the sidecar alone for as long
+/// as the copy takes. `data_absence_is_retired` honors this lock where the
+/// sidecar's age is no evidence. It is released when the data is published,
+/// and when this process ends. Never waits: nobody else locks a sidecar.
+fn claim_in_flight(claim: &fs::File) -> io::Result<()> {
+    loop {
+        if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Whether `info/<name>` is still the sidecar `claim` created.
+fn claim_is_current(info: RawFd, name: &CStr, claim: &fs::File) -> bool {
+    match (
+        stat_at(info, name, libc::AT_SYMLINK_NOFOLLOW),
+        stat_fd(claim.as_raw_fd()),
+    ) {
+        (Ok(sidecar), Ok(claim)) => stat_identity(&sidecar) == stat_identity(&claim),
+        _ => false,
+    }
+}
+
+/// Give up an id claim that got no data: unlink its sidecar, unless the
+/// name holds another one by now (a claim whose copy ran without the root
+/// lock can have been stripped and its id taken again by a trashd that
+/// predates the in-flight lock).
+fn release_claim_at(info: RawFd, name: &CStr, claim: &fs::File) {
+    if claim_is_current(info, name, claim) {
+        let _ = raw_unlinkat(info, name, 0);
+    }
 }
 
 /// The claim goes through the directories `guard` validated (security-2);
@@ -4759,6 +4929,10 @@ thread_local! {
     /// The errno making a restored copy durable fails with on this thread.
     static DESTINATION_SYNC_ERRNO: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    /// Runs once a copy is staged complete, before it is published, with
+    /// the stage's name: tests act as the other writers of the root there
+    /// (store-metadata-6).
+    static STAGE_PROBE: NameProbe = const { std::cell::RefCell::new(None) };
 }
 
 /// unlinkat(2) as a raw syscall. Store-internal removals must never go
@@ -4878,20 +5052,55 @@ fn prepare_atomic_write_replacement(
 
 /// True when a data-absent entry is old enough for purge/empty to treat as
 /// fully retired. `trash()` writes the sidecar BEFORE the data lands, so a
-/// freshly-written data-absent sidecar may be an in-flight trash (the
-/// cross-device copy window spans seconds) — stripping its sidecar
-/// would strand the completed move as an unrestorable orphan (#169).
+/// freshly-written data-absent sidecar may be an in-flight trash —
+/// stripping its sidecar would strand the completed move as an unrestorable
+/// orphan (#169). A copy from another filesystem takes as long as it takes
+/// and runs without the root lock: its sidecar is locked for that time
+/// (`claim_in_flight`), and a locked sidecar is in flight whatever its age
+/// (store-metadata-6).
 pub fn data_absence_is_retired(info_path: &Path) -> bool {
+    let Ok(path) = CString::new(info_path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    data_absence_is_retired_at(libc::AT_FDCWD, &path)
+}
+
+/// `data_absence_is_retired` for the sidecar `name` of the directory
+/// `info`: a purge asks through the info/ its root lock validated.
+fn data_absence_is_retired_at(info: RawFd, name: &CStr) -> bool {
     const GRACE_SECS: u64 = 5;
-    let sidecar_age = fs::symlink_metadata(info_path)
+    // O_NONBLOCK: whatever a racer puts at the name must not hang the open.
+    let fd = unsafe {
+        libc::openat(
+            info,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        // Unreadable sidecar: nothing in flight to protect; purge semantics
+        // for a genuinely missing sidecar still apply.
+        return true;
+    }
+    let sidecar = unsafe { fs::File::from_raw_fd(fd) };
+    // A shared lock conflicts with the writer's exclusive one and works on
+    // a read-only descriptor on NFS too. Only a lock that is held says "in
+    // flight"; a filesystem without locks leaves the age to decide.
+    if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            return false;
+        }
+    } else {
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+    }
+    let sidecar_age = sidecar
+        .metadata()
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
         .map(|d| d.as_secs());
     match sidecar_age {
         Some(age) => age >= GRACE_SECS,
-        // Unreadable sidecar: nothing in flight to protect; purge semantics
-        // for a genuinely missing sidecar still apply.
         None => true,
     }
 }
@@ -5529,7 +5738,30 @@ fn copy_staged_at_with_rename(
     publication: Publication,
     rename: impl FnOnce(RawFd, &CStr, RawFd, &CStr) -> io::Result<()>,
 ) -> io::Result<(u64, u64)> {
-    let (staging, identity) = (0u32..64)
+    let (staging, identity) = stage_copy_at(src_parent, src_name, staging_parent, source)?;
+    publish_staged_at(
+        staging_parent,
+        &staging,
+        dst_parent,
+        dst_name,
+        source,
+        identity,
+        publication,
+        rename,
+    )?;
+    Ok(identity)
+}
+
+/// The first half of `copy_staged_at_with_rename`: copy a regular file or
+/// directory tree under a hidden name in `staging_parent`, returning that
+/// name and the copy's identity. Nothing else refers to the copy yet.
+fn stage_copy_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    staging_parent: RawFd,
+    source: &libc::stat,
+) -> io::Result<(CString, (u64, u64))> {
+    let staged = (0u32..64)
         .find_map(|attempt| {
             let staging = CString::new(format!(
                 "{COPY_STAGE_PREFIX}{}-{}-{attempt}",
@@ -5560,7 +5792,30 @@ fn copy_staged_at_with_rename(
             }
         })
         .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::AlreadyExists)))?;
-    let published = match rename(staging_parent, &staging, dst_parent, dst_name) {
+    #[cfg(test)]
+    STAGE_PROBE.with_borrow(|probe| {
+        if let Some(probe) = probe {
+            probe(&staged.0);
+        }
+    });
+    Ok(staged)
+}
+
+/// The second half: give the copy staged as `staging` (identity `identity`)
+/// its final name without replacing anything. A stage that cannot be
+/// published is removed.
+#[allow(clippy::too_many_arguments)]
+fn publish_staged_at(
+    staging_parent: RawFd,
+    staging: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    source: &libc::stat,
+    identity: (u64, u64),
+    publication: Publication,
+    rename: impl FnOnce(RawFd, &CStr, RawFd, &CStr) -> io::Result<()>,
+) -> io::Result<()> {
+    let published = match rename(staging_parent, staging, dst_parent, dst_name) {
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -5569,7 +5824,7 @@ fn copy_staged_at_with_rename(
         {
             publish_without_noreplace(
                 staging_parent,
-                &staging,
+                staging,
                 dst_parent,
                 dst_name,
                 source,
@@ -5579,11 +5834,10 @@ fn copy_staged_at_with_rename(
         }
         result => result,
     };
-    if let Err(error) = published {
-        let _ = remove_created_tree_at(staging_parent, &staging, identity);
-        return Err(error);
+    if published.is_err() {
+        let _ = remove_created_tree_at(staging_parent, staging, identity);
     }
-    Ok(identity)
+    published
 }
 
 /// Publication where RENAME_NOREPLACE is unsupported: regular files can be
@@ -5739,8 +5993,8 @@ fn publish_copy_noreplace(
                 ));
             }
             if snapshot_directory_at(src_parent, src_name)? != before {
-                eprintln!(
-                    "trashd: warning: restored a stable snapshot but the trash directory changed during the copy; keeping the remaining trash copy as an orphan"
+                crate::report_note(
+                    "trashd: warning: restored a stable snapshot but the trash directory changed during the copy; keeping the remaining trash copy as an orphan",
                 );
                 return Ok(());
             }
@@ -5762,12 +6016,12 @@ fn publish_copy_noreplace(
                 true,
             ) {
                 Ok(true) => {}
-                Ok(false) => eprintln!(
-                    "trashd: warning: restored directory but its trash copy changed during retirement; keeping the unmatched remainder as an orphan"
+                Ok(false) => crate::report_note(
+                    "trashd: warning: restored directory but its trash copy changed during retirement; keeping the unmatched remainder as an orphan",
                 ),
-                Err(e) => eprintln!(
+                Err(e) => crate::report_note(&format!(
                     "trashd: warning: restored directory but could not completely retire its trash copy: {e}"
-                ),
+                )),
             }
             Ok(())
         }
@@ -14629,6 +14883,146 @@ mod tests {
         UNLINK_PROBE.set(None);
         let seen = seen.borrow().clone();
         (result, seen)
+    }
+
+    // store-metadata-6: the copy that brings an operand from another
+    // filesystem into the trash ran under the root lock, so one large tree,
+    // or a copier stopped with Ctrl-Z, held every delete of the user. It is
+    // staged without the lock. What protects it then: the claimed sidecar
+    // is locked, so no purge and no `fsck --fix` takes the entry for one
+    // whose data is gone, however old the sidecar looks; and the stage is
+    // leased, so no sweep takes it for abandoned.
+    #[test]
+    fn a_copy_into_the_trash_is_staged_without_the_root_lock() {
+        let Some(dir) = cross_device_dir("unlocked-copy") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let (store, _data) = cross_device_store();
+        let root = store.home.clone();
+        fs::write(dir.join("file"), "payload").unwrap();
+        fs::create_dir(dir.join("tree")).unwrap();
+        fs::write(dir.join("tree/inner"), "payload").unwrap();
+        fs::write(dir.join("pinned"), "payload").unwrap();
+        let parent = fs::File::open(&dir).unwrap();
+        let shared_lock = |path: &Path| {
+            fs::File::open(path).is_ok_and(|file| unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) == 0
+            })
+        };
+        let mut outcomes = Vec::new();
+        for (name, pinned) in [("file", false), ("tree", false), ("pinned", true)] {
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let (record, home) = (seen.clone(), root.clone());
+            STAGE_PROBE.set(Some(Box::new(move |stage: &CStr| {
+                let mut seen = record.borrow_mut();
+                // A new open file description conflicts with the store's own.
+                let free = matches!(
+                    RootMutationGuard::try_acquire_as(&home, unsafe { libc::geteuid() }),
+                    Ok(Some(_))
+                );
+                seen.push(("root lock free", free));
+                if !free {
+                    // Every other writer of this root waits here.
+                    return;
+                }
+                let sidecar = home.join("info").join(format!("{name}.trashinfo"));
+                let stage = home
+                    .join(".trashd")
+                    .join(OsStr::from_bytes(stage.to_bytes()));
+                // As old as the sidecar of data that is long gone.
+                let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+                fs::File::options()
+                    .append(true)
+                    .open(&sidecar)
+                    .and_then(|file| file.set_modified(hour_ago))
+                    .unwrap();
+                seen.push(("claim in flight", !data_absence_is_retired(&sidecar)));
+                let mut config = Config::default();
+                config.never_trash.clear();
+                config.retention.max_age_days = 0;
+                config.retention.max_size_gb = 0.0;
+                config.retention.disk_pressure_percent = 0;
+                let other = TrashStore::open_isolated(&home, config).unwrap();
+                let _ = other.empty(None);
+                seen.push(("purge kept the claim", sidecar.exists()));
+                let _ = other.cleanup_unfinished();
+                seen.push(("sweep kept the stage", stage.exists()));
+            })));
+            let result = if pinned {
+                store.trash_at(parent.as_raw_fd(), OsStr::new(name), &dir.join(name), None)
+            } else {
+                store.trash(&dir.join(name), None)
+            };
+            STAGE_PROBE.set(None);
+            let landed = root.join("files").join(name).exists()
+                && shared_lock(&root.join("info").join(format!("{name}.trashinfo")));
+            let retired = !dir.join(name).exists();
+            outcomes.push((name, result, landed, retired, seen.borrow().clone()));
+        }
+        let stages: Vec<_> = fs::read_dir(root.join(".trashd"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name.as_bytes().starts_with(COPY_STAGE_PREFIX.as_bytes()))
+            .collect();
+        // Once no copy is staged, an abandoned stage is swept as before.
+        fs::write(root.join(".trashd/.trashd-copy-1-2-0"), "abandoned").unwrap();
+        store.cleanup_unfinished().unwrap();
+        let swept = !root.join(".trashd/.trashd-copy-1-2-0").exists();
+        let _ = fs::remove_dir_all(&dir);
+        for (name, result, landed, retired, seen) in outcomes {
+            assert_eq!(result.as_deref().ok(), Some(name), "{result:?}");
+            assert!(
+                landed && retired,
+                "{name}: landed {landed}, retired {retired}"
+            );
+            assert_eq!(
+                seen,
+                [
+                    ("root lock free", true),
+                    ("claim in flight", true),
+                    ("purge kept the claim", true),
+                    ("sweep kept the stage", true),
+                ],
+                "{name}"
+            );
+        }
+        assert!(stages.is_empty(), "{stages:?}");
+        assert!(swept);
+    }
+
+    // store-metadata-6: every writer waited for the root lock in a blocking
+    // flock, so behind a holder that was stopped (Ctrl-Z in a critical
+    // section) they hung until it went on. The wait is bounded and ends
+    // busy: nothing is deleted and nothing is left in the trash.
+    #[test]
+    fn a_held_root_lock_is_reported_busy() {
+        let (mut store, _data, work, _) = test_store();
+        store.root_lock_wait = std::time::Duration::from_millis(200);
+        let root = store.home.clone();
+        let file = create_file(work.path(), "kept", "payload");
+        let parent = fs::File::open(work.path()).unwrap();
+        // Another open file description, as another process has.
+        let holder = RootMutationGuard::acquire(&root).unwrap();
+        let started = std::time::Instant::now();
+        let by_path = store.trash(&file, None);
+        let pinned = store.trash_at(parent.as_raw_fd(), OsStr::new("kept"), &file, None);
+        let waited = started.elapsed();
+        drop(holder);
+        for result in [by_path, pinned] {
+            assert!(
+                matches!(&result, Err(TrashError::Io(e)) if e.raw_os_error() == Some(libc::EBUSY)),
+                "{result:?}"
+            );
+        }
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "payload");
+        assert!(store.list(None).unwrap().is_empty());
+        assert_eq!(fs::read_dir(root.join("info")).unwrap().count(), 0);
+        // Released, the same delete goes through.
+        store.trash(&file, None).unwrap();
+        assert!(!file.exists());
     }
 
     // store-core-4: purge, restore and the copy fallbacks' source retirement

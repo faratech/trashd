@@ -99,7 +99,8 @@ impl TrashStore {
 
     /// Unpublished stages still have their original data. Claim abandoned
     /// work under the root lock, then remove outside it. Cross-device copies
-    /// hold the root lock; announced data stages hold their own file locks.
+    /// hold a lease on the root's stages (the preload's, the root lock);
+    /// announced data stages hold their own file locks.
     /// Sample at most 32 candidates in the existing unlocked sweep, keeping
     /// writer-lock work bounded and reaching stages behind live work over
     /// later maintenance passes (#383, #388, #389).
@@ -117,10 +118,16 @@ impl TrashStore {
         // The state directory the lock validated, not `.trashd` by path
         // (security-1).
         let state = guard.state().try_clone().ok()?;
+        // A copy is staged without the root lock, under a lease: while any
+        // writer of this root holds one, no copy stage counts as abandoned
+        // (store-metadata-6).
+        let copies_idle = guard.claim_idle_stages().ok().flatten();
         let mut claimed = Vec::new();
         for name in candidates.iter().take(STAGES_PER_SWEEP) {
             if is_copy_stage(name) {
-                if let Ok(claim) = claim_copy_stage_at(state.as_raw_fd(), name) {
+                if copies_idle.is_some()
+                    && let Ok(claim) = claim_copy_stage_at(state.as_raw_fd(), name)
+                {
                     claimed.push(claim);
                 }
             } else if is_data_stage(name)
@@ -130,6 +137,9 @@ impl TrashStore {
                 claimed.push(claim);
             }
         }
+        // Before the root lock: a writer that gets it next takes a lease,
+        // which this claim would refuse.
+        drop(copies_idle);
         drop(guard);
         Some((state, claimed))
     }
@@ -338,9 +348,11 @@ impl Detached {
     }
 }
 
+/// The state directory of `root` for the unlocked sweep: opened like the
+/// store's other directories, with no symlink followed in the root or in
+/// `.trashd` and on the root's own device (security-1).
 fn open_cleanup_state(root: &Path) -> io::Result<Option<fs::File>> {
-    let path = CString::new(root.join(".trashd").as_os_str().as_bytes())?;
-    match open_directory_at(libc::AT_FDCWD, &path, true, false) {
+    match open_store_child(root, c".trashd") {
         Ok(state) => Ok(Some(state)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),

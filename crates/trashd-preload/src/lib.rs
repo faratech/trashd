@@ -970,8 +970,9 @@ enum StoreError {
     Unavailable,
     /// A path another user could control: refuse instead of writing there.
     Unsafe,
-    /// The selected store was prepared but cannot be locked. Final: no
-    /// other store is tried.
+    /// The selected store was prepared but cannot be locked: tampering, a
+    /// race, failing media, or a lock that stayed held for the whole wait
+    /// (EBUSY). Final: no other store is tried, and the delete fails.
     Lock(io::Error),
 }
 
@@ -1179,7 +1180,13 @@ fn trash_dir_for(
 /// path checks still decide every rejection exactly as before, and a store
 /// that passes them but cannot be locked is a final error.
 fn lock_store(root: &Path, uid: u32) -> Result<store_lock::RootMutationGuard, StoreError> {
-    match store_lock::RootMutationGuard::acquire_as(root, uid) {
+    // Never without end: this runs inside the caller's unlink(). A store
+    // whose lock stays held for the whole wait is busy, and so is the
+    // delete (EBUSY, `StoreError::Lock`); the file stays (store-metadata-6).
+    let wait = store_lock::ROOT_LOCK_WAIT;
+    #[cfg(test)]
+    let wait = tests::store_lock_wait().unwrap_or(wait);
+    match store_lock::RootMutationGuard::acquire_within(root, uid, wait) {
         Ok(guard) => return Ok(guard),
         Err(error)
             if !matches!(
@@ -1194,7 +1201,7 @@ fn lock_store(root: &Path, uid: u32) -> Result<store_lock::RootMutationGuard, St
     ensure_private_dir(root, uid, true)?;
     ensure_private_dir(&root.join("files"), uid, true)?;
     ensure_private_dir(&root.join("info"), uid, true)?;
-    store_lock::RootMutationGuard::acquire_as(root, uid).map_err(lock_failure)
+    store_lock::RootMutationGuard::acquire_within(root, uid, wait).map_err(lock_failure)
 }
 
 /// Why a prepared store could not be locked. Taking the lock opens
@@ -1716,6 +1723,147 @@ impl From<io::Error> for CopyError {
             Some(libc::EBUSY) => CopyError::Keep(libc::EBUSY),
             _ => CopyError::Unstored,
         }
+    }
+}
+
+/// Distinguishes the stages one process makes in the same nanosecond.
+static STAGE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A cross-device copy on its way into a store whose lock was released for
+/// it (store-metadata-6): the copy is written as `stage` in the store's
+/// state directory and renamed to `files/<id>` once the store is locked
+/// again. Two locks stand in for the store's meanwhile, as in trashd-common
+/// (`TrashStore::copy_into_claim`), and both end with this process. The
+/// claimed sidecar is locked, so a purge that finds it without data leaves
+/// it; and the stage is leased, so no sweep takes it for abandoned.
+struct StagedCopy {
+    /// The sidecar this delete claimed, locked while its data is copied.
+    claim: fs::File,
+    info_name: CString,
+    /// The store's directories as its lock validated them.
+    info: fs::File,
+    state: fs::File,
+    /// (device, inode) of files/, info/ and the state directory.
+    pinned: [(u64, u64); 3],
+    stage: CString,
+    _lease: store_lock::StageLease,
+}
+
+impl StagedCopy {
+    /// With the store locked: lease a stage and lock the claim.
+    fn begin(
+        guard: &store_lock::RootMutationGuard,
+        claim: fs::File,
+        info_name: &CStr,
+    ) -> io::Result<Self> {
+        let identity = |directory: &fs::File| -> io::Result<(u64, u64)> {
+            let metadata = directory.metadata()?;
+            Ok((metadata.dev(), metadata.ino()))
+        };
+        let pinned = [
+            identity(guard.files())?,
+            identity(guard.info())?,
+            identity(guard.state())?,
+        ];
+        // The name the store's sweep knows a copy stage by.
+        let stage = CString::new(format!(
+            ".trashd-copy-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos()),
+            STAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))?;
+        let lease = guard.lease_stages()?;
+        // Never waits: nobody else locks a sidecar.
+        while unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(Self {
+            claim,
+            info_name: info_name.to_owned(),
+            info: guard.info().try_clone()?,
+            state: guard.state().try_clone()?,
+            pinned,
+            stage,
+            _lease: lease,
+        })
+    }
+
+    /// Whether info/<name> is still the sidecar this delete claimed.
+    fn claim_is_current(&self) -> bool {
+        match (
+            fdops::stat_nofollow_at(self.info.as_raw_fd(), &self.info_name),
+            self.claim.metadata(),
+        ) {
+            (Ok(sidecar), Ok(claim)) => fdops::identity(&sidecar) == (claim.dev(), claim.ino()),
+            _ => false,
+        }
+    }
+
+    /// Lock the store again and give the finished stage its name in files/.
+    fn publish(
+        &self,
+        root: &Path,
+        uid: u32,
+        id: &CStr,
+    ) -> Result<store_lock::RootMutationGuard, CopyError> {
+        let guard = lock_store(root, uid).map_err(|error| match error {
+            // As when no store can be used at all (#194).
+            StoreError::Unavailable => CopyError::Unstored,
+            StoreError::Unsafe => CopyError::Keep(libc::EACCES),
+            StoreError::Lock(error) => CopyError::Keep(error.raw_os_error().unwrap_or(libc::EIO)),
+        })?;
+        // The lock covers this copy only if it validated the directories
+        // the entry was claimed and staged in, and the id is this entry's
+        // only while the claim is still its sidecar (a trashd that predates
+        // the claim's lock strips one whose data it cannot see yet).
+        let validated = [guard.files(), guard.info(), guard.state()].map(|directory| {
+            directory
+                .metadata()
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+        });
+        if validated != self.pinned.map(Some) || !self.claim_is_current() {
+            return Err(CopyError::Keep(libc::EBUSY));
+        }
+        let (state, files) = (self.state.as_raw_fd(), guard.files().as_raw_fd());
+        if let Err(error) = fdops::rename_noreplace_at(state, &self.stage, files, id) {
+            // The id was taken meanwhile: see the caller (#225).
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                return Err(CopyError::Unstored);
+            }
+            // No RENAME_NOREPLACE (NFS, 9p), or a rename this process may
+            // not make (its own seccomp filter): a link is exclusive too. A
+            // stage that then cannot be unlinked is another name of the
+            // entry's data, which the store's sweep removes.
+            if unsafe { libc::linkat(state, self.stage.as_ptr(), files, id.as_ptr(), 0) } != 0 {
+                return Err(CopyError::Unstored);
+            }
+            let _ = fdops::unlink_at(state, &self.stage, 0);
+        }
+        // With its data the entry is an ordinary one.
+        unsafe { libc::flock(self.claim.as_raw_fd(), libc::LOCK_UN) };
+        Ok(guard)
+    }
+
+    /// Give up: remove the stage, if `created` is still it, and the claim.
+    fn abandon(self, created: Option<(u64, u64)>) {
+        remove_owned_copy(&self.state, &self.stage, created);
+        if self.claim_is_current() {
+            let _ = fdops::unlink_at(self.info.as_raw_fd(), &self.info_name, 0);
+        }
+    }
+}
+
+impl Drop for StagedCopy {
+    /// A forked child may hold a descriptor of the claim too: unlocked, not
+    /// only closed, as the store's lock is.
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.claim.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -2379,7 +2527,7 @@ fn trash_entry(
     // landed in /etc/sudoers.d (security-2).
     let (files, info) = (guard.files(), guard.info());
     let mut attempts = 0;
-    let (info_path, dest, target, info_name, rename_error) = loop {
+    let (info_path, dest, target, info_name, claim, rename_error) = loop {
         let (id, info_path, mut info_file) =
             match unique_id_atomic(&info_dir, info, files, &base_name, &date) {
                 Some(v) => v,
@@ -2394,7 +2542,6 @@ fn trash_entry(
         // Write through the descriptor that claimed the name: reopening it
         // with O_TRUNC cost two syscalls (#305).
         let written = io::Write::write_all(&mut info_file, trashinfo.as_bytes());
-        drop(info_file);
         if written.is_err() {
             release();
             return (TrashAttempt::NotTrashed, None);
@@ -2445,7 +2592,7 @@ fn trash_entry(
             }
             return (TrashAttempt::NotTrashed, None);
         }
-        break (info_path, dest, target, info_name, rename_error);
+        break (info_path, dest, target, info_name, info_file, rename_error);
     };
     let release = || {
         let _ = fdops::unlink_at(info.as_raw_fd(), &info_name, 0);
@@ -2509,20 +2656,45 @@ fn trash_entry(
         // with O_NOFOLLOW|O_NONBLOCK and re-verifies dev/ino first: a racer
         // swapping the file for a FIFO must not block the copy forever, and
         // a symlink swap must not be read through (#111).
+        //
+        // The copy is staged in the store's state directory WITHOUT the
+        // store's lock, which is taken again to publish it. Held through
+        // the copy, it made every other delete of the user wait for a large
+        // file, in every layer (store-metadata-6).
         let mut created = None;
-        // Losing the files/<id> race on the O_EXCL create falls back like any
+        let staged = match StagedCopy::begin(&guard, claim, &info_name) {
+            Ok(staged) => staged,
+            Err(error) => {
+                release();
+                return match lock_failure(error) {
+                    StoreError::Lock(error) => (
+                        TrashAttempt::Error(error.raw_os_error().unwrap_or(libc::EIO)),
+                        None,
+                    ),
+                    _ => (TrashAttempt::NotTrashed, None),
+                };
+            }
+        };
+        drop(guard);
+        // Losing the files/<id> race at publication falls back like any
         // other copy failure; unlink never fails with EEXIST (#225).
-        let copied = match copy_regular_verified(
+        let published = copy_regular_verified(
             (parent, name),
-            (files, &target),
+            (&staged.state, &staged.stage),
             expect_dev,
             expect_ino,
             &mut created,
-        ) {
-            Ok(source) => source,
+        )
+        .and_then(|source| {
+            #[cfg(test)]
+            tests::race_probe(tests::Race::Staged);
+            let guard = staged.publish(&trash_dir, uid, &target)?;
+            Ok((source, guard))
+        });
+        let (copied, guard) = match published {
+            Ok(published) => published,
             Err(error) => {
-                remove_owned_copy(files, &target, created);
-                release();
+                staged.abandon(created);
                 let changed = || {
                     fdops::metadata_nofollow_at(parent, name)
                         .is_ok_and(|now| !same_copy_source(&meta, &now))
@@ -2534,6 +2706,7 @@ fn trash_entry(
                 };
             }
         };
+        drop(staged);
         let result = retire_copied_source(
             operand,
             &dest,
@@ -3711,6 +3884,8 @@ mod tests {
         Retire,
         /// The scan grant of an unreadable directory the hook examined.
         Grant,
+        /// The publication of a cross-device copy that is staged complete.
+        Staged,
     }
 
     /// A step that follows the data of a cross-device copy.
@@ -3816,6 +3991,19 @@ mod tests {
                 probe(race);
             }
         });
+    }
+
+    thread_local! {
+        static STORE_LOCK_WAIT: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
+    }
+
+    /// How long this thread's hooks wait for a store's lock, if a test set it.
+    pub(super) fn store_lock_wait() -> Option<std::time::Duration> {
+        STORE_LOCK_WAIT.get()
+    }
+
+    fn set_store_lock_wait(wait: Option<std::time::Duration>) {
+        STORE_LOCK_WAIT.set(wait);
     }
 
     /// Install (or with None, remove) this thread's race probe.
@@ -4214,6 +4402,154 @@ mod tests {
             },
         );
         assert_ne!(verdict, Some(false));
+    }
+
+    // store-metadata-6: the copy of a file to a trash on another filesystem
+    // was made under the store's lock, so every other delete of the user
+    // waited for a large file, in every layer. It is staged without the
+    // lock: the claimed sidecar is locked instead, which tells a purge the
+    // data is on its way, and the stage is leased against the sweep.
+    #[test]
+    fn a_cross_device_copy_is_staged_without_the_store_lock() {
+        use std::os::fd::AsRawFd;
+        let base = tempfile::tempdir().unwrap();
+        let verdict = mounts::in_private_mounts(
+            "tests::a_cross_device_copy_is_staged_without_the_store_lock",
+            || {
+                let root = fs::canonicalize(base.path()).unwrap();
+                let Some((mount, target)) = other_filesystem(&root) else {
+                    return false;
+                };
+                // Safety: the re-run child runs this one test on its own.
+                unsafe { std::env::set_var("HOME", &root) };
+                unsafe { std::env::set_var("XDG_DATA_HOME", root.join("data")) };
+                let trash = root.join("data/Trash");
+                // Whether a new open file description gets `operation` on
+                // `file`: it conflicts with the hook's own.
+                let locks = |file: &Path, operation: libc::c_int| {
+                    fs::File::options()
+                        .read(true)
+                        .write(true)
+                        .open(file)
+                        .is_ok_and(|file| unsafe {
+                            libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) == 0
+                        })
+                };
+                let sidecars = |trash: &Path| -> Vec<PathBuf> {
+                    fs::read_dir(trash.join("info"))
+                        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+                        .unwrap_or_default()
+                };
+                fs::write(mount.join("file"), b"mine").unwrap();
+                let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let (record, home) = (seen.clone(), trash.clone());
+                set_race_probe(Some(Box::new(move |race| {
+                    if race != Race::Staged {
+                        return;
+                    }
+                    let state = home.join(".trashd");
+                    let mut seen = record.borrow_mut();
+                    seen.push((
+                        "store lock free",
+                        locks(&state.join("store.lock"), libc::LOCK_EX),
+                    ));
+                    seen.push((
+                        "stage leased",
+                        state.join("copy.lock").exists()
+                            && !locks(&state.join("copy.lock"), libc::LOCK_EX),
+                    ));
+                    let claims = sidecars(&home);
+                    seen.push((
+                        "claim in flight",
+                        claims.len() == 1 && !locks(&claims[0], libc::LOCK_SH),
+                    ));
+                    seen.push(("nothing published", entries_of(&home.join("files")) == 0));
+                })));
+                let (operand, meta) = operand_of(&mount.join("file"));
+                let result = trash_entry(&operand, &meta, 1, 0).0;
+                set_race_probe(None);
+                let claims = sidecars(&trash);
+                let landed = claims.len() == 1
+                    && locks(&claims[0], libc::LOCK_SH)
+                    && fs::read(trash.join("files").join(claims[0].file_stem().unwrap()))
+                        .is_ok_and(|content| content == b"mine")
+                    && !mount.join("file").exists();
+                let idle = locks(&trash.join(".trashd/copy.lock"), libc::LOCK_EX)
+                    && fs::read_dir(trash.join(".trashd")).is_ok_and(|entries| {
+                        entries.flatten().all(|entry| {
+                            !entry.file_name().as_bytes().starts_with(b".trashd-copy-")
+                        })
+                    });
+                unmount(&target);
+                let seen = seen.borrow().clone();
+                eprintln!("{result:?}, landed {landed}, idle {idle}, {seen:?}");
+                result == TrashAttempt::Trashed
+                    && landed
+                    && idle
+                    && seen
+                        == [
+                            ("store lock free", true),
+                            ("stage leased", true),
+                            ("claim in flight", true),
+                            ("nothing published", true),
+                        ]
+            },
+        );
+        assert_ne!(verdict, Some(false));
+    }
+
+    // store-metadata-6: the hook waited for a store's lock in a blocking
+    // flock, inside the caller's unlink(), for as long as the holder lived
+    // or stayed stopped. The wait ends, the delete fails busy and the file
+    // stays; it is never handed to the real delete.
+    #[test]
+    fn a_busy_store_fails_the_delete_and_keeps_the_file() {
+        use std::os::fd::AsRawFd;
+        const CHILD: &str = "TRASHD_PRELOAD_BUSY_STORE";
+        const TEST: &str = "tests::a_busy_store_fails_the_delete_and_keeps_the_file";
+        // HOME and XDG_DATA_HOME select the store: alone in a child.
+        if !mounts::is_rerun_child(TEST, CHILD) {
+            assert_eq!(mounts::rerun_test(TEST, CHILD), Some(true));
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        // Safety: this child runs this one test.
+        unsafe { std::env::set_var("HOME", &root) };
+        unsafe { std::env::set_var("XDG_DATA_HOME", root.join("data")) };
+        let trash = root.join("data/Trash");
+        let attempt = |name: &str| {
+            let (operand, meta) = operand_of(&root.join(name));
+            trash_entry(&operand, &meta, 1, 0).0
+        };
+        fs::write(root.join("first"), b"prepares the trash").unwrap();
+        let prepared = attempt("first");
+        fs::write(root.join("kept"), b"mine").unwrap();
+        set_store_lock_wait(Some(std::time::Duration::from_millis(200)));
+        // Another open file description, as another process has.
+        let holder = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(trash.join(".trashd/store.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let started = std::time::Instant::now();
+        let busy = attempt("kept");
+        let waited = started.elapsed();
+        let kept = fs::read(root.join("kept")).is_ok_and(|content| content == b"mine")
+            && entries_of(&trash.join("info")) == 1;
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let freed = attempt("kept");
+        set_store_lock_wait(None);
+        eprintln!("prepared {prepared:?}, busy {busy:?} after {waited:?} kept {kept}, {freed:?}");
+        mounts::report_test_verdict(Some(
+            prepared == TrashAttempt::Trashed
+                && busy == TrashAttempt::Error(libc::EBUSY)
+                && waited < std::time::Duration::from_secs(5)
+                && kept
+                && freed == TrashAttempt::Trashed
+                && !root.join("kept").exists(),
+        ));
     }
 
     // recent-changes-5: metadata the copy cannot reproduce is no reason to

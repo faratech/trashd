@@ -909,13 +909,15 @@ def run():
         # own look at the entry; a second link to the victim stands in for a
         # swap after the hook's last identity check.
         import fcntl, time
-        flock_nr = {"x86_64": 73, "aarch64": 32}[os.uname().machine]
+        # The wait for a trash's lock is a poll: flock(LOCK_NB), then a
+        # sleep (nanosleep or clock_nanosleep), never a blocking flock.
+        lock_wait_nrs = {"x86_64": {"73", "35", "230"}, "aarch64": {"32", "101", "115"}}[os.uname().machine]
 
         def waits_for_lock(pid):
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 try:
-                    if Path(f"/proc/{pid}/syscall").read_text().split()[0] == str(flock_nr):
+                    if Path(f"/proc/{pid}/syscall").read_text().split()[0] in lock_wait_nrs:
                         return True
                 except (OSError, IndexError):
                     pass
@@ -1044,6 +1046,42 @@ def run():
                                 capture_output=True, timeout=10)
         assert result.returncode == 0 and not (fixture / "victim").exists(), result.stderr
         print("PASS: a process out of descriptors deletes normally")
+
+        # Every writer waited for the trash's lock in a blocking flock, the
+        # hook inside its caller's unlink(): behind a holder that was
+        # stopped, every delete of the user hung until it went on. The wait
+        # ends after ten seconds, the delete fails busy and the file stays;
+        # it is never handed to the real delete (store-metadata-6).
+        fixture, data, environment = focused_fixture("busy-trash")
+        first = fixture / "first"
+        first.write_bytes(b"prepares the trash")
+        result = subprocess.run(["/usr/bin/unlink", str(first)], env=environment, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        victim = fixture / "victim"
+        victim.write_bytes(b"kept")
+        code = ("import errno,os,sys,time\n"
+                "started=time.monotonic()\n"
+                "try: os.unlink(sys.argv[1])\n"
+                "except OSError as error:\n"
+                " assert error.errno==errno.EBUSY, error\n"
+                " sys.exit(0 if 5 < time.monotonic()-started < 30 else 4)\n"
+                "sys.exit(3)\n")
+        with open(data / "Trash/.trashd/store.lock", "r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                result = subprocess.run(["/usr/bin/python3", "-c", code, str(victim)], env=environment,
+                                        capture_output=True, timeout=60)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        assert result.returncode == 0, ("a delete behind a held trash lock did not fail busy",
+                                        result.returncode, result.stderr)
+        assert victim.read_bytes() == b"kept"
+        assert [record.stem for record in (data / "Trash/info").glob("*.trashinfo")] == ["first"]
+        # Released, the same delete goes through.
+        result = subprocess.run(["/usr/bin/unlink", str(victim)], env=environment, capture_output=True)
+        assert result.returncode == 0 and not victim.exists(), result.stderr
+        assert (data / "Trash/files/victim").read_bytes() == b"kept"
+        print("PASS: a delete behind a held trash lock fails busy and keeps the file")
     return 0
 
 
