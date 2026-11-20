@@ -1461,6 +1461,22 @@ def main():
             result = run(["-r", old])
             assert result.returncode == 0 and not old.exists(), result.stderr
             assert trashed_since(before) == set(), trashed_since(before)
+            # Such a tree goes in one pass, as before shim-1, also when a
+            # swept directory holds it, and -v still names its entries.
+            user_config.write_text('never_trash = ["*/old", "*~"]\n')
+            backup = root / "control/backup~"
+            nested = backup / "old"
+            (nested / "sub").mkdir(parents=True)
+            (nested / "a.txt").write_bytes(b"x")
+            (nested / "sub/b.txt").write_bytes(b"x")
+            (backup / "keep.txt").write_bytes(b"x")
+            before = set(records.glob("*.trashinfo"))
+            result = run(["-rv", backup])
+            assert result.returncode == 0 and not backup.exists(), result.stderr
+            assert trashed_since(before) == {str(backup / "keep.txt")}, trashed_since(before)
+            shown = result.stdout.splitlines()
+            for path in (nested / "a.txt", nested / "sub/b.txt", nested / "sub", nested, backup):
+                assert any(line.endswith(f"'{path}'") for line in shown), (path, shown)
             print("PASS: excluded directories are judged entry by entry; whitelisted and ordinary entries are trashed")
 
             # bypass_paths names the program that ran rm, never the shim: a

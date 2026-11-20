@@ -384,6 +384,21 @@ impl Config {
             .then_some(ExclusionKind::NotWhitelisted)
     }
 
+    /// Whether a never_trash pattern excludes `dir` together with everything
+    /// that can ever be below it, so a recursive removal may delete the tree
+    /// for real in one pass instead of judging each entry: the pattern ends
+    /// in an unescaped `*`, which matches across `/` (`/tmp/*`,
+    /// `~/.cache/*`), or names a literal component (`*/node_modules`).
+    /// Configured never_trash is a veto no local policy can lift, so every
+    /// descendant would be excluded in turn. A suffix such as `*~` or an
+    /// only_trash miss says nothing about what a directory holds (shim-1).
+    pub fn never_trash_covers_tree(&self, dir: &Path) -> bool {
+        let path = dir.to_string_lossy();
+        self.never_trash
+            .iter()
+            .any(|pattern| pattern_covers_descendants(pattern) && pattern_matches(pattern, &path))
+    }
+
     /// Look for a .trashd.toml in the file's parent directory (or ancestors).
     ///
     /// Walks all the way to the filesystem root: a fixed 5-level cap silently
@@ -526,6 +541,19 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
         || canonical.is_some_and(|canonical| expanded_pattern_matches(&canonical, path))
 }
 
+/// Whether `pattern`, once it matches a path, matches every path below it:
+/// a trailing unescaped `*` absorbs any further components, and a literal
+/// `*/name` component stays in every descendant.
+fn pattern_covers_descendants(pattern: &str) -> bool {
+    if let Some(head) = pattern.strip_suffix('*') {
+        let escapes = head.len() - head.trim_end_matches('\\').len();
+        return escapes % 2 == 0;
+    }
+    pattern.strip_prefix("*/").is_some_and(|component| {
+        !component.is_empty() && !component.contains(['/', '*', '?', '[', '\\'])
+    })
+}
+
 /// `pattern_matches` for a pattern whose `~/` is already expanded.
 fn expanded_pattern_matches(pattern: &str, path: &str) -> bool {
     // Keep common literal prefix/suffix rules allocation-free, but only
@@ -576,6 +604,55 @@ fn sanitize_patterns(list: &[String], what: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A tree may go in one pass only where the pattern that excludes the
+    // directory excludes everything below it too (shim-1 kept the per-entry
+    // sweep for every other exclusion).
+    #[test]
+    fn only_wildcard_tails_and_components_cover_a_tree() {
+        let config = Config {
+            never_trash: [
+                "/tmp/*",
+                "*/node_modules",
+                "*~",
+                "*.tmp",
+                "draft\\*",
+                "/srv/*/cache*",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..Config::default()
+        };
+        for covered in [
+            "/tmp/build",
+            "/tmp/a/b",
+            "/p/node_modules",
+            "/srv/x/cache.d",
+        ] {
+            assert!(
+                config.never_trash_covers_tree(Path::new(covered)),
+                "{covered}"
+            );
+            let below = Path::new(covered).join("deeper/file.rs");
+            assert!(config.should_skip_configured(&below), "{}", below.display());
+        }
+        for not_covered in [
+            "/p/thesis~",
+            "/p/export.tmp",
+            "/p/draft*",
+            "/p/src",
+            "/p/node_modules_x",
+        ] {
+            assert!(
+                !config.never_trash_covers_tree(Path::new(not_covered)),
+                "{not_covered}"
+            );
+        }
+        assert!(pattern_covers_descendants("a\\\\*"));
+        assert!(!pattern_covers_descendants("a\\*"));
+        assert!(pattern_covers_descendants("*/node*"));
+        assert!(!pattern_covers_descendants("*/node?"));
+    }
 
     // #337: an escaped `*` stays literal on the fast paths too.
     #[test]

@@ -550,8 +550,12 @@ fn main() -> ExitCode {
             }
             // A directory's own name is no verdict on what it holds: its
             // entries are judged one by one, never deleted for real as a
-            // tree (shim-1, common-policy-1, common-policy-2).
-            Err(trashd_common::store::TrashError::Excluded { .. }) if is_dir && args.recursive => {
+            // tree (shim-1, common-policy-1, common-policy-2). Where a
+            // never_trash pattern excludes everything below it as well
+            // (`/tmp/*`), the next arm removes the tree in one pass.
+            Err(trashd_common::store::TrashError::Excluded { path, .. })
+                if is_dir && args.recursive && !store.config().never_trash_covers_tree(&path) =>
+            {
                 let mut walk = Walk {
                     store: &store,
                     device: None,
@@ -1167,8 +1171,12 @@ struct Walk<'a> {
 /// What trashing an entry came to.
 enum Outcome {
     Done,
-    /// Configured not to be trashed: the caller removes it for real.
-    Excluded,
+    /// Configured not to be trashed: the caller removes it for real. With
+    /// `whole`, a never_trash pattern excludes everything below it as well,
+    /// so a directory may go for real in one pass.
+    Excluded {
+        whole: bool,
+    },
     /// A filesystem was mounted inside it since it was confirmed: it no
     /// longer moves as one.
     Confined,
@@ -1543,14 +1551,19 @@ impl Walk<'_> {
                     Some(Outcome::Confined) => self.report(display, busy()),
                     // It stays for the mount it holds.
                     Some(Outcome::HoldsMount(error)) => self.report(display, error),
-                    Some(Outcome::Excluded) => {
+                    Some(Outcome::Excluded { whole }) => {
                         // A confirmed entry is never a directory (those are
                         // descended), so whatever replaced it cannot be
                         // removed recursively (#355). Without prompts, a
                         // directory not descended is judged entry by entry
-                        // now, never deleted for real whole (shim-1).
+                        // now, never deleted for real whole (shim-1), unless
+                        // never_trash excludes everything below it too.
                         if !self.interactive() && was_directory(access) {
-                            self.sweep(access, display);
+                            if whole {
+                                self.real_remove(access, display, true);
+                            } else {
+                                self.sweep(access, display);
+                            }
                         } else {
                             self.real_remove(access, display, false);
                         }
@@ -1584,7 +1597,9 @@ impl Walk<'_> {
                             // Never recursively: what it holds may be new;
                             // or something mounted inside it stays.
                             Some(
-                                Outcome::Excluded | Outcome::Confined | Outcome::HoldsMount(_),
+                                Outcome::Excluded { .. }
+                                | Outcome::Confined
+                                | Outcome::HoldsMount(_),
                             ) => {}
                         }
                     }
@@ -1619,7 +1634,7 @@ impl Walk<'_> {
                         Ok(true) => match self.trash(parent, name, access, display) {
                             // rmdir(2) alone: whatever replaced the emptied
                             // directory meanwhile stays (shim-4).
-                            Some(Outcome::Excluded) => {
+                            Some(Outcome::Excluded { .. }) => {
                                 if let Err(e) = real_rmdir(access) {
                                     self.report_io(display, e);
                                 }
@@ -1718,7 +1733,9 @@ impl Walk<'_> {
                 self.notification.add(display);
                 Some(Outcome::Done)
             }
-            Err(TrashError::Excluded { .. }) => Some(Outcome::Excluded),
+            Err(TrashError::Excluded { path, .. }) => Some(Outcome::Excluded {
+                whole: self.store.config().never_trash_covers_tree(&path),
+            }),
             Err(e @ TrashError::HoldsMount(_)) => Some(Outcome::HoldsMount(e)),
             Err(TrashError::Io(e)) => {
                 self.report_io(display, e);
@@ -1836,8 +1853,14 @@ impl Walk<'_> {
             return false;
         }
         match self.trash(parent, name, access, display) {
-            Some(Outcome::Excluded) if entry.is_dir() => true,
-            Some(Outcome::Excluded) => {
+            // Everything below it is excluded too: one pass, as before
+            // shim-1, instead of a store verdict per entry.
+            Some(Outcome::Excluded { whole: true }) if entry.is_dir() => {
+                self.real_remove(access, display, true);
+                false
+            }
+            Some(Outcome::Excluded { .. }) if entry.is_dir() => true,
+            Some(Outcome::Excluded { .. }) => {
                 self.real_remove(access, display, false);
                 false
             }

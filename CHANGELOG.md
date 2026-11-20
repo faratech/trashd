@@ -39,6 +39,13 @@
 - Release builds strip symbols and use thin LTO with one codegen unit:
   installed binaries and the preload library shrink 25–36%.
 
+- `rm -r` of a directory that a `never_trash` pattern excludes along
+  with everything below it (`/tmp/*`, `*/node_modules`) deletes the tree
+  in one pass again, as before the per-entry sweep for excluded
+  directories: 20,200 entries in about 0.2 s instead of 0.8 to 1.9 s.
+  Exclusions that name only the directory itself (`*~`, an `only_trash`
+  miss) are still swept entry by entry. (#448, #553)
+
 ### Fixed
 
 - The shim honors `--preserve-root`/`--no-preserve-root` in command-line
