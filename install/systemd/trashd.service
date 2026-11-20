@@ -8,6 +8,10 @@ Type=simple
 ExecStart=/usr/local/lib/trashd/trashd
 Restart=always
 RestartSec=5
+# The daemon exits 78 when this kernel or container cannot run fanotify at
+# all (Linux < 5.9, no CAP_SYS_ADMIN, no fanotify). A restart cannot fix
+# that, and every 5 s forever only floods the journal (daemon-4).
+RestartPreventExitStatus=78
 
 # Capabilities
 AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
@@ -27,6 +31,13 @@ MemoryMax=256M
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trashd
+# One DELETE line per removed file: journald's default per-unit limit
+# (10000 lines per 30 s, scaled by free space) dropped most of one large
+# `rm -rf` and recorded only "Suppressed N messages" (daemon-1). Raised
+# tenfold, but kept finite so local users cannot flood the journal into
+# rotating older logs away. Override with a drop-in if you need more.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100000
 
 [Install]
 # The conventional target for system services. It is also what both

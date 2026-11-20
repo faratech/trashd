@@ -156,6 +156,79 @@
   fdatasyncs the new sidecar and fsyncs `info/` before retiring the
   source, where the trash copy becomes the only copy. (#520, #522)
 
+- install.sh and `make install` put the optional i686 preload where this
+  host's loaders actually expand `$LIB` (as `ld.so --list-diagnostics`
+  reports it, glibc 2.33+) and register the `$LIB` entry only then;
+  everywhere else they register the 64-bit library alone. The fixed
+  `lib64/` + `lib/` layout could not be resolved on Debian/Ubuntu
+  (`lib/<triplet>`) and loaded the wrong ELF class on Arch, so every
+  process printed a preload error and ran without Layer 2. A `$LIB`
+  entry that does not load cleanly after registration is replaced by the
+  flat entry, and stale per-ABI trees are deleted only after no entry
+  names them. (#469, #550, #470, #406)
+
+- install.sh and `make install` set umask 022 and create the trashd tree
+  and `/etc/trashd` with mode 0755, so `/etc/ld.so.preload` is left at
+  0644 even when sudo carries a hardened 027/077 umask. The package
+  scriptlets also chmod the list after registering. Before this, an
+  unreadable list or tree silently turned off Layers 1 and 2 for every
+  non-root user. (#473)
+
+- The Arch package ships its scriptlets in `packaging/trashd.install`
+  (`install=` in the PKGBUILD). pacman never ran the functions written
+  into the PKGBUILD, so the package never registered the preload. Both
+  packages now drop the entry before their files are erased (RPM
+  `%preun` on erase, Arch `pre_remove`) instead of afterwards, when it
+  already named a deleted library. (#474, #549, #477, #551,
+  #408)
+
+- `make install` probes the built preload and binaries with the host's
+  loader before copying anything, as install.sh does (#191). A preload
+  built against a newer glibc than the host's no longer reaches
+  `/etc/ld.so.preload`, where it would stop every dynamically linked
+  program. Its `/etc/ld.so.preload` rewrites are single `&&` chains: a
+  failed awk no longer replaces the list with a partial copy, and
+  uninstall stops before deleting a library that is still registered.
+  (#475, #471)
+
+- The root login hook no longer wraps a shell given a `-c` command, or a
+  non-login interactive shell. `bash -lic 'cmd'` used to discard `cmd`
+  and exit 0 (or run its stdin as root commands), and Fedora's
+  `/etc/bashrc` turned every interactive root bash into a login shell. A
+  busybox login shell is re-executed as `busybox sh -l`; `busybox -l`
+  failed with "applet not found" and ended the login. (#476, #472)
+
+- install.sh and the Makefile refuse a `PREFIX` containing a backslash.
+  `awk -v` unescaped it, so reinstalls duplicated the entry and
+  uninstall left it naming a deleted library. (#480)
+
+- Source installs stage the build under `$TMPDIR` instead of a hardcoded
+  `/tmp`. They stop with a clear message before any change if the stage
+  is mounted `noexec`, and as root they accept only a `TMPDIR` that
+  nobody but root can modify. (#479)
+
+- `trash self-update` run as root starts the installer with a cleared
+  environment and always an explicit, validated `PREFIX`. Before, a
+  `PREFIX` inherited through `su` or `sudo -E` decided where root
+  installed the library every process loads, bypassing the
+  root-owned-prefix check (#199). (#441)
+
+- The fanotify daemon exits with status 78 when fanotify cannot run at
+  all (kernel older than 5.9, no `CAP_SYS_ADMIN`, or no fanotify). The
+  unit's `RestartPreventExitStatus=78` stops `Restart=always` from
+  relaunching it every 5 seconds forever. (#464)
+
+- The daemon unit raises journald's per-unit rate limit from 10,000 to
+  100,000 lines per 30 s, because one large `rm -rf` dropped most of its
+  DELETE audit lines. The limit stays finite so local users cannot flood
+  the journal. (#461)
+
+- The release workflow builds with a read-only token that is not
+  persisted into `.git/config`. Provenance is attested in a separate job
+  that runs no build code, and only the release job, which builds
+  nothing, can write releases and tags. CI's checkout no longer persists
+  its token either. (#478)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

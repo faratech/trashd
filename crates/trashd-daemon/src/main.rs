@@ -123,6 +123,20 @@ fn main() {
     }
 }
 
+/// Exit status for a host that cannot run fanotify at all (EX_CONFIG).
+/// install/systemd/trashd.service lists it in RestartPreventExitStatus=.
+const EXIT_UNSUPPORTED: i32 = 78;
+
+/// fanotify_init errors that no restart can fix — a kernel without
+/// FAN_REPORT_DFID_NAME (EINVAL, before 5.9), no CAP_SYS_ADMIN (EPERM), no
+/// fanotify (ENOSYS) — map to [`EXIT_UNSUPPORTED`]; anything else to 1.
+fn fanotify_init_exit_code(error: &io::Error) -> i32 {
+    match error.raw_os_error() {
+        Some(libc::EINVAL | libc::EPERM | libc::ENOSYS) => EXIT_UNSUPPORTED,
+        _ => 1,
+    }
+}
+
 fn run() -> io::Result<()> {
     let config = Config::load();
 
@@ -145,7 +159,18 @@ fn run() -> io::Result<()> {
             if e.raw_os_error() == Some(libc::EINVAL) {
                 eprintln!("trashd: fanotify_init failed (kernel too old? need 5.9+)");
             }
-            return Err(e);
+            let code = fanotify_init_exit_code(&e);
+            if code != EXIT_UNSUPPORTED {
+                return Err(e);
+            }
+            // Restarting cannot help here: exit with the status the unit's
+            // RestartPreventExitStatus= names instead of being relaunched
+            // every RestartSec forever (daemon-4).
+            eprintln!(
+                "trashd: fanotify is unavailable on this system; exiting {code} (not restarted)"
+            );
+            eprintln!("trashd: fatal: {e}");
+            std::process::exit(code);
         }
     };
     eprintln!("trashd: fanotify initialized (fd {})", fan_fd);
@@ -952,6 +977,26 @@ fn fanotify_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // daemon-4: a kernel without FAN_REPORT_DFID_NAME (EINVAL, < 5.9), a
+    // container without CAP_SYS_ADMIN (EPERM) or a kernel without fanotify
+    // (ENOSYS) never starts working on a restart. Those exit with the status
+    // the unit's RestartPreventExitStatus= names, so Restart=always does not
+    // relaunch the daemon every 5 s forever; transient failures still retry.
+    #[test]
+    fn unsupported_fanotify_exits_without_restart() {
+        let unit = include_str!("../../../install/systemd/trashd.service");
+        let prevent = format!("RestartPreventExitStatus={EXIT_UNSUPPORTED}");
+        assert!(unit.lines().any(|line| line == prevent), "{prevent}");
+        for errno in [libc::EINVAL, libc::EPERM, libc::ENOSYS] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert_eq!(fanotify_init_exit_code(&error), EXIT_UNSUPPORTED, "{error}");
+        }
+        for errno in [libc::EMFILE, libc::ENOMEM] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert_eq!(fanotify_init_exit_code(&error), 1, "{error}");
+        }
+    }
 
     // #438: a resolved audit path must not keep the kernel's
     // ` (deleted)` suffix from a /proc/self/fd readlink of an inode whose

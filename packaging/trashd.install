@@ -1,0 +1,43 @@
+# pacman scriptlets for trashd, named by install= in the PKGBUILD: pacman
+# runs scriptlets only from that file (packaged as .INSTALL), never from
+# functions in the PKGBUILD itself (install-3).
+#
+# Layer 2 registration is owned by these hooks: the Makefile deliberately
+# skips /etc/ld.so.preload when DESTDIR is set (#408). Mirror install.sh — a
+# whole-token match on the flat entry (this package builds one arch, so there
+# is no $LIB form), and on removal drop only our entry, keeping other
+# libraries that share a line (#229, #261).
+
+post_install() {
+    local entry='/usr/lib/trashd/libtrashd_preload.so'
+    if [ -f "$entry" ] \
+        && ! awk -v lib="$entry" '{ line = $0; if ((h = index(line, "#")) > 0) line = substr(line, 1, h - 1); n = split(line, e, /[ \t:]+/); for (i = 1; i <= n; i++) if (e[i] == lib) found = 1 } END { exit !found }' /etc/ld.so.preload 2>/dev/null; then
+        if [ -s /etc/ld.so.preload ] && [ "$(tail -c1 /etc/ld.so.preload | wc -l)" -eq 0 ]; then
+            printf '\n' >> /etc/ld.so.preload
+        fi
+        printf '%s\n' "$entry" >> /etc/ld.so.preload
+        # ld.so silently skips a list other users cannot read (install-2).
+        chmod 0644 /etc/ld.so.preload
+    fi
+}
+
+post_upgrade() {
+    # The entry is stable across versions; re-running the idempotent
+    # registration also repairs it if a user removed it by hand.
+    post_install
+}
+
+# pre_remove, not post_remove: by then the library is gone and every process
+# started meanwhile prints an ld.so error for the dangling entry (install-6,
+# #166). pacman does not run it on upgrades.
+pre_remove() {
+    local entry='/usr/lib/trashd/libtrashd_preload.so'
+    if [ -f /etc/ld.so.preload ] && grep -qsF '/usr/lib/trashd/' /etc/ld.so.preload; then
+        awk -v lib="$entry" '{ line = $0; comment = ""; if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) } if (index(line, lib) == 0) { print $0; next } n = split(line, entry, /[ \t:]+/); out = ""; for (i = 1; i <= n; i++) if (entry[i] != "" && entry[i] != lib) out = out (out == "" ? "" : " ") entry[i]; if (comment != "") out = out (out == "" ? "" : " ") comment; if (out != "") print out }' \
+            /etc/ld.so.preload > /etc/ld.so.preload.trashd-pacsave \
+            && chmod 0644 /etc/ld.so.preload.trashd-pacsave \
+            && mv -f /etc/ld.so.preload.trashd-pacsave /etc/ld.so.preload \
+            || { rm -f /etc/ld.so.preload.trashd-pacsave; echo "warning: could not remove $entry from /etc/ld.so.preload" >&2; }
+        [ -s /etc/ld.so.preload ] || rm -f /etc/ld.so.preload
+    fi
+}

@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # No dtolnay/rust-toolchain step on purpose: rustup honors rust-toolchain.toml
       # (channel + clippy/rustfmt components), so the workflow can't drift from the pin.
       # First cargo/clippy/fmt invocation below installs the pinned toolchain.
@@ -45,6 +47,8 @@ jobs:
         run: sudo env TRASH_BYPASS=1 ./tests/integration.sh target/release
       - name: RPM spec lists exactly what make install stages
         run: python3 tests/rpm_files_check.py
+      - name: Package scriptlets and workflow permissions
+        run: python3 tests/packaging_lint.py
       - name: Installer behavior in disposable filesystem
         run: sudo env TRASH_BYPASS=1 ./tests/install_regression.sh target/release
       - name: Preload policy and raw filename round trips

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# sudo keeps a hardened caller umask (027/077). It created /etc/ld.so.preload
+# and the trashd tree unreadable to everyone but root: ld.so silently skips a
+# preload list it cannot read and the profile hook never saw the shim, so
+# Layers 1 and 2 were off for every other user (install-2).
+umask 022
 
 # Bypass trashd interception during install — we don't want the LD_PRELOAD
 # layer trashing old binaries when install overwrites them.
@@ -15,12 +20,15 @@ BIN_DIR="${PREFIX}/bin"
 # separated tokens: a prefix like '/opt/my dir' produced an entry ld.so
 # splits at the space (two errors from EVERY dynamically linked process)
 # that this script's own registered-check never matched again, so each
-# reinstall appended another broken line (#422). Refuse such paths before
-# anything is created, for install and uninstall alike.
+# reinstall appended another broken line (#422). A backslash is unescaped by
+# the `awk -v` comparisons below, so the entry was never found again either:
+# reinstalls duplicated it and uninstall left it naming a deleted library
+# (install-9). Refuse such paths before anything is created, for install and
+# uninstall alike.
 for _path_var in PREFIX SHIM_DIR REAL_DIR LIB_DIR BIN_DIR; do
     case "${!_path_var}" in
-        *[[:space:]]*|*:*)
-            echo "error: \$${_path_var}='${!_path_var}' contains whitespace or ':' — unsafe for /etc/ld.so.preload and the profile hook" >&2
+        *[[:space:]]*|*:*|*\\*)
+            echo "error: \$${_path_var}='${!_path_var}' contains whitespace, ':' or '\\' — unsafe for /etc/ld.so.preload and the profile hook" >&2
             exit 1
             ;;
     esac
@@ -69,6 +77,35 @@ preload_append_entry() {
         printf '\n' >> /etc/ld.so.preload
     fi
     echo "$1" >> /etc/ld.so.preload
+    # ld.so skips a list it cannot read, silently, for every other user
+    # (install-2): repair one some earlier tool created with a tight umask.
+    chmod 0644 /etc/ld.so.preload
+}
+
+# The directory this loader substitutes for $LIB, as glibc 2.33+ reports it
+# (dl_dst_lib). Fails when the loader is absent, too old to say, or reports
+# anything but a plain relative path.
+ldso_lib_dir() {
+    [ -x "$1" ] || return 1
+    _ld_dir="$("$1" --list-diagnostics 2>/dev/null | awk -F'"' '$1 == "dl_dst_lib=" { print $2 }')" || return 1
+    case "${_ld_dir}" in
+        '' | /* | *..* | *[!A-Za-z0-9_./-]*) return 1 ;;
+    esac
+    printf '%s\n' "${_ld_dir}"
+}
+
+# True when programs start without any loader complaint about the registered
+# preload entries: /bin/true for the native ABI, and the i386 libc (itself a
+# runnable program) where an i386 loader exists.
+preload_entries_load() {
+    [ -z "$(env -u LD_PRELOAD /bin/true 2>&1 >/dev/null)" ] || return 1
+    if [ -x /lib/ld-linux.so.2 ]; then
+        _pe_libc32="$(dirname "$(readlink -f /lib/ld-linux.so.2)")/libc.so.6"
+        if [ -x "${_pe_libc32}" ]; then
+            [ -z "$(env -u LD_PRELOAD "${_pe_libc32}" 2>&1 >/dev/null)" ] || return 1
+        fi
+    fi
+    return 0
 }
 
 # -----------------------------------------------------------------------
@@ -359,7 +396,30 @@ else
     # Source install — build the locked dependency graph without root privileges.
     # Build scripts and proc macros execute arbitrary code, so a sudo install must
     # delegate compilation to the account that invoked sudo.
-    BUILD_STAGE="$(mktemp -d /tmp/trashd-build.XXXXXXXX)"
+    #
+    # Stage under TMPDIR rather than a hardcoded /tmp, which CIS hardening
+    # mounts noexec: cargo runs build scripts and proc macros from its target
+    # directory (install-8). Root hands the stage to the build account below,
+    # so as root only a TMPDIR that nobody else can rename or replace is used.
+    root_controlled_dir() {
+        _rcd="$(readlink -f -- "$1" 2>/dev/null)" || return 1
+        while :; do
+            [ -d "${_rcd}" ] || return 1
+            read -r _rcd_uid _rcd_mode <<<"$(stat -c '%u %a' -- "${_rcd}")"
+            [ "${_rcd_uid}" = 0 ] || return 1
+            # Writable by group or others is fine only with the sticky bit.
+            (( (8#${_rcd_mode} & 01000) || !(8#${_rcd_mode} & 022) )) || return 1
+            [ "${_rcd}" != / ] || return 0
+            _rcd="$(dirname -- "${_rcd}")"
+        done
+    }
+    BUILD_PARENT="${TMPDIR:-/tmp}"
+    if [ "$(id -u)" -eq 0 ] && ! root_controlled_dir "${BUILD_PARENT}"; then
+        echo "error: TMPDIR=${BUILD_PARENT} can be modified by users other than root" >&2
+        echo "Unset TMPDIR or point it at a root-owned directory." >&2
+        exit 1
+    fi
+    BUILD_STAGE="$(mktemp -d "${BUILD_PARENT%/}/trashd-build.XXXXXXXX")"
     cleanup_build_stage() {
         if [ -n "${BUILD_STAGE:-}" ]; then
             if [ -x /usr/bin/rm ]; then
@@ -370,6 +430,15 @@ else
         fi
     }
     trap cleanup_build_stage EXIT
+    printf '#!/bin/sh\nexit 0\n' > "${BUILD_STAGE}/exec-probe"
+    chmod 0755 "${BUILD_STAGE}/exec-probe"
+    if ! "${BUILD_STAGE}/exec-probe" 2>/dev/null; then
+        echo "error: ${BUILD_PARENT} does not allow running programs (mounted noexec?)," >&2
+        echo "and cargo must run build scripts from its build directory." >&2
+        echo "Point TMPDIR at a root-owned directory that allows it: sudo TMPDIR=<dir> ./install.sh" >&2
+        exit 1
+    fi
+    rm -f "${BUILD_STAGE}/exec-probe"
 
     # Optional i686 preload build (#229), run with the same privileges as
     # the main build. Exits 3 (skip) when the i686 target is not installed;
@@ -490,13 +559,16 @@ atomic_install() {
 }
 
 echo "==> Installing binaries..."
+# Mode 0755 even on a reinstall: a tree an older installer created under a
+# tight umask kept the shim and the preload out of every other user's reach
+# (install-2).
+install -d -m 0755 "${LIB_DIR}" "${SHIM_DIR}" "${REAL_DIR}"
 atomic_install "${TARGET_DIR}/trash"       "${BIN_DIR}/trash"
 atomic_install "${TARGET_DIR}/trashd-exec" "${BIN_DIR}/trashd-exec"
 atomic_install "${TARGET_DIR}/trashd"      "${LIB_DIR}/trashd"
 ln -sfn "${LIB_DIR}/trashd" "${BIN_DIR}/trashd"
 
 echo "==> Setting up shim directory..."
-mkdir -p "${SHIM_DIR}" "${REAL_DIR}"
 
 # Stash the real rm binary. Resolve candidates through `which -a` and skip
 # anything inside the trashd tree: if the shim is already on PATH, plain
@@ -594,20 +666,26 @@ fi
 echo "==> Installing LD_PRELOAD library (Layer 2)..."
 atomic_install "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/libtrashd_preload.so"
 echo "    Installed ${LIB_DIR}/libtrashd_preload.so"
-PRELOAD_ENTRY="${LIB_DIR}/libtrashd_preload.so"
-if [ -n "${PRELOAD32_SRC}" ] && [ -f "${PRELOAD32_SRC}" ]; then
-    # Per-ABI layout: one $LIB entry resolves to lib64/ for 64-bit and lib/
-    # for 32-bit processes, so 32-bit programs load the i686 library instead
-    # of erroring on the 64-bit one (#229).
-    atomic_install "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/lib64/libtrashd_preload.so"
-    atomic_install "${PRELOAD32_SRC}" "${LIB_DIR}/lib/libtrashd_preload.so"
+PRELOAD_FLAT="${LIB_DIR}/libtrashd_preload.so"
+PRELOAD_ENTRY="${PRELOAD_FLAT}"
+# Per-ABI layout (#229): one $LIB entry lets 32-bit processes load the i686
+# library instead of erroring on the 64-bit one. ld.so expands $LIB to a
+# distribution's own directory (lib64 and lib on RPM-style hosts,
+# lib/<triplet> on Debian/Ubuntu, lib and lib32 on Arch), so the fixed
+# lib64/ + lib/ layout made every process on Debian and Arch print a preload
+# error and run without Layer 2 (install-1). Lay the copies out where this
+# host's x86_64 and i386 loaders report $LIB, and register the 64-bit
+# library alone wherever that is unknown, as release tarballs do.
+if [ -n "${PRELOAD32_SRC}" ] && [ -f "${PRELOAD32_SRC}" ] && [ "$(uname -m)" = x86_64 ] \
+    && PRELOAD_LIB64="$(ldso_lib_dir /lib64/ld-linux-x86-64.so.2)" \
+    && PRELOAD_LIB32="$(ldso_lib_dir /lib/ld-linux.so.2)" \
+    && [ "${PRELOAD_LIB64}" != "${PRELOAD_LIB32}" ]; then
+    atomic_install "${PRELOAD_DIR}/libtrashd_preload.so" "${LIB_DIR}/${PRELOAD_LIB64}/libtrashd_preload.so"
+    atomic_install "${PRELOAD32_SRC}" "${LIB_DIR}/${PRELOAD_LIB32}/libtrashd_preload.so"
     PRELOAD_ENTRY="${LIB_DIR}/\$LIB/libtrashd_preload.so"
-    echo "    Installed 32-bit preload ${LIB_DIR}/lib/libtrashd_preload.so (registered via \$LIB)"
-else
-    # The flat entry resolves to the copy installed above, so per-ABI
-    # copies left by a previous $LIB install would never be referenced
-    # again — drop the stale trees (#406).
-    rm -rf "${LIB_DIR}/lib" "${LIB_DIR}/lib64"
+    echo "    Installed 32-bit preload ${LIB_DIR}/${PRELOAD_LIB32}/libtrashd_preload.so (registered via \$LIB)"
+elif [ -n "${PRELOAD32_SRC}" ]; then
+    echo "    Skipped the 32-bit preload: this system's loaders do not report where \$LIB points"
 fi
 # Enable system-wide: catches unlink/rmdir from any dynamically-linked program.
 # Registration is FORM-SPECIFIC (#406): a prior install without the i686
@@ -616,9 +694,11 @@ fi
 # ABI's library was never preloaded after an upgrade or downgrade. A
 # transition replaces the other form's entry.
 if preload_registered "${PRELOAD_ENTRY}"; then
+    # Repairs a list an older installer created under a tight umask (install-2).
+    chmod 0644 /etc/ld.so.preload
     echo "    Already in /etc/ld.so.preload"
 else
-    if preload_registered "${LIB_DIR}/libtrashd_preload.so" \
+    if preload_registered "${PRELOAD_FLAT}" \
         || preload_registered "${LIB_DIR}/\$LIB/libtrashd_preload.so"; then
         preload_remove_entries
         echo "    Replaced the other registration form in /etc/ld.so.preload"
@@ -628,6 +708,20 @@ else
     # preload list.
     preload_append_entry "${PRELOAD_ENTRY}"
     echo "    Enabled system-wide via /etc/ld.so.preload"
+fi
+# The per-ABI entry must load cleanly for every ABI that can be run here;
+# otherwise fall back to the 64-bit library alone (install-1).
+if [ "${PRELOAD_ENTRY}" != "${PRELOAD_FLAT}" ] && ! preload_entries_load; then
+    preload_remove_entries
+    preload_append_entry "${PRELOAD_FLAT}"
+    PRELOAD_ENTRY="${PRELOAD_FLAT}"
+    echo "    warning: the \$LIB entry did not load cleanly; registered the 64-bit library only" >&2
+fi
+# The flat entry resolves to the copy installed above, so per-ABI copies are
+# never referenced again. Drop them only now that the $LIB entry is gone:
+# deleting them first left it naming missing files (install-10, #406).
+if [ "${PRELOAD_ENTRY}" = "${PRELOAD_FLAT}" ]; then
+    rm -rf "${LIB_DIR}/lib" "${LIB_DIR}/lib64" "${LIB_DIR}/lib32"
 fi
 
 echo "==> Installing PATH + seccomp hook (Layers 1 & 4)..."
@@ -743,6 +837,8 @@ fi
 
 echo "==> Installing global config..."
 GLOBAL_CONFIG_DIR="/etc/trashd"
+# Every user's processes read the global policy (install-2).
+install -d -m 0755 "${GLOBAL_CONFIG_DIR}"
 if [ ! -f "${GLOBAL_CONFIG_DIR}/config.toml" ]; then
     install -Dm644 "$(dirname "$0")/config/trashd.toml" "${GLOBAL_CONFIG_DIR}/config.toml"
     echo "    Installed ${GLOBAL_CONFIG_DIR}/config.toml"

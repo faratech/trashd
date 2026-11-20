@@ -72,6 +72,10 @@ cargo build --release
 # install.sh exactly — a whole-token match on the flat entry (a single-arch
 # RPM build has no i686 library and thus no $LIB form), and on removal drop
 # only our entry, keeping other libraries that share a line (#229, #261).
+# The list is left mode 0644: ld.so silently skips one other users cannot
+# read (install-2). Deregistration runs in %preun on erase ($1 == 0), before
+# the payload is removed: in %postun the library was already gone, so every
+# process started meanwhile printed an ld.so error (install-6, #166).
 # NOTE: lines inside these scriptlets must not start with '#' — rpm strips
 # them as spec comments before the scriptlet runs.
 %post
@@ -83,21 +87,23 @@ if [ -f "%{_prefix}/lib/trashd/libtrashd_preload.so" ] \
         printf '\n' >> /etc/ld.so.preload || :
     fi
     printf '%s\n' "$trashd_entry" >> /etc/ld.so.preload || :
+    chmod 0644 /etc/ld.so.preload || :
 fi
 
 %preun
 %systemd_preun trashd.service
-
-%postun
-%systemd_postun_with_restart trashd.service
 if [ "$1" -eq 0 ] && [ -f /etc/ld.so.preload ] \
     && grep -qsF %{_prefix}/lib/trashd/ /etc/ld.so.preload; then
     awk -v lib=%{_prefix}/lib/trashd/libtrashd_preload.so '{ line = $0; comment = ""; if ((h = index(line, "#")) > 0) { comment = substr(line, h); line = substr(line, 1, h - 1) } if (index(line, lib) == 0) { print $0; next } n = split(line, entry, /[ \t:]+/); out = ""; for (i = 1; i <= n; i++) if (entry[i] != "" && entry[i] != lib) out = out (out == "" ? "" : " ") entry[i]; if (comment != "") out = out (out == "" ? "" : " ") comment; if (out != "") print out }' \
         /etc/ld.so.preload > /etc/ld.so.preload.trashd-rpmnew \
         && chmod 0644 /etc/ld.so.preload.trashd-rpmnew \
-        && mv -f /etc/ld.so.preload.trashd-rpmnew /etc/ld.so.preload || :
+        && mv -f /etc/ld.so.preload.trashd-rpmnew /etc/ld.so.preload \
+        || { rm -f /etc/ld.so.preload.trashd-rpmnew; echo "warning: could not remove %{_prefix}/lib/trashd/libtrashd_preload.so from /etc/ld.so.preload" >&2; }
     [ -s /etc/ld.so.preload ] || rm -f /etc/ld.so.preload
 fi
+
+%postun
+%systemd_postun_with_restart trashd.service
 
 %changelog
 * Thu Mar 20 2026 Faratech <dev@faratech.com> - 0.1.0-1

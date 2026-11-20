@@ -120,7 +120,7 @@ cd trashd
 sudo ./install.sh
 ```
 
-Run the installer with `sudo` from your normal (non-root) account that owns the checkout. It compiles as your user in a private staging area — never as root — using the committed `Cargo.lock`, then installs:
+Run the installer with `sudo` from your normal (non-root) account that owns the checkout. It compiles as your user in a private staging area under `$TMPDIR` (default `/tmp`; if that is mounted `noexec`, run `sudo TMPDIR=<dir> ./install.sh` with a root-owned directory that allows running programs) — never as root — using the committed `Cargo.lock`, then installs:
 
 1. The `trash` command and helpers into `/usr/local/bin/` and `/usr/local/lib/trashd/`.
 2. An `rm` shim that shadows the real `rm` on your `PATH` (the real `rm` is kept safely at `/usr/local/lib/trashd/real/rm`).
@@ -797,7 +797,7 @@ Work through these in order:
 
 ### "My program's deletions are not trashed, but `rm` works"
 
-Almost always one of: the program is statically linked (use `trashd-exec ./your-program`), it runs setuid (same answer), it is — or descends from — a `bypass_processes` entry, or on a packaging-based install the preload library was never registered in `/etc/ld.so.preload`. `TRASHD_PRELOAD_LOG=1 ./your-program` confirms whether the hooks fire at all.
+Almost always one of: the program is statically linked (use `trashd-exec ./your-program`), it runs setuid (same answer), it is — or descends from — a `bypass_processes` entry, or the preload library is not listed in `/etc/ld.so.preload` (or that file is not readable by the user running the program). `TRASHD_PRELOAD_LOG=1 ./your-program` confirms whether the hooks fire at all.
 
 ### "How do I see why the seccomp layer is or is not active?"
 
@@ -892,7 +892,7 @@ sudo make uninstall          # removes the install; your trash contents are pres
 
 ### Distribution packages
 
-Templates live in [`packaging/`](packaging/): an RPM spec (`trashd.spec`) and an Arch `PKGBUILD`. They build with `cargo build --release --locked` and install via `make install PREFIX=/usr`. Two behavioural notes: packages install the preload library **without** registering it in `/etc/ld.so.preload` (enable Layer 2 by adding the library path there), and the admin config is preserved across upgrades (`%config(noreplace)` / `backup=`). `trash self-update` deliberately refuses to manage package-owned `/usr` installs.
+Templates live in [`packaging/`](packaging/): an RPM spec (`trashd.spec`) and an Arch `PKGBUILD`. They build with `cargo build --release --locked` and install via `make install PREFIX=/usr`. Two behavioural notes: packages register the preload library in `/etc/ld.so.preload` on install (RPM `%post`, Arch `post_install` in `trashd.install`) and remove the entry before their files are erased (`%preun`, `pre_remove`), and the admin config is preserved across upgrades (`%config(noreplace)` / `backup=`). `trash self-update` deliberately refuses to manage package-owned `/usr` installs.
 
 ### Manual install (what the scripts do, by hand)
 
@@ -996,12 +996,12 @@ Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastes
 | --- | --- | --- |
 | Linux, any kernel | Layers 1–2 (shim + preload) | The protection most users rely on |
 | Linux 5.6+ | Layer 4 (seccomp user-notification, `openat2` pinning) | Older kernels simply lack kernel trapping |
-| Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts |
+| Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts; on an older kernel, or without fanotify, it exits with status 78 and systemd does not restart it |
 | `CAP_SYS_ADMIN` (via systemd ambient capabilities) | Layer 3 daemon | Granted by the shipped unit; you do not set it by hand |
 | Rust 1.99.1+ | Building from source only | Runtime has no Rust dependency |
 | systemd | Daemon + cleanup timer (optional conveniences) | Layers 1, 2, and 4 work without systemd |
 
-Architectures: x86-64 is the primary target (including an optional i686 preload for 32-bit processes on multilib systems); aarch64 is supported for Layers 1–3 and for Layer 4's `unlinkat`-only filter. Release artifacts are built against a glibc 2.28 floor, so they run on older enterprise distributions.
+Architectures: x86-64 is the primary target (including an optional i686 preload for 32-bit processes on multilib systems, used where the system's loaders report their `$LIB` directories, glibc 2.33+); aarch64 is supported for Layers 1–3 and for Layer 4's `unlinkat`-only filter. Release artifacts are built against a glibc 2.28 floor, so they run on older enterprise distributions.
 
 ### FreeDesktop.org Trash specification v1.0
 
