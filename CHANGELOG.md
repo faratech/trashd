@@ -708,6 +708,17 @@
   image behind. `tests/daemon_umount_race.py` is the opt-in experiment
   behind #467; no CI job runs it. (#467)
 
+- `install.sh` reports a started daemon as "auditing deletions on the
+  filesystems it can mark; see journalctl -u trashd" instead of
+  "monitoring deletions", and the README's architecture diagram no
+  longer says it watches all deletions system-wide. btrfs subvolume
+  mounts, tmpfs, overlay and FUSE are not audited. (#463 follow-up)
+
+- The seccomp unit test `forwards_hup_int_term_without_recycled_pids`
+  fails when an assertion in its forked case fails. The panic used to
+  end the forked process with status 0, so no assertion there could fail
+  the test.
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

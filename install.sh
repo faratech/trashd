@@ -798,7 +798,7 @@ if [ -d /run/systemd/system ] && [ -d /etc/systemd/system ] && command -v system
     systemctl enable trashd 2>/dev/null || true
     systemctl restart trashd 2>/dev/null || true
     if systemctl is-active --quiet trashd 2>/dev/null; then
-        echo "    trashd is running (monitoring deletions)"
+        echo "    trashd is running (auditing deletions on the filesystems it can mark; see journalctl -u trashd)"
     else
         echo "    trashd installed but could not start (needs CAP_SYS_ADMIN)"
         echo "    Start manually: sudo systemctl start trashd"

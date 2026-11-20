@@ -550,7 +550,7 @@ The one-sentence version: **four independent safety nets watch for deletions at 
   └─────────────────────────────┘
 
   ┌─────────────────────────────┐
-  │ 3 · fanotify daemon         │  watches ALL deletions system-wide
+  │ 3 · fanotify daemon         │  watches deletions on the filesystems it can mark
   │    trashd (audit only)      │  Cannot stop a deletion — it logs it
   └─────────────────────────────┘
 ```

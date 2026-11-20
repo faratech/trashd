@@ -561,6 +561,25 @@ env PATH="$INSTALL_PATH" PREFIX=/work/custom "$WORK/good/install.sh" --uninstall
 echo "PASS: cleanup units follow PREFIX and are removed on uninstall"
 
 # -----------------------------------------------------------------------
+# daemon-3 follow-up: a started daemon audits the filesystems it can mark,
+# which excludes btrfs subvolume mounts, tmpfs, overlay and FUSE; the
+# installer reported it as "monitoring deletions" without qualification.
+# -----------------------------------------------------------------------
+mkdir -p /run/systemd/system
+env PATH="$WORK/fakebin:$INSTALL_PATH" PREFIX=/work/custom "$WORK/good/install.sh" > "$WORK/active.log" 2>&1 \
+    || fail "install with a running systemd failed: $(tail -3 "$WORK/active.log")"
+env PATH="$WORK/fakebin:$INSTALL_PATH" PREFIX=/work/custom "$WORK/good/install.sh" --uninstall > "$WORK/active-un.log" 2>&1 \
+    || fail "uninstall with a running systemd failed: $(tail -3 "$WORK/active-un.log")"
+rmdir /run/systemd/system
+running=$(grep "trashd is running" "$WORK/active.log") \
+    || fail "no status line for a started daemon: $(tail -20 "$WORK/active.log")"
+[[ "$running" != *"(monitoring deletions)"* ]] \
+    || fail "installer claims the daemon monitors every deletion: $running"
+[[ "$running" == *"filesystems it can mark"* && "$running" == *"journalctl -u trashd"* ]] \
+    || fail "daemon status line does not say what is audited: $running"
+echo "PASS: the installer reports what a started daemon audits"
+
+# -----------------------------------------------------------------------
 # #421: --purge must also reach trash in passwd homes outside /home.
 # -----------------------------------------------------------------------
 env PATH="$INSTALL_PATH" "$WORK/good/install.sh" --uninstall --purge > "$WORK/purge.log" 2>&1 \

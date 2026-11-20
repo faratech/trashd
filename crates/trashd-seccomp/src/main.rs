@@ -2229,39 +2229,44 @@ mod tests {
                     unsafe { libc::waitpid(harness_child, &mut status, 0) },
                     harness_child
                 );
-                assert_eq!(status, 0);
+                assert_eq!(status, 0, "signal case failed");
                 return;
             }
-            let signal: i32 = signal.parse().unwrap();
-            let signals = SignalWait::new().unwrap();
-            let child = unsafe { libc::fork() };
-            assert!(child >= 0);
-            if child == 0 {
-                unsafe { libc::signal(signal, libc::SIG_DFL) };
-                signals.restore_for_exec();
-                loop {
-                    unsafe { libc::pause() };
+            // A panic must fail this process: unwinding out of a forked
+            // harness thread ends it with status 0.
+            let case = std::panic::catch_unwind(|| {
+                let signal: i32 = signal.parse().unwrap();
+                let signals = SignalWait::new().unwrap();
+                let child = unsafe { libc::fork() };
+                assert!(child >= 0);
+                if child == 0 {
+                    unsafe { libc::signal(signal, libc::SIG_DFL) };
+                    signals.restore_for_exec();
+                    loop {
+                        unsafe { libc::pause() };
+                    }
                 }
-            }
-            let wrapper = unsafe { libc::getpid() };
-            let sender = unsafe { libc::fork() };
-            assert!(sender >= 0);
-            if sender == 0 {
-                unsafe {
-                    libc::usleep(20_000);
-                    // From outside the job: a member of the command's process
-                    // group signals the whole group (seccomp-orch-6).
-                    libc::setpgid(0, 0);
-                    libc::kill(wrapper, signal);
-                    libc::_exit(0);
+                let wrapper = unsafe { libc::getpid() };
+                let sender = unsafe { libc::fork() };
+                assert!(sender >= 0);
+                if sender == 0 {
+                    unsafe {
+                        libc::usleep(20_000);
+                        // From outside the job: a member of the command's
+                        // process group signals the whole group
+                        // (seccomp-orch-6).
+                        libc::setpgid(0, 0);
+                        libc::kill(wrapper, signal);
+                        libc::_exit(0);
+                    }
                 }
-            }
-            assert_eq!(
-                ChildProcess(child).wait(None, &signals).unwrap(),
-                CommandStatus::Signaled(signal)
-            );
-            unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
-            unsafe { libc::_exit(0) };
+                assert_eq!(
+                    ChildProcess(child).wait(None, &signals).unwrap(),
+                    CommandStatus::Signaled(signal)
+                );
+                unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
+            });
+            unsafe { libc::_exit(i32::from(case.is_err())) };
         }
         // #350: ALRM (GNU `timeout -s ALRM`), timer and real-time signals too.
         for signal in [
@@ -2282,5 +2287,20 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "signal {signal}");
         }
+        // A failed assertion in the forked case must fail the rerun: its
+        // panic used to end the forked process with status 0, so no
+        // assertion above could fail this test.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::forwards_hup_int_term_without_recycled_pids",
+                "--nocapture",
+            ])
+            .env(CHILD, "not a signal")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "a panic in the forked case passed");
     }
 }
