@@ -235,7 +235,11 @@ impl Config {
             Err(e) => {
                 // Never eprintln!: it panics on a failing stderr, and a
                 // seccomp supervisor outlives its terminal (common-policy-3).
-                crate::report_note(&format!("trashd: bad config {}: {}", path.display(), e));
+                crate::report_note(&format!(
+                    "trashd: bad config {}: {}",
+                    path.display(),
+                    legacy_config::describe(&e, &contents)
+                ));
                 None
             }
         }
@@ -997,6 +1001,27 @@ mod tests {
         // A file that does not parse at all still drops the layer.
         std::fs::write(&path, "only_trash = [\"*.rs\"\n").unwrap();
         assert!(Config::load_partial(&path).is_none());
+    }
+
+    // common-policy-4: a bad-config warning says where parsing stopped and
+    // why. The parser's own rendering quotes the offending line, and a
+    // config can be a symlink to a file that is not one.
+    #[test]
+    fn bad_config_warning_never_quotes_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "root:SECRETMARKER:19000:0:99999:7:::\n").unwrap();
+        let (loaded, notes) = crate::test_notes::of(|| Config::load_partial(&path));
+        assert!(loaded.is_none());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(!notes[0].contains("SECRETMARKER"), "{notes:?}");
+        assert!(
+            notes[0].starts_with(&format!(
+                "trashd: bad config {}: line 1, column 37: ",
+                path.display()
+            )),
+            "{notes:?}"
+        );
     }
 
     // common-policy-3: a seccomp supervisor outlives its terminal. A load

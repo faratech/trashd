@@ -836,6 +836,214 @@ def run():
         recorded = {path.name for path in (trash / "info").glob("*.trashinfo")}
         assert {"older.trashinfo", "state.trashinfo"} <= recorded, recorded
         print("PASS: a recursive removal never destroys the trash it filled")
+
+        # /etc/ld.so.preload loads the library into setuid programs, whose
+        # environment is their invoker's. There XDG_CONFIG_HOME must not
+        # choose a file root reads (through a symlink, with its first line
+        # echoed by the parse error), and XDG_DATA_HOME must not choose where
+        # root creates directories (preload-1, common-policy-4, preload-2).
+        # The helper is a setuid-root copy of unlink(1), run by nobody; the
+        # sandbox's own /etc is a tmpfs, so the preload file exists only here.
+        import shutil
+        privileged = root / "privileged"
+        privileged.mkdir()
+        helper = privileged / "unlink"
+        shutil.copyfile(Path("/usr/bin/unlink").resolve(), helper)
+        os.chown(helper, 0, 0)
+        helper.chmod(0o4755)
+        os.makedirs("/root", mode=0o700, exist_ok=True)
+        root_trash = Path("/root/.local/share/Trash")
+
+        def as_nobody():
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+
+        def run_privileged(victim, **variables):
+            victim.write_bytes(b"deleted by a setuid program")
+            environment = {"PATH": "/usr/bin:/bin", "HOME": "/home/nobody", **variables}
+            preload_file = Path("/etc/ld.so.preload")
+            preload_file.write_text(library + "\n")
+            try:
+                result = subprocess.run([str(helper), str(victim)], env=environment,
+                                        capture_output=True, preexec_fn=as_nobody, timeout=10)
+            finally:
+                preload_file.unlink()
+            assert result.returncode == 0 and not victim.exists(), (victim, result.stderr)
+            records = list((root_trash / "info").glob(victim.name + "*.trashinfo"))
+            assert len(records) == 1, (victim, records, result.stderr)
+            stored = root_trash / "files" / records[0].stem
+            assert stored.read_bytes() == b"deleted by a setuid program", victim
+            return result
+
+        secret = privileged / "shadow"
+        secret.write_text("root:SECRETMARKER:19000:0:99999:7:::\n")
+        secret.chmod(0o600)
+        for name, config in [("symlinked", None), ("policy", 'never_trash = ["*"]\n')]:
+            xdg = privileged / f"xdg-{name}"
+            (xdg / "trashd").mkdir(parents=True)
+            if config is None:
+                (xdg / "trashd/config.toml").symlink_to(secret)
+            else:
+                (xdg / "trashd/config.toml").write_text(config)
+            for entry in (xdg, xdg / "trashd", xdg / "trashd/config.toml"):
+                os.lchown(entry, 65534, 65534)
+            result = run_privileged(privileged / f"setuid-config-{name}", XDG_CONFIG_HOME=str(xdg))
+            assert b"SECRETMARKER" not in result.stderr, result.stderr
+            assert b"bad config" not in result.stderr, result.stderr
+        print("PASS: a setuid program reads no config its invoker's environment names")
+
+        run_privileged(Path("/etc/setuid-data-home"), XDG_DATA_HOME="/etc/newdir")
+        assert not os.path.lexists("/etc/newdir"), "root created a directory the invoker chose"
+        run_privileged(Path("/etc/setuid-home"), HOME="/etc/newhome")
+        assert not os.path.lexists("/etc/newhome"), "root created a directory the invoker chose"
+        print("PASS: a setuid program creates no directory its invoker's environment names")
+
+        # A deletion names an entry of a directory: the one a descriptor is
+        # open on (rm -r, find -delete, shutil.rmtree), or the one its
+        # pathname led to. The hook moved, copied and retired that entry by
+        # absolute path, with every directory in it resolved again: a
+        # directory swapped for a symlink in between had root act on the
+        # entry of that name wherever the link led (preload-3). Here the
+        # swap happens while the hook waits for the trash's lock, after its
+        # own look at the entry; a second link to the victim stands in for a
+        # swap after the hook's last identity check.
+        import fcntl, time
+        flock_nr = {"x86_64": 73, "aarch64": 32}[os.uname().machine]
+
+        def waits_for_lock(pid):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    if Path(f"/proc/{pid}/syscall").read_text().split()[0] == str(flock_nr):
+                        return True
+                except (OSError, IndexError):
+                    pass
+                time.sleep(0.01)
+            return False
+
+        swap_code = ("import os,sys\n"
+                     "if sys.argv[2] == 'descriptor':\n"
+                     " os.unlink('victim', dir_fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY))\n"
+                     "else:\n"
+                     " os.unlink(sys.argv[1] + '/victim')\n")
+        for crossing in [False, True]:
+            for spelling in ["descriptor", "path"]:
+                fixture, data, environment = focused_fixture(f"swapped-parent-{spelling}-{crossing}")
+                first = fixture / "first"
+                first.write_bytes(b"prepares the trash")
+                result = subprocess.run(["/usr/bin/unlink", str(first)], env=environment, capture_output=True)
+                assert result.returncode == 0, result.stderr
+                ground = fixture / "ground"
+                ground.mkdir()
+                if crossing:
+                    # A world-writable mount root holds no topdir trash, so
+                    # the entry is copied to the home trash and then retired.
+                    subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "-o", "mode=0777", "none", str(ground)], check=True)
+                try:
+                    real, aside, elsewhere = ground / "dir", ground / "dir.real", ground / "elsewhere"
+                    real.mkdir()
+                    elsewhere.mkdir()
+                    (real / "victim").write_bytes(b"the caller's entry")
+                    with open(data / "Trash/.trashd/store.lock", "r+b") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        child = subprocess.Popen(["/usr/bin/python3", "-c", swap_code, str(real), spelling],
+                                                 env=environment, stderr=subprocess.PIPE)
+                        try:
+                            assert waits_for_lock(child.pid), "the hook never waited for the trash's lock"
+                            os.rename(real, aside)
+                            os.link(aside / "victim", elsewhere / "victim")
+                            os.symlink(elsewhere, real)
+                        finally:
+                            fcntl.flock(lock, fcntl.LOCK_UN)
+                            try:
+                                status = child.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                child.kill()
+                                raise
+                    assert status == 0, (spelling, crossing, child.stderr.read())
+                    assert (elsewhere / "victim").is_file(), \
+                        (spelling, crossing, "the entry of another directory was removed")
+                    assert not (aside / "victim").exists(), (spelling, crossing, "the caller's entry stayed")
+                    records = list((data / "Trash/info").glob("victim*.trashinfo"))
+                    assert len(records) == 1, (spelling, crossing, records)
+                    assert (data / "Trash/files" / records[0].stem).read_bytes() == b"the caller's entry"
+                finally:
+                    if crossing:
+                        subprocess.run(["/usr/bin/umount", str(ground)], check=True)
+        print("PASS: a swapped parent directory never redirects the move, the copy or the retirement")
+
+        # The hook read the path of a caller's directory descriptor from
+        # /proc and gave up without it, so where no /proc is mounted (a
+        # chroot, a build root) every entry rm -r, find -delete and
+        # shutil.rmtree removed was deleted for good (preload-9).
+        fixture, data, environment = focused_fixture("without-proc")
+        tree = fixture / "tree"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "a").write_bytes(b"a")
+        (tree / "sub/b").write_bytes(b"b")
+        result = subprocess.run(
+            ["/usr/bin/unshare", "--mount", "/bin/sh", "-c",
+             'mount -t tmpfs none /proc && exec /usr/bin/python3 -c "$1" "$2"', "sh",
+             "import os,shutil,sys\nassert not os.path.exists('/proc/self')\nshutil.rmtree(sys.argv[1])\n",
+             str(tree)], env=environment, capture_output=True, timeout=30)
+        assert result.returncode == 0 and not tree.exists(), result.stderr
+        stored = {record.stem for record in (data / "Trash/info").glob("*.trashinfo")}
+        assert {"a", "b", "sub", "tree"} <= stored, (stored, result.stderr)
+        assert (data / "Trash/files/a").read_bytes() == b"a"
+        assert (data / "Trash/files/b").read_bytes() == b"b"
+        print("PASS: deletions relative to a directory descriptor are trashed without /proc")
+
+        # unlink needs no permission on the file itself, the copy to a trash
+        # on another filesystem does. A file its owner may not read fell
+        # through to the real unlink and was deleted for good; the delete
+        # now fails and keeps it, as rm through the shim does (preload-6).
+        fixture, data, environment = focused_fixture("unreadable-source")
+        other = fixture / "other"
+        other.mkdir()
+        # The mount root is root's: nobody cannot create a topdir trash on
+        # it, so the entry goes to nobody's home trash on another filesystem.
+        subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "-o", "mode=0755", "none", str(other)], check=True)
+        try:
+            owned = other / "owned"
+            owned.mkdir()
+            secret = owned / "secret"
+            secret.write_bytes(b"only the trash could not read it")
+            secret.chmod(0o000)
+            for entry in (fixture, data, owned, secret):
+                os.chown(entry, 65534, 65534)
+            code = ("import os,sys\n"
+                    "try: os.unlink(sys.argv[1])\n"
+                    "except PermissionError: sys.exit(0)\n"
+                    "sys.exit(3)\n")
+            result = subprocess.run(["/usr/bin/python3", "-c", code, str(secret)], env=environment,
+                                    capture_output=True, preexec_fn=as_nobody, timeout=10)
+            assert result.returncode == 0, ("an unreadable file's unlink did not fail", result.stderr)
+            assert secret.read_bytes() == b"only the trash could not read it"
+            assert not list((data / "Trash/info").glob("*.trashinfo")), "stray recovery sidecar"
+            assert not list((data / "Trash/files").iterdir()), "stray recovery copy"
+        finally:
+            subprocess.run(["/usr/bin/umount", str(other)], check=True)
+        print("PASS: a file the trash cannot read is kept, never deleted for good")
+
+        # A process out of descriptors cannot lock its trash. That is a
+        # trash it cannot use, so the real delete runs; it used to fail the
+        # unlink with EMFILE, which unlink never returns (preload-7).
+        fixture, data, environment = focused_fixture("descriptor-limit")
+        (fixture / "victim").write_bytes(b"deleted for real")
+        code = ("import ctypes,errno,os,resource\n"
+                "c=ctypes.CDLL(None,use_errno=True)\n"
+                "resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))\n"
+                "held=[]\n"
+                "try:\n"
+                " while True: held.append(os.open('/dev/null',os.O_RDONLY))\n"
+                "except OSError as error: assert error.errno==errno.EMFILE\n"
+                "result=c.unlink(b'victim')\n"
+                "assert result==0, (result, errno.errorcode.get(ctypes.get_errno()))\n")
+        result = subprocess.run(["/usr/bin/python3", "-c", code], cwd=fixture, env=environment,
+                                capture_output=True, timeout=10)
+        assert result.returncode == 0 and not (fixture / "victim").exists(), result.stderr
+        print("PASS: a process out of descriptors deletes normally")
     return 0
 
 

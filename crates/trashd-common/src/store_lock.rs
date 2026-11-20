@@ -199,6 +199,20 @@ impl RootMutationGuard {
     }
 }
 
+impl Drop for RootMutationGuard {
+    /// Unlock explicitly instead of leaving it to the close. The lock
+    /// belongs to the open file description, and a child forked by another
+    /// thread while the guard was held has a descriptor of it too: closing
+    /// ours left that child (a fork pool worker that never execs) holding
+    /// the store's lock, and every writer of that trash waiting, for as
+    /// long as it lived (preload-4). Unlocking through any descriptor of
+    /// the description releases it. Nothing relies on a forked child
+    /// keeping the lock.
+    fn drop(&mut self) {
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Test hook: runs with a root's path and `false` right before
 /// `acquire_with` validates it, and with `true` once it holds the validated
 /// descriptors. Tests show `files/` as a symlink to everything but the
@@ -361,6 +375,56 @@ mod tests {
             },
         );
         assert_ne!(verdict, Some(false));
+    }
+
+    // preload-4: an flock belongs to the open file description, which a
+    // fork duplicates. A child forked by another thread while a guard was
+    // held, and that never execs (a fork pool worker), kept the store locked
+    // after the guard was dropped: every later writer of that trash waited
+    // forever, in every layer.
+    #[test]
+    fn a_dropped_guard_unlocks_while_a_forked_child_still_holds_its_descriptor() {
+        use std::os::unix::fs::DirBuilderExt;
+        const CHILD: &str = "TRASHD_TEST_FORKED_LOCK";
+        const TEST: &str = "store_lock::tests::a_dropped_guard_unlocks_while_a_forked_child_still_holds_its_descriptor";
+        if !crate::mounts::is_rerun_child(TEST, CHILD) {
+            assert_eq!(crate::mounts::rerun_test(TEST, CHILD), Some(true));
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("Trash");
+        for p in [&root, &root.join("files"), &root.join("info")] {
+            std::fs::DirBuilder::new().mode(0o700).create(p).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let guard = super::RootMutationGuard::acquire_as(&root, uid).unwrap();
+        let held = matches!(
+            super::RootMutationGuard::try_acquire_as(&root, uid),
+            Ok(None)
+        );
+        // The re-run child runs this one test: forking here is the scenario.
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0);
+        if forked == 0 {
+            // Lives on with the inherited descriptor, and never execs.
+            unsafe {
+                libc::alarm(60);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        drop(guard);
+        let unlocked = matches!(
+            super::RootMutationGuard::try_acquire_as(&root, uid),
+            Ok(Some(_))
+        );
+        unsafe {
+            libc::kill(forked, libc::SIGKILL);
+            libc::waitpid(forked, std::ptr::null_mut(), 0);
+        }
+        eprintln!("held {held} unlocked {unlocked}");
+        crate::mounts::report_test_verdict(Some(held && unlocked));
     }
 
     #[test]

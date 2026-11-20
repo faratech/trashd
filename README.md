@@ -511,7 +511,7 @@ When a file is deleted, trashd walks up from the file's directory to `/` and use
 | `TRASH_BYPASS=1` | Disable interception entirely (shim, preload, and seccomp all honour it). The main "off switch" — see [Delete permanently on purpose](#delete-permanently-on-purpose). |
 | `TRASHD_SECCOMP_AUTO=0` | Stop login shells from auto-wrapping root shells with `trashd-exec`. Set in your shell profile if you only want explicit wrapping. |
 | `TRASHD_SECCOMP_ACTIVE` | Read-only status set by `trashd-exec` once kernel protection is live (`1` = active). Check it with `echo $TRASHD_SECCOMP_ACTIVE`; do not set it yourself — the preload verifies a matching cookie before trusting it. |
-| `TRASHD_PRELOAD_LOG=1` | Make the `LD_PRELOAD` layer log every interception to stderr (e.g. `[trashd-preload] trashed: /path -> …`). The first tool to reach for when a deletion was (or was not) caught unexpectedly. |
+| `TRASHD_PRELOAD_LOG=1` | Make the `LD_PRELOAD` layer log every interception to stderr (e.g. `[trashd-preload] trashed: /path -> …`). The first tool to reach for when a deletion was (or was not) caught unexpectedly. Ignored in setuid programs. |
 | `EDITOR` | Editor used by `trash config edit` (default `vi`). May include arguments, e.g. `EDITOR="code --wait"`. |
 | `DISPLAY` / `WAYLAND_DISPLAY` | When either is set, the shim sends a desktop notification (via `notify-send`) after trashing. Unset in SSH/cron sessions, where notifications are skipped. |
 
@@ -611,6 +611,8 @@ Safety mechanisms inside the `.so`:
 - **Trash-directory skip:** paths inside any trash folder (`~/.local/share/Trash/`, `.Trash-$UID/`, `.Trash/`) are never intercepted, so trash maintenance (`trash empty`, restores) cannot recurse into itself.
 - **Config change detection:** the config file's mtime is re-checked at most every 60 seconds and changes are logged. A full reload still requires process restart — mutating global state inside a preload library is unsafe, so long-running processes keep the policy they started with.
 - **Unsafe-trash refusal:** a trash directory another user could control is rejected with `EACCES` rather than used. A home that simply cannot host a trash (e.g. a service account with `HOME=/nonexistent`) falls through to the real syscall, and root running with another user's `HOME` uses root's own trash instead.
+- **Privileged programs:** `/etc/ld.so.preload` loads the library into setuid, setgid and file-capability programs too, whose environment belongs to whoever ran them. There the library ignores `HOME`, `XDG_*` and `TRASHD_PRELOAD_LOG`: it reads only `/etc/trashd/config.toml` and trashes into the home of the program's effective user (from `/etc/passwd`), or lets the real syscall run when that home does not exist.
+- **Pinned operand:** an entry is checked, moved, copied and removed in the directory the caller named — its directory descriptor, or the directory its pathname led to, opened once — never through a path resolved again. A directory swapped for a symlink in mid-delete cannot redirect the deletion, and `rm -r`, `find -delete` and `shutil.rmtree` are trashed even where no `/proc` is mounted.
 
 </details>
 
@@ -774,6 +776,7 @@ trashd is engineered so that *trashd's own bugs should not become your data loss
 | Deletion inside a wrapped session after a Landlock restriction attempt | Preload trashes in-process where loaded; static/raw-syscall deletions proceed to the kernel and may permanently delete what policy permits | Expected: the kernel enforces the target's own Landlock policy; trashd never overrides it |
 | Trash storage is unsafe (e.g. another user could control the trash directory) | Preload refuses with `EACCES`; the shim reports an error and deletes nothing | Fix ownership/permissions on the trash directory |
 | Trash cannot be created at all (e.g. service account with `HOME=/nonexistent`) | Preload lets the real `unlink`/`rmdir` run; root with a foreign `HOME` uses root's own trash | Give the account a real home, or accept real deletes for it |
+| The trash is on another filesystem and the file cannot be copied there: the deleting user may not read it, or the finished copy cannot be synced | Preload fails the delete (`EACCES`, `EIO`) and keeps the file, as the shim does | Make the file readable, or delete it on purpose with `TRASH_BYPASS=1` |
 | Other operational failure inside preload (after safety checks) | The result of the real syscall is returned so the calling program still works | Check `TRASHD_PRELOAD_LOG=1` output and `trash log` |
 
 The pattern: trashd prefers **keeping the caller's program working** over hard-failing every deletion, except where using the trash would itself be unsafe (controllable-by-others trash directory, unplannable recursive delete, unpublishable cross-device restore), where it refuses instead. The seccomp wrapper follows the same philosophy — setup failures run your command unwrapped with a clear report rather than not at all; only a supervisor that cannot start aborts the launch, because running behind a dead listener would strand syscalls.

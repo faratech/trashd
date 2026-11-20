@@ -591,6 +591,60 @@
   the move, the entry records the size of what landed, and gets a
   `directorysizes` row only if a directory landed. (#492)
 
+- The preload ignores `HOME`, `XDG_*` and `TRASHD_PRELOAD_LOG` in a
+  setuid, setgid or file-capability program, where `/etc/ld.so.preload`
+  loads it too and the environment is the invoker's. It reads only
+  `/etc/trashd/config.toml` there and prepares a trash only below the
+  effective user's existing passwd home. `XDG_CONFIG_HOME` naming a
+  symlink to `/etc/shadow` had a setuid-root program print root's line
+  of it, and `XDG_DATA_HOME=/etc/nologin` had it create that directory.
+  (#481, #546, #545)
+
+- A bad-config warning (store, shim, supervisor and preload) gives the
+  line, the column and the parser's message, never the parser's own
+  rendering, which quotes the source line it stopped at. (#545, #481)
+
+- The preload checks, moves, copies and removes an entry as a name in
+  the directory the caller named: its directory descriptor, or the
+  directory its pathname led to, opened once. It used the absolute path,
+  with every directory resolved again after the checks, so a directory
+  swapped for a symlink in mid-delete had root move the entry of that
+  name elsewhere (`/etc/shadow`) into its trash, or unlink it for good
+  after a cross-device copy. On x86-64 a copied source is still removed
+  with `unlink`, through the descriptor's `/proc` link. (#482)
+
+- Deletions relative to a directory descriptor (`rm -r`, `find -delete`,
+  `shutil.rmtree`) are trashed where the descriptor's `/proc` link
+  cannot be read: no `/proc` in a chroot, or a path longer than
+  `PATH_MAX`. The preload then finds the directory's path by walking up
+  through `..`. It used to give up, and the kernel deleted the entries
+  for good. (#488)
+
+- A cross-device delete through the preload fails and keeps the file
+  when the trash cannot copy it: `EACCES`/`EPERM` for a file the
+  deleting user may not read (unlink needs no permission on the file
+  itself), `EIO` for a copy that cannot be synced. Both fell through to
+  the real unlink. An owner or timestamps the copy cannot reproduce no
+  longer fail it: root in a user namespace lost a file whose group the
+  namespace does not map to `fchown`'s EINVAL. Such a copy keeps no
+  set-id bits. (#485, #489)
+
+- A trash root's lock is released when its guard is dropped, not when
+  its last descriptor closes. A child forked by another thread during a
+  delete (a fork pool worker that never execs) kept the trash locked for
+  as long as it lived, and every writer of that trash waited. (#483)
+
+- The preload publishes its config, its `dlsym` results and its seccomp
+  verdict through atomics instead of `OnceLock`. A child forked while
+  another thread loaded the config waited forever on its first deletion.
+  (#484)
+
+- A process out of descriptors, locks, memory or disk space while the
+  preload locks a trash (`EMFILE`, `ENFILE`, `ENOMEM`, `ENOLCK`,
+  `ENOSPC`, `EDQUOT`, `EROFS`) gets the real delete, as when the trash
+  cannot be created. `unlink` used to fail with an errno it never
+  returns, which also kept a user from freeing a full disk. (#486)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start
