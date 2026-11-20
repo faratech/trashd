@@ -90,7 +90,7 @@ The protected-mode paths need a real notification listener: they skip on WSL and
 
 ### trashd — fanotify monitor
 
-Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+) and watches `FAN_DELETE` only. Resolves the parent via `open_by_handle_at()` with a directory fd opened per lookup on the mount whose fsid matches (no fds are held, so `umount` works). With nothing markable it idles and re-scans mounts each second. Detection/audit only. Without fanotify (old kernel, no capability) it exits with status 78 and systemd does not restart it. FUSE and virtual filesystems are never marked; btrfs subvolume mounts cannot be marked (one startup warning); events of mounts that share an fsid are logged by name only.
+Uses `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+) and watches `FAN_DELETE` only. Resolves the parent via `open_by_handle_at()` with a directory fd opened per lookup on the mount whose fsid matches (no fds are held, so `umount` works). Each lookup still opens the mount for a few microseconds, during which an `umount` reports busy, so lookups are kept few: none for a directory the same batch shows removed, and a decoded path is reused for 20 ms (`HandleCache`). `tests/daemon_umount_race.py` (via `tests/sandbox.py --loop-device MIB`) measures that race; it is opt-in and no CI job runs it. With nothing markable it idles and re-scans mounts each second. Detection/audit only. Without fanotify (old kernel, no capability) it exits with status 78 and systemd does not restart it. FUSE and virtual filesystems are never marked; btrfs subvolume mounts cannot be marked (one startup warning); events of mounts that share an fsid are logged by name only.
 
 ## Key design decisions
 
