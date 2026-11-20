@@ -233,7 +233,9 @@ impl Config {
         {
             Ok(partial) => Some(partial),
             Err(e) => {
-                eprintln!("trashd: bad config {}: {}", path.display(), e);
+                // Never eprintln!: it panics on a failing stderr, and a
+                // seccomp supervisor outlives its terminal (common-policy-3).
+                crate::report_note(&format!("trashd: bad config {}: {}", path.display(), e));
                 None
             }
         }
@@ -995,6 +997,41 @@ mod tests {
         // A file that does not parse at all still drops the layer.
         std::fs::write(&path, "only_trash = [\"*.rs\"\n").unwrap();
         assert!(Config::load_partial(&path).is_none());
+    }
+
+    // common-policy-3: a seccomp supervisor outlives its terminal. A load
+    // warning written with eprintln! panicked on a stderr that fails
+    // (EIO on a hung-up pty, EPIPE, ENOSPC), outside the supervisor's guard.
+    #[test]
+    fn load_warnings_never_panic_on_a_failing_stderr() {
+        const CHILD: &str = "TRASHD_TEST_FAILING_STDERR";
+        const TEST: &str = "config::tests::load_warnings_never_panic_on_a_failing_stderr";
+        if crate::mounts::is_rerun_child(TEST, CHILD) {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, "only_trash = [\"*.{o,a}\", \"\"\nnever_trash = 3\n").unwrap();
+            let fixed = directory.path().join("fixed.toml");
+            std::fs::write(&fixed, "only_trash = [\"*.{o,a}\", \"\"]\n").unwrap();
+            // Every write to stderr now fails with ENOSPC; the verdict goes
+            // to stdout.
+            let full = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&full), 2) },
+                2
+            );
+            let survived = std::panic::catch_unwind(|| {
+                let broken = Config::load_partial(&path).is_none();
+                let mut config = Config::default();
+                config.merge(Config::load_partial(&fixed).expect("the layer parses"));
+                broken && config.only_trash.is_empty()
+            });
+            crate::mounts::report_test_verdict(Some(survived.unwrap_or(false)));
+            return;
+        }
+        assert_eq!(crate::mounts::rerun_test(TEST, CHILD), Some(true));
     }
 
     #[test]

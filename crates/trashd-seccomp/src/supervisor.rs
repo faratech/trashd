@@ -174,9 +174,10 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
     // Only a privileged supervisor can outrank its targets (#311). An
     // unreadable own status leaves nothing to compare with: protect nobody
     // rather than lend our credentials blindly.
+    let labels = SecurityLabels::own();
     let credentials = match Credentials::of("self") {
-        Some(own) if own.privileged() => CredentialGate::Compare(own),
-        Some(_) => CredentialGate::Unprivileged,
+        Some(own) if own.privileged() => CredentialGate::Compare(own, labels),
+        Some(_) => CredentialGate::Unprivileged(labels),
         None => CredentialGate::Unknown,
     };
     let session = SessionAncestry::discover();
@@ -240,7 +241,7 @@ pub fn run_supervisor(fd: i32, broker_fd: i32, ready_fd: i32) -> io::Result<()> 
 /// trashd-exec session must follow config edits, or removed never_trash
 /// entries keep permanently deleting (#437).
 struct SessionState {
-    /// `config_mtime()` observed at the last (re)load.
+    /// `config_mtime()` observed before the last (re)load.
     mtime: i64,
     /// Last wall-clock moment `refresh` sampled the config files. The
     /// sample costs two stats; at bulk-delete rates that dominated the
@@ -252,10 +253,19 @@ struct SessionState {
 
 impl SessionState {
     fn open() -> Result<Self, trashd_common::store::TrashError> {
-        Ok(Self::from_parts(TrashStore::open()?))
+        // Sampled before the load, as `refresh` does: an edit landing while
+        // the store opens is then a change, not the baseline (seccomp-sup-3).
+        let mtime = config_mtime();
+        Ok(Self {
+            mtime,
+            ..Self::from_parts(TrashStore::open()?)
+        })
     }
 
     fn from_parts(store: TrashStore) -> Self {
+        // Retention runs once the target has its answer (#319), from the
+        // launch-time store on, not only after a reload (seccomp-sup-1).
+        store.defer_maintenance();
         Self {
             mtime: config_mtime(),
             last_check: std::time::Instant::now(),
@@ -286,15 +296,19 @@ impl SessionState {
 
     /// `refresh` with the mtime sample and the loader injected, so a unit
     /// test can drive both without the ambient configuration.
+    ///
+    /// The reload runs after a notification was dequeued, outside the
+    /// handler's guard: a panicking load keeps the previous store serving,
+    /// so that notification is still answered (seccomp-sup-2).
     fn refresh_with(&mut self, now: i64, load: impl FnOnce() -> Option<TrashStore>) -> bool {
         if now == self.mtime {
             return false;
         }
         self.mtime = now;
-        match load() {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)).unwrap_or(None) {
             Some(store) => {
                 // Retention must keep waiting until the target is answered,
-                // exactly as at startup.
+                // exactly as at startup (`from_parts`).
                 store.defer_maintenance();
                 self.store = store;
                 true
@@ -309,23 +323,39 @@ impl SessionState {
     }
 }
 
-/// The pair of mtimes [`Config::load`] reads, combined as the preload combines
-/// them (a symmetric sum collides when the two files swap mtimes). A missing
-/// file contributes 0, so deleting a config counts as a change too.
+/// The identity of the two files [`Config::load`] reads, combined in order
+/// (a symmetric combination collides when the layers swap). A missing file
+/// keys differently from any present one, so deleting a config is a change.
 fn config_mtime() -> i64 {
     config_mtime_of(&Config::global_config_path(), &Config::user_config_path())
 }
 
 fn config_mtime_of(global: &std::path::Path, user: &std::path::Path) -> i64 {
+    use std::hash::{Hash, Hasher};
     use std::os::unix::fs::MetadataExt;
     // Nanosecond resolution: a seconds-only key misses an edit made in the
     // same second as the load, leaving stale policy in force indefinitely.
-    let mtime = |path: &std::path::Path| {
-        std::fs::metadata(path)
-            .map(|m| m.mtime().wrapping_mul(1_000_000_007) ^ m.mtime_nsec())
-            .unwrap_or(0)
+    // The mtime alone is not enough either (seccomp-sup-3): Nix and
+    // home-manager link every generation to a store file stamped at one
+    // fixed time, and an edit can keep its timestamp tick. The link itself
+    // (a retarget) and the followed file's inode, size and ctime, which
+    // userspace cannot set, catch both.
+    let layer = |path: &std::path::Path| {
+        let link = std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec()));
+        let file = std::fs::metadata(path).ok().map(|m| {
+            (
+                (m.dev(), m.ino(), m.size()),
+                (m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()),
+            )
+        });
+        (link, file)
     };
-    mtime(global).wrapping_mul(1000003) ^ mtime(user)
+    // SipHash with fixed keys: the same files give the same key every time.
+    let mut hasher = std::hash::DefaultHasher::new();
+    (layer(global), layer(user)).hash(&mut hasher);
+    hasher.finish() as i64
 }
 
 pub(crate) fn signal_ready(fd: i32, ready: bool) {
@@ -569,16 +599,59 @@ impl Credentials {
     }
 }
 
+/// The LSM labels (SELinux, AppArmor, Smack) the kernel reports for our own
+/// task. The kernel checks a target's MAC policy only after seccomp trapped
+/// its delete, so a move made under our label would carry out deletions the
+/// target's policy denies (seccomp-sup-5). Credentials alone cannot tell:
+/// `aa-exec`, path-attached profiles and SELinux domain transitions keep
+/// every ID and capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecurityLabels(Vec<(&'static str, Vec<u8>)>);
+
+impl SecurityLabels {
+    /// Per-task label files under `/proc/<tid>`, as the LSMs expose them.
+    const FILES: [&'static str; 3] = [
+        "attr/current",
+        "attr/apparmor/current",
+        "attr/smack/current",
+    ];
+
+    /// Our labels: only the files this kernel answers for us, so a host with
+    /// no LSM pays nothing per notification.
+    fn own() -> Self {
+        Self(
+            Self::FILES
+                .into_iter()
+                .filter_map(|file| {
+                    Some((file, read_proc_bytes(&format!("/proc/self/{file}"), 256)?))
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether task `tid` carries exactly our labels. A label we know but
+    /// cannot read for the target fails closed.
+    fn shared_by(&self, tid: u32) -> bool {
+        self.0.iter().all(|(file, own)| {
+            read_proc_bytes(&format!("/proc/{tid}/{file}"), 256).as_deref() == Some(own.as_slice())
+        })
+    }
+}
+
 /// The supervisor performs trapped deletes with its own credentials, and
 /// seccomp traps them before the kernel's permission check. A filter set up
 /// for a root session survives su/sudo, so a target switched to another
-/// user, or one that dropped capabilities, would borrow root's (#311).
+/// user, or one that dropped capabilities, would borrow root's (#311). A
+/// target confined by another LSM label would borrow our label's access
+/// (seccomp-sup-5).
 pub(crate) enum CredentialGate {
-    /// Privileged supervisor: only targets with identical credentials.
-    Compare(Credentials),
+    /// Privileged supervisor: only targets with identical credentials and
+    /// security labels.
+    Compare(Credentials, SecurityLabels),
     /// Unprivileged supervisor: no target can hold less than we do in a way
-    /// that matters to unlink (setuid cannot elevate past NoNewPrivs).
-    Unprivileged,
+    /// that matters to unlink (setuid cannot elevate past NoNewPrivs), except
+    /// through a security label of its own.
+    Unprivileged(SecurityLabels),
     /// Our own credentials are unknown: lend them to nobody.
     Unknown,
 }
@@ -586,8 +659,10 @@ pub(crate) enum CredentialGate {
 impl CredentialGate {
     fn lends_to(&self, tid: u32) -> bool {
         match self {
-            CredentialGate::Compare(own) => Credentials::of(&tid.to_string()).as_ref() == Some(own),
-            CredentialGate::Unprivileged => true,
+            CredentialGate::Compare(own, labels) => {
+                labels.shared_by(tid) && Credentials::of(&tid.to_string()).as_ref() == Some(own)
+            }
+            CredentialGate::Unprivileged(labels) => labels.shared_by(tid),
             CredentialGate::Unknown => false,
         }
     }
@@ -942,7 +1017,7 @@ pub(crate) mod tests {
         if !own.privileged() || own.fsuid != 0 {
             return; // needs root to start a target as another user
         }
-        let gate = CredentialGate::Compare(own);
+        let gate = CredentialGate::Compare(own, SecurityLabels::own());
         let mut same = std::process::Command::new("sleep")
             .arg("5")
             .spawn()
@@ -956,7 +1031,7 @@ pub(crate) mod tests {
         assert!(gate.lends_to(same.id()));
         assert!(!gate.lends_to(dropped.id()));
         assert!(!CredentialGate::Unknown.lends_to(same.id()));
-        assert!(CredentialGate::Unprivileged.lends_to(dropped.id()));
+        assert!(CredentialGate::Unprivileged(SecurityLabels::own()).lends_to(dropped.id()));
         for child in [&mut same, &mut dropped] {
             let _ = child.kill();
             let _ = child.wait();
@@ -991,6 +1066,28 @@ pub(crate) mod tests {
         }
         let _ = sandboxed.kill();
         let _ = sandboxed.wait();
+    }
+
+    // seccomp-sup-5: seccomp traps a delete before the kernel's LSM check.
+    // A target confined by AppArmor, SELinux or Smack, with credentials equal
+    // to ours (or under an unprivileged supervisor), must not have deletions
+    // its policy denies carried out under our unconfined label.
+    #[test]
+    fn targets_with_other_security_labels_are_never_lent_credentials() {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+        let own = SecurityLabels::own();
+        assert!(own.shared_by(tid), "{own:?}");
+        let confined = SecurityLabels(vec![("attr/current", b"confined (enforce)\n".to_vec())]);
+        assert!(!confined.shared_by(tid));
+        assert!(CredentialGate::Unprivileged(own.clone()).lends_to(tid));
+        assert!(!CredentialGate::Unprivileged(confined.clone()).lends_to(tid));
+        let credentials = Credentials::of("self").unwrap();
+        assert!(!CredentialGate::Compare(credentials, confined).lends_to(tid));
+        // A label we know but cannot read for the target fails closed.
+        let unreadable = SecurityLabels(vec![("attr/no-such-label", b"ours".to_vec())]);
+        assert!(!unreadable.shared_by(tid));
+        // A target that is gone carries no label at all.
+        assert!(!SecurityLabels(vec![("attr/current", Vec::new())]).shared_by(u32::MAX));
     }
 
     // #320: stopping at the orchestrator and using its cached ancestry must
@@ -1284,11 +1381,12 @@ pub(crate) mod tests {
                 .unwrap();
         };
         let key = || config_mtime_of(&global, &user);
-        assert_eq!(key(), 0, "missing files contribute nothing");
+        let none = key();
+        assert_eq!(key(), none, "the same files give the same key");
         std::fs::write(&global, "").unwrap();
         stamp(&global, 1_000);
         let with_global = key();
-        assert_ne!(with_global, 0);
+        assert_ne!(with_global, none);
         std::fs::write(&user, "").unwrap();
         stamp(&user, 2_000);
         let with_both = key();
@@ -1301,7 +1399,7 @@ pub(crate) mod tests {
         // A removed layer is a change, not the same key with a zero.
         std::fs::remove_file(&global).unwrap();
         assert_ne!(key(), with_both);
-        assert_ne!(key(), 0, "the surviving layer still counts");
+        assert_ne!(key(), none, "the surviving layer still counts");
         // Same-second edits must still register: the key is nanosecond
         // resolution, so two stamps one nanosecond apart differ.
         std::fs::File::options()
@@ -1324,6 +1422,43 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_ne!(key(), ns_one, "sub-second edit must change the key");
+
+        // seccomp-sup-3: Nix and home-manager link every generation's config
+        // to a store file with one normalized mtime. Retargeting the link
+        // changes the policy, never the followed mtime.
+        let stamp_ns = |path: &std::path::Path, time: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        };
+        let normalized = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let generations = [fixture.path().join("a.toml"), fixture.path().join("b.toml")];
+        for (generation, content) in generations
+            .iter()
+            .zip(["only_trash = []\n", "never_trash = []\n"])
+        {
+            std::fs::write(generation, content).unwrap();
+            stamp_ns(generation, normalized);
+        }
+        std::os::unix::fs::symlink(&generations[0], &global).unwrap();
+        let first = key();
+        let staged = fixture.path().join("global.next");
+        std::os::unix::fs::symlink(&generations[1], &staged).unwrap();
+        std::fs::rename(&staged, &global).unwrap();
+        assert_ne!(key(), first, "a retargeted config link must change the key");
+        // A present file stamped at the epoch is not a missing file.
+        std::fs::remove_file(&global).unwrap();
+        let missing = key();
+        std::fs::write(&global, "").unwrap();
+        stamp_ns(&global, std::time::UNIX_EPOCH);
+        assert_ne!(
+            key(),
+            missing,
+            "an epoch-stamped file keys like a missing one"
+        );
     }
 
     // #437: a changed mtime swaps in the reloaded store, a failed load keeps
@@ -1359,5 +1494,58 @@ pub(crate) mod tests {
         assert_eq!(session.store().home_dir(), fixture.path().join("two"));
         // And the failed sample became the baseline again.
         assert!(!session.refresh_with(3_000, || panic!("failed sample must be adopted")));
+
+        // seccomp-sup-2: the reload runs after a notification was dequeued
+        // and outside the handler's guard. A panicking load must keep the
+        // previous store serving rather than end the supervisor with that
+        // notification unanswered.
+        let reloaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.refresh_with(4_000, || panic!("reload panics"))
+        }));
+        assert_eq!(reloaded.ok(), Some(false), "a reload panic escaped");
+        assert_eq!(session.store().home_dir(), fixture.path().join("two"));
+        assert!(!session.refresh_with(4_000, || panic!("failed sample must be adopted")));
+    }
+
+    // seccomp-sup-1: the launch-time store ran retention inside the trapped
+    // syscall, before the target had its answer (#319); only a reloaded
+    // store deferred it.
+    #[test]
+    fn session_stores_defer_retention_until_the_target_is_answered() {
+        use std::os::fd::AsRawFd;
+        let fixture = tempfile::tempdir().unwrap();
+        let work = fixture.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let store = |name: &str| {
+            let config = trashd_common::Config {
+                never_trash: Vec::new(),
+                ..Default::default()
+            };
+            TrashStore::open_isolated(&fixture.path().join(name), config).unwrap()
+        };
+        let parent = std::fs::File::open(&work).unwrap();
+        let trash = |session: &SessionState, name: &str| {
+            let path = work.join(name);
+            std::fs::write(&path, b"deferred").unwrap();
+            let marker = session.store().home_dir().join(".trashd/last_purge");
+            let _ = std::fs::remove_file(&marker);
+            session
+                .store()
+                .trash_at_canonical(
+                    parent.as_raw_fd(),
+                    std::ffi::OsStr::new(name),
+                    &path,
+                    Some("seccomp"),
+                    || true,
+                )
+                .unwrap();
+            assert!(!marker.exists(), "retention ran before the answer");
+            session.store().run_deferred_maintenance();
+            assert!(marker.exists(), "deferred retention runs after it");
+        };
+        let mut session = SessionState::from_parts(store("launch"));
+        trash(&session, "at-launch.txt");
+        assert!(session.refresh_with(i64::MIN, || Some(store("reloaded"))));
+        trash(&session, "after-reload.txt");
     }
 }

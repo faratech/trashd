@@ -28,8 +28,11 @@
 //!   that would leave the pinned base (through `..` or an absolute symlink)
 //!   is not trashed; the original target syscall executes instead.
 //! * The leaf component may be swapped by a sibling between fstatat and
-//!   renameat — identical to what plain unlink(2) acts on; trash_at re-stats
-//!   post-move so recorded metadata always matches the trashed inode.
+//!   renameat for another of the same kind — identical to what plain
+//!   unlink(2) acts on; trash_at re-stats post-move so recorded metadata
+//!   always matches the trashed inode. A swap that changes what unlink or
+//!   rmdir accepts is re-checked right before the move and gets the
+//!   kernel's errno; only the final instant before renameat remains.
 //! * rmdir emptiness can go stale before the move; a repopulated tree lands
 //!   in the trash whole (recoverable), matching the legacy acceptance.
 
@@ -386,10 +389,19 @@ fn same_policy_ancestors(source: RawFd, mapped: RawFd, path: &std::path::Path) -
 /// never retried through an unverified display spelling.
 fn physical_path(fs: &TargetFs, parent: RawFd, name: &OsStr) -> Option<std::path::PathBuf> {
     let candidate = pinned_directory_path(parent)?;
-    if fs.shares_our_view() && !candidate.as_os_str().as_bytes().ends_with(b" (deleted)") {
+    let spelled = CString::new(candidate.as_os_str().as_bytes()).ok()?;
+    // A shared root and namespace do not prove the parent is reachable at
+    // its readlink: one on a lazily unmounted mount reads relative to the
+    // detached root, and one under an overmount names what now covers it
+    // (seccomp-sup-8). The same mount and inode at that spelling in our view
+    // does; anything else takes the verifying path below.
+    if fs.shares_our_view()
+        && mount_identity(parent, c"", libc::AT_EMPTY_PATH)
+            .is_some_and(|pinned| mount_identity(libc::AT_FDCWD, &spelled, 0) == Some(pinned))
+    {
         return Some(candidate.join(name));
     }
-    let candidate = CString::new(candidate.as_os_str().as_bytes()).ok()?;
+    let candidate = spelled;
     let mapped = unsafe {
         libc::open(
             candidate.as_ptr(),
@@ -419,6 +431,15 @@ fn physical_path(fs: &TargetFs, parent: RawFd, name: &OsStr) -> Option<std::path
     Some(path.join(name))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Scoped lookups that fail with EAGAIN before a real attempt is made.
+    static FORCED_EAGAIN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Runs once when the store first asks whether it may commit a move.
+    static BEFORE_COMMIT: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// `resolve_parent` with an explicit containment mode: RESOLVE_IN_ROOT,
 /// RESOLVE_BENEATH, or 0 for a target that shares this process's view.
 fn resolve_parent_with(base_fd: RawFd, prefix: &OsStr, containment: u64) -> io::Result<RawFd> {
@@ -440,19 +461,40 @@ fn resolve_parent_with(base_fd: RawFd, prefix: &OsStr, containment: u64) -> io::
         // into the supervisor's namespace. Mount crossings remain legal.
         resolve: libc::RESOLVE_NO_MAGICLINKS | containment,
     };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            base_fd as i64,
-            c.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
+    // A scoped walk fails EAGAIN when any rename or mount on the system
+    // races one of its `..` steps; openat2(2) documents that as transient.
+    // Declining instead made the delete permanent for raw-syscall callers
+    // (seccomp-sup-7). The lookup only reads, so retrying is safe; the
+    // bound keeps a rename storm from stalling the supervisor.
+    const ATTEMPTS: usize = 16;
+    let open = || {
+        #[cfg(test)]
+        if FORCED_EAGAIN.with(|forced| forced.replace(forced.get().saturating_sub(1))) > 0 {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                base_fd as i64,
+                c.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(fd as RawFd)
+        }
     };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+    let mut result = open();
+    for _ in 1..ATTEMPTS {
+        match &result {
+            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => result = open(),
+            _ => break,
+        }
     }
-    Ok(fd as RawFd)
+    result
 }
 
 /// True when the directory `name` inside `parent_fd` contains no entries
@@ -503,14 +545,53 @@ pub fn dir_is_empty(parent_fd: RawFd, name: &OsStr) -> io::Result<bool> {
     Ok(empty)
 }
 
-/// fstatat(AT_SYMLINK_NOFOLLOW) convenience: (st_mode, st_dev, st_size, uid).
-pub fn stat_nofollow(parent_fd: RawFd, name: &OsStr) -> io::Result<(u32, u64, i64, u32)> {
+/// fstatat(AT_SYMLINK_NOFOLLOW) convenience:
+/// (st_mode, st_dev, st_size, uid, st_ino).
+pub fn stat_nofollow(parent_fd: RawFd, name: &OsStr) -> io::Result<(u32, u64, i64, u32, u64)> {
     let c = CString::new(name.as_bytes())?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatat(parent_fd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((st.st_mode, st.st_dev as u64, st.st_size, st.st_uid))
+    Ok((
+        st.st_mode,
+        st.st_dev as u64,
+        st.st_size,
+        st.st_uid,
+        st.st_ino,
+    ))
+}
+
+/// Whether the entry `name` now holds still fits the unlink/rmdir checks
+/// made on the inode `checked`: unlink never moves a directory, and rmdir
+/// moves the directory it verified or another it now verifies empty. A
+/// vanished name fits: the move then fails, and the kernel reports ENOENT.
+fn leaf_still_fits(parent: RawFd, name: &OsStr, remove_dir: bool, checked: (u64, u64)) -> bool {
+    let Ok((mode, dev, _, _, ino)) = stat_nofollow(parent, name) else {
+        return true;
+    };
+    let is_dir = mode & libc::S_IFMT == libc::S_IFDIR;
+    if !remove_dir {
+        return !is_dir;
+    }
+    is_dir && ((dev, ino) == checked || dir_is_empty(parent, name).unwrap_or(false))
+}
+
+/// What the kernel's own syscall answers for the entry that replaced the
+/// checked one, or Decline when it fits after all.
+fn replaced_leaf_verdict(parent: RawFd, name: &OsStr, remove_dir: bool) -> Decision {
+    let Ok((mode, ..)) = stat_nofollow(parent, name) else {
+        return Decision::Continue;
+    };
+    let is_dir = mode & libc::S_IFMT == libc::S_IFDIR;
+    match (remove_dir, is_dir) {
+        (false, true) => Decision::Errno(libc::EISDIR),
+        (true, false) => Decision::Errno(libc::ENOTDIR),
+        (true, true) if matches!(dir_is_empty(parent, name), Ok(false)) => {
+            Decision::Errno(libc::ENOTEMPTY)
+        }
+        _ => Decision::Decline,
+    }
 }
 
 /// Outcome of the pinned interception attempt.
@@ -672,7 +753,7 @@ pub fn try_pinned(
 
     // Type checks against the PINNED parent (symlinks NOT followed for the
     // final component — matches unlink/rmdir semantics).
-    let (mode, dev, _size, owner) = match stat_nofollow(parent, name) {
+    let (mode, dev, _size, owner, ino) = match stat_nofollow(parent, name) {
         Ok(v) => v,
         Err(_) => return Ok(Decision::Continue),
     };
@@ -743,7 +824,25 @@ pub fn try_pinned(
     // inside TrashStore::trash_at, which applies config eligibility to that
     // path for parity with the other layers. A physical path is canonical
     // already and needs no second resolution (#320).
-    let still_valid = || notify_fd < 0 || crate::supervisor::notif_id_valid(notify_fd, notify_id);
+    //
+    // unlink(2) and rmdir(2) check the type when they act, while the store
+    // moves whatever the name holds by then: a leaf swapped since the checks
+    // above must not have unlink trash a tree, or rmdir a file or populated
+    // directory, and report success (seccomp-sup-9). The store asks right
+    // before its move; a same-kind swap stays the documented residual.
+    let replaced = std::cell::Cell::new(false);
+    let still_valid = || {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_COMMIT.with(|hook| hook.take()) {
+            hook();
+        }
+        if notify_fd >= 0 && !crate::supervisor::notif_id_valid(notify_fd, notify_id) {
+            return false;
+        }
+        let fits = leaf_still_fits(parent, name, remove_dir, (dev, ino));
+        replaced.set(!fits);
+        fits
+    };
     let trashed = store.trash_at_canonical(parent, name, &physical, Some("seccomp"), still_valid);
     match trashed {
         Ok(id) => {
@@ -775,6 +874,9 @@ pub fn try_pinned(
                 // The pin failed with the grant still in place and the
                 // original still at its name: put its own mode back.
                 restore_mode(parent, name, granted);
+            }
+            if replaced.get() {
+                return Ok(replaced_leaf_verdict(parent, name, remove_dir));
             }
             Ok(Decision::Decline)
         }
@@ -937,6 +1039,87 @@ time.sleep(60)
             physical_path(&filesystem, parent.0, OsStr::new("victim.txt")),
             None
         );
+    }
+
+    // seccomp-sup-8: a target sharing our root and mount namespace can still
+    // pin a parent our view cannot reach at the readlink's spelling: on a
+    // lazily unmounted mount it reads relative to the detached root, and
+    // under an overmount it names whatever now covers it. Policy, the trash
+    // and Path= then followed a different location.
+    #[test]
+    fn shared_view_parents_off_our_tree_are_not_trusted() {
+        const CHILD: &str = "TRASHD_TEST_UNREACHABLE_PARENT";
+        const TEST: &str = "pin::tests::shared_view_parents_off_our_tree_are_not_trusted";
+        if std::env::var_os(CHILD).is_some() {
+            // A private mount namespace (unshare below): nothing mounted
+            // here is visible to the host.
+            let fixture = tempfile::tempdir().unwrap();
+            let name = format!("trashd-unreachable-{}", std::process::id());
+            let mount_point = fixture.path().join("usb");
+            std::fs::create_dir(&mount_point).unwrap();
+            let mount_tmpfs = || {
+                let target = CString::new(mount_point.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe {
+                        libc::mount(
+                            c"tmpfs".as_ptr(),
+                            target.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    },
+                    0,
+                    "{}",
+                    io::Error::last_os_error()
+                );
+                let photos = mount_point.join(&name);
+                std::fs::create_dir(&photos).unwrap();
+                std::fs::write(photos.join("img.jpg"), b"on the stick").unwrap();
+                photos
+            };
+            for detach in [true, false] {
+                let photos = mount_tmpfs();
+                let mut child = spawn_with_cwd(&photos);
+                let mapped = || {
+                    let filesystem = TargetFs::open(child.id()).unwrap();
+                    assert!(filesystem.shares_our_view());
+                    physical_path(
+                        &filesystem,
+                        filesystem.cwd().unwrap(),
+                        OsStr::new("img.jpg"),
+                    )
+                };
+                assert_eq!(mapped(), Some(photos.join("img.jpg")), "reachable parent");
+                if detach {
+                    let target = CString::new(mount_point.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(
+                        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) },
+                        0
+                    );
+                } else {
+                    // The same spelling now names a different directory.
+                    mount_tmpfs();
+                }
+                assert_eq!(mapped(), None, "detached: {detach}");
+                child.kill().unwrap();
+                let _ = child.wait();
+            }
+            return;
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: a private mount namespace requires root");
+            return;
+        }
+        let status = std::process::Command::new("/usr/bin/unshare")
+            .args(["-m", "--propagation", "private"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env("TRASH_BYPASS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
     }
 
     #[test]
@@ -1948,6 +2131,133 @@ time.sleep(60)
             !victim.exists(),
             "absolute-path victim moved via pinned root"
         );
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    // seccomp-sup-7: a scoped openat2 fails EAGAIN whenever any rename or
+    // mount anywhere on the system races its `..` step. That transient
+    // failure declined the delete, which is permanent for a raw-syscall
+    // caller; the lookup is retried a bounded number of times instead.
+    #[test]
+    fn transient_scoped_lookup_failures_are_retried() {
+        let (store, work, _g) = setup("eagain");
+        std::fs::create_dir(work.join("sub")).unwrap();
+        let mut child = spawn_with_cwd(work.parent().unwrap());
+        let attempt = |name: &str, failures: u32| {
+            let victim = work.join(name);
+            std::fs::write(&victim, b"retried").unwrap();
+            let raw = format!("{}/sub/../{name}", work.display());
+            FORCED_EAGAIN.with(|forced| forced.set(failures));
+            let decision = try_pinned(
+                child.id(),
+                unlinkat_nr(),
+                &[libc::AT_FDCWD as u64, 0, 0, 0, 0, 0],
+                OsStr::new(&raw),
+                &victim,
+                false,
+                -1,
+                0,
+                &store,
+            )
+            .expect("pinned attempt");
+            FORCED_EAGAIN.with(|forced| forced.set(0));
+            (decision, victim.exists())
+        };
+        let (once, kept) = attempt("once.txt", 1);
+        assert!(matches!(once, Decision::Trashed), "{once:?}");
+        assert!(!kept);
+        // A lookup that never settles is still declined, not retried forever.
+        let (always, kept) = attempt("always.txt", u32::MAX);
+        assert!(matches!(always, Decision::Decline), "{always:?}");
+        assert!(kept);
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    // seccomp-sup-9: unlink(2) and rmdir(2) check the type when they act,
+    // but the store moved whatever the name held after the checks here. A
+    // sibling's RENAME_EXCHANGE in between had unlink trash a whole tree, or
+    // rmdir a file or a populated directory, and report success.
+    #[test]
+    fn a_leaf_swapped_after_the_checks_gets_the_kernels_errno() {
+        let (store, work, fixture) = setup("leaf-swap");
+        let mut child = spawn_with_cwd(&work);
+        let attempt = |name: &str, other: &str, remove_dir: bool| {
+            let (first, second) = (
+                CString::new(work.join(name).as_os_str().as_bytes()).unwrap(),
+                CString::new(work.join(other).as_os_str().as_bytes()).unwrap(),
+            );
+            BEFORE_COMMIT.with(|hook| {
+                hook.set(Some(Box::new(move || {
+                    let exchanged = unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            libc::AT_FDCWD,
+                            first.as_ptr(),
+                            libc::AT_FDCWD,
+                            second.as_ptr(),
+                            libc::RENAME_EXCHANGE,
+                        )
+                    };
+                    assert_eq!(exchanged, 0, "{}", io::Error::last_os_error());
+                })))
+            });
+            let flags = if remove_dir { libc::AT_REMOVEDIR } else { 0 };
+            let decision = try_pinned(
+                child.id(),
+                unlinkat_nr(),
+                &[libc::AT_FDCWD as u64, 0, flags as u64, 0, 0, 0],
+                OsStr::new(name),
+                &work.join(name),
+                remove_dir,
+                -1,
+                0,
+                &store,
+            )
+            .expect("pinned attempt");
+            BEFORE_COMMIT.with(|hook| hook.set(None));
+            decision
+        };
+        // unlink of a file exchanged for a populated directory.
+        std::fs::write(work.join("item"), b"file").unwrap();
+        std::fs::create_dir(work.join("item.d")).unwrap();
+        std::fs::write(work.join("item.d/kept"), b"inside").unwrap();
+        let unlinked = attempt("item", "item.d", false);
+        assert!(
+            matches!(unlinked, Decision::Errno(libc::EISDIR)),
+            "{unlinked:?}"
+        );
+        assert_eq!(std::fs::read(work.join("item/kept")).unwrap(), b"inside");
+        // rmdir of an empty directory exchanged for a file.
+        std::fs::create_dir(work.join("hollow")).unwrap();
+        std::fs::write(work.join("hollow.f"), b"file").unwrap();
+        let removed = attempt("hollow", "hollow.f", true);
+        assert!(
+            matches!(removed, Decision::Errno(libc::ENOTDIR)),
+            "{removed:?}"
+        );
+        assert_eq!(std::fs::read(work.join("hollow")).unwrap(), b"file");
+        // rmdir of an empty directory exchanged for a populated one.
+        std::fs::create_dir(work.join("empty")).unwrap();
+        std::fs::create_dir(work.join("full")).unwrap();
+        std::fs::write(work.join("full/kept"), b"inside").unwrap();
+        let removed = attempt("empty", "full", true);
+        assert!(
+            matches!(removed, Decision::Errno(libc::ENOTEMPTY)),
+            "{removed:?}"
+        );
+        assert_eq!(std::fs::read(work.join("empty/kept")).unwrap(), b"inside");
+        // Nothing was trashed and no sidecar stays behind.
+        assert!(store.list(None).unwrap().is_empty());
+        let infos = fixture.path().join("trash/info");
+        assert_eq!(std::fs::read_dir(infos).unwrap().count(), 0);
+        // A same-kind swap stays the documented residual: unlink(2) acts on
+        // whatever file the name holds when it runs.
+        std::fs::write(work.join("plain"), b"first").unwrap();
+        std::fs::write(work.join("plain.new"), b"second").unwrap();
+        let swapped = attempt("plain", "plain.new", false);
+        assert!(matches!(swapped, Decision::Trashed), "{swapped:?}");
         child.kill().unwrap();
         let _ = child.wait();
     }
