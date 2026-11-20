@@ -1795,13 +1795,14 @@ impl TrashStore {
         // Log operation
         crate::oplog::log_restore_in(&self.home, &entry.id, &restore_to);
 
-        // Report hash mismatch as a warning after successful restore
+        // Report hash mismatch as a warning after successful restore. The
+        // path and digest come from the sidecar: escape them (cli-2).
         if let Some((expected, actual)) = hash_warning {
             eprintln!(
                 "trashd: warning: hash mismatch for restored file {}",
-                restore_to.display()
+                crate::display::printable_path(&restore_to)
             );
-            eprintln!("  expected: {expected}");
+            eprintln!("  expected: {}", crate::display::printable(&expected));
             eprintln!("  actual:   {actual}");
             eprintln!("  file may be corrupted — verify contents before use");
         }
@@ -1902,7 +1903,7 @@ impl TrashStore {
                 failed += 1;
                 eprintln!(
                     "trashd: warning: refusing to delete '{}': it belongs to another trash root",
-                    entry.trashed_path.display()
+                    crate::display::printable_path(&entry.trashed_path)
                 );
                 continue;
             }
@@ -1910,13 +1911,24 @@ impl TrashStore {
             match self.purge_reporting_kind(entry, max_age_days.is_some(), deadline) {
                 Ok(was_directory) => cache.note_removal(entry, was_directory),
                 Err(e) => {
-                    if !matches!(e, TrashError::EntryNotFound(_)) {
-                        eprintln!(
-                            "trashd: warning: could not delete '{}': {e}",
-                            entry.trashed_path.display()
-                        );
-                        failed += 1;
-                    }
+                    // A refused snapshot is not always a vanished entry: one
+                    // compressed or touched since the listing is still in
+                    // the trash, and is not deleted (#217) (store-core-6).
+                    let reason = match e {
+                        TrashError::EntryNotFound(_) if !Self::entry_outlived_snapshot(entry) => {
+                            continue;
+                        }
+                        TrashError::EntryNotFound(_) => {
+                            "it changed after it was selected; run `trash empty` again".into()
+                        }
+                        e => e.to_string(),
+                    };
+                    eprintln!(
+                        "trashd: warning: could not delete '{}': {}",
+                        crate::display::printable_path(&entry.trashed_path),
+                        crate::display::printable(&reason)
+                    );
+                    failed += 1;
                     continue;
                 }
             }
@@ -1929,6 +1941,27 @@ impl TrashStore {
         // Only roots whose cache the removals affected (#336).
         cache.apply(self);
         (count, failed)
+    }
+
+    /// Whether the entry a refused snapshot names is still in the trash:
+    /// its sidecar still records the same original path and deletion date,
+    /// so it changed (was compressed, its sidecar rewritten or touched)
+    /// rather than vanished. A sidecar recording anything else belongs to a
+    /// different entry trashed under the same ID since (store-core-6).
+    fn entry_outlived_snapshot(entry: &TrashEntry) -> bool {
+        let Some(mut info) = crate::trashinfo::read_sidecar(&entry.info_path)
+            .ok()
+            .and_then(|content| TrashInfo::from_trashinfo(&content))
+        else {
+            return false;
+        };
+        if !info.original_path.is_absolute() {
+            info.original_path =
+                Self::topdir_for_trash(&entry.trash_root).join(&info.original_path);
+        }
+        !entry.orphaned
+            && info.original_path == entry.info.original_path
+            && info.deletion_date == entry.info.deletion_date
     }
 
     /// Run auto_purge only if enough time has passed since the last run.
@@ -2485,7 +2518,7 @@ impl TrashStore {
             // Retention retries it; the entry itself is gone.
             eprintln!(
                 "trashd: warning: purged '{}' but could not delete all of its data yet ({error}); it is retried later",
-                entry.id
+                crate::display::printable(&entry.id)
             );
         }
         sidecar?;
@@ -11807,6 +11840,43 @@ mod tests {
         };
         let (purged, failed) = store.empty_entries_reporting(&[stuck, vanished], None);
         assert_eq!((purged, failed), (0, 1), "ENOTDIR fails, ENOENT does not");
+    }
+
+    // Regression (store-core-6, cli-5): an entry compressed or otherwise
+    // changed between `trash empty`'s listing and its purge was counted as
+    // already vanished, so `trash empty` reported success while the entry
+    // the user confirmed stayed in the trash.
+    #[test]
+    fn empty_counts_entries_changed_since_selection_as_failures() {
+        let (store, _data, work, _lock) = test_store();
+        let doomed = create_file(work.path(), "changed.txt", &"x".repeat(4096));
+        store.trash(&doomed, None).unwrap();
+        let selected = store.list(None).unwrap();
+        // A compressor rewrites the sidecar's marker after the listing.
+        set_compression_marker(&selected[0].info_path, Some("zstd")).unwrap();
+        let (purged, failed) = store.empty_entries_reporting(&selected, None);
+        assert_eq!((purged, failed), (0, 1), "a changed entry is not gone");
+        assert_eq!(
+            store.list(None).unwrap().len(),
+            1,
+            "it is kept, not deleted"
+        );
+
+        // The selected entry vanished and a different one reused its ID:
+        // the confirmed entry is gone, which is what was asked for.
+        let stale = store.list(None).unwrap();
+        store.purge_entry(&stale[0]).unwrap();
+        fs::create_dir(work.path().join("sub")).unwrap();
+        let other = create_file(&work.path().join("sub"), "changed.txt", "other");
+        let id = store.trash(&other, None).unwrap();
+        assert_eq!(id, stale[0].id, "the fixture must reuse the ID");
+        let (purged, failed) = store.empty_entries_reporting(&stale, None);
+        assert_eq!((purged, failed), (0, 0));
+        assert_eq!(
+            store.list(None).unwrap()[0].info.original_path,
+            other,
+            "the new entry survives"
+        );
     }
 
     // Isolation boundary (#428) through empty: an isolated store must not

@@ -11,11 +11,12 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
 
     let entries = match store.list(None) {
         Ok(e) => e,
-        Err(e) => fatal(e),
+        Err(e) => fatal_untrusted(e),
     };
 
     let now = chrono::Local::now();
     let mut compressed = 0usize;
+    let mut failed = 0usize;
     let mut saved = 0u64;
     if !dry_run {
         sweep_interrupted_attempts(&entries);
@@ -56,9 +57,9 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
         if size_before > restore_limit {
             continue;
         }
-        // --dry-run performs the real compression into a stage file it then
-        // discards, so "would be compressed" means exactly what the real run
-        // would keep: one keep/discard decision, one code path (#415). The
+        // --dry-run performs the real compression, counting its output, so
+        // "would be compressed" means exactly what the real run would keep:
+        // one keep/discard decision, one code path (#415). The
         // shared path also skips already-zstd data the way the real run does,
         // by checking the magic under the entry's lock.
         let mode = if dry_run {
@@ -73,7 +74,7 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
                     println!(
                         "  {} {} ({})",
                         printable_path(&entry.trashed_path),
-                        entry.id.dimmed(),
+                        printable(&entry.id).dimmed(),
                         format_size(size_before),
                     );
                 } else {
@@ -83,32 +84,41 @@ pub fn run(store: &TrashStore, older: &str, dry_run: bool) {
             Ok(None) => {} // not worth compressing; original untouched
             Err(e) => {
                 eprintln!(
-                    "  {} {}: {e}",
+                    "  {} {}: {}",
                     "warn:".yellow(),
                     printable_path(&entry.trashed_path),
+                    printable(&e.to_string()),
                 );
+                failed += 1;
             }
         }
     }
 
-    if dry_run {
-        if compressed == 0 {
-            println!("{}", "Nothing to compress.".dimmed());
-        } else {
-            println!(
-                "\n{} {} items would be compressed (zstd)",
-                "Dry run:".yellow().bold(),
-                compressed,
-            );
-        }
-    } else if compressed == 0 {
+    if compressed == 0 && failed == 0 {
         println!("{}", "Nothing to compress.".dimmed());
+    } else if compressed == 0 {
+        // Every attempt failed (an unwritable state directory, a full disk):
+        // scripts and timers read the exit status, as for empty and fsck
+        // (#409, #156) (cli-3).
+        fatal(format!("{failed} item(s) could not be compressed"));
+    } else if dry_run {
+        println!(
+            "\n{} {} items would be compressed (zstd)",
+            "Dry run:".yellow().bold(),
+            compressed,
+        );
     } else {
         println!(
             "{} compressed {} items, saved {}",
             "Done:".green().bold(),
             compressed,
             format_size(saved),
+        );
+    }
+    if failed > 0 {
+        eprintln!(
+            "{} {failed} item(s) could not be compressed",
+            "warn:".yellow()
         );
     }
 }
@@ -194,14 +204,15 @@ fn is_zstd(path: &std::path::Path) -> bool {
 enum CommitMode {
     /// The real run: publish the stage (marker, then rename) via the hooks.
     Publish,
-    /// `--dry-run`: report the verdict and drop the stage untouched, so the
-    /// estimate can never claim a file the real run would discard (#415).
+    /// `--dry-run`: report the verdict from the compressed length alone, so
+    /// the estimate can never claim a file the real run would discard
+    /// (#415), and nothing is written to the trash (recent-changes-6).
     ReportOnly,
 }
 
 /// Compress a trashed entry's data in-place with zstd (streaming, bounded
 /// memory). Returns `Some(new_size)` when swapped (or, in `ReportOnly`, when
-/// the stage qualified), `None` when compression wasn't worthwhile.
+/// the compressed size qualified), `None` when compression wasn't worthwhile.
 ///
 /// Crash-safe ordering (#23): the `X-Trashd-Compressed` marker is recorded
 /// BEFORE the compressed data is renamed over the original. A crash in the
@@ -216,6 +227,43 @@ fn compress_file_zstd(
     mode: CommitMode,
 ) -> std::io::Result<Option<u64>> {
     compress_before_publish(store, entry, size_before, mode, || {}, || {})
+}
+
+/// Encode exactly `size` bytes of `input` into `output`; false when the
+/// source no longer has that size.
+fn encode_zstd(
+    input: &mut std::fs::File,
+    size: u64,
+    output: impl std::io::Write,
+) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut enc = zstd::stream::Encoder::new(output, 3)?;
+    // A writer with an existing descriptor need not honor our flock.
+    // Bound work even if it keeps extending the same inode (#386).
+    let copied = std::io::copy(
+        &mut Read::by_ref(input).take(size.saturating_add(1)),
+        &mut enc,
+    )?;
+    if copied != size {
+        return Ok(false);
+    }
+    enc.finish()?;
+    Ok(true)
+}
+
+/// Stands in for the stage file in a dry run, which needs only the
+/// compressed length (recent-changes-6).
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn compress_before_publish(
@@ -266,33 +314,40 @@ fn compress_before_publish(
     // follow a planted symlink. RAII removes abandoned attempts; a run killed
     // by a signal skips RAII, so attempts are staged in the root's private
     // state directory (same filesystem) rather than files/, where a leftover
-    // listed as an orphaned entry forever (#327).
-    let mut tmp = trashd_common::store::create_data_stage(&entry.trash_root)?;
-    {
-        let mut enc = zstd::stream::Encoder::new(tmp.as_file_mut(), 3)?;
-        // A writer with an existing descriptor need not honor our flock.
-        // Bound work even if it keeps extending the same inode (#386).
-        let copied = std::io::copy(
-            &mut Read::by_ref(&mut input).take(size_before.saturating_add(1)),
-            &mut enc,
-        )?;
-        if copied != size_before {
-            return Ok(None);
+    // listed as an orphaned entry forever (#327). A dry run needs only the
+    // compressed length: it counts the encoder's output instead, so it never
+    // takes space in the trash or strands a stage when interrupted
+    // (recent-changes-6).
+    let mut tmp = match mode {
+        CommitMode::Publish => Some(trashd_common::store::create_data_stage(&entry.trash_root)?),
+        CommitMode::ReportOnly => None,
+    };
+    let compressed_len = match tmp.as_mut() {
+        Some(stage) => {
+            if !encode_zstd(&mut input, size_before, stage.as_file_mut())? {
+                return Ok(None);
+            }
+            stage.as_file().metadata()?.len()
         }
-        enc.finish()?;
-    }
-    let compressed_len = tmp.as_file().metadata()?.len();
+        None => {
+            let mut counted = ByteCount(0);
+            if !encode_zstd(&mut input, size_before, &mut counted)? {
+                return Ok(None);
+            }
+            counted.0
+        }
+    };
     if compressed_len >= size_before {
         // Incompressible content — discard the attempt, keep the original.
         // This is the single keep/discard verdict: --dry-run reports exactly
         // what passes it, so the estimate cannot drift from the real run.
         return Ok(None);
     }
-    if mode == CommitMode::ReportOnly {
-        // The verdict is in and the trash is still untouched: no marker, no
-        // swap, no timestamps. Dropping `tmp` removes the stage file (#415).
+    let Some(tmp) = tmp else {
+        // The verdict is in and the trash is still untouched: no stage, no
+        // marker, no swap, no timestamps (#415).
         return Ok(Some(compressed_len));
-    }
+    };
     // Preserve ownership before restoring modes, so set-ID permissions keep
     // their original meaning. Refuse the swap if ownership cannot be kept.
     let temporary_metadata = tmp.as_file().metadata()?;
@@ -603,6 +658,103 @@ mod tests {
             "the dry run must agree with the real run's discard"
         );
         assert_eq!(fs::read(&entry.trashed_path).unwrap(), random);
+        assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+    }
+
+    /// A trashd entry of 8 KiB of compressible data, trashed from `dir/name`.
+    fn trashed(dir: &Path, name: &str) -> TrashStore {
+        let mut config = trashd_common::Config::default();
+        config.never_trash.clear();
+        let store = TrashStore::open_isolated(&dir.join("Trash"), config).unwrap();
+        let source = dir.join(name);
+        fs::write(&source, vec![b'x'; 8192]).unwrap();
+        store.trash(&source, None).unwrap();
+        store
+    }
+
+    // Regression (cli-2): the dry run escaped the stored path but printed
+    // the filename-derived ID raw, so a crafted name reached the terminal.
+    #[test]
+    fn dry_run_lines_escape_the_entry_id() {
+        const CHILD: &str = "TRASHD_COMPRESS_DRY_RUN_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            run(&trashed(Path::new(&dir), "esc\x1b[2Jname"), "0", true);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = crate::util::rerun_test(
+            "commands::compress::tests::dry_run_lines_escape_the_entry_id",
+            CHILD,
+            dir.path().as_os_str(),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(stdout.contains("1 items would be compressed"), "{stdout}");
+        assert!(
+            !output.stdout.contains(&0x1b),
+            "raw escape in the dry run: {stdout:?}"
+        );
+    }
+
+    /// Replace the root's state directory with a regular file: staging there
+    /// then fails with ENOTDIR, which root cannot override either.
+    fn block_state_directory(store: &TrashStore) {
+        let state = store.home_dir().join(".trashd");
+        fs::rename(&state, store.home_dir().join("saved-state")).unwrap();
+        fs::write(&state, b"not a directory").unwrap();
+    }
+
+    // Regression (cli-3): when every compression attempt failed, `trash
+    // compress` printed "Nothing to compress." and exited 0, so a timer or
+    // script never noticed that nothing could be compressed.
+    #[test]
+    fn compress_fails_when_every_attempt_failed() {
+        const CHILD: &str = "TRASHD_COMPRESS_FAILURE_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let store = trashed(Path::new(&dir), "data");
+            block_state_directory(&store);
+            run(&store, "0", false);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = crate::util::rerun_test(
+            "commands::compress::tests::compress_fails_when_every_attempt_failed",
+            CHILD,
+            dir.path().as_os_str(),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}{stderr}");
+        assert!(!stdout.contains("Nothing to compress."), "{stdout}");
+        assert!(
+            stderr.contains("1 item(s) could not be compressed"),
+            "{stderr}"
+        );
+    }
+
+    // Regression (recent-changes-6): --dry-run staged a full compressed copy
+    // of each candidate in the trash's state directory (up to
+    // max_file_size_mb, stranded if interrupted) only to learn its length.
+    // The verdict needs no stage file and no writable trash.
+    #[test]
+    fn dry_run_estimates_without_staging_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, entry) = fixture(dir.path(), "data");
+        block_state_directory(&store);
+        let sidecar = fs::read(&entry.info_path).unwrap();
+        let reported = compress_before_publish(
+            &store,
+            &entry,
+            8192,
+            CommitMode::ReportOnly,
+            || panic!("a dry run must stop before publishing"),
+            || panic!("a dry run must not persist"),
+        )
+        .unwrap();
+        // The same length, and so the same verdict, as the real run's stage.
+        let expected = zstd::encode_all(&vec![b'x'; 8192][..], 3).unwrap().len() as u64;
+        assert_eq!(reported, Some(expected));
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), vec![b'x'; 8192]);
         assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
     }
 

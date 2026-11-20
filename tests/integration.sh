@@ -446,6 +446,73 @@ fi
 trash empty -y >/dev/null 2>&1
 
 # -----------------------------------------------------------------------
+# A read-only state directory (WS-J): the dry run stages nothing, so it
+# still reports the entry (recent-changes-6); the real run fails every
+# attempt and must exit non-zero, not print "Nothing to compress." (cli-3).
+# -----------------------------------------------------------------------
+STATE="$XDG_DATA_HOME/Trash/.trashd"
+for i in $(seq 1 200); do echo "line $i of ordinary text that compresses well"; done > /home/test/trashd_it_rocomp.txt
+rm /home/test/trashd_it_rocomp.txt
+mount --bind "$STATE" "$STATE"
+mount -o remount,bind,ro "$STATE"
+DRY_STATUS=0
+DRY_OUT=$(trash compress --older 0d --dry-run 2>&1) || DRY_STATUS=$?
+REAL_STATUS=0
+REAL_OUT=$(trash compress --older 0d 2>&1) || REAL_STATUS=$?
+umount "$STATE"
+if [ "$DRY_STATUS" -eq 0 ] && echo "$DRY_OUT" | grep -q "1 items would be compressed"; then
+    pass "trash compress --dry-run writes nothing to the trash"
+else
+    fail "trash compress --dry-run writes nothing to the trash" "exit $DRY_STATUS: $DRY_OUT"
+fi
+if [ "$REAL_STATUS" -ne 0 ] && echo "$REAL_OUT" | grep -q "1 item(s) could not be compressed" \
+    && ! echo "$REAL_OUT" | grep -q "Nothing to compress"; then
+    pass "trash compress fails when every attempt failed"
+else
+    fail "trash compress fails when every attempt failed" "exit $REAL_STATUS: $REAL_OUT"
+fi
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# Errors naming a recorded path are escaped (cli-2): a crafted name must
+# not reach the terminal as control bytes (here OSC 52, a clipboard write).
+# -----------------------------------------------------------------------
+ESC_NAME=$'trashd_it_esc\e]52;c;QQ==\a.txt'
+echo "esc" > "/home/test/$ESC_NAME"
+rm "/home/test/$ESC_NAME"
+echo "blocker" > "/home/test/$ESC_NAME"
+ESC_ERR=$(NO_COLOR=1 trash restore "$ESC_NAME" 2>&1 >/dev/null || true)
+if [[ "$ESC_ERR" == *"already exists"* && "$ESC_ERR" != *$'\e'* && "$ESC_ERR" != *$'\a'* \
+    && "$ESC_ERR" == *'trashd_it_esc\u{1b}]52;c;QQ==\u{7}.txt'* ]]; then
+    pass "trash restore escapes recorded paths in errors"
+else
+    fail "trash restore escapes recorded paths in errors" "$(printf '%q' "$ESC_ERR")"
+fi
+rm --permanent "/home/test/$ESC_NAME" 2>/dev/null
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# trash config set/add/remove keep comments and layout (cli-7)
+# -----------------------------------------------------------------------
+CONFIG_FILE="$XDG_CONFIG_HOME/trashd/config.toml"
+mkdir -p "$(dirname "$CONFIG_FILE")"
+printf '# keep big builds out of trash (ticket 123)\nmax_dir_size_mb = 10 # per build\n' > "$CONFIG_FILE"
+trash config set max_dir_size_mb 50 >/dev/null 2>&1
+trash config add never_trash '*.iso' >/dev/null 2>&1
+trash config add never_trash '*.img' >/dev/null 2>&1
+trash config remove never_trash '*.img' >/dev/null 2>&1
+if grep -qx '# keep big builds out of trash (ticket 123)' "$CONFIG_FILE" \
+    && grep -qx 'max_dir_size_mb = 50 # per build' "$CONFIG_FILE" \
+    && [ "$(trash config get max_dir_size_mb 2>&1)" = 50 ] \
+    && trash config get never_trash 2>&1 | grep -q '\*\.iso' \
+    && ! trash config get never_trash 2>&1 | grep -q '\*\.img'; then
+    pass "trash config edits keep comments"
+else
+    fail "trash config edits keep comments" "$(cat "$CONFIG_FILE")"
+fi
+trash config reset -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
 # Automatic compression is opt-in (store-metadata-5): after a retention pass
 # over a week-old entry, a spec-style restore (moving files/<id> back, as
 # GNOME Files does) still yields the original bytes.

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod config_file;
 pub mod directorysizes;
+pub mod display;
 pub(crate) mod local_trust;
 pub mod mounts;
 pub mod oplog;

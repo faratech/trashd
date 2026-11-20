@@ -371,6 +371,47 @@
   removing the same tree. A directory the other remover deleted first
   counts as removed. (#535)
 
+- Error messages and `trash compress --dry-run` lines escape control
+  characters in recorded paths and trash IDs, as listings already did. A
+  crafted `.trashinfo` on removable media (`Path=...%1B]52;...%07`)
+  could write to the clipboard or rewrite the screen through `trash
+  restore`, `undo`, `purge` or `empty` errors; the store's restore,
+  purge and empty warnings are escaped too. (#442)
+
+- `trash empty` exits non-zero when a confirmed entry changed while the
+  prompt waited (it was compressed, or its sidecar was rewritten or
+  touched). Such an entry was counted as already gone; it is kept and
+  reported. An ID reused by a different entry still counts as gone.
+  (#523, #543)
+
+- `trash compress` exits non-zero when every compression attempt failed
+  (for example an unwritable state directory or a full disk), instead of
+  printing "Nothing to compress." and exiting 0; partial failures end
+  with a count of the items that could not be compressed. (#443)
+
+- `trash compress --dry-run` measures the compressed size without
+  writing a full compressed copy of each candidate into the trash's
+  state directory, so it needs no free space or write access there and
+  leaves nothing behind when interrupted. (#490)
+
+- `trash config set/add/remove` edit the file in place and keep
+  comments, blank lines and key order, including the commented template
+  `trash config edit` seeds; they previously rewrote the file from a
+  parsed table and dropped them all. Settings promoted from a legacy
+  `[retention]` table move with their comments. (#446)
+
+- The audit daemon names btrfs subvolume mounts it cannot monitor in one
+  prominent warning, and its status line reports them as not monitored.
+  The kernel refuses whole-filesystem fanotify marks on subvolumes
+  (`EXDEV`), and the default `/` and `/home` on Fedora, openSUSE and
+  Ubuntu-on-btrfs are subvolumes; the other layers still protect them.
+  (#463)
+
+- The audit daemon keeps every directory it learned from one read until
+  that read's deletions are logged. When a read carried more removed
+  directories than the 4,096-entry cache holds, the outermost were
+  evicted first and their entries were logged as bare names. (#468)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

@@ -24,7 +24,7 @@ pub fn run(
     drop(progress);
     let entries = match entries {
         Ok(e) => e,
-        Err(e) => fatal(e),
+        Err(e) => fatal_untrusted(e),
     };
 
     if entries.is_empty() {

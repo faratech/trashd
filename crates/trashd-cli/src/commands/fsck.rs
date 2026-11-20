@@ -99,7 +99,11 @@ fn check_trash_dir_with_listing<I: Iterator<Item = std::io::Result<std::fs::DirE
         match store.lock_trash_root(trash_dir) {
             Ok(g) => Some(g),
             Err(e) => {
-                eprintln!("Could not lock {}: {e}", printable_path(trash_dir));
+                eprintln!(
+                    "Could not lock {}: {}",
+                    printable_path(trash_dir),
+                    printable(&e.to_string())
+                );
                 return Findings {
                     unchecked: 1,
                     ..Findings::default()
@@ -244,7 +248,7 @@ fn check_trash_dir_with_listing<I: Iterator<Item = std::io::Result<std::fs::DirE
                 match res {
                     Ok(()) => println!("    {}", "removed".green()),
                     Err(e) => {
-                        println!("    {} {e}", "failed:".red());
+                        println!("    {} {}", "failed:".red(), printable(&e.to_string()));
                         unresolved += 1;
                     }
                 }

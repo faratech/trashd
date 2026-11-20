@@ -16,7 +16,7 @@ pub fn run(
         Ok(Some((_, entries))) => entries,
         Ok(None) if all => fatal(format!("no matches for '{label}'")),
         Ok(None) => fatal(format!("trash entry not found: {label}")),
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     };
     if all {
         run_all(store, &entries, to, force);
@@ -53,7 +53,7 @@ pub fn run(
     }
     match restore_selected_entry(store, &mut entries[0], to, force) {
         Ok(path) => println!("{} {}", "Restored:".green().bold(), printable_path(&path)),
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     }
 }
 
@@ -156,6 +156,53 @@ mod tests {
             b"keep suffix"
         );
         assert!(store.list(None).unwrap().is_empty());
+    }
+
+    // Regression (cli-2): an error naming a recorded path or ID went to the
+    // terminal raw. A crafted sidecar's `Path=...%1B]52;c;...%07` loaded
+    // attacker text into the clipboard (OSC 52) through `restore` and `undo`.
+    #[test]
+    fn restore_and_undo_errors_escape_recorded_paths() {
+        const CHILD: &str = "TRASHD_RESTORE_ERROR_CHILD";
+        const TEST: &str =
+            "commands::restore::tests::restore_and_undo_errors_escape_recorded_paths";
+        if let Some(value) = std::env::var_os(CHILD) {
+            let (command, root) = value.to_str().unwrap().split_once(':').unwrap();
+            let mut config = trashd_common::Config::default();
+            config.never_trash.clear();
+            let store = TrashStore::open_isolated(Path::new(root), config).unwrap();
+            let id = store.list(None).unwrap().remove(0).id;
+            match command {
+                "restore" => run(&store, id.as_ref(), None, false, false),
+                _ => crate::commands::undo::run(&store),
+            }
+            unreachable!("the conflict must end the command");
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let mut config = trashd_common::Config::default();
+        config.never_trash.clear();
+        let root = fixture.path().join("Trash");
+        let store = TrashStore::open_isolated(&root, config).unwrap();
+        let original = fixture.path().join("name\x1b]52;c;QQ==\x07");
+        fs::write(&original, b"recover me").unwrap();
+        store.trash(&original, None).unwrap();
+        fs::write(&original, b"recreated").unwrap();
+        for command in ["restore", "undo"] {
+            let value = format!("{command}:{}", root.display());
+            let output = crate::util::rerun_test(TEST, CHILD, value.as_ref());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{command}: {stderr}");
+            assert!(
+                stderr.contains("original path already exists"),
+                "{command}: {stderr}"
+            );
+            assert!(
+                !output.stderr.contains(&0x1b) && !output.stderr.contains(&0x07),
+                "{command}: raw control bytes reached the terminal: {stderr:?}"
+            );
+            assert!(stderr.contains("name\\u{1b}]52;c;QQ==\\u{7}"), "{stderr}");
+        }
+        assert_eq!(fs::read(&original).unwrap(), b"recreated");
     }
 
     #[test]

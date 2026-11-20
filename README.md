@@ -295,8 +295,8 @@ Trash Status
 | `trash empty --older <dur>` | With `empty`: only entries older than the duration. Still retries interrupted-cleanup jobs. |
 | `trash empty --dry-run` | Preview the selection (and any pending cleanup retries) without deleting anything. |
 | `trash empty -y` / `--yes` | Skip the confirmation prompt. Intended for scripts and the cleanup timer. |
-| `trash compress [--older <dur>]` | Compress entries older than the duration in place with zstd (default `7d`). `trash restore` decompresses them transparently; other file managers restore the compressed bytes as they are. |
-| `trash compress --dry-run` | Preview what would be compressed. |
+| `trash compress [--older <dur>]` | Compress entries older than the duration in place with zstd (default `7d`). `trash restore` decompresses them transparently; other file managers restore the compressed bytes as they are. Exits non-zero when every attempt failed. |
+| `trash compress --dry-run` | Preview what would be compressed. Writes nothing, not even temporary files. |
 | `trash fsck` | Check every trash directory for orphaned metadata, orphaned files, and corrupt `.trashinfo` files. Exits non-zero if any problem (or an unreadable trash root) is found, so scripts can gate on it. |
 | `trash fsck --fix` | Repair: removes orphaned `.trashinfo` files; asks before removing each orphaned data file. Corrupt metadata is never auto-deleted — the data file is preserved for manual recovery. Exits non-zero if anything remains broken afterwards. |
 
@@ -617,7 +617,7 @@ Safety mechanisms inside the `.so`:
 <details>
 <summary><strong>Deep dive — Layer 3: the fanotify audit daemon</strong> (implementation detail; skip unless debugging)</summary>
 
-Watches all real filesystems for `FAN_DELETE` / `FAN_DELETE_SELF` (files and directories, `FAN_ONDIR`) using `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Deleted paths are reconstructed from the parent directory's file handle plus the event's filename, resolved with `open_by_handle_at()` on the matching mount; no directory descriptors are held open, so mounts can still be unmounted cleanly. Virtual filesystems (tmpfs, ramfs, devtmpfs, overlay, squashfs) are skipped, I/O is non-blocking with a 1-second poll, and with nothing markable the daemon idles and re-scans mounts every second. It runs under systemd with `AmbientCapabilities=CAP_SYS_ADMIN` (unit: [`install/systemd/trashd.service`](install/systemd/trashd.service)) and logs PID, process name, and path for every deletion it sees — including deletions that deliberately bypassed trashd.
+Watches all real filesystems for `FAN_DELETE` / `FAN_DELETE_SELF` (files and directories, `FAN_ONDIR`) using `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Deleted paths are reconstructed from the parent directory's file handle plus the event's filename, resolved with `open_by_handle_at()` on the matching mount; no directory descriptors are held open, so mounts can still be unmounted cleanly. Virtual filesystems (tmpfs, ramfs, devtmpfs, overlay, squashfs) are skipped, I/O is non-blocking with a 1-second poll, and with nothing markable the daemon idles and re-scans mounts every second. btrfs subvolume mounts (the default `/` and `/home` on Fedora, openSUSE and Ubuntu-on-btrfs) cannot be audited: with FID reporting the kernel refuses whole-filesystem marks on them (`EXDEV`). The daemon names them in one `WARNING` line at startup and excludes them from its "monitoring N filesystem(s)" count; Layers 1, 2 and 4 still protect files there. It runs under systemd with `AmbientCapabilities=CAP_SYS_ADMIN` (unit: [`install/systemd/trashd.service`](install/systemd/trashd.service)) and logs PID, process name, and path for every deletion it sees — including deletions that deliberately bypassed trashd.
 
 One shared ordering guarantee spans layers: trash publication, compression, and retirement all take a persistent private lock (`.trashd/store.lock`) per trash root, and cleanup re-validates an entry's data identity and metadata version before mutating it, so a recycled ID can never inherit a previous entry's purge/compress decision. Install all rebuilt components from the same release together — older writers do not participate in this lock (existing IDs and `.trashinfo` files remain compatible, no migration needed).
 
@@ -1002,7 +1002,7 @@ Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastes
 | --- | --- | --- |
 | Linux, any kernel | Layers 1–2 (shim + preload) | The protection most users rely on |
 | Linux 5.6+ | Layer 4 (seccomp user-notification, `openat2` pinning) | Older kernels simply lack kernel trapping |
-| Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts; on an older kernel, or without fanotify, it exits with status 78 and systemd does not restart it |
+| Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts; on an older kernel, or without fanotify, it exits with status 78 and systemd does not restart it. It cannot audit btrfs subvolume mounts and warns about them |
 | `CAP_SYS_ADMIN` (via systemd ambient capabilities) | Layer 3 daemon | Granted by the shipped unit; you do not set it by hand |
 | Rust 1.99.1+ | Building from source only | Runtime has no Rust dependency |
 | systemd | Daemon + cleanup timer (optional conveniences) | Layers 1, 2, and 4 work without systemd |

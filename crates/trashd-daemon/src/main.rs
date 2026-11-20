@@ -191,6 +191,8 @@ fn run() -> io::Result<()> {
     // marked for: a remount at the same path is a NEW superblock whose old
     // fanotify mark died with the unmount (#98).
     let mut marked_paths: Vec<(PathBuf, Fsid)> = Vec::new();
+    // btrfs subvolume mounts the kernel refused, named once in one warning.
+    let mut subvolumes: Vec<PathBuf> = Vec::new();
     for mount in &mount_list {
         if matches!(
             mount.fstype.as_str(),
@@ -214,6 +216,7 @@ fn run() -> io::Result<()> {
                 marked += 1;
                 marked_paths.push((mount.path.clone(), fsid_of_path(&mount.path)));
             }
+            Err(e) if refused_subvolume(&mount.fstype, &e) => subvolumes.push(mount.path.clone()),
             Err(e) => {
                 eprintln!(
                     "trashd: failed to mark \"{}\": {e}",
@@ -221,6 +224,9 @@ fn run() -> io::Result<()> {
                 );
             }
         }
+    }
+    if let Some(warning) = unmonitored_subvolumes_warning(&subvolumes) {
+        eprintln!("{warning}");
     }
 
     // Exiting here made Restart=always relaunch the daemon forever (#228).
@@ -248,7 +254,7 @@ fn run() -> io::Result<()> {
     }
     order_for_resolution(&mut mount_fds);
 
-    eprintln!("trashd: monitoring {} filesystem(s) for deletions", marked);
+    eprintln!("{}", monitoring_status(marked, subvolumes.len()));
 
     let mount_table_changed = |timeout: libc::c_int| {
         mount_table.as_ref().is_some_and(|table| {
@@ -307,7 +313,7 @@ fn run() -> io::Result<()> {
                 let now = std::time::Instant::now();
                 let changed = pfds[1].revents & (libc::POLLPRI | libc::POLLERR) != 0;
                 if changed || (mount_table.is_none() && mount_refresh_due(last_refresh, now)) {
-                    refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
+                    refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds, &mut subvolumes);
                     last_refresh = now;
                 }
                 continue;
@@ -415,7 +421,7 @@ fn run() -> io::Result<()> {
             mount_refresh_due(last_refresh, now)
         };
         if changed {
-            refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds);
+            refresh_mounts(fan_fd, &mut marked_paths, &mut mount_fds, &mut subvolumes);
             last_refresh = now;
         }
     }
@@ -522,13 +528,17 @@ fn resolve_event_path(
 /// records lost their directory. A stale handle uses its last known path.
 #[derive(Default)]
 struct HandleCache {
-    paths: std::collections::HashMap<(Fsid, Vec<u8>), PathBuf>,
-    order: std::collections::VecDeque<(Fsid, Vec<u8>)>,
+    /// Each handle's path and the batch that last remembered it.
+    paths: std::collections::HashMap<(Fsid, Vec<u8>), (PathBuf, u64)>,
+    /// Handles in the order they were remembered, with that batch; an older
+    /// batch than the handle's own marks a superseded position.
+    order: std::collections::VecDeque<((Fsid, Vec<u8>), u64)>,
     /// What decoding each handle found during the current batch. The
     /// records of one batch share few directories, and decoding (a mount
     /// open, fstatfs, open_by_handle_at, readlink and two closes) gives the
     /// path at processing time for any record of the batch alike (#344).
     batch: std::collections::HashMap<(Fsid, Vec<u8>), Option<PathBuf>>,
+    generation: u64,
 }
 
 impl HandleCache {
@@ -536,6 +546,8 @@ impl HandleCache {
 
     fn new_batch(&mut self) {
         self.batch.clear();
+        self.generation += 1;
+        self.evict();
     }
 
     fn decoded(&self, key: &(Fsid, Vec<u8>)) -> Option<&Option<PathBuf>> {
@@ -547,18 +559,42 @@ impl HandleCache {
     }
 
     fn remember(&mut self, key: (Fsid, Vec<u8>), path: &std::path::Path) {
-        if self.paths.insert(key.clone(), path.to_path_buf()).is_none() {
-            self.order.push_back(key);
-            if self.order.len() > Self::CAPACITY
-                && let Some(oldest) = self.order.pop_front()
+        let generation = self.generation;
+        match self
+            .paths
+            .insert(key.clone(), (path.to_path_buf(), generation))
+        {
+            Some((_, previous)) if previous == generation => {}
+            _ => self.order.push_back((key, generation)),
+        }
+        self.evict();
+    }
+
+    /// Drop the least recently remembered paths beyond CAPACITY, but never
+    /// one remembered in the current batch: the batch's entries resolve
+    /// through it, and FIFO eviction dropped a large batch's outermost
+    /// directories before their entries were logged (daemon-8). The cache
+    /// exceeds CAPACITY by at most one batch's directories, until the next.
+    fn evict(&mut self) {
+        while self.order.len() > Self::CAPACITY
+            && self
+                .order
+                .front()
+                .is_some_and(|(_, generation)| *generation != self.generation)
+            && let Some((key, generation)) = self.order.pop_front()
+        {
+            if self
+                .paths
+                .get(&key)
+                .is_some_and(|(_, current)| *current == generation)
             {
-                self.paths.remove(&oldest);
+                self.paths.remove(&key);
             }
         }
     }
 
     fn get(&self, key: &(Fsid, Vec<u8>)) -> Option<&PathBuf> {
-        self.paths.get(key)
+        self.paths.get(key).map(|(path, _)| path)
     }
 }
 
@@ -861,14 +897,52 @@ fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Whether a failed whole-filesystem mark is the kernel refusing a btrfs
+/// subvolume mount: with FID reporting, a mount whose root has another fsid
+/// than its superblock's root (every subvolume) fails with EXDEV, and no
+/// other mark type reports the deletions under it (daemon-3).
+fn refused_subvolume(fstype: &str, error: &io::Error) -> bool {
+    fstype == "btrfs" && error.raw_os_error() == Some(libc::EXDEV)
+}
+
+/// One prominent line naming btrfs subvolume mounts that are not audited.
+fn unmonitored_subvolumes_warning(paths: &[PathBuf]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| format!("\"{}\"", escape_path(path)))
+        .collect();
+    Some(format!(
+        "trashd: WARNING: deletions on btrfs subvolume mount(s) {} are NOT audited: \
+         the kernel refuses whole-filesystem fanotify marks on subvolumes (EXDEV); \
+         the other layers still protect them",
+        paths.join(", ")
+    ))
+}
+
+/// The startup status: only mounts actually marked count as monitored.
+fn monitoring_status(marked: usize, unmonitored_subvolumes: usize) -> String {
+    let mut status = format!("trashd: monitoring {marked} filesystem(s) for deletions");
+    if unmonitored_subvolumes > 0 {
+        status.push_str(&format!(
+            "; {unmonitored_subvolumes} btrfs subvolume mount(s) are NOT monitored"
+        ));
+    }
+    status
+}
+
 /// Diff a fresh /proc/mounts scan against the marked set; mark anything new
 /// (#37) and record it for handle resolution, and RE-mark anything whose
 /// filesystem identity changed: a remount at the same path is a new
-/// superblock whose old mark died with the unmount (#98).
+/// superblock whose old mark died with the unmount (#98). A btrfs subvolume
+/// mount the kernel refuses is warned about once (daemon-3).
 fn refresh_mounts(
     fan_fd: RawFd,
     marked: &mut Vec<(PathBuf, Fsid)>,
     watched: &mut Vec<WatchedMount>,
+    subvolumes: &mut Vec<PathBuf>,
 ) {
     let fresh = mounts::list_mounts_uncached();
     let live_paths: Vec<PathBuf> = fresh.iter().map(|m| m.path.clone()).collect();
@@ -877,6 +951,7 @@ fn refresh_mounts(
     // with the superblock).
     marked.retain(|(p, _)| live_paths.contains(p));
     watched.retain(|(p, _)| live_paths.contains(p));
+    subvolumes.retain(|p| live_paths.contains(p));
 
     for mount in &fresh {
         if matches!(
@@ -921,8 +996,19 @@ fn refresh_mounts(
                     marked.push((mount.path.clone(), fsid_of_path(&mount.path)));
                 }
             },
-            Err(_) => continue,
+            Err(e) => {
+                if refused_subvolume(&mount.fstype, &e) && !subvolumes.contains(&mount.path) {
+                    subvolumes.push(mount.path.clone());
+                    if let Some(warning) =
+                        unmonitored_subvolumes_warning(std::slice::from_ref(&mount.path))
+                    {
+                        eprintln!("{warning}");
+                    }
+                }
+                continue;
+            }
         }
+        subvolumes.retain(|p| p != &mount.path);
 
         // Record the current identity for handle resolution; descriptors are
         // opened per lookup, so a remount needs nothing else.
@@ -996,6 +1082,43 @@ mod tests {
             let error = io::Error::from_raw_os_error(errno);
             assert_eq!(fanotify_init_exit_code(&error), 1, "{error}");
         }
+    }
+
+    // Regression (daemon-3): with FID reporting the kernel refuses a
+    // whole-filesystem mark on a btrfs subvolume mount (EXDEV), and the
+    // default Fedora, openSUSE and Ubuntu-on-btrfs layouts mount / and /home
+    // as subvolumes. One "failed to mark" line per mount was all the daemon
+    // said, while it reported itself as monitoring.
+    #[test]
+    fn btrfs_subvolume_refusals_are_reported_prominently() {
+        let exdev = io::Error::from_raw_os_error(libc::EXDEV);
+        assert!(refused_subvolume("btrfs", &exdev));
+        assert!(!refused_subvolume(
+            "btrfs",
+            &io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(!refused_subvolume("ext4", &exdev));
+
+        assert_eq!(unmonitored_subvolumes_warning(&[]), None);
+        let warning = unmonitored_subvolumes_warning(&[
+            PathBuf::from("/"),
+            PathBuf::from(OsStr::from_bytes(b"/home\n")),
+        ])
+        .unwrap();
+        assert!(warning.starts_with("trashd: WARNING: "), "{warning}");
+        assert!(warning.contains("\"/\", \"/home\\x0a\""), "{warning}");
+        assert!(warning.contains("NOT audited"), "{warning}");
+        assert!(!warning.contains('\n'), "one line: {warning:?}");
+
+        assert_eq!(
+            monitoring_status(1, 2),
+            "trashd: monitoring 1 filesystem(s) for deletions; \
+             2 btrfs subvolume mount(s) are NOT monitored"
+        );
+        assert_eq!(
+            monitoring_status(3, 0),
+            "trashd: monitoring 3 filesystem(s) for deletions"
+        );
     }
 
     // #438: a resolved audit path must not keep the kernel's
@@ -1301,10 +1424,75 @@ mod tests {
         );
     }
 
+    /// A DFID_NAME record naming `name` in the directory with handle `handle`
+    /// on filesystem `fsid`, and the cache key that handle decodes to.
+    fn entry_record(fsid: (i32, i32), handle: u64, name: &[u8]) -> (Vec<u8>, (Fsid, Vec<u8>)) {
+        let mut file_handle = 8u32.to_ne_bytes().to_vec(); // handle_bytes
+        file_handle.extend_from_slice(&1i32.to_ne_bytes()); // handle_type
+        file_handle.extend_from_slice(&handle.to_ne_bytes()); // f_handle
+        let mut record = vec![FAN_EVENT_INFO_TYPE_DFID_NAME, 0, 0, 0];
+        record.extend_from_slice(&fsid.0.to_ne_bytes());
+        record.extend_from_slice(&fsid.1.to_ne_bytes());
+        record.extend_from_slice(&file_handle);
+        record.extend_from_slice(name);
+        record.push(0);
+        while record.len() % 4 != 0 {
+            record.push(0);
+        }
+        let len = record.len() as u16;
+        record[2..4].copy_from_slice(&len.to_ne_bytes());
+        let mut event = event_header(0);
+        event.extend(record);
+        let total = event.len() as u32;
+        event[..4].copy_from_slice(&total.to_ne_bytes());
+        (event, (Some(fsid), file_handle))
+    }
+
+    // Regression (daemon-8): one read can carry more removed directories
+    // than the cache holds. They are learned outermost first, so FIFO
+    // eviction dropped this batch's outermost directories before its entries
+    // were logged, and those entries were logged as bare names.
+    #[test]
+    fn a_batch_keeps_every_directory_it_learned() {
+        let directories = HandleCache::CAPACITY + 1000;
+        let fsid = (7, 9);
+        let mut cache = HandleCache::default();
+        // Older batches filled the cache.
+        for i in 0..HandleCache::CAPACITY {
+            cache.new_batch();
+            cache.remember(
+                (None, i.to_ne_bytes().to_vec()),
+                std::path::Path::new("/old"),
+            );
+        }
+        // This batch's learning pass, outermost directory first.
+        cache.new_batch();
+        for i in 0..directories {
+            let (_, key) = entry_record(fsid, i as u64, b"");
+            cache.remember(key, &PathBuf::from(format!("/tree/d{i}")));
+        }
+        // Its logging pass: entries of the outermost and innermost
+        // directories, whose handles no longer decode.
+        for i in [0, 1, directories / 2, directories - 1] {
+            let (event, _) = entry_record(fsid, i as u64, b"entry");
+            assert_eq!(
+                extract_dfid_name_path(&event, &[], &mut cache),
+                Some(PathBuf::from(format!("/tree/d{i}/entry"))),
+                "directory {i} was evicted within its own batch"
+            );
+        }
+        // The next batch trims the cache back to its capacity, newest kept.
+        cache.new_batch();
+        assert_eq!(cache.paths.len(), HandleCache::CAPACITY);
+        let (event, _) = entry_record(fsid, directories as u64 - 1, b"entry");
+        assert!(extract_dfid_name_path(&event, &[], &mut cache).is_some_and(|p| p.is_absolute()));
+    }
+
     #[test]
     fn handle_cache_is_bounded() {
         let mut cache = HandleCache::default();
         for i in 0..HandleCache::CAPACITY + 10 {
+            cache.new_batch();
             cache.remember((None, i.to_ne_bytes().to_vec()), std::path::Path::new("/x"));
         }
         assert_eq!(cache.paths.len(), HandleCache::CAPACITY);

@@ -7,7 +7,7 @@ pub fn run(store: &TrashStore, target: &std::ffi::OsStr) {
     let mut entries = match store.select_entries(target, false) {
         Ok(Some((_, entries))) => entries,
         Ok(None) => fatal(format!("'{label}' not found in trash")),
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     };
     if entries.len() > 1 {
         eprintln!(
