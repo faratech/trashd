@@ -466,6 +466,65 @@
   filesystem or stop at its ESTALE. Such deletions are logged by file
   name only, after one warning naming the fsid. (#466)
 
+- trashd-exec's workers ignore SIGTERM like the other job signals and
+  are torn down with SIGKILL. A process-group SIGTERM (bash `kill %1`,
+  GNU `timeout`, a systemd stop) ended both workers while the command
+  ran its cleanup, whose deletes then failed with ENOSYS. (#493)
+
+- trashd-exec no longer forwards a signal that a member of the command's
+  own process group sent to the whole group (`kill 0`, `trap 'kill 0'
+  EXIT`). The command received it twice, which many tools take as "force
+  quit". A group signal sent from outside the job still cannot be told
+  from one sent to the wrapper alone. (#498)
+
+- A wrapped root login no longer hangs `exit` (ssh, `sudo -i`, `su -`)
+  while a setsid daemon it started (tmux, ssh-agent, gpg-agent, a SysV
+  service) is alive. A keeper process reports the command's status once
+  only descendants outside the session remain, and keeps protecting them
+  until they exit. (#495)
+
+- 32-bit programs (i386 and x32 on x86-64, AArch32 on aarch64) run under
+  trashd-exec; every one of their syscalls used to fail with ENOSYS.
+  Only their deletes, io_uring and landlock_restrict_self calls are
+  refused. (#496)
+
+- The seccomp supervisor no longer hangs on a lost broker reply.
+  Requests carry no descriptor (an orchestrator at its descriptor limit
+  could not receive one), replies are matched by request id, and a
+  request times out after 5 seconds. (#494)
+
+- Watchdog failover hands queued deletes to the replacement supervisor
+  instead of continuing them, which was a permanent delete for static
+  and raw-syscall callers. Only repeated rapid supervisor deaths decline
+  the queue. (#497)
+
+- The seccomp supervisor's launch-time store defers retention until the
+  trapped syscall is answered, as reloaded stores already did. (#499)
+
+- A config load can no longer panic on a failing stderr, and a panicking
+  config reload keeps the previous store serving, so the dequeued delete
+  is still answered. (#500, #449)
+
+- The supervisor lends its credentials only to targets with the same
+  SELinux/AppArmor/Smack label. A confined process with root's
+  credentials no longer has deletions its policy denies carried out
+  under the supervisor's label. (#503)
+
+- Config reloads in a seccomp session follow symlink retargets and files
+  with normalized mtimes (Nix, home-manager), keyed on the link's and
+  the file's identity, size and ctime. (#501)
+
+- A scoped openat2 lookup that fails with a transient EAGAIN is retried
+  up to 16 times instead of declining the delete. (#505)
+
+- A parent directory on a lazily unmounted or overmounted mount is no
+  longer trusted at its /proc readlink spelling, which misdirected
+  policy, the trash choice and Path=. (#506)
+
+- An entry swapped for a directory, file or populated tree after the
+  supervisor's unlink/rmdir checks gets the kernel's
+  EISDIR/ENOTDIR/ENOTEMPTY instead of being trashed with success. (#507)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

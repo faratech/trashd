@@ -118,6 +118,52 @@ def children(pid):
         return []
 
 
+def protection(process, target):
+    """The keeper (the wrapper's only child), its watchdog and supervisor."""
+    keeper = wait_until(lambda: next(iter(children(process.pid)), None), "keeper")
+    watchdog = wait_until(lambda: next((p for p in children(keeper) if p != target), None), "watchdog")
+    supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+    return keeper, watchdog, supervisor
+
+
+def i386_probe():
+    """A static i386 program: write(1, "ok\n", 3), unlink("victim"), then
+    exit with the negated unlink result (its errno, or 0)."""
+    import struct
+    base, code_at = 0x08048000, 52 + 32
+    message = base + code_at + 45
+    code = b"".join([
+        b"\xB8" + struct.pack("<I", 4), b"\xBB" + struct.pack("<I", 1),
+        b"\xB9" + struct.pack("<I", message), b"\xBA" + struct.pack("<I", 3), b"\xCD\x80",
+        b"\xB8" + struct.pack("<I", 10), b"\xBB" + struct.pack("<I", message + 3), b"\xCD\x80",
+        b"\xF7\xD8\x89\xC3", b"\xB8" + struct.pack("<I", 1), b"\xCD\x80",
+    ])
+    assert len(code) == 45
+    code += b"ok\nvictim\0"
+    total = code_at + len(code)
+    header = b"\x7fELF\x01\x01\x01" + bytes(9)
+    header += struct.pack("<HHIIIIIHHHHHH", 2, 3, 1, base + code_at, 52, 0, 0, 52, 32, 1, 0, 0, 0)
+    header += struct.pack("<IIIIIIII", 1, 0, base, base, total, total, 5, 0x1000)
+    return header + code
+
+
+DAEMON = r'''
+import os, sys, time
+victim, go, done = sys.argv[1:]
+if os.fork() == 0:
+    os.setsid()
+    devnull = os.open("/dev/null", os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    while not os.path.exists(go):
+        time.sleep(0.01)
+    os.unlink(victim)
+    open(done, "w").close()
+    os._exit(0)
+os._exit(7)
+'''
+
+
 def recovery_records(data, original):
     records = []
     for info in (data / "Trash/info").glob("*.trashinfo"):
@@ -273,6 +319,44 @@ for row in sys.stdin:
             _, errors = empty.communicate()
             status = "hung"
         print(json.dumps([status, errors]), flush=True)
+        continue
+    elif mode == "term-cleanup":
+        # seccomp-orch-1: a process-group SIGTERM must leave the cleanup's
+        # own deletes protected, not failing with ENOSYS.
+        import errno, signal
+        def cleanup(signum, frame):
+            # A forwarded copy of the group signal may follow; run once.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                os.unlink(path)
+                result = "cleaned"
+            except OSError as error:
+                result = errno.errorcode[error.errno]
+            print(json.dumps(result), flush=True)
+            os._exit(0)
+        signal.signal(signal.SIGTERM, cleanup)
+        print(json.dumps("armed"), flush=True)
+        continue
+    elif mode == "blocked-unlink":
+        # Report the deleting thread, then block in its trapped unlink.
+        def blocked():
+            os.unlink(path)
+            print(json.dumps("ok"), flush=True)
+        thread = threading.Thread(target=blocked)
+        thread.start()
+        print(json.dumps(thread.native_id), flush=True)
+        thread.join()
+        continue
+    elif mode == "orphans":
+        # Adopted orphans each cost the keeper a descriptor.
+        for _ in range(int(os.path.basename(path))):
+            child = os.fork()
+            if child == 0:
+                if os.fork() == 0:
+                    time.sleep(120)
+                os._exit(0)
+            os.waitpid(child, 0)
+        print(json.dumps("spawned"), flush=True)
         continue
     elif mode == "exit":
         break
@@ -507,8 +591,7 @@ def run():
                 for mode in ["common-copy", "preload-copy"]:
                     delete(process, work, data, mode, f"nested-{mode}.txt")
                     delete(process, work, data, mode, f"nested-{mode}.link", symlink=True)
-                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
-                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                _, watchdog, supervisor = protection(process, target)
                 os.kill(supervisor, signal.SIGKILL)
                 wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
                 for mode in ["unlink", "child", "dirfd", "thread", "thread-dirfd", "thread-private"]:
@@ -571,8 +654,7 @@ def run():
                 process.stdin.write(json.dumps(["landlock-child", str(child_victim)]) + "\n"); process.stdin.flush()
                 assert line(process) == "denied"
                 assert child_victim.read_bytes() == b"child refused\n"
-                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
-                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                _, watchdog, supervisor = protection(process, target)
                 os.kill(supervisor, signal.SIGKILL)
                 wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
                 again = work / "landlock-after-restart.txt"
@@ -595,8 +677,7 @@ def run():
             try:
                 target, active = line(process)
                 assert active == "1"
-                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
-                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                _, watchdog, supervisor = protection(process, target)
                 os.kill(supervisor, signal.SIGSTOP)
                 wait_until(lambda: "State:\tT" in Path(f"/proc/{supervisor}/status").read_text(), "stopped supervisor")
                 process.stdin.write(json.dumps(["landlock-setup", ""]) + "\n"); process.stdin.flush()
@@ -645,8 +726,7 @@ def run():
                 assert active == "1"
                 process.stdin.write(json.dumps(["landlock-overflow", ""]) + "\n"); process.stdin.flush()
                 assert line(process, timeout=40) == "installed"
-                watchdog = wait_until(lambda: next((p for p in children(process.pid) if p != target), None), "watchdog")
-                supervisor = wait_until(lambda: children(watchdog), "supervisor")[0]
+                _, watchdog, supervisor = protection(process, target)
                 os.kill(supervisor, signal.SIGKILL)
                 wait_until(lambda: [p for p in children(watchdog) if p != supervisor], "replacement supervisor")
                 victim = work / "landlock-overflow.txt"
@@ -771,9 +851,10 @@ def run():
                 event, orphan = line(process)
                 assert event == "adopted"
                 wait_until(lambda: not Path(f"/proc/{original}").exists(), "original command reaped")
-                before = cpu_seconds(process.pid)
+                keeper = children(process.pid)[0]
+                before = cpu_seconds(process.pid) + cpu_seconds(keeper)
                 time.sleep(0.5)
-                assert cpu_seconds(process.pid) - before < 0.2, "wrapper spins while waiting"
+                assert cpu_seconds(process.pid) + cpu_seconds(keeper) - before < 0.2, "wrapper spins while waiting"
                 Path(str(path) + ".go").touch()
                 assert line(process) == "ok"
                 assert recovery_records(data, path), "orphan deletion was not recovered"
@@ -781,6 +862,114 @@ def run():
             finally:
                 stop(process)
         print("PASS: protected wrapper with ignored SIGCHLD keeps status and does not spin", flush=True)
+
+        # seccomp-orch-1: bash `kill %1`, GNU timeout and systemd stops signal
+        # the whole process group. The workers ignore SIGTERM, so the
+        # command's cleanup deletes stay protected instead of failing ENOSYS.
+        with (fixture / "group-sigterm.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                _, active = line(process)
+                assert active == "1"
+                path = work / "group-sigterm.lock"
+                path.write_bytes(b"removed by the cleanup trap\n")
+                process.stdin.write(json.dumps(["term-cleanup", str(path)]) + "\n"); process.stdin.flush()
+                assert line(process) == "armed"
+                os.killpg(process.pid, signal.SIGTERM)
+                assert line(process) == "cleaned"
+                assert recovery_records(data, path), "the cleanup's delete was not protected"
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: a process-group SIGTERM leaves the cleanup trap protected", flush=True)
+
+        # seccomp-orch-4: a 32-bit program runs; only its deletes are refused.
+        if os.uname().machine == "x86_64":
+            probe = work / "probe32"
+            probe.write_bytes(i386_probe())
+            probe.chmod(0o755)
+            (work / "victim").write_bytes(b"stays\n")
+            result = subprocess.run([str(BIN), str(probe)], env=protected_env, cwd=work,
+                                    capture_output=True, timeout=10)
+            if result.returncode == 127 and b"Exec format error" in result.stderr:
+                print("SKIP: this kernel runs no 32-bit programs", flush=True)
+            else:
+                assert result.stdout == b"ok\n", result
+                assert result.returncode == errno.ENOSYS, result
+                assert (work / "victim").read_bytes() == b"stays\n"
+                assert not recovery_records(data, work / "victim")
+                print("PASS: 32-bit programs run with their deletes refused", flush=True)
+
+        # seccomp-orch-5: failover forks the replacement at once, which
+        # trashes the queued delete; draining first CONTINUEd it for good.
+        with (fixture / "failover-queue.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                target, active = line(process)
+                assert active == "1"
+                _, watchdog, supervisor = protection(process, target)
+                os.kill(supervisor, signal.SIGSTOP)
+                wait_until(lambda: "State:\tT" in Path(f"/proc/{supervisor}/status").read_text(), "stopped supervisor")
+                path = work / "failover-queue.txt"
+                path.write_bytes(b"queued during failover\n")
+                process.stdin.write(json.dumps(["blocked-unlink", str(path)]) + "\n"); process.stdin.flush()
+                thread = line(process)
+                def queued():
+                    try:
+                        return Path(f"/proc/{target}/task/{thread}/syscall").read_text().split()[0] in ("35", "87", "263")
+                    except (OSError, IndexError):
+                        return False
+                wait_until(queued, "queued unlink")
+                os.kill(supervisor, signal.SIGKILL)
+                assert line(process) == "ok"
+                assert not path.exists()
+                assert recovery_records(data, path), "failover declined the queued delete"
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: failover hands queued deletes to the replacement", flush=True)
+
+        # seccomp-orch-2: at its descriptor limit (one per adopted orphan)
+        # the keeper still answers the supervisor; a request used to carry a
+        # descriptor it could not receive, and the delete hung.
+        import resource
+        def low_descriptor_limit():
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        with (fixture / "broker-emfile.log").open("w") as log:
+            process = subprocess.Popen(
+                [str(BIN), sys.executable, "-u", "-c", TARGET], env=protected_env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True,
+                start_new_session=True, preexec_fn=low_descriptor_limit)
+            try:
+                _, active = line(process)
+                assert active == "1"
+                process.stdin.write(json.dumps(["orphans", str(work / "80")]) + "\n"); process.stdin.flush()
+                assert line(process, timeout=30) == "spawned"
+                delete(process, work, data, "unlink", "broker-emfile.txt")
+            finally:
+                stop(process)
+        print("PASS: a keeper at its descriptor limit still serves deletes", flush=True)
+
+        # seccomp-orch-3: a wrapped command that leaves a setsid daemon
+        # (tmux, an agent, a service) exits with its own status at once; the
+        # keeper goes on protecting the daemon, whose later delete is trashed.
+        victim, go, done = work / "daemon-victim.txt", work / "daemon.go", work / "daemon.done"
+        victim.write_bytes(b"deleted by a daemon after logout\n")
+        with (fixture / "setsid-daemon.log").open("w") as log:
+            process = subprocess.Popen(
+                [str(BIN), sys.executable, "-c", DAEMON, str(victim), str(go), str(done)],
+                env=protected_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=log, start_new_session=True)
+            try:
+                assert process.wait(timeout=5) == 7, "the wrapper waited for a daemon"
+                go.touch()
+                wait_until(done.exists, "daemon delete")
+                assert not victim.exists()
+                assert recovery_records(data, victim), "the daemon's delete was not protected"
+            finally:
+                stop(process)
+        print("PASS: a setsid daemon neither holds the session nor loses protection", flush=True)
 
 
 if __name__ == "__main__":
