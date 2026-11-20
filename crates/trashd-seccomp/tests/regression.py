@@ -256,6 +256,24 @@ for row in sys.stdin:
         thread = threading.Thread(target=worker)
         thread.start(); thread.join()
         if errors: raise errors[0]
+    elif mode == "empty-race":
+        # store-core-4: the copied `trash` empties the store inside this
+        # session while this process deletes every file in `path`. Each of
+        # those deletes waits for the supervisor, which takes the root lock.
+        names = sorted(os.listdir(path))
+        empty = subprocess.Popen(["/opt/trashd/bin/trash", "empty", "-y"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        for name in names:
+            os.unlink(os.path.join(path, name))
+        try:
+            _, errors = empty.communicate(timeout=30)
+            status = empty.returncode
+        except subprocess.TimeoutExpired:
+            empty.kill()
+            _, errors = empty.communicate()
+            status = "hung"
+        print(json.dumps([status, errors]), flush=True)
+        continue
     elif mode == "exit":
         break
     elif mode == "sigchld":
@@ -502,6 +520,35 @@ def run():
             finally:
                 stop(process)
         print("PASS: protected deletes, forked children, dirfds, FIFO, restart, signals", flush=True)
+
+        # store-core-4: purge held the root lock across unlinks that trap
+        # into the supervisor. A concurrent delete in the same session made
+        # the supervisor wait for that lock while the purger waited for the
+        # supervisor, and every delete in the session hung.
+        trash = data / "Trash"
+        for index in range(2000):
+            (trash / "files" / f"aged-{index}").write_bytes(b"x")
+            (trash / "info" / f"aged-{index}.trashinfo").write_text(
+                f"[Trash Info]\nPath=/work/aged-{index}\nDeletionDate=2000-01-01T00:00:00\n")
+        racing = work / "empty-race"
+        racing.mkdir()
+        for index in range(300):
+            (racing / f"deleted-{index}.txt").write_bytes(b"deleted during empty\n")
+        with (fixture / "empty-race.log").open("w") as log:
+            process = launch(protected_env, log)
+            try:
+                _, active = line(process)
+                assert active == "1", "empty race lost listener"
+                process.stdin.write(json.dumps(["empty-race", str(racing)]) + "\n"); process.stdin.flush()
+                status, errors = line(process, timeout=60)
+                assert status == 0, f"trash empty returned {status}: {errors}"
+                assert not any(racing.iterdir()), "a delete racing the empty did not complete"
+                assert not any((trash / "files").glob("aged-*")), "the empty did not complete"
+                process.stdin.write(json.dumps(["exit", ""]) + "\n"); process.stdin.flush()
+                assert process.wait(timeout=5) == 0
+            finally:
+                stop(process)
+        print("PASS: trash empty and concurrent deletes in one session never deadlock", flush=True)
 
         # A target that sandboxes itself with Landlock after startup keeps
         # its native refusals: the supervisor must decline rather than

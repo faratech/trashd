@@ -104,6 +104,9 @@ pub struct TrashStore {
     purge_not_due_until: std::cell::Cell<Option<std::time::Instant>>,
     /// Identities of each trash root and its ancestors (`trash_ancestry`).
     trash_ancestry: std::cell::RefCell<Vec<TrashAncestry>>,
+    /// How long an explicit purge, empty or restore waits for an entry lock
+    /// before it reports the entry busy ([`ENTRY_LOCK_WAIT`]).
+    entry_lock_wait: std::time::Duration,
 }
 
 /// A single entry in the trash.
@@ -350,6 +353,7 @@ impl TrashStore {
             maintenance_due: std::cell::Cell::new(false),
             purge_not_due_until: std::cell::Cell::new(None),
             trash_ancestry: std::cell::RefCell::new(Vec::new()),
+            entry_lock_wait: ENTRY_LOCK_WAIT,
             home,
             isolated,
             #[cfg(test)]
@@ -754,6 +758,7 @@ impl TrashStore {
         // Try rename (fast, same filesystem — should always work with topdir trash)
         let mut copy_done = false;
         let mut created_identity = None;
+        let mut copy_lock = None;
         let move_result: Result<(), TrashError> = (|| {
             let source_name =
                 CString::new(abs_path.as_os_str().as_bytes()).map_err(io::Error::from)?;
@@ -825,15 +830,16 @@ impl TrashStore {
                 self.durability_events.borrow_mut().push("files");
                 self.sync_new_sidecar(&claim, &trash_dir)?;
                 copy_done = true;
-                // Source retirement can trap into a seccomp supervisor that
-                // needs this same root lock, so only under an active seccomp
-                // filter is the lock released before retiring. Otherwise the
-                // lock is held through retirement: dropping it let a waiting
-                // purge delete the fresh trash copy, after which retiring
-                // the source destroyed both copies (#243).
-                if std::env::var_os("TRASHD_SECCOMP_ACTIVE").is_some_and(|v| v == "1") {
-                    drop(guard.take());
-                }
+                // Source retirement unlinks, which trap into a seccomp
+                // supervisor that may be waiting for this same root lock, so
+                // the lock is released before retiring (store-core-4). The
+                // environment cannot say whether this process is filtered
+                // (`sudo` resets it inside a wrapped session), and retiring a
+                // large tree held every trash writer of this user. The fresh
+                // copy keeps its entry lock instead: a purge must not delete
+                // it while retiring the source destroys the other copy (#243).
+                copy_lock = lock_published_copy(files.as_raw_fd(), &id_name);
+                drop(guard.take());
                 // Raw syscalls throughout: the system-wide preload would
                 // otherwise trash the source a second time (#104).
                 #[cfg(test)]
@@ -903,15 +909,19 @@ impl TrashStore {
         // The move completed: make sure a concurrent purge did not strip the
         // sidecar while the data was absent mid-move (#169).
 
-        // On the seccomp path the root lock was released before retirement
-        // (#243): re-acquire it and verify the entry survived. Reporting
-        // success for a copy a purge already deleted would hide data loss.
-        if guard.is_none() {
-            let _verify_guard = self.lock_trash_root(&trash_dir)?;
+        // The copy path released the root lock before retirement: re-acquire
+        // it and verify the entry survived. Reporting success for a copy a
+        // purge already deleted would hide data loss.
+        let verify_guard = if guard.is_none() {
+            let verify_guard = self.lock_trash_root(&trash_dir)?;
             if fs::symlink_metadata(&dest).is_err() || !info_file.exists() {
                 return Err(TrashError::EntryNotFound(id.clone()));
             }
-        }
+            Some(verify_guard)
+        } else {
+            None
+        };
+        drop(copy_lock);
 
         // Post-move identity refresh for the rename path (#246, mirroring
         // trash_at): the final component may have been replaced between the
@@ -950,14 +960,15 @@ impl TrashStore {
         }
 
         // Update directorysizes cache if we just trashed a directory
-        if guard.is_some() && meta.is_dir() {
+        if meta.is_dir() {
             let _ = crate::directorysizes::record_directory(&trash_dir, OsStr::new(&id), sizes.1);
         }
 
-        // Log operation
-        crate::oplog::log_trash_in(&self.home, &abs_path, &id, command);
-
         drop(guard);
+        drop(verify_guard);
+        // The log is not part of publication: write it after releasing the
+        // lock every trash writer waits on (store-metadata-3).
+        crate::oplog::log_trash_in(&self.home, &abs_path, &id, command);
         // Run auto-purge if enough time has passed since the last one.
         // Scanning the entire trash on every deletion is O(n) — throttle it.
         self.after_mutation();
@@ -1220,8 +1231,8 @@ impl TrashStore {
             }
         }
 
-        let guard = match self.lock_trash_root_prepared(&trash_dir) {
-            Ok(g) => g,
+        let mut guard = match self.lock_trash_root_prepared(&trash_dir) {
+            Ok(g) => Some(g),
             Err(e) => {
                 unsafe { libc::close(files_fd) };
                 return Err(e);
@@ -1288,6 +1299,7 @@ impl TrashStore {
             Err(io::Error::last_os_error())
         };
         let mut copied = false;
+        let mut copy_lock = None;
         if let Err(e) = moved {
             // Nothing partial was created at dest (rename is atomic).
             if !is_copy_fallback_error(&e) {
@@ -1335,7 +1347,11 @@ impl TrashStore {
             copied = true;
             // The entry is complete from here on. A failed or partial source
             // removal keeps it: the target's own syscall then decides, and at
-            // worst a duplicate remains in the trash.
+            // worst a duplicate remains in the trash. Retirement unlinks, so
+            // it runs without the root lock, as in trash() (store-core-4):
+            // the shim calls this inside filtered sessions.
+            copy_lock = lock_published_copy(files_fd, &cid);
+            drop(guard.take());
             #[cfg(test)]
             self.durability_events.borrow_mut().push("retire");
             let retired = match &snapshot {
@@ -1365,6 +1381,26 @@ impl TrashStore {
 
         // The move completed: make sure a concurrent purge did not strip the
         // sidecar while the data was absent mid-move (#169).
+
+        // Retirement ran without the root lock: re-acquire it and verify the
+        // entry survived, as trash() does.
+        let verify_guard = if guard.is_none() {
+            let verify_guard = match self.lock_trash_root(&trash_dir) {
+                Ok(verify_guard) => verify_guard,
+                Err(e) => {
+                    unsafe { libc::close(files_fd) };
+                    return Err(e);
+                }
+            };
+            if stat_at(files_fd, &cid, libc::AT_SYMLINK_NOFOLLOW).is_err() || !info_file.exists() {
+                unsafe { libc::close(files_fd) };
+                return Err(TrashError::EntryNotFound(id.clone()));
+            }
+            Some(verify_guard)
+        } else {
+            None
+        };
+        drop(copy_lock);
 
         // POST-MOVE IDENTITY CHECK (audit review): the final component could
         // have been replaced between our metadata/hash reads and the rename —
@@ -1423,8 +1459,10 @@ impl TrashStore {
                 victim_sizes.1,
             );
         }
-        crate::oplog::log_trash_in(&self.home, &display_path, &id, command);
         drop(guard);
+        drop(verify_guard);
+        // After releasing the lock every trash writer waits on, as in trash().
+        crate::oplog::log_trash_in(&self.home, &display_path, &id, command);
         self.after_mutation();
 
         Ok(id)
@@ -1611,7 +1649,7 @@ impl TrashStore {
             } else {
                 configured.min(HARD_DECOMPRESS_LIMIT)
             };
-            decompress_zstd_entry(entry, max_output)?;
+            decompress_zstd_entry(entry, max_output, self.entry_lock_deadline())?;
         }
 
         // Re-check through the pinned parent after decompression. The publish
@@ -1621,13 +1659,21 @@ impl TrashStore {
             return Err(TrashError::RestoreConflict(restore_to));
         }
 
-        // Serialize against compressors (auto-purge and CLI both flock the
-        // same path before validating): without this lock a compressor could
-        // swap zstd bytes into the stat→rename window below and the rename
-        // would publish compressed bytes as the restored file (#168). Held
-        // through the publish; compressors hold it for milliseconds.
-        let _compress_lock = lock_entry_file(&entry.trashed_path)
-            .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
+        // Serialize against compressors and purges (auto-purge, the CLI and
+        // purge all flock the entry before validating): without this lock a
+        // compressor could swap zstd bytes into the stat→rename window below
+        // and the rename would publish compressed bytes as the restored file
+        // (#168), and a purge could delete an entry being copied across
+        // filesystems without the root lock. Held through the publish. A
+        // busy entry is reported as such, never as already gone (cli-5).
+        let entry_lock = lock_entry_file_until(&entry.trashed_path, self.entry_lock_deadline())
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    TrashError::Io(error)
+                } else {
+                    TrashError::EntryNotFound(entry.id.clone())
+                }
+            })?;
 
         let root_guard = self.lock_trash_root(&entry.trash_root)?;
         // Refresh after decompression and all lock waits. The validator checks
@@ -1662,33 +1708,60 @@ impl TrashStore {
         // is deliberately no plain-rename fallback: every path either uses
         // RENAME_NOREPLACE or creates the destination with an exclusive *at
         // syscall before streaming a copy.
-        match rename_noreplace_at(
+        let copy = match rename_noreplace_at(
             source_parent.as_raw_fd(),
             &source_name,
             destination.parent.as_raw_fd(),
             &destination.name,
         ) {
-            Ok(()) => {}
+            Ok(()) => false,
             Err(e) if is_conflict_error(&e) => {
                 return Err(TrashError::RestoreConflict(restore_to));
             }
-            Err(e) if is_copy_fallback_error(&e) => {
-                publish_copy_noreplace(
-                    source_parent.as_raw_fd(),
-                    &source_name,
-                    destination.parent.as_raw_fd(),
-                    &destination.name,
-                    expected_identity,
-                )
-                .map_err(|copy_error| {
-                    if is_conflict_error(&copy_error) {
-                        TrashError::RestoreConflict(restore_to.clone())
-                    } else {
-                        TrashError::Io(copy_error)
-                    }
-                })?;
-            }
+            Err(e) if is_copy_fallback_error(&e) => true,
             Err(e) => return Err(TrashError::Io(e)),
+        };
+        let root_guard = if copy {
+            // The copy and the retirement of the trash copy run without the
+            // root lock, under the entry lock alone: retirement unlinks, which
+            // trap into a seccomp supervisor that may be waiting for this
+            // lock (store-core-4), and a long copy held every trash writer of
+            // this user meanwhile (store-metadata-6).
+            drop(root_guard);
+            publish_copy_noreplace(
+                source_parent.as_raw_fd(),
+                &source_name,
+                destination.parent.as_raw_fd(),
+                &destination.name,
+                expected_identity,
+            )
+            .map_err(|copy_error| {
+                if is_conflict_error(&copy_error) {
+                    TrashError::RestoreConflict(restore_to.clone())
+                } else {
+                    TrashError::Io(copy_error)
+                }
+            })?;
+            // The restore is complete: a root that can no longer be locked
+            // only keeps the sidecar, which purge retires as data-absent.
+            self.lock_trash_root(&entry.trash_root).ok()
+        } else {
+            Some(root_guard)
+        };
+        // Remove the trashinfo: detach it under the root lock if it is still
+        // the version restored, and delete it after releasing the lock.
+        let sidecar = root_guard.as_ref().and_then(|_| {
+            if sidecar_version(&entry.info_path) != entry.sidecar_version {
+                return None;
+            }
+            let mut detached = Detached::open(&entry.trash_root).ok()?;
+            detached.take(&entry.info_path).ok()?;
+            Some(detached)
+        });
+        drop(root_guard);
+        drop(entry_lock);
+        if let Some(sidecar) = sidecar {
+            let _ = sidecar.remove();
         }
 
         // (Decompression already happened in-trash, before the move above.)
@@ -1711,11 +1784,6 @@ impl TrashStore {
         } else {
             None
         };
-
-        // Remove trashinfo
-        if sidecar_version(&entry.info_path) == entry.sidecar_version {
-            let _ = raw_unlink_path(&entry.info_path);
-        }
 
         if maintain {
             self.refresh_cache_after_removal(
@@ -1838,7 +1906,8 @@ impl TrashStore {
                 );
                 continue;
             }
-            match self.purge_reporting_kind(entry, max_age_days.is_some()) {
+            let deadline = self.entry_lock_deadline();
+            match self.purge_reporting_kind(entry, max_age_days.is_some(), deadline) {
                 Ok(was_directory) => cache.note_removal(entry, was_directory),
                 Err(e) => {
                     if !matches!(e, TrashError::EntryNotFound(_)) {
@@ -1998,9 +2067,13 @@ impl TrashStore {
             return Ok(());
         }
 
+        // Every entry lock this pass waits for shares one budget: a busy
+        // entry is skipped and retried on the next pass (store-core-9).
+        let lock_deadline =
+            std::time::Instant::now() + self.entry_lock_wait.min(RETENTION_ENTRY_LOCK_BUDGET);
         let cache = std::cell::RefCell::new(CacheRefresh::default());
         let purge = |entry: &TrashEntry| {
-            let was_directory = self.purge_reporting_kind(entry, true)?;
+            let was_directory = self.purge_reporting_kind(entry, true, lock_deadline)?;
             cache.borrow_mut().note_removal(entry, was_directory);
             Ok::<(), TrashError>(())
         };
@@ -2067,7 +2140,8 @@ impl TrashStore {
             // atomic_write swaps a new one in, and a restorer that then opens
             // the path sees the new inode/sidecar version and aborts cleanly
             // post-lock.
-            let mut input = match lock_entry_file(&path) {
+            // A busy entry is skipped until the next pass.
+            let mut input = match lock_entry_file_until(&path, lock_deadline) {
                 Ok(Some(f)) => f,
                 _ => continue,
             };
@@ -2352,18 +2426,29 @@ impl TrashStore {
         if self.isolated && entry.trash_root != self.home {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        let was_directory = self.purge_reporting_kind(entry, false)?;
+        let was_directory = self.purge_reporting_kind(entry, false, self.entry_lock_deadline())?;
         if maintain {
             self.refresh_cache_after_removal(entry, was_directory);
         }
         Ok(())
     }
 
+    /// When an explicit command stops waiting for an entry lock.
+    fn entry_lock_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.entry_lock_wait
+    }
+
     /// Purge one validated entry; true when its data was a directory. A purge
     /// `by_age` (retention, `empty --older`) never takes data whose sidecar
     /// exists but cannot be parsed: its age is unknown (`has_unparsed_sidecar`).
-    fn purge_reporting_kind(&self, entry: &TrashEntry, by_age: bool) -> Result<bool, TrashError> {
-        let _data_lock = match lock_entry_file(&entry.trashed_path) {
+    /// An entry still locked at `lock_deadline` is busy (`WouldBlock`).
+    fn purge_reporting_kind(
+        &self,
+        entry: &TrashEntry,
+        by_age: bool,
+        lock_deadline: std::time::Instant,
+    ) -> Result<bool, TrashError> {
+        let _data_lock = match lock_entry_file_until(&entry.trashed_path, lock_deadline) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
@@ -2379,37 +2464,31 @@ impl TrashStore {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
         let was_directory = data.as_ref().is_some_and(|metadata| metadata.is_dir());
-        // Raw syscalls throughout: the libc wrappers are hooked by the
-        // system-wide preload, which multiplied a large purge's syscalls by
-        // ~13 while only deciding to leave trash internals alone (#335).
-        let mut detached = None;
+        // Detach data and sidecar under the lock; delete them after releasing
+        // it (`Detached`, store-core-4). Raw syscalls throughout: the libc
+        // wrappers are hooked by the system-wide preload, which multiplied a
+        // large purge's syscalls by ~13 while only deciding to leave trash
+        // internals alone (#335).
+        let mut detached = Detached::open(&entry.trash_root)?;
         match data {
-            Some(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                // Detach the tree under the lock; delete it after releasing
-                // it. Deleting in place held every trash writer (all deletes
-                // of this user) for the whole removal of a large tree.
-                detached = Some(detach_for_removal(entry)?);
-            }
-            Some(_) => raw_unlink_path(&entry.trashed_path)?,
+            Some(_) => detached.take(&entry.trashed_path)?,
             None if data_absence_is_retired(&entry.info_path) => {}
             None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
         }
-        match raw_unlink_path(&entry.info_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        let sidecar = match detached.take(&entry.info_path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
         drop(guard);
         drop(_data_lock);
-        if let Some((state, name)) = detached
-            && let Err(error) = remove_tree_at(state.as_raw_fd(), &name, 0)
-        {
+        if let Err(error) = detached.remove() {
             // Retention retries it; the entry itself is gone.
             eprintln!(
                 "trashd: warning: purged '{}' but could not delete all of its data yet ({error}); it is retried later",
                 entry.id
             );
         }
+        sidecar?;
         Ok(was_directory)
     }
 
@@ -2625,6 +2704,13 @@ fn claim_unique_id(
     // verify files/<candidate> is free. Ok(Some) = claimed; Ok(None) = taken,
     // try another; Err = fatal IO error.
     let try_claim = |candidate: &str| -> Result<Option<(PathBuf, fs::File)>, io::Error> {
+        // An orphaned data file occupying files/<candidate> is skipped before
+        // its info name is claimed: releasing a claim unlinks, which under
+        // the root lock traps into a seccomp supervisor that may be waiting
+        // for that lock (store-core-4).
+        if files_dir.join(candidate).symlink_metadata().is_ok() {
+            return Ok(None);
+        }
         let info_path = info_dir.join(format!("{candidate}.trashinfo"));
         match fs::OpenOptions::new()
             .write(true)
@@ -2634,10 +2720,15 @@ fn claim_unique_id(
         {
             Ok(claim) => {
                 if files_dir.join(candidate).symlink_metadata().is_ok() {
-                    // The info name was free but an orphaned data file already
-                    // occupies files/<candidate>. Release the info we claimed
-                    // and try a different id rather than overwrite it.
-                    let _ = raw_unlink_path(&info_path);
+                    // Data appeared at files/<candidate> after the check
+                    // (another tool). Release the info we claimed and try a
+                    // different id rather than overwrite it: detached, it is
+                    // deleted by the next sweep, outside the lock.
+                    let released = Detached::open(trash_dir)
+                        .and_then(|mut released| released.take(&info_path));
+                    if released.is_err() {
+                        let _ = raw_unlink_path(&info_path);
+                    }
                     Ok(None)
                 } else {
                     Ok(Some((info_path, claim)))
@@ -2840,13 +2931,19 @@ fn lexically_normalized(path: &Path) -> PathBuf {
 /// Decompress a marked entry with bounded memory and bounded output. The
 /// compressed source remains untouched until a complete plaintext sibling has
 /// been written, synced, and the entry identity has been revalidated.
-fn decompress_zstd_entry(entry: &mut TrashEntry, max_output: u64) -> io::Result<()> {
-    decompress_before_commit(entry, max_output, || {})
+/// An entry lock still held at `lock_deadline` makes the entry busy.
+fn decompress_zstd_entry(
+    entry: &mut TrashEntry,
+    max_output: u64,
+    lock_deadline: std::time::Instant,
+) -> io::Result<()> {
+    decompress_before_commit(entry, max_output, lock_deadline, || {})
 }
 
 fn decompress_before_commit(
     entry: &mut TrashEntry,
     max_output: u64,
+    lock_deadline: std::time::Instant,
     before_commit: impl FnOnce(),
 ) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
@@ -2870,7 +2967,7 @@ fn decompress_before_commit(
             "trash entry was replaced during decompression",
         ));
     }
-    input.lock()?;
+    lock_entry_data_until(&input, lock_deadline)?;
     if file_identity(&entry.trashed_path) != Some(expected_identity)
         || sidecar_version(&entry.info_path) != Some(expected_sidecar)
         || !compression_source_matches(&metadata, &input.metadata()?)
@@ -3722,6 +3819,12 @@ fn prepare_tree_removal(
             result => result.map(|()| None),
         };
     }
+    #[cfg(test)]
+    TREE_STATUS_PROBE.with_borrow(|probe| {
+        if let Some(probe) = probe {
+            probe(name);
+        }
+    });
     // A mount point that travelled into the trash with its directory (rm -r
     // of a tree holding one) is never touched: purging through it deleted
     // the mounted filesystem's data, and even its mode stays as it is. It
@@ -3748,16 +3851,27 @@ fn prepare_tree_removal(
     if depth > REMOVE_TREE_MAX_DEPTH {
         return Err(io::Error::other("directory tree too deep to remove"));
     }
+    // Another remover may finish this directory first: the sweep of detached
+    // jobs runs unlocked beside a purge still removing its tree. A detached
+    // tree is private and only shrinks, so a directory gone since its status
+    // was read is already removed, not a failure (store-metadata-10).
+    let gone = |error: io::Error| match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(None),
+        _ => Err(error),
+    };
     if mode & 0o700 != 0o700
         && unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW) } != 0
     {
         // Linux rejects AT_SYMLINK_NOFOLLOW for fchmodat; lstat proved this
         // is a directory, which nobody else can swap inside a private root.
         if unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, 0) } != 0 {
-            return Err(io::Error::last_os_error());
+            return gone(io::Error::last_os_error());
         }
     }
-    let directory = open_directory_at(parent, name, true, false)?;
+    let directory = match open_directory_at(parent, name, true, false) {
+        Ok(directory) => directory,
+        Err(error) => return gone(error),
+    };
     if stat_identity(&stat_fd(directory.as_raw_fd())?) != identity {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -4151,6 +4265,20 @@ fn remove_entry(
     })
 }
 
+/// A test hook called with the name a store operation is about to act on.
+#[cfg(test)]
+type NameProbe = std::cell::RefCell<Option<Box<dyn Fn(&CStr)>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs before every store-internal unlink on this thread, with the
+    /// name being unlinked: tests check which locks are held (store-core-4).
+    static UNLINK_PROBE: NameProbe = const { std::cell::RefCell::new(None) };
+    /// Runs once a tree removal has read a directory's status, before it
+    /// changes or opens it: tests act as a concurrent remover there.
+    static TREE_STATUS_PROBE: NameProbe = const { std::cell::RefCell::new(None) };
+}
+
 /// unlink(2) of an absolute path as a raw syscall (see `raw_unlinkat`).
 fn raw_unlink_path(path: &Path) -> io::Result<()> {
     raw_unlinkat(
@@ -4164,6 +4292,12 @@ fn raw_unlink_path(path: &Path) -> io::Result<()> {
 /// through the interposable libc wrapper: under a system-wide LD_PRELOAD the
 /// hook would trash them again (#104, #192, #196).
 fn raw_unlinkat(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+    #[cfg(test)]
+    UNLINK_PROBE.with_borrow(|probe| {
+        if let Some(probe) = probe {
+            probe(name);
+        }
+    });
     if unsafe { libc::syscall(libc::SYS_unlinkat, parent, name.as_ptr(), flags) } == 0 {
         Ok(())
     } else {
@@ -4289,24 +4423,86 @@ pub fn data_absence_is_retired(info_path: &Path) -> bool {
     }
 }
 
-/// Take an exclusive flock on an entry's data file. Restore holds it across
-/// its identity check → rename and both compressors hold it across their
+/// How long an explicit command (purge, empty, restore, compress) waits for
+/// an entry lock before it reports the entry busy. trashd's own holders keep
+/// it for at most a few seconds (encoding up to 64 MiB and syncing it); a
+/// longer hold is a process that flock()ed the file before it was deleted:
+/// the lock moved into the trash with the inode (store-core-9, cli-8).
+pub const ENTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most one retention pass waits for entry locks in total. Retention
+/// skips a busy entry and retries it on its next pass; in the seccomp
+/// supervisor it runs on the thread that answers every trapped delete.
+const RETENTION_ENTRY_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// flock(LOCK_EX) on `file`, retrying a contended lock until `deadline`.
+/// At least one attempt is made; expiry is a `WouldBlock` error. Polling
+/// rather than blocking: a blocking flock waited forever on a holder outside
+/// trashd (store-core-9).
+pub(crate) fn lock_file_until(file: &fs::File, deadline: std::time::Instant) -> io::Result<()> {
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(error);
+        }
+        std::thread::sleep(pause.min(left));
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
+/// [`lock_file_until`] on an entry's data, which reports expiry as a busy
+/// entry. Public for the CLI compressor, which serializes on the same lock.
+pub fn lock_entry_data_until(file: &fs::File, deadline: std::time::Instant) -> io::Result<()> {
+    lock_file_until(file, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the trash entry is busy: another process holds a lock on it",
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// Take an exclusive flock on an entry's data. Restore holds it across its
+/// identity check → publication and both compressors hold it across their
 /// validate → swap (through the marker write and data swap, #170), so
 /// "validated" can never interleave with "renamed" — the #105 revalidations
-/// alone left that window open (#168). Blocking is fine: the other side
-/// holds it for milliseconds. Non-regular entries (symlinks, dirs) are
-/// never swapped by compressors, so there is nothing to serialize —
-/// Ok(None). Any open error means the entry vanished or changed; callers
-/// map that to EntryNotFound.
-fn lock_entry_file(path: &Path) -> io::Result<Option<fs::File>> {
-    if !fs::symlink_metadata(path)?.is_file() {
+/// alone left that window open (#168). Purge takes it too, so a directory
+/// entry is locked as well: restore copies one across filesystems, and the
+/// copy fallbacks retire their source, without the root lock (store-core-4).
+/// The wait ends at `deadline` with a busy (`WouldBlock`) error, never an
+/// indefinite block (store-core-9). Symlinks and special files are never
+/// opened: Ok(None). Any open error means the entry vanished or changed;
+/// callers map that to EntryNotFound.
+fn lock_entry_file_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<Option<fs::File>> {
+    let metadata = fs::symlink_metadata(path)?;
+    let directory = if metadata.is_dir() {
+        libc::O_DIRECTORY
+    } else if metadata.is_file() {
+        0
+    } else {
         return Ok(None);
-    }
+    };
     // O_NONBLOCK like every other entry-data open (#111): a FIFO swapped
     // into the path in the TOCTOU window must not hang the caller.
     let file = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | directory)
         .open(path)
     {
         Ok(file) => file,
@@ -4318,16 +4514,50 @@ fn lock_entry_file(path: &Path) -> io::Result<Option<fs::File>> {
         }
         Err(error) => return Err(error),
     };
-    // File::lock is flock(LOCK_EX) without an EINTR retry (std uses cvt, not
-    // cvt_r), so a handled signal while blocked would surface as an error —
-    // retry instead (#170).
-    loop {
-        match file.lock() {
-            Ok(()) => return Ok(Some(file)),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+    match lock_entry_data_until(&file, deadline) {
+        Ok(()) => Ok(Some(file)),
+        // Where a directory cannot be locked (NFS emulates flock with write
+        // locks, and a directory is never open for writing), it is purged
+        // and restored unlocked, as before directories took this lock.
+        Err(error)
+            if directory != 0
+                && matches!(
+                    error.raw_os_error(),
+                    Some(libc::EBADF | libc::ENOLCK | libc::EOPNOTSUPP | libc::EINVAL)
+                ) =>
+        {
+            Ok(None)
         }
+        Err(error) => Err(error),
     }
+}
+
+/// Lock the data a copy fallback just published as `files/<id>` before it
+/// releases the root lock to retire the source: purge waits for (and then
+/// reports busy) an entry whose source is still being retired, so it can
+/// never delete the fresh copy and leave the retirement to delete the only
+/// other one (#243). Never waits: a holder already queued for the root lock
+/// would deadlock with us. Without the lock the retirement proceeds as a
+/// move followed by that purge.
+fn lock_published_copy(files: RawFd, id: &CStr) -> Option<fs::File> {
+    let status = stat_at(files, id, libc::AT_SYMLINK_NOFOLLOW).ok()?;
+    let directory = match status.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::O_DIRECTORY,
+        libc::S_IFREG => 0,
+        _ => return None,
+    };
+    let fd = unsafe {
+        libc::openat(
+            files,
+            id.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | directory,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    (unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(file)
 }
 
 /// Strip redundant separators and `.` components from a conflict destination
@@ -6596,15 +6826,16 @@ mod tests {
             } else {
                 b"newer content".to_vec()
             };
-            let error = decompress_before_commit(&mut entry, 16384, || {
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .unwrap()
-                    .write_all(&extra)
-                    .unwrap();
-            })
-            .unwrap_err();
+            let error =
+                decompress_before_commit(&mut entry, 16384, std::time::Instant::now(), || {
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(&extra)
+                        .unwrap();
+                })
+                .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::NotFound);
             bytes.extend_from_slice(&extra);
             assert_eq!(fs::read(&path).unwrap(), bytes, "encoded={encoded}");
@@ -8233,7 +8464,9 @@ mod tests {
         let entry = store.find_entry(&id).unwrap();
 
         // Hold the flock like a compressor mid validate→swap.
-        let guard = lock_entry_file(&entry.trashed_path).unwrap().unwrap();
+        let guard = lock_entry_file_until(&entry.trashed_path, std::time::Instant::now())
+            .unwrap()
+            .unwrap();
 
         std::thread::scope(|scope| {
             let handle = scope.spawn(move || {
@@ -9718,7 +9951,10 @@ mod tests {
         let outcome = as_unprivileged(
             "store::tests::raw_removal_handles_read_only_trees_and_unreadable_data",
             move || {
-                let locked = matches!(lock_entry_file(&unreadable), Ok(None));
+                let locked = matches!(
+                    lock_entry_file_until(&unreadable, std::time::Instant::now()),
+                    Ok(None)
+                );
                 let dir = fs::File::open(&parent).unwrap();
                 let removed = remove_tree_at(dir.as_raw_fd(), c"tree", 0).is_ok();
                 locked && removed && !parent.join("tree").exists()
@@ -10147,7 +10383,7 @@ mod tests {
         if let Some(root) = std::env::var_os(CHILD) {
             let store = TrashStore::open_isolated(Path::new(&root), Config::default()).unwrap();
             let mut entry = store.find_entry("data").unwrap();
-            decompress_before_commit(&mut entry, 1024 * 1024, || {
+            decompress_before_commit(&mut entry, 1024 * 1024, std::time::Instant::now(), || {
                 let stages = sweep_detached(store.home_dir());
                 assert_eq!(stages.len(), 1);
                 let state = fs::File::open(store.home.join(".trashd")).unwrap();
@@ -13469,5 +13705,228 @@ mod tests {
                 "enabled={enabled}"
             );
         }
+    }
+
+    /// Run `operation` on its own thread and fail the test if it has not
+    /// returned within `limit`. A blocked operation stays behind on its
+    /// thread; the caller releases whatever blocks it.
+    fn returns_within<T: Send + 'static>(
+        name: &str,
+        limit: std::time::Duration,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(operation());
+        });
+        receiver
+            .recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("{name} did not return within {limit:?}"))
+    }
+
+    // store-core-9 / cli-8: a process that flock()ed a file before it was
+    // deleted keeps that lock on the inode now in files/. Purge, empty,
+    // restore and retention blocked on it forever (in the supervisor, the
+    // whole session's deletes with them). They give up after a bounded wait:
+    // explicit commands report the entry busy, never already gone, and
+    // retention skips it. The entry stays intact.
+    #[test]
+    fn entry_flocks_held_by_other_processes_never_block_forever() {
+        let (store, _data, work, _) = test_store();
+        let content = "x".repeat(4096);
+        let source = create_file(work.path(), "state.dat", &content);
+        let id = store.trash(&source, None).unwrap();
+        backdate_entry(&store, &id, chrono::Duration::days(10));
+        let entry = store.find_entry(&id).unwrap();
+        let sidecar = fs::read(&entry.info_path).unwrap();
+        let holder = fs::File::open(&entry.trashed_path).unwrap();
+        holder.lock().unwrap();
+
+        // TrashStore is !Sync: each operation opens its own instance.
+        let home = store.home.clone();
+        let open = move |configure: fn(&mut Config)| {
+            let home = home.clone();
+            move || {
+                let mut config = retention_off();
+                configure(&mut config);
+                let mut store = TrashStore::open_isolated(&home, config).unwrap();
+                store.entry_lock_wait = std::time::Duration::from_millis(300);
+                store
+            }
+        };
+        let limit = std::time::Duration::from_secs(20);
+        let busy = |result: Result<(), TrashError>| match result {
+            Err(TrashError::Io(error)) => error.kind() == io::ErrorKind::WouldBlock,
+            _ => false,
+        };
+
+        let (snapshot, store) = (entry.clone(), open(|_| {}));
+        let purged = returns_within("purge", limit, move || store().purge_resolved(&snapshot));
+        assert!(busy(purged), "purge must report the entry busy");
+
+        let (snapshot, store) = (entry.clone(), open(|_| {}));
+        let emptied = returns_within("empty", limit, move || {
+            store().empty_entries_reporting(&[snapshot], None)
+        });
+        assert_eq!(emptied, (0, 1), "empty must count the busy entry failed");
+
+        let (mut snapshot, store) = (entry.clone(), open(|_| {}));
+        let restored = returns_within("restore", limit, move || {
+            store().restore_entry(&mut snapshot, None).map(|_| ())
+        });
+        assert!(busy(restored), "restore must report the entry busy");
+
+        let roots = [entry.trash_root.clone()];
+        let store = open(|config| {
+            config.retention.max_age_days = 1;
+            config.retention.auto_compress = true;
+        });
+        let retained = returns_within("retention", limit, move || {
+            store().auto_purge_in_roots(&roots).is_ok()
+        });
+        assert!(retained, "retention must skip the busy entry");
+
+        drop(holder);
+        assert!(!source.exists(), "the busy entry was restored");
+        assert_eq!(fs::read_to_string(&entry.trashed_path).unwrap(), content);
+        assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+    }
+
+    /// Run `operation`, recording each store-internal unlink it issues while
+    /// `root`'s mutation lock is held.
+    fn unlinks_under_root_lock<T>(root: &Path, operation: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let lock = root.join(".trashd/store.lock");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = seen.clone();
+        UNLINK_PROBE.set(Some(Box::new(move |name: &CStr| {
+            // A new open file description conflicts with the store's own.
+            let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&lock) else {
+                return;
+            };
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                record
+                    .borrow_mut()
+                    .push(name.to_string_lossy().into_owned());
+            }
+        })));
+        let result = operation();
+        UNLINK_PROBE.set(None);
+        let seen = seen.borrow().clone();
+        (result, seen)
+    }
+
+    // store-core-4: purge, restore and the copy fallbacks' source retirement
+    // unlinked while holding the root lock. Under trashd-exec every unlink
+    // traps into the single-threaded supervisor, which may itself be waiting
+    // for that lock on another process's delete, and the whole session hung.
+    // No store-internal unlink may run under the root lock.
+    #[test]
+    fn no_store_unlink_runs_under_the_root_lock() {
+        let mut violations = Vec::new();
+        let (store, _data, work, _) = test_store();
+        let root = store.home.clone();
+        let tree = work.path().join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/inner"), "payload").unwrap();
+        let sources = [
+            create_file(work.path(), "file", "payload"),
+            tree,
+            create_file(work.path(), "emptied", "payload"),
+            create_file(work.path(), "restored", "payload"),
+        ];
+        let ids: Vec<String> = sources
+            .iter()
+            .map(|source| store.trash(source, None).unwrap())
+            .collect();
+        for id in &ids[..2] {
+            let entry = store.find_entry(id).unwrap();
+            let (result, seen) = unlinks_under_root_lock(&root, || store.purge_resolved(&entry));
+            result.unwrap();
+            violations.push(("purge", seen));
+        }
+        let entry = store.find_entry(&ids[2]).unwrap();
+        let (counts, seen) =
+            unlinks_under_root_lock(&root, || store.empty_entries_reporting(&[entry], None));
+        assert_eq!(counts, (1, 0));
+        violations.push(("empty", seen));
+        let mut entry = store.find_entry(&ids[3]).unwrap();
+        let (result, seen) =
+            unlinks_under_root_lock(&root, || store.restore_entry(&mut entry, None));
+        result.unwrap();
+        violations.push(("restore", seen));
+        // An orphan occupying the natural id makes the claim move on.
+        fs::write(root.join("files/occupied"), "orphan").unwrap();
+        let occupied = create_file(work.path(), "occupied", "payload");
+        let (result, seen) = unlinks_under_root_lock(&root, || store.trash(&occupied, None));
+        assert_ne!(result.unwrap(), "occupied");
+        violations.push(("id claim", seen));
+
+        // Cross-device: both copy fallbacks retire their source, and restore
+        // retires the trash copy.
+        if let Some(dir) = cross_device_dir("unlock-unlinks") {
+            let (store, _data) = cross_device_store();
+            let root = store.home.clone();
+            fs::write(dir.join("pinned"), "payload").unwrap();
+            fs::create_dir(dir.join("tree")).unwrap();
+            fs::write(dir.join("tree/inner"), "payload").unwrap();
+            fs::write(dir.join("moved"), "payload").unwrap();
+            let parent = fs::File::open(&dir).unwrap();
+            let mut results = Vec::new();
+            for name in ["pinned", "tree"] {
+                let (result, seen) = unlinks_under_root_lock(&root, || {
+                    store.trash_at(parent.as_raw_fd(), OsStr::new(name), &dir.join(name), None)
+                });
+                results.push(result.is_ok());
+                violations.push(("cross-device trash_at", seen));
+                if let Ok(id) = result {
+                    let mut entry = store.find_entry(&id).unwrap();
+                    let (result, seen) =
+                        unlinks_under_root_lock(&root, || store.restore_entry(&mut entry, None));
+                    results.push(result.is_ok());
+                    violations.push(("cross-device restore", seen));
+                }
+            }
+            let (result, seen) =
+                unlinks_under_root_lock(&root, || store.trash(&dir.join("moved"), None));
+            results.push(result.is_ok());
+            violations.push(("cross-device trash", seen));
+            let restored = ["pinned", "tree/inner"].map(|name| dir.join(name).exists());
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(results, [true; 5]);
+            assert_eq!(restored, [true; 2]);
+        } else {
+            eprintln!("SKIP: no tmpfs on another device for the cross-device cases");
+        }
+        violations.retain(|(_, seen)| !seen.is_empty());
+        assert!(
+            violations.is_empty(),
+            "unlinked while holding the root lock: {violations:#?}"
+        );
+    }
+
+    // store-metadata-10: the unlocked sweep of detached jobs can walk a tree
+    // that a live purge is still removing. A directory the other remover
+    // deleted between this walk's status read and its chmod or open was
+    // recorded as a failure, so the job counted as pending and `trash empty`
+    // failed although the tree was gone.
+    #[test]
+    fn a_concurrent_remover_never_leaves_a_detached_job_pending() {
+        let (store, _data, _work, _) = test_store();
+        let job = store.home.join(".trashd/purging-raced");
+        fs::create_dir_all(job.join("writable")).unwrap();
+        fs::write(job.join("writable/file"), "payload").unwrap();
+        fs::create_dir(job.join("read-only")).unwrap();
+        fs::set_permissions(job.join("read-only"), fs::Permissions::from_mode(0o555)).unwrap();
+        let raced = job.clone();
+        TREE_STATUS_PROBE.set(Some(Box::new(move |name: &CStr| {
+            if matches!(name.to_bytes(), b"writable" | b"read-only") {
+                fs::remove_dir_all(raced.join(OsStr::from_bytes(name.to_bytes()))).unwrap();
+            }
+        })));
+        let report = store.cleanup_unfinished_in_roots(std::slice::from_ref(&store.home));
+        TREE_STATUS_PROBE.set(None);
+        let report = report.unwrap();
+        assert_eq!(report.pending, 0, "{report:?}");
+        assert!(!job.exists(), "the detached job was not finished");
     }
 }

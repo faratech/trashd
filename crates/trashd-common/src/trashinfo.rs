@@ -459,7 +459,7 @@ impl TrashInfo {
 /// anything longer is truncated with an ellipsis marker.
 pub const MAX_COMMAND_BYTES: usize = 256;
 
-fn cap_command(cmd: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn cap_command(cmd: &str) -> std::borrow::Cow<'_, str> {
     if cmd.len() <= MAX_COMMAND_BYTES {
         return std::borrow::Cow::Borrowed(cmd);
     }

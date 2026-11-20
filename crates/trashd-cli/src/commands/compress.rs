@@ -246,7 +246,12 @@ fn compress_before_publish(
     }
     // Serialize compressors that opened the same inode. The second one may
     // have waited on a file that has since been replaced; don't swap it back.
-    input.lock()?;
+    // A process that locked the file before it was trashed still holds the
+    // lock: give up after a bounded wait and report the entry busy (cli-8).
+    trashd_common::store::lock_entry_data_until(
+        &input,
+        std::time::Instant::now() + trashd_common::store::ENTRY_LOCK_WAIT,
+    )?;
     let current = std::fs::symlink_metadata(path)?;
     if !compression_source_matches(&metadata, &current) {
         return Ok(None);
@@ -821,6 +826,40 @@ mod tests {
             content
         );
         assert_eq!(fs::read_dir(root.join("files")).unwrap().count(), 1);
+    }
+
+    // cli-8: an application that held an flock on a file when it was
+    // deleted keeps it on the inode in files/. `trash compress`, even with
+    // --dry-run, blocked in flock until that process exited. It gives up
+    // after a bounded wait with a busy error and leaves the entry alone.
+    #[test]
+    fn compression_gives_up_on_an_entry_another_process_holds_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, entry) = fixture(dir.path(), "data");
+        let holder = fs::File::open(&entry.trashed_path).unwrap();
+        holder.lock().unwrap();
+        let root = store.home_dir().to_path_buf();
+        for mode in [CommitMode::ReportOnly, CommitMode::Publish] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let (root, entry) = (root.clone(), entry.clone());
+            std::thread::spawn(move || {
+                let store =
+                    TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+                let result = compress_file_zstd(&store, &entry, 8192, mode);
+                let _ = sender.send(result.map_err(|error| error.kind()));
+            });
+            let result = receiver
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("compression blocked on another process's flock");
+            assert_eq!(result, Err(std::io::ErrorKind::WouldBlock));
+        }
+        drop(holder);
+        assert_eq!(fs::read(&entry.trashed_path).unwrap(), vec![b'x'; 8192]);
+        assert!(
+            !fs::read_to_string(&entry.info_path)
+                .unwrap()
+                .contains("X-Trashd-Compressed")
+        );
     }
 
     #[test]

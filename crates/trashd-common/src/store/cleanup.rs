@@ -219,14 +219,23 @@ pub(super) fn is_copy_stage(name: &CStr) -> bool {
     }) && parts.next().is_none()
 }
 
+pub(super) fn claim_copy_stage_at(state: RawFd, name: &CStr) -> io::Result<CString> {
+    claim_into_container(state, state, name, "copy-")
+}
+
 /// Exclusive mkdir claims a private container even on filesystems without
 /// RENAME_NOREPLACE. Its data name is initially absent, so the rename cannot
 /// replace another stage or unrelated state. A crash leaves a purging-
 /// container that the normal detached sweep can finish.
-pub(super) fn claim_copy_stage_at(state: RawFd, name: &CStr) -> io::Result<CString> {
+fn claim_into_container(
+    state: RawFd,
+    from: RawFd,
+    name: &CStr,
+    label: &str,
+) -> io::Result<CString> {
     for attempt in 0u32..64 {
         let claim = CString::new(format!(
-            "{DETACHED_PREFIX}copy-{}-{}-{attempt}",
+            "{DETACHED_PREFIX}{label}{}-{}-{attempt}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -242,12 +251,7 @@ pub(super) fn claim_copy_stage_at(state: RawFd, name: &CStr) -> io::Result<CStri
         let claimed = (|| {
             let directory = open_directory_at(state, &claim, true, false)?;
             if unsafe {
-                libc::renameat(
-                    state,
-                    name.as_ptr(),
-                    directory.as_raw_fd(),
-                    c"data".as_ptr(),
-                )
+                libc::renameat(from, name.as_ptr(), directory.as_raw_fd(), c"data".as_ptr())
             } != 0
             {
                 return Err(io::Error::last_os_error());
@@ -263,40 +267,77 @@ pub(super) fn claim_copy_stage_at(state: RawFd, name: &CStr) -> io::Result<CStri
     Err(io::Error::from(io::ErrorKind::AlreadyExists))
 }
 
-/// Move a directory entry's data into its root's private state directory
-/// (same filesystem), returning that directory and the new name.
-pub(super) fn detach_for_removal(entry: &TrashEntry) -> io::Result<(fs::File, CString)> {
-    let state_dir = CString::new(entry.trash_root.join(".trashd").as_os_str().as_bytes())?;
-    let state = open_directory_at(libc::AT_FDCWD, &state_dir, true, false)?;
-    let files_dir = CString::new(entry.trash_root.join("files").as_os_str().as_bytes())?;
-    let files = open_directory_at(libc::AT_FDCWD, &files_dir, true, true)?;
-    let data_name = CString::new(
-        entry
-            .trashed_path
-            .file_name()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
-            .as_bytes(),
-    )?;
+/// Move `dir/name` into the root's private state directory `state` (same
+/// filesystem) as a detached deletion job, returning the job's name.
+fn detach_at(state: RawFd, dir: RawFd, name: &CStr) -> io::Result<CString> {
     for attempt in 0u32..64 {
-        let name = CString::new(format!(
+        let detached = CString::new(format!(
             "{DETACHED_PREFIX}{}-{}-{attempt}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.subsec_nanos())
         ))?;
-        match rename_noreplace_at(files.as_raw_fd(), &data_name, state.as_raw_fd(), &name) {
-            Ok(()) => return Ok((state, name)),
+        match rename_noreplace_at(dir, name, state, &detached) {
+            Ok(()) => return Ok(detached),
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+            // No RENAME_NOREPLACE here: claim a fresh container instead of
+            // deleting in place under the lock.
             Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
-                // No RENAME_NOREPLACE here: delete in place, under the lock.
-                remove_tree_at(files.as_raw_fd(), &data_name, 0)?;
-                return Ok((state, CString::default()));
+                return claim_into_container(state, dir, name, "");
             }
             Err(error) => return Err(error),
         }
     }
     Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+/// Store nodes a mutation took out of `files/` and `info/` under the root
+/// lock, to be deleted once it is released. Under trashd-exec every unlink
+/// traps into the session's single-threaded supervisor, which may itself be
+/// waiting for that lock on another process's delete; a rename does not
+/// trap, so a mutation only detaches under the lock and deletes afterwards
+/// (store-core-4). Deleting outside it also keeps a large tree's removal
+/// from holding every writer. A detached node is private: nothing else can
+/// reuse its name, and a crash leaves a job the sweep finishes.
+pub(super) struct Detached {
+    state: fs::File,
+    names: Vec<CString>,
+}
+
+impl Detached {
+    pub(super) fn open(root: &Path) -> io::Result<Self> {
+        let state = CString::new(root.join(".trashd").as_os_str().as_bytes())?;
+        Ok(Self {
+            state: open_directory_at(libc::AT_FDCWD, &state, true, false)?,
+            names: Vec::new(),
+        })
+    }
+
+    /// Detach `dir/name`; call with the root lock held.
+    pub(super) fn take_at(&mut self, dir: RawFd, name: &CStr) -> io::Result<()> {
+        let detached = detach_at(self.state.as_raw_fd(), dir, name)?;
+        self.names.push(detached);
+        Ok(())
+    }
+
+    /// `take_at` for an absolute path.
+    pub(super) fn take(&mut self, path: &Path) -> io::Result<()> {
+        self.take_at(libc::AT_FDCWD, &CString::new(path.as_os_str().as_bytes())?)
+    }
+
+    /// Delete everything detached; call after releasing the root lock. The
+    /// first failure is returned, and its job is retried by the sweep.
+    pub(super) fn remove(self) -> io::Result<()> {
+        let mut result = Ok(());
+        for name in &self.names {
+            let removed = remove_tree_at(self.state.as_raw_fd(), name, 0);
+            if result.is_ok() {
+                result = removed;
+            }
+        }
+        result
+    }
 }
 
 fn open_cleanup_state(root: &Path) -> io::Result<Option<fs::File>> {

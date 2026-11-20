@@ -335,6 +335,42 @@
   excludes them (`rm -rf ~/.local` under a whitelist). Emptying tools
   run as their own processes and keep working. (#458)
 
+- A `trash empty`, `purge` or `restore`, or a cross-device `rm`, inside
+  a `trashd-exec` session no longer hangs the whole session when another
+  process deletes a file at the same time. These operations unlinked
+  while holding the trash root lock, and each unlink traps into the
+  session's supervisor, which may itself be waiting for that lock. Purge
+  and restore now move data and sidecars into the root's private state
+  directory under the lock and delete them after releasing it. Restore
+  copies across filesystems, and both copy fallbacks retire their
+  source, without the root lock; an entry lock keeps purges away from
+  the fresh copy. A long cross-device restore no longer holds every
+  trash writer of the user. (#521, #539)
+
+- A file another process held an `flock` on when it was deleted no
+  longer blocks trashd forever. `trash purge`, `empty`, `restore` and
+  `compress` (including `--dry-run`) wait up to 5 seconds for the entry
+  and then report it busy, and retention skips it until its next pass.
+  In a seccomp supervisor, retention stalled every delete of the session
+  behind such an entry. (#526, #447)
+
+- The operation log caps the recorded command at 256 bytes, as sidecars
+  do. The shim records its whole argv for every operand, so one `rm` of
+  thousands of files wrote gigabytes of log under the root lock, and its
+  rotations erased all earlier history. Trash records are now written
+  after the root lock is released. (#536)
+
+- Log rotation retires only the log it measured. It runs under a lock on
+  the log, and a writer whose log another writer already rotated appends
+  to the new one. Before, it renamed the new log over
+  `operations.log.1`, deleting the previous generation and losing its
+  own record. (#541)
+
+- `trash empty` no longer fails with "deletion jobs still need cleanup"
+  when its sweep of detached deletion jobs races another process still
+  removing the same tree. A directory the other remover deleted first
+  counts as removed. (#535)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

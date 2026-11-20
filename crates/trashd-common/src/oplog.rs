@@ -8,7 +8,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Log a trash operation.
@@ -27,7 +27,10 @@ pub(crate) fn log_trash_in(
     trash_id: &str,
     command: Option<&str>,
 ) {
-    let cmd = command.unwrap_or("-");
+    // Capped as in sidecars: the shim passes its whole argv for every
+    // operand, so one large rm wrote O(N^2) bytes and rotated away all
+    // earlier history (store-metadata-3).
+    let cmd = crate::trashinfo::cap_command(command.unwrap_or("-"));
     write_log(
         home,
         &format!(
@@ -237,7 +240,24 @@ fn write_log(home: &Path, message: &str) {
     let pid = std::process::id();
     let line = format!("{timestamp} pid={pid} {message}\n");
 
-    let result = open_log_for_append(&path).and_then(|mut f| {
+    let result = open_log_for_append(&path).and_then(|f| append_record(&path, f, &line));
+
+    if let Err(e) = result {
+        eprintln!("trashd: failed to write operation log: {e}");
+    }
+}
+
+/// Append `line` through `f`, a descriptor of the log at `path`. Rotation
+/// retires only the inode this writer measured: under the log's flock, a
+/// descriptor whose inode no longer sits at `path` (another writer rotated
+/// it) is reopened. A stale writer renamed the next generation over `.1`,
+/// deleting the previous one, and wrote into the unlinked inode
+/// (store-metadata-8).
+fn append_record(path: &Path, mut f: fs::File, line: &str) -> io::Result<()> {
+    // Writers hold the log for one record. A lock that is not granted in
+    // time only skips rotation: the record is never dropped or delayed long.
+    const LOG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+    for _ in 0..8 {
         let metadata = f.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -245,16 +265,26 @@ fn write_log(home: &Path, message: &str) {
                 "operation log is not a regular file",
             ));
         }
+        let locked =
+            crate::store::lock_file_until(&f, std::time::Instant::now() + LOG_LOCK_WAIT).is_ok();
+        let current = fs::symlink_metadata(path);
+        if !current
+            .is_ok_and(|current| (current.dev(), current.ino()) == (metadata.dev(), metadata.ino()))
+        {
+            f = open_log_for_append(path)?;
+            continue;
+        }
         if metadata.permissions().mode() & 0o7777 != 0o600 {
             f.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        rotate_oversized_log(&path, metadata.len() + line.len() as u64);
-        f.write_all(line.as_bytes())
-    });
-
-    if let Err(e) = result {
-        eprintln!("trashd: failed to write operation log: {e}");
+        if locked {
+            // Measured under the lock every rotating writer takes.
+            rotate_oversized_log(path, f.metadata()?.len() + line.len() as u64);
+        }
+        return f.write_all(line.as_bytes());
     }
+    // The log kept changing under us: keep the record without rotating.
+    f.write_all(line.as_bytes())
 }
 
 /// Retire the current log as `operations.log.1` (replacing any older
@@ -364,6 +394,74 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("id=after-first-rotation"))
         );
+    }
+
+    // store-metadata-3: the shim passes its whole argv as the command for
+    // every operand, and each TRASH record copied it uncapped. One large rm
+    // wrote O(N^2) bytes, and its 1 MiB rotations wiped both generations of
+    // earlier history. The command is capped as it is in sidecars.
+    #[test]
+    fn trash_records_cap_the_recorded_command() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(".trashd/operations.log");
+        log_purge_in(home.path(), "earlier");
+        let command = format!("rm {}", "operand ".repeat(128 * 1024));
+        for id in ["first", "second", "third"] {
+            log_trash_in(
+                home.path(),
+                std::path::Path::new("/tmp/operand"),
+                id,
+                Some(&command),
+            );
+        }
+        let content = std::fs::read_to_string(&log).unwrap_or_default();
+        let records: Vec<&str> = content.lines().filter(|l| l.contains(" TRASH ")).collect();
+        assert_eq!(records.len(), 3);
+        for record in records {
+            assert!(record.len() <= 600, "{} byte record", record.len());
+        }
+        assert!(!home.path().join(".trashd/operations.log.1").exists());
+        assert!(
+            read_log_file(&log, 100)
+                .iter()
+                .any(|line| line.ends_with("PURGE id=earlier"))
+        );
+    }
+
+    // store-metadata-8: rotation measured its own descriptor but renamed
+    // whatever was at the path. A writer still holding a log another writer
+    // had already rotated renamed the NEW log over `.1`, deleting the
+    // previous generation, and wrote its record into the unlinked inode.
+    #[test]
+    fn rotation_renames_only_the_measured_log() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(".trashd/operations.log");
+        let rotated = home.path().join(".trashd/operations.log.1");
+        let history = "h".repeat(super::OPERATIONS_LOG_MAX_BYTES as usize - 200);
+        log_purge_in(home.path(), &history);
+        // A writer opened the full log; another rotated it meanwhile and
+        // started the next generation.
+        let stale = super::open_log_for_append(&log).unwrap();
+        std::fs::rename(&log, &rotated).unwrap();
+        log_purge_in(home.path(), "fresh");
+        super::append_record(
+            &log,
+            stale,
+            &format!("{} PURGE id=stale\n", "x".repeat(300)),
+        )
+        .unwrap();
+        let previous = std::fs::read_to_string(&rotated).unwrap_or_default();
+        let current = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            previous.contains(&history),
+            "the previous generation was lost"
+        );
+        for record in ["id=fresh", "id=stale"] {
+            assert!(
+                previous.contains(record) || current.contains(record),
+                "{record} was lost"
+            );
+        }
     }
 
     #[test]

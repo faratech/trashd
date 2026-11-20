@@ -700,6 +700,8 @@ After each trash operation, trashd runs a retention pass — throttled to at mos
 3. **Size:** if the trash on your home filesystem still exceeds `retention.max_size_gb` (default 10 GB), purge the oldest survivors that are at least an hour old until it fits — and only when that can make it fit. Trash on other filesystems (removable media, whose sizes and dates whoever wrote it controls) is not counted, and foreign trash is measured by the space its files actually occupy. A single item larger than the cap is refused at deletion time (`rm` keeps it; use `rm --permanent`), and one already in the trash is left to the age limit rather than trimmed along with everything else.
 4. **Disk pressure:** if the home-trash filesystem is fuller than `retention.disk_pressure_percent` (default 90%), purge the oldest 10% of survivors that are at least an hour old. The one-hour grace means a file you *just* deleted is never pressure-purged — `trash undo` right after a delete always works.
 
+A program that held an `flock` on a file when you deleted it still holds it on the trashed copy. Retention skips such a busy entry and retries it on its next pass; `trash purge`, `empty`, `restore` and `compress` wait up to 5 seconds for it and then report it busy instead of hanging.
+
 ### Scheduled cleanup (optional)
 
 The installer ships a per-user systemd timer, **disabled by default**, that runs `trash empty --older 30d -y` weekly (with up to an hour of random delay, and `Persistent=true` so a missed week runs at next login):
@@ -988,7 +990,7 @@ Every trash, restore, purge, and empty operation appends one line to `~/.local/s
 2026-03-19T22:51:22 pid=20598 RESTORE id=report.pdf to=/home/user/report.pdf
 ```
 
-Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastest way to answer "what deleted this, and when?" after the fact.
+Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastest way to answer "what deleted this, and when?" after the fact. The recorded command is capped at 256 bytes, as in `.trashinfo` files, so one `rm` of thousands of files cannot rotate away the log's history.
 
 ---
 
