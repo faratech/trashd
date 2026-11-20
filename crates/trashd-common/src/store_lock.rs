@@ -319,6 +319,50 @@ mod tests {
         drop(super::RootMutationGuard::acquire(&root).unwrap());
     }
 
+    // security-1: the lock keeps descriptors of files/ and info/ only on
+    // the root's own device; one mounted over (another filesystem a server
+    // controls) is refused with EXDEV.
+    #[test]
+    fn store_directories_must_share_the_roots_device() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("Trash");
+        for p in [&root, &root.join("files"), &root.join("info")] {
+            std::fs::DirBuilder::new().mode(0o700).create(p).unwrap();
+        }
+        let verdict = crate::mounts::in_private_mounts(
+            "store_lock::tests::store_directories_must_share_the_roots_device",
+            || {
+                let files =
+                    std::ffi::CString::new(root.join("files").as_os_str().as_encoded_bytes())
+                        .unwrap();
+                if unsafe {
+                    libc::mount(
+                        c"none".as_ptr(),
+                        files.as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        c"mode=0700".as_ptr().cast(),
+                    )
+                } != 0
+                {
+                    return false;
+                }
+                let _ = std::fs::set_permissions(
+                    root.join("files"),
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                let refused = super::RootMutationGuard::acquire(&root)
+                    .err()
+                    .and_then(|e| e.raw_os_error())
+                    == Some(libc::EXDEV);
+                unsafe { libc::umount2(files.as_ptr(), libc::MNT_DETACH) };
+                refused && super::RootMutationGuard::acquire(&root).is_ok()
+            },
+        );
+        assert_ne!(verdict, Some(false));
+    }
+
     #[test]
     fn unsafe_lock_never_changes_the_victim() {
         use std::os::unix::fs::{DirBuilderExt, symlink};

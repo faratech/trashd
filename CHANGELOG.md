@@ -18,6 +18,12 @@
   `max_dir_size_mb`; the #412 entry above overstated what its per-file
   check did. (#454, #548, #487)
 
+- Automatic retention no longer stats network or FUSE mounts (NFS,
+  CIFS/SMB, 9p, sshfs and the like). A dead server or an unresponsive
+  FUSE daemon hung `rm` and every delete in a wrapped root session.
+  `trash ls`, `trash empty` and `trash status` still include those
+  trashes. (#511)
+
 ### Performance
 
 - The recorded deleting command in each `.trashinfo` is capped at 256
@@ -418,6 +424,47 @@
   that read's deletions are logged. When a read carried more removed
   directories than the 4,096-entry cache holds, the outermost were
   evicted first and their entries were logged as bare names. (#468)
+
+- A trash root is changed only through the directory descriptors its
+  lock validated: `files/`, `info/` and `.trashd/` are opened without
+  following a symlink, must be owned by the user with mode 0700 and must
+  be on the root's own device. Entry validation, the entry lock, purge,
+  restore's sidecar removal, new-entry claims, renames, cross-device
+  copies and sidecar rewrites all go through them, and topdir trashes
+  are listed through the same kind of descriptor. A FUSE or NFS server
+  could answer `files` with a private directory for the lock's check and
+  with a symlink to `/etc` for every later lookup. Routine retention
+  running as root then purged files there, and a root delete on such a
+  mount published its copy in `/etc/sudoers.d`. (#508, #509)
+
+- Another user's FUSE mount (its `user_id=` mount option is not the
+  caller's, or is missing) never holds a topdir trash: neither the store
+  nor the preload probes or selects one there, and deletes on it are
+  copied to the home trash. A regular file copied off a `nosuid`
+  filesystem keeps no set-id bits, file capabilities or `trusted.*`
+  attributes. (#508, #509)
+
+- Repairing a trash directory's mode (store, mount discovery and the
+  preload) goes through a descriptor of the directory just checked. It
+  used chmod(2) of the path, which followed a symlink swapped in after
+  the check and could chmod `/` or a setuid binary to 0700. (#510)
+
+- Purge opens up a directory lacking u+rwx only through a pinned
+  descriptor of the directory it statted. Its path-following retry
+  chmodded whatever a racing process had swapped in, such as
+  `/etc/passwd`, to 0700. (#528)
+
+- The fanotify daemon never marks or statfs's FUSE filesystems. Their
+  marks always fail, but only after the kernel has asked the server for
+  statfs, and a hostile or dead server never answers, which stalled the
+  daemon. Its startup resolution list now comes from the mounts it
+  marked rather than a statfs of every mount. (#462)
+
+- When two mounted filesystems share an fsid (a cloned or snapshotted
+  ext4 keeps its UUID), the daemon no longer decodes deletion handles on
+  whichever one sorted first, which could log a path on the wrong
+  filesystem or stop at its ESTALE. Such deletions are logged by file
+  name only, after one warning naming the fsid. (#466)
 
 ### Documentation
 

@@ -2012,10 +2012,12 @@ fn trash_entry(
         Ok(selected) => selected,
         Err(StoreError::Unavailable) => return (TrashAttempt::NotTrashed, None),
         Err(StoreError::Unsafe) => return (TrashAttempt::UnsafeStore, None),
+        // EXDEV: a store directory on another device than its root, which
+        // the lock refuses (security-1).
         Err(StoreError::Lock(e))
             if matches!(
                 e.raw_os_error(),
-                Some(libc::EACCES | libc::ELOOP | libc::ENOTDIR)
+                Some(libc::EACCES | libc::ELOOP | libc::ENOTDIR | libc::EXDEV)
             ) =>
         {
             return (TrashAttempt::UnsafeStore, None);
