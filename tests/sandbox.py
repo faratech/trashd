@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 MARKER = Path("/.trashd-test-sandbox")
@@ -54,6 +55,18 @@ def require_sandbox():
 
 def mount(*args):
     subprocess.run(["/usr/bin/mount", *map(str, args)], check=True)
+
+
+def unmount_tree(target):
+    # Tasks that exit after their task_work has run drop their last file and
+    # mount references from a kernel workqueue (delayed fput/mntput), so the
+    # tree can stay busy briefly after the namespace's init is reaped. Retry
+    # for a bounded time; a tree that stays busy still fails closed.
+    for _ in range(40):
+        if subprocess.run(["/usr/bin/umount", "-R", str(target)], stderr=subprocess.DEVNULL).returncode == 0:
+            return
+        time.sleep(0.25)
+    subprocess.run(["/usr/bin/umount", "-R", str(target)], check=True)
 
 
 def enter(root, command):
@@ -225,7 +238,7 @@ def run(args, command):
         # failed unmount deliberately leaves scratch behind and errors.
         for target in (root, external):
             if os.path.ismount(target):
-                subprocess.run(["/usr/bin/umount", "-R", str(target)], check=True)
+                unmount_tree(target)
         shutil.rmtree(scratch)
 
 
