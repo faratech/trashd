@@ -79,8 +79,10 @@ struct Rm {
     /// Accepted for GNU rm compatibility. Optional value `all` is allowed.
     /// The switch itself is resolved from the raw command line in
     /// `scan_preserve_root`, because its state is ORDER-dependent (#430).
-    #[arg(long = "preserve-root", num_args = 0..=1, require_equals = true, value_name = "all", value_parser = clap::builder::PossibleValuesParser::new(["all"]))]
-    preserve_root: Option<String>,
+    /// Every occurrence's value is kept: a later valueless occurrence
+    /// replaced an earlier `all` under args_override_self (shim-6).
+    #[arg(long = "preserve-root", num_args = 0..=1, require_equals = true, value_name = "all", value_parser = clap::builder::PossibleValuesParser::new(["all"]), action = clap::ArgAction::Append)]
+    preserve_root: Vec<String>,
 
     /// Accepted for GNU rm compatibility. Like `preserve_root`, this only
     /// feeds the initial value of the scan; the last occurrence on the
@@ -277,7 +279,7 @@ fn main() -> ExitCode {
     // Accepted for GNU rm compatibility — parsed so these invocations trash
     // rather than fall through to a permanent delete.
     // GNU --preserve-root=all additionally refuses mount-point operands.
-    let preserve_all = args.preserve_root.as_deref() == Some("all");
+    let preserve_all = preserve_all(&args);
 
     // If --permanent, pass through to real rm (stripping our custom flags).
     // args_os (NOT args): argv may contain non-UTF-8 filenames, and
@@ -349,6 +351,9 @@ fn main() -> ExitCode {
 
     let mut exit_code = ExitCode::SUCCESS;
     let mut notification = TrashedNotification::default();
+    // Once, like GNU's stdin_tty: only a terminal is asked about
+    // write-protected entries (shim-2).
+    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
     for operand in &args.files {
         // GNU rm refuses operands naming '.' or '..' (including `subdir/..`):
@@ -449,7 +454,10 @@ fn main() -> ExitCode {
                 }
                 // Unlistable: only rmdir(2) can tell whether it is empty, and
                 // an empty directory holds no data to keep. Trashing it as if
-                // empty moved its whole unseen contents away.
+                // empty moved its whole unseen contents away. Whatever
+                // replaced it since the lstat (the listing then fails with
+                // ENOTDIR) or while -i asks is refused by rmdir(2) itself,
+                // never unlinked (shim-4).
                 Err(_) => {
                     // -i still confirms it first (#342).
                     if behavior.interaction == Interaction::Always
@@ -460,7 +468,7 @@ fn main() -> ExitCode {
                     {
                         continue;
                     }
-                    if let Err(e) = real_rm(file, false, true) {
+                    if let Err(e) = real_rmdir(file) {
                         rm_err!("rm: cannot remove '{}': {}", file.display(), as_rm_says(e));
                         exit_code = ExitCode::FAILURE;
                     }
@@ -501,18 +509,14 @@ fn main() -> ExitCode {
             if !prompt_user(&msg) {
                 continue;
             }
-        } else if matches!(
-            behavior.interaction,
-            Interaction::Sometimes | Interaction::Once
-        ) && write_protected(&meta)
-        {
+        } else if behavior.asks_write_protected(stdin_tty) && write_protected(file, &meta) {
             // GNU rm's default asks before removing anything the effective
             // user may not write to, and -I leaves that check active after
             // its one question (#432). -f and --interactive=never suppress
-            // it. Unlike GNU, which checks for a tty first, the question is
-            // asked unconditionally: stdin that is not a tty answers EOF and
-            // the file is kept, which errs toward keeping data. GNU words
-            // other types (fifos, sockets, devices) by kind too; the plain
+            // it, and like GNU and POSIX it is asked only on a terminal: a
+            // script's stdin is not an answer, and reading it took data
+            // meant for the commands after rm (shim-2). GNU words other
+            // types (fifos, sockets, devices) by kind too; the plain
             // question here follows the filed wording for them.
             let kind = kind_of(&meta);
             let msg = match kind {
@@ -588,16 +592,51 @@ fn main() -> ExitCode {
                 );
                 exit_code = ExitCode::FAILURE;
             }
-            Err(e) => {
-                rm_err!("trashd: failed to trash '{}': {e}", file.display());
-                rm_err!("trashd: refusing permanent removal; use --permanent to bypass trash");
-                exit_code = ExitCode::FAILURE;
-            }
+            Err(e) => match vanished(&e, file) {
+                // Gone since it was examined: missing like any operand, so
+                // -f ignores it, as GNU rm -f ignores ENOENT from its own
+                // removal; there is nothing left to remove permanently
+                // (shim-8).
+                Some(_) if behavior.ignore_missing => {}
+                Some(gone) => {
+                    rm_err!(
+                        "rm: cannot remove '{}': {}",
+                        file.display(),
+                        as_rm_says(gone)
+                    );
+                    exit_code = ExitCode::FAILURE;
+                }
+                None => {
+                    rm_err!("trashd: failed to trash '{}': {e}", file.display());
+                    rm_err!("trashd: refusing permanent removal; use --permanent to bypass trash");
+                    exit_code = ExitCode::FAILURE;
+                }
+            },
         }
     }
 
     notification.send();
     exit_code
+}
+
+/// The lstat error of an operand that vanished while it was being trashed,
+/// when `error` is the store's report of that. The store says NotFound for
+/// any failed lstat and ENOENT for a missing trash directory too, so only
+/// the operand's own absence, checked again, makes it a missing operand.
+fn vanished(
+    error: &trashd_common::store::TrashError,
+    file: &std::path::Path,
+) -> Option<std::io::Error> {
+    use trashd_common::store::TrashError;
+    let missing = match error {
+        TrashError::NotFound(_) => true,
+        TrashError::Io(e) => is_missing(e),
+        _ => false,
+    };
+    if !missing {
+        return None;
+    }
+    file.symlink_metadata().err().filter(is_missing)
 }
 
 /// GNU rm -f ignores operands that do not exist, including paths through a
@@ -717,6 +756,16 @@ impl RemovalBehavior {
     fn prompt_once(&self, recursive: bool, operands: usize) -> bool {
         self.interaction == Interaction::Once && (recursive || operands > 3)
     }
+
+    /// Whether the default and -I modes ask about a write-protected entry
+    /// at all. GNU's prompt() checks write protection only under
+    /// `!ignore_missing_files && (RMI_ALWAYS || stdin_tty)`, and POSIX asks
+    /// only when stdin is a terminal; -i asks its own question (shim-2).
+    fn asks_write_protected(&self, stdin_tty: bool) -> bool {
+        matches!(self.interaction, Interaction::Sometimes | Interaction::Once)
+            && stdin_tty
+            && !self.ignore_missing
+    }
 }
 
 /// True when an operand IS the filesystem root. Like GNU rm's preserve-root
@@ -733,6 +782,12 @@ fn is_root_operand(p: &std::path::Path) -> bool {
         (Ok(operand), Ok(root)) => operand.dev() == root.dev() && operand.ino() == root.ino(),
         _ => false,
     }
+}
+
+/// Whether `--preserve-root=all` was given (it refuses mount-point operands).
+/// Like GNU's preserve_all_root, nothing given later clears it (shim-6).
+fn preserve_all(args: &Rm) -> bool {
+    args.preserve_root.iter().any(|value| value == "all")
 }
 
 /// The final state of GNU rm's one preserve-root switch across the raw
@@ -954,23 +1009,44 @@ struct PlanBudget {
     max_pins: usize,
     pins: std::rc::Rc<std::cell::Cell<usize>>,
     exhausted: bool,
+    /// The descriptor limit to put back once the walk is over.
+    restore: Option<libc::rlimit>,
 }
 
 impl PlanBudget {
     const MAX_BYTES: usize = 32 * 1024 * 1024;
     const MAX_DEPTH: usize = 128;
-    const MAX_PINS: usize = 256;
+    /// The soft descriptor limit a walk raises itself toward, within the
+    /// hard limit: about 21,800 pinned directories (shim-7).
+    const FD_TARGET: libc::rlim_t = 65536;
 
     fn new() -> Self {
         let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        let mut restore = None;
         // The filesystem-boundary survey holds a directory and listing per
         // traversal level in addition to retained plan pins. Reserve both,
         // plus room for the store, diagnostics, and operand parent handle.
         let max_pins = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            // Every directory planned under -i stays pinned until the plan
+            // is carried out, so the usual soft limit of 1024 (and a fixed
+            // cap of 256) refused trees GNU rm removes. Raise it toward the
+            // hard limit for this walk; dropping the budget puts it back
+            // before anything is spawned (shim-7).
+            let wanted = limit.rlim_max.min(Self::FD_TARGET);
+            if limit.rlim_cur < wanted {
+                let raised = libc::rlimit {
+                    rlim_cur: wanted,
+                    rlim_max: limit.rlim_max,
+                };
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                    restore = Some(limit);
+                    limit = raised;
+                }
+            }
             let open = std::fs::read_dir("/proc/self/fd")
                 .map(|listing| listing.count())
                 .unwrap_or(16);
-            ((limit.rlim_cur as usize).saturating_sub(open + 16) / 3).min(Self::MAX_PINS)
+            (limit.rlim_cur.min(Self::FD_TARGET) as usize).saturating_sub(open + 16) / 3
         } else {
             16
         };
@@ -979,6 +1055,7 @@ impl PlanBudget {
             max_pins,
             pins: std::rc::Rc::new(std::cell::Cell::new(0)),
             exhausted: false,
+            restore,
         }
     }
 
@@ -1012,6 +1089,16 @@ impl PlanBudget {
             file,
             pins: self.pins.clone(),
         })
+    }
+}
+
+impl Drop for PlanBudget {
+    /// A raised descriptor limit is the walk's alone: a child (notify-send)
+    /// must not inherit one past what select(2) handles.
+    fn drop(&mut self) {
+        if let Some(limit) = self.restore {
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        }
     }
 }
 
@@ -1492,8 +1579,10 @@ impl Walk<'_> {
                     // Now empty unless something new arrived, which stays.
                     match std::fs::read_dir(&pinned).map(|mut listing| listing.next().is_none()) {
                         Ok(true) => match self.trash(parent, name, access, display) {
+                            // rmdir(2) alone: whatever replaced the emptied
+                            // directory meanwhile stays (shim-4).
                             Some(Outcome::Excluded) => {
-                                if let Err(e) = real_rm(access, false, true) {
+                                if let Err(e) = real_rmdir(access) {
                                     self.report_io(display, e);
                                 }
                             }
@@ -1875,33 +1964,28 @@ fn prompt_user_with(
 /// Whether rm's default interactive mode asks before removing this entry:
 /// GNU rm asks when the effective user may not write to it, and exempts
 /// symlinks (whose permission bits are meaningless) (#432).
-fn write_protected(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
+fn write_protected(path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
     // GNU grants privileged users every write (can_write_any_file), so it
     // never asks root; neither do we, keeping root's scripted removals
     // silent like GNU's.
     let privileged = unsafe { libc::geteuid() == 0 };
-    !privileged
-        && !meta.file_type().is_symlink()
-        && write_protected_by_bits(meta.mode(), meta.uid(), meta.gid())
+    !privileged && !meta.file_type().is_symlink() && denies_write(path)
 }
 
-/// The mode-bit half of that question, on injected ids: the owner class when
-/// euid owns the entry, the group class when egid matches, "other"
-/// otherwise. GNU answers through faccessat(W_OK, AT_EACCESS), which also
-/// credits ACLs and supplementary groups; the bit comparison answers the
-/// same for ordinary permission bits and errs toward asking where an ACL
-/// would grant write — that is, toward keeping data (#432).
-fn write_protected_by_bits(mode: u32, uid: u32, gid: u32) -> bool {
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    if uid == euid {
-        mode & libc::S_IWUSR == 0
-    } else if gid == egid {
-        mode & libc::S_IWGRP == 0
-    } else {
-        mode & libc::S_IWOTH == 0
-    }
+/// The kernel's answer, asked the way GNU's write_protected_p asks it:
+/// faccessat(W_OK, AT_EACCESS) under the effective ids, which credits
+/// supplementary groups and ACLs where comparing mode bits with the primary
+/// group did not (shim-3). It follows a symlink, hence the exemption above.
+/// Only EACCES means write-protected: any other failure (a read-only
+/// filesystem, an entry gone meanwhile) is left for the removal to report.
+fn denies_write(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let status =
+        unsafe { libc::faccessat(libc::AT_FDCWD, name.as_ptr(), libc::W_OK, libc::AT_EACCESS) };
+    status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
 }
 
 thread_local! {
@@ -2341,9 +2425,16 @@ fn passthrough_with_args(args: &[std::ffi::OsString]) -> ExitCode {
     // Set TRASH_BYPASS=1 so the LD_PRELOAD layer doesn't re-intercept
     // the real rm's unlink() calls when we're passing through. Exec in
     // place: a child and a wait cost a process per passthrough, and turned
-    // the real rm's death by a signal into exit 1 (#353).
+    // the real rm's death by a signal into exit 1 (#353). argv[0] is `rm`,
+    // never the stash path: GNU rm names itself after it in usage lines and
+    // prompts, and a multicall stash (busybox, uutils) dispatches on its
+    // basename. The shim's own argv[0] could be `unlink` (shim-5).
     use std::os::unix::process::CommandExt;
-    let error = Command::new(&rm).args(args).env("TRASH_BYPASS", "1").exec();
+    let error = Command::new(&rm)
+        .arg0("rm")
+        .args(args)
+        .env("TRASH_BYPASS", "1")
+        .exec();
     rm_err!("trashd: failed to exec {}: {error}", rm.display());
     ExitCode::FAILURE
 }
@@ -2362,13 +2453,24 @@ fn real_rm_shown(
     recursive: bool,
     allow_empty_dir: bool,
 ) -> std::io::Result<()> {
-    // Set TRASH_BYPASS so the LD_PRELOAD layer doesn't re-intercept
-    // our unlink/rmdir calls when we genuinely want a real delete.
+    bypassing_preload(|| real_rm_inner(path, display, recursive, allow_empty_dir))
+}
+
+/// rmdir(2) of `path` for real, and nothing else: whatever replaced the
+/// directory since it was examined (a regular file, a symlink) is refused
+/// with ENOTDIR, never unlinked by a fresh type check (shim-4).
+fn real_rmdir(path: &std::path::Path) -> std::io::Result<()> {
+    bypassing_preload(|| std::fs::remove_dir(path))
+}
+
+/// Run a removal with TRASH_BYPASS set, so the LD_PRELOAD layer doesn't
+/// re-intercept our unlink/rmdir calls when we genuinely want a real delete.
+fn bypassing_preload<T>(remove: impl FnOnce() -> T) -> T {
     // Safety: the shim is single-threaded (no other threads to race with).
     unsafe {
         std::env::set_var("TRASH_BYPASS", "1");
     }
-    let result = real_rm_inner(path, display, recursive, allow_empty_dir);
+    let result = remove();
     unsafe {
         std::env::remove_var("TRASH_BYPASS");
     }
@@ -2572,6 +2674,31 @@ mod tests {
         // any removal.
         assert!(from_clap(&["--no-preserve-root", "--help"]).is_some());
         assert!(from_clap(&["--help", "--no-preserve-root"]).is_some());
+    }
+
+    // shim-6: GNU sets preserve_all_root only on `--preserve-root=all` and
+    // nothing clears it, so a later plain `--preserve-root` (or any
+    // abbreviation of either) keeps it. A token after `--` is an operand.
+    #[test]
+    fn preserve_root_all_is_sticky() {
+        for argv in [
+            &["rm", "-r", "--preserve-root=all", "--preserve-root", "x"][..],
+            &["rm", "-r", "--preserve-root=all", "--pres", "x"],
+            &["rm", "-r", "--pr=all", "--preserve-root", "x"],
+            &["rm", "-r", "--preserve-root=all", "--no-preserve-root", "x"],
+            &["rm", "-r", "--preserve-root", "--preserve-root=all", "x"],
+        ] {
+            let args = Rm::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(preserve_all(&args), "{argv:?}");
+        }
+        for argv in [
+            &["rm", "-r", "--preserve-root", "x"][..],
+            &["rm", "-r", "x"],
+            &["rm", "-r", "--", "--preserve-root=all"],
+        ] {
+            let args = Rm::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(!preserve_all(&args), "{argv:?}");
+        }
     }
 
     // #431: GNU checks the exact spelling of --no-preserve-root and rejects
@@ -2798,48 +2925,75 @@ mod tests {
         }
     }
 
-    // #432: the write-protected question follows the effective identity —
-    // owner class, then group class, then "other" — and a symlink is never
-    // asked about, whatever it points at.
+    // #432, shim-3: the write-protected question is the kernel's answer
+    // under the effective ids. The owner class decides for the owner, and a
+    // supplementary group's bits count like the primary group's; a symlink
+    // is never asked about, whatever it points at, and root never is.
+    // Needs root to set up the identities; the child drops them.
     #[test]
-    fn write_protection_follows_the_effective_identity() {
-        use std::os::unix::fs::MetadataExt;
-        let euid = unsafe { libc::geteuid() };
-        let egid = unsafe { libc::getegid() };
-        // The owner class decides when euid owns the entry.
-        assert!(write_protected_by_bits(0o444, euid, egid.wrapping_add(1)));
-        assert!(!write_protected_by_bits(0o644, euid, egid.wrapping_add(1)));
-        // The group class when the owner is someone else but egid matches.
-        assert!(write_protected_by_bits(0o444, euid.wrapping_add(1), egid));
-        assert!(!write_protected_by_bits(0o464, euid.wrapping_add(1), egid));
-        // Otherwise "other".
-        assert!(write_protected_by_bits(
-            0o444,
-            euid.wrapping_add(1),
-            egid.wrapping_add(1)
-        ));
-        assert!(!write_protected_by_bits(
-            0o446,
-            euid.wrapping_add(1),
-            egid.wrapping_add(1)
-        ));
-
+    fn write_protection_is_the_kernels_answer() {
+        if unsafe { libc::geteuid() } != 0
+            || !in_child("tests::write_protection_is_the_kernels_answer")
+        {
+            return;
+        }
         let dir = scratch("wprot");
-        let file = dir.join("f");
-        std::fs::write(&file, b"x").unwrap();
-        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o444))
-            .unwrap();
-        let meta = std::fs::symlink_metadata(&file).unwrap();
-        // Whatever this process's privilege, the answer matches the bits.
-        assert_eq!(
-            write_protected(&meta),
-            unsafe { libc::geteuid() } != 0
-                && write_protected_by_bits(meta.mode(), meta.uid(), meta.gid())
-        );
-        // A symlink's bits are meaningless: never asked about.
+        let fixture = |name: &str, mode: u32, uid: u32, gid: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .unwrap();
+            std::os::unix::fs::chown(&path, Some(uid), Some(gid)).unwrap();
+            path
+        };
+        let cases = [
+            (fixture("group-writable", 0o664, 1001, 2000), false),
+            (fixture("group-denied", 0o646, 1001, 2000), true),
+            (fixture("group-read-only", 0o644, 1001, 2000), true),
+            (fixture("owner-writable", 0o644, 65534, 2000), false),
+            (fixture("owner-read-only", 0o464, 65534, 2000), true),
+            (fixture("other-writable", 0o446, 1001, 1001), false),
+            (fixture("other-read-only", 0o664, 1001, 1001), true),
+        ];
         let link = dir.join("link");
-        std::os::unix::fs::symlink(&file, &link).unwrap();
-        assert!(!write_protected(&std::fs::symlink_metadata(&link).unwrap()));
+        std::os::unix::fs::symlink("group-denied", &link).unwrap();
+        let protected =
+            |path: &Path| write_protected(path, &std::fs::symlink_metadata(path).unwrap());
+        assert!(!protected(&cases[1].0), "root is never asked");
+        // An unprivileged member of group 2000, in this child only.
+        unsafe {
+            let groups = [2000];
+            assert_eq!(libc::setgroups(1, groups.as_ptr()), 0);
+            assert_eq!(libc::setresgid(65534, 65534, 65534), 0);
+            assert_eq!(libc::setresuid(65534, 65534, 65534), 0);
+        }
+        for (path, expected) in &cases {
+            assert_eq!(protected(path), *expected, "{path:?}");
+        }
+        assert!(!protected(&link));
+        // Only EACCES asks: a missing entry is for its removal to report.
+        assert!(!denies_write(&dir.join("missing")));
+    }
+
+    // shim-2: the default and -I modes ask about write protection only on
+    // a terminal and while missing operands are not ignored (GNU's
+    // `!ignore_missing_files && stdin_tty`); -i and -f never ask it.
+    #[test]
+    fn write_protected_question_needs_a_terminal() {
+        for (argv, asks) in [
+            (&["rm", "f"][..], true),
+            (&["rm", "-I", "f"], true),
+            (&["rm", "--interactive=once", "f"], true),
+            (&["rm", "-f", "-I", "f"], false),
+            (&["rm", "-f", "--interactive=once", "f"], false),
+            (&["rm", "-i", "f"], false),
+            (&["rm", "-f", "f"], false),
+            (&["rm", "--interactive=never", "f"], false),
+        ] {
+            let behavior = behavior(argv);
+            assert_eq!(behavior.asks_write_protected(true), asks, "{argv:?}");
+            assert!(!behavior.asks_write_protected(false), "{argv:?}");
+        }
     }
 
     // #432/#436: prompting reads one line and applies GNU's yes rule; a
@@ -2957,6 +3111,95 @@ mod tests {
         for operand in ["", "file", "a/b", "/tmp/x/", "a/../b", "./file"] {
             assert!(!is_dot_operand(Path::new(operand)), "{operand}");
         }
+    }
+
+    /// Whether this process is the child copy of the test binary that runs
+    /// `test`'s body. The parent runs only that test in the child and
+    /// returns false: what the body does to the process (clearing
+    /// TRASH_BYPASS, whose absence lets a system-wide preload trash the
+    /// harness's deletions; dropping privileges) must never reach the
+    /// harness. A child that ran no test (a renamed one) fails the parent.
+    fn in_child(test: &str) -> bool {
+        const CHILD: &str = "TRASHD_SHIM_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some_and(|named| named == test) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, test)
+            .env("TRASH_BYPASS", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(" 1 passed;"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    // shim-4: the rmdir-only removal refuses anything but a directory, and
+    // a directory with entries, whatever replaced the one examined.
+    #[test]
+    fn rmdir_removes_nothing_but_an_empty_directory() {
+        if !in_child("tests::rmdir_removes_nothing_but_an_empty_directory") {
+            return;
+        }
+        let dir = scratch("rmdir");
+        let file = dir.join("file");
+        std::fs::write(&file, b"data").unwrap();
+        assert_eq!(
+            real_rmdir(&file).unwrap_err().raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"data");
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            real_rmdir(&link).unwrap_err().raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink() && target.is_dir());
+        std::fs::write(target.join("keep"), b"x").unwrap();
+        assert_eq!(
+            real_rmdir(&target).unwrap_err().raw_os_error(),
+            Some(libc::ENOTEMPTY)
+        );
+        let empty = dir.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        real_rmdir(&empty).unwrap();
+        assert!(!empty.exists());
+    }
+
+    // shim-8: a store error about an operand that is gone when checked again
+    // is a missing operand (ignored under -f); the same error while the
+    // operand is still there is a trash failure, never hidden.
+    #[test]
+    fn only_an_operand_still_gone_counts_as_vanished() {
+        use trashd_common::store::TrashError;
+        let dir = scratch("vanished");
+        let store = TrashStore::open_isolated(&dir.join("Trash"), trashd_common::Config::default())
+            .unwrap();
+        let victim = dir.join("victim");
+        let error = store.trash(&victim, None).unwrap_err();
+        assert!(matches!(error, TrashError::NotFound(_)), "{error}");
+        let gone = vanished(&error, &victim).expect("a vanished operand");
+        assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
+        let enoent = || TrashError::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
+        let enotdir = TrashError::Io(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        assert!(vanished(&enoent(), &victim).is_some());
+        assert!(vanished(&enotdir, &victim).is_some());
+        // Still there: ENOENT came from elsewhere (a missing trash files/).
+        std::fs::write(&victim, b"x").unwrap();
+        assert!(vanished(&enoent(), &victim).is_none());
+        assert!(vanished(&TrashError::NotFound(victim.clone()), &victim).is_none());
+        // Other errors never describe a missing operand.
+        let denied = TrashError::Io(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(vanished(&denied, &dir.join("absent")).is_none());
+        assert!(vanished(&TrashError::Refused(victim.clone()), &dir.join("absent")).is_none());
     }
 
     // Regression (#103): the --permanent passthrough filter must strip the

@@ -4,9 +4,23 @@
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
+
+
+def gnu_rm(env):
+    """GNU rm where one is installed: /usr/bin/rm may be uutils instead."""
+    for candidate in ("/usr/bin/gnurm", "/usr/bin/rm", "/bin/rm"):
+        try:
+            version = subprocess.run([candidate, "--version"], capture_output=True, text=True,
+                                     env=dict(env, TRASH_BYPASS="1"), timeout=10).stdout
+        except OSError:
+            continue
+        if "GNU coreutils" in version:
+            return Path(candidate)
+    return None
 
 
 def main():
@@ -219,6 +233,43 @@ def main():
         assert (real_cache / "trashd/real-rm-probes").read_text().startswith("real "), "verdict"
         print("PASS: symlinked caches and --version-rejecting rm binaries are remembered")
 
+        # Every passthrough route execs the real rm as `rm`, not by its stash
+        # path: GNU rm names itself after argv[0] in its usage lines and
+        # prompts (shim-5). A script fixture cannot see argv[0] (the kernel
+        # replaces it with the interpreter), so the stash is GNU rm itself.
+        gnu_binary = gnu_rm(env)
+        if gnu_binary:
+            argv0 = root / "passthrough-argv0"
+            (argv0 / "bin").mkdir(parents=True)
+            (argv0 / "real").mkdir()
+            (argv0 / "caller").mkdir()
+            argv0_shim = argv0 / "bin/rm"
+            shutil.copy2(binary, argv0_shim)
+            shutil.copy2(gnu_binary, argv0 / "real/rm")
+            def via_stash(args, extra_env=None, program=None, answer=None):
+                return subprocess.run([*(program or [str(argv0_shim)]), *map(str, args)], input=answer,
+                                      env=dict(env, **(extra_env or {})), cwd=root,
+                                      capture_output=True, text=True, timeout=10)
+            result = via_stash(["--help"])
+            assert result.returncode == 0 and "Usage: rm [OPTION]" in result.stdout, result.stdout
+            result = via_stash(["--no-such-option"], {"TRASH_BYPASS": "1"})
+            assert result.returncode == 1 and "Try 'rm --help'" in result.stderr, result.stderr
+            result = via_stash(["--permanent", "argv0-missing"])
+            assert result.returncode == 1 and result.stderr.startswith("rm: cannot remove 'argv0-missing'"), result.stderr
+            # A bypassed caller (make) reaches the same exec: GNU's -i prompt
+            # names the program too.
+            caller = argv0 / "caller/make"
+            caller.write_bytes(Path("/bin/sh").read_bytes())
+            caller.chmod(0o755)
+            victim = root / "argv0-victim"
+            victim.write_bytes(b"kept")
+            result = via_stash([argv0_shim, victim], program=[str(caller), "-c", '"$0" -i "$1"'], answer="n\n")
+            assert result.stderr.startswith("rm: remove regular file"), result.stderr
+            assert victim.read_bytes() == b"kept", result.stderr
+            print("PASS: passthrough runs the real rm as 'rm' (usage, try-help, diagnostics, prompts)")
+        else:
+            print("SKIP: no GNU rm to observe the passthrough argv[0]")
+
         for name, flags, directory in [
             ("repeated-force", ["-ff"], False),
             ("repeated-recursive", ["-r", "--recursive"], True),
@@ -343,6 +394,36 @@ def main():
         assert run([plain / "x"]).returncode == 1 and plain.exists()
         print("PASS: -f ignores ENOTDIR operands")
 
+        # An operand that vanishes after the shim saw it, while the store
+        # waits for its lock, is missing like any other: silent under -f,
+        # GNU's diagnostic without it, and never "refusing permanent
+        # removal", which offers to delete what is already gone (shim-8).
+        import fcntl
+        import time
+        warmup = root / "vanish-warmup"
+        warmup.write_bytes(b"x")
+        assert run([warmup]).returncode == 0
+        store_lock = root / "data/Trash/.trashd/store.lock"
+        for flags, status, expected in [(["-f"], 0, ""), ([], 1, "rm: cannot remove '{}': No such file or directory\n")]:
+            victim = root / "vanish-while-locked"
+            victim.write_bytes(b"x")
+            before = set((root / "data/Trash/info").glob("*.trashinfo"))
+            with open(store_lock, "r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                proc = subprocess.Popen([str(binary), *flags, str(victim)], env=env, cwd=root,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.monotonic() + 10
+                while not any(line.split()[1] == "->" and str(proc.pid) in line.split()
+                              for line in Path("/proc/locks").read_text().splitlines()):
+                    assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()
+                    time.sleep(0.01)
+                victim.unlink()
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            _, stderr = proc.communicate(timeout=10)
+            assert proc.returncode == status and stderr == expected.format(victim), (flags, proc.returncode, stderr)
+            assert set((root / "data/Trash/info").glob("*.trashinfo")) == before, (flags, "orphaned sidecar")
+        print("PASS: an operand that vanishes before its move is missing, silent under -f")
+
         # The preserve-root switch is ONE sequential value: --no-preserve-root
         # clears it and a LATER --preserve-root restores the guard, which then
         # refuses '/' before anything is touched (#430). The refusal happens
@@ -355,6 +436,28 @@ def main():
             assert result.returncode != 0, (flags, result.returncode)
             assert "it is dangerous to operate recursively on '/'" in result.stderr, (flags, result.stderr)
         print("PASS: a later --preserve-root restores the guard over '/'")
+
+        # --preserve-root=all is sticky: a later plain --preserve-root (an
+        # alias plus an explicit flag) must not drop it and let a mount
+        # point's contents be emptied into the trash (shim-6).
+        gnu_binary = gnu_rm(env)
+        for program in [None, gnu_binary] if gnu_binary else [None]:
+            mount_point = root / ("preserve-all-" + ("gnu" if program else "shim"))
+            mount_point.mkdir()
+            subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "none", str(mount_point)], check=True)
+            try:
+                (mount_point / "inside").write_bytes(b"stays")
+                before = set((root / "data/Trash/info").glob("*.trashinfo"))
+                result = subprocess.run([str(program or binary), "-r", "--preserve-root=all", "--preserve-root",
+                                         str(mount_point)], env=env, cwd=root, capture_output=True, text=True, timeout=10)
+                assert result.returncode == 1, (program, result.stderr)
+                assert (mount_point / "inside").read_bytes() == b"stays", (program, result.stderr)
+                assert set((root / "data/Trash/info").glob("*.trashinfo")) == before, (program, result.stderr)
+                if program is None:
+                    assert "Device or resource busy" in result.stderr, result.stderr
+            finally:
+                subprocess.run(["/usr/bin/umount", str(mount_point)], check=True)
+        print("PASS: --preserve-root=all survives a later --preserve-root")
 
         # GNU checks the exact spelling of --no-preserve-root alone: an
         # unambiguous abbreviation is diagnosed and removes nothing (#431),
@@ -450,61 +553,144 @@ def main():
         print("PASS: -d on an unlistable non-empty directory refuses like rm")
 
         # GNU rm's default asks before removing an entry the effective user
-        # may not write to; EOF or any non-y answer keeps the file without an
-        # error, and -f / --interactive=never remove without asking (#432).
-        def nobody_fixture(name, mode=0o444, content=b"precious"):
+        # may not write to, but only when stdin is a terminal (#432, shim-2);
+        # any non-y answer keeps the file without an error, and -f /
+        # --interactive=never remove without asking. The sandbox's /dev holds
+        # a few bound nodes only: this mount namespace gets its own devpts.
+        def nobody_fixture(name, mode=0o444, content=b"precious", owner=(65534, 65534)):
             path = nobody / name
             path.write_bytes(content)
             os.chmod(path, mode)
-            os.chown(path, 65534, 65534)
+            os.chown(path, *owner)
             return path
+        def on_terminal(command, answers, **kwargs):
+            """Run `command` with stdin on a pseudo-terminal holding `answers`."""
+            if not os.path.ismount("/dev/pts"):
+                os.makedirs("/dev/pts", exist_ok=True)
+                subprocess.run(["/usr/bin/mount", "-t", "devpts", "-o", "newinstance,ptmxmode=0666",
+                                "devpts", "/dev/pts"], check=True)
+            if not os.path.lexists("/dev/ptmx"):
+                os.symlink("pts/ptmx", "/dev/ptmx")
+            master, slave = os.openpty()
+            try:
+                os.write(master, answers.encode())
+                return subprocess.run(command, stdin=slave, capture_output=True, text=True, timeout=10, **kwargs)
+            finally:
+                os.close(slave)
+                os.close(master)
+        def as_nobody_rm(args, answers=None, program=None, preexec=as_nobody, **kwargs):
+            # Run as `rm`: GNU's prompts name argv[0].
+            command = ["rm", *map(str, args)]
+            kwargs.update(executable=str(program or binary), env=nobody_env, cwd=nobody, preexec_fn=preexec)
+            if answers is not None:
+                return on_terminal(command, answers, **kwargs)
+            return subprocess.run(command, capture_output=True, text=True, timeout=10, **kwargs)
         protected = nobody_fixture("write-protected")
-        declined = subprocess.run([str(binary), str(protected)], env=nobody_env, cwd=nobody,
-                                  capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        declined = as_nobody_rm([protected], answers="n\n")
         assert declined.returncode == 0 and protected.exists(), declined.stderr
         assert declined.stderr == f"rm: remove write-protected regular file '{protected}'? ", declined.stderr
-        confirmed = subprocess.run([str(binary), str(protected)], env=nobody_env, cwd=nobody,
-                                   input="y\n", capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        confirmed = as_nobody_rm([protected], answers="y\n")
         assert confirmed.returncode == 0 and not protected.exists(), confirmed.stderr
         assert confirmed.stderr == f"rm: remove write-protected regular file '{protected}'? ", confirmed.stderr
         assert list((nobody / "data/Trash/info").glob("write-protected*")), "answering yes must trash"
 
         empty = nobody_fixture("write-protected-empty", content=b"")
-        asked = subprocess.run([str(binary), str(empty)], env=nobody_env, cwd=nobody,
-                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        asked = as_nobody_rm([empty], answers="n\n")
         assert asked.returncode == 0 and empty.exists(), asked.stderr
         assert asked.stderr == f"rm: remove write-protected regular empty file '{empty}'? ", asked.stderr
         sealed = nobody / "write-protected-dir"
         sealed.mkdir()
         os.chmod(sealed, 0o555)
         os.chown(sealed, 65534, 65534)
-        asked = subprocess.run([str(binary), "-d", str(sealed)], env=nobody_env, cwd=nobody,
-                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        asked = as_nobody_rm(["-d", sealed], answers="n\n")
         assert asked.returncode == 0 and sealed.is_dir(), asked.stderr
         assert asked.stderr == f"rm: remove write-protected directory '{sealed}'? ", asked.stderr
         link = nobody / "write-protected-link"
         link.symlink_to("no-such-target")
-        asked = subprocess.run([str(binary), str(link)], env=nobody_env, cwd=nobody,
-                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        asked = as_nobody_rm([link], answers="n\n")
         assert asked.returncode == 0 and not link.exists() and asked.stderr == "", asked.stderr
         forced = nobody_fixture("write-protected-force")
-        forced_run = subprocess.run([str(binary), "-f", str(forced)], env=nobody_env, cwd=nobody,
-                                    capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        forced_run = as_nobody_rm(["-f", forced], answers="n\n")
         assert forced_run.returncode == 0 and not forced.exists() and forced_run.stderr == "", forced_run.stderr
         never = nobody_fixture("write-protected-never")
-        never_run = subprocess.run([str(binary), "--interactive=never", str(never)], env=nobody_env, cwd=nobody,
-                                   capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        never_run = as_nobody_rm(["--interactive=never", never], answers="n\n")
         assert never_run.returncode == 0 and not never.exists() and never_run.stderr == "", never_run.stderr
         writable = nobody_fixture("plain-writable", mode=0o644)
-        quiet = subprocess.run([str(binary), str(writable)], env=nobody_env, cwd=nobody,
-                               capture_output=True, text=True, timeout=10, preexec_fn=as_nobody)
+        quiet = as_nobody_rm([writable], answers="n\n")
         assert quiet.returncode == 0 and not writable.exists() and quiet.stderr == "", quiet.stderr
+
+        # Without a terminal nothing is asked, as in GNU rm and POSIX: the
+        # file goes (xargs gives rm /dev/null) and a caller's piped stdin is
+        # left unread for the commands after it (shim-2).
+        unasked = nobody_fixture("write-protected-no-tty")
+        result = as_nobody_rm([unasked], stdin=subprocess.DEVNULL)
+        assert result.returncode == 0 and not unasked.exists() and result.stderr == "", result.stderr
+        assert list((nobody / "data/Trash/info").glob("write-protected-no-tty*")), "must trash"
+        piped = nobody_fixture("write-protected-piped")
+        result = subprocess.run(["/bin/sh", "-c", '"$0" "$1"; cat', str(binary), str(piped)],
+                                input="leftover-1\nleftover-2\n", capture_output=True, text=True,
+                                timeout=10, env=nobody_env, cwd=nobody, preexec_fn=as_nobody)
+        assert result.returncode == 0 and not piped.exists() and result.stderr == "", result.stderr
+        assert result.stdout == "leftover-1\nleftover-2\n", result.stdout
+        # -i asks with or without a terminal, as GNU's RMI_ALWAYS does.
+        always = nobody_fixture("write-protected-always")
+        result = as_nobody_rm(["-i", always], stdin=subprocess.DEVNULL)
+        assert result.returncode == 0 and always.exists(), result.stderr
+        assert result.stderr == f"rm: remove regular file '{always}'? [y/N] ", result.stderr
+        # -f keeps ignoring missing operands under a later -I: its one
+        # question is asked, and then nothing about write protection, as
+        # GNU's prompt() skips the check while ignore_missing_files is set.
+        once = [nobody_fixture(f"once-{n}", mode=0o644) for n in "abc"] + [nobody_fixture("write-protected-once")]
+        result = as_nobody_rm(["-f", "-I", *once], answers="y\nn\n")
+        assert result.returncode == 0 and result.stderr == "rm: remove 4 arguments? [y/N] ", result.stderr
+        assert not any(path.exists() for path in once), result.stderr
+
+        # Whether the user may write is the kernel's answer: a supplementary
+        # group's bits and an ACL grant count, as GNU's faccessat(W_OK,
+        # AT_EACCESS) has it (shim-3). GNU rm, where installed, agrees.
+        def as_member():
+            os.setgroups([2000]); os.setgid(65534); os.setuid(65534)
+        def grant_write(path, uid):
+            # system.posix_acl_access: version 2, then (tag, perm, id) sorted
+            # by tag: owner rw, user `uid` rw, group r, mask rw, other r.
+            undefined = 0xffffffff
+            entries = [(0x01, 6, undefined), (0x02, 6, uid), (0x04, 4, undefined), (0x10, 6, undefined), (0x20, 4, undefined)]
+            os.setxattr(path, "system.posix_acl_access",
+                        struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries))
+        gnu_binary = gnu_rm(env)
+        checked = []
+        for name, mode, owner, acl, asks in [
+            ("group-writable", 0o664, (1001, 2000), False, False),
+            ("group-denied", 0o646, (1001, 2000), False, True),
+            ("group-read-only", 0o644, (1001, 2000), False, True),
+            ("acl-writable", 0o644, (1001, 1001), True, False),
+        ]:
+            outcomes = []
+            for program in [None, gnu_binary] if gnu_binary else [None]:
+                victim = nobody_fixture(f"{name}-{'gnu' if program else 'shim'}", mode=mode, owner=owner)
+                if acl:
+                    try:
+                        grant_write(victim, 65534)
+                    except OSError:
+                        victim.unlink()
+                        break  # No POSIX ACLs on this filesystem.
+                result = as_nobody_rm([victim], answers="n\n", program=program, preexec=as_member)
+                question = f"rm: remove write-protected regular file '{victim}'? " if asks else ""
+                assert result.returncode == 0 and result.stderr == question, (name, program, result.stderr)
+                assert victim.exists() == asks, (name, program, result.stderr)
+                outcomes.append((result.stderr.replace(victim.name, "V"), victim.exists()))
+                if victim.exists():
+                    victim.unlink()
+            else:
+                checked.append(name)
+            assert len(set(outcomes)) <= 1, (name, outcomes)
         # Later assertions count nobody's trash contents: this block's entries
         # must not litter them.
         for stored in (nobody / "data/Trash/files").glob("*"):
             shutil.rmtree(stored) if stored.is_dir() else stored.unlink()
         shutil.rmtree(nobody / "data/Trash/info", ignore_errors=True)
-        print("PASS: write-protected entries are asked about, kept on decline, silent under -f and never")
+        print("PASS: write-protected entries are asked about on a terminal only, by the kernel's",
+              f"permission check ({', '.join(checked)}), silent under -f and never")
 
         # -ri confirms every entry, as rm does, instead of one prompt for the tree.
         def interactive(answers, tree):
@@ -560,12 +746,33 @@ def main():
         assert len(added) == 1 and f"Path={tree}\n" in added[0], added
         print("PASS: -ri prompts for each entry and trashes confirmed subtrees whole")
 
-        # Keep directory inodes pinned, but refuse the complete operand
-        # before mutation if its plan cannot leave descriptor headroom.
+        # The usual soft limit of 1024 descriptors refused any -ri tree of
+        # more than 256 directories, after every question was answered: a
+        # walk raises its soft limit toward the hard one for its plan (shim-7).
         import resource
-        def low_fd_limit():
+        def usual_fd_limit():
             _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
+        tree = root / "wide-300"
+        for index in range(300):
+            child = tree / f"dir-{index:03}"
+            child.mkdir(parents=True)
+            (child / "payload").write_bytes(b"complete wide tree")
+        before = set(info.glob("*.trashinfo"))
+        result = subprocess.run([str(binary), "-ri", str(tree)], input="y\n" * 2000,
+            text=True, capture_output=True, env=env, cwd=root, preexec_fn=usual_fd_limit, timeout=60)
+        added = set(info.glob("*.trashinfo")) - before
+        assert result.returncode == 0 and not tree.exists(), result.stderr[-400:]
+        assert len(added) == 1, added
+        stored = root / "data/Trash/files" / added.pop().stem
+        assert sum(1 for path in stored.glob("*/payload") if path.read_bytes() == b"complete wide tree") == 300
+        print("PASS: -ri plans 300 directories at the usual soft descriptor limit")
+
+        # Keep directory inodes pinned, but refuse the complete operand
+        # before mutation if its plan cannot leave descriptor headroom. The
+        # hard limit is lowered too: a walk raises the soft one up to it.
+        def low_fd_limit():
+            resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
         for width, should_succeed in [(3, True), (128, False)]:
             tree = root / f"low-fd-wide-{width}"
             for index in range(width):
@@ -603,8 +810,7 @@ def main():
         # in addition to the retained pins. A plan that fits only its pins must
         # still refuse before any entrywise fallback can mutate the source.
         def medium_fd_limit():
-            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         for depth, should_succeed, one_filesystem in [
                 (8, True, False), (40, False, False), (8, True, True), (17, False, True)]:
             tree = root / f"medium-fd-deep-{depth}-{one_filesystem}"
@@ -993,6 +1199,34 @@ def main():
         assert confirmed.returncode == 0 and not empty.exists(), confirmed.stderr
         print("PASS: -di confirms an unlistable empty directory")
 
+        # That removal is rmdir(2) alone: a regular file put in the
+        # directory's place while -i asks is refused as not a directory,
+        # never unlinked for real (shim-4).
+        swapped = nobody / "rmdir-swapped"
+        swapped.mkdir()
+        os.chown(swapped, 65534, 65534)
+        swapped.chmod(0o000)
+        proc = subprocess.Popen([str(binary), "-di", str(swapped)], stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=nobody_env, cwd=nobody, preexec_fn=as_nobody)
+        asked = b""
+        while not asked.endswith(b"? [y/N] "):
+            byte = proc.stderr.read(1)
+            assert byte, asked
+            asked += byte
+        assert asked == f"rm: remove directory '{swapped}'? [y/N] ".encode(), asked
+        swapped.chmod(0o700)
+        swapped.rmdir()
+        swapped.write_bytes(b"swapped in")
+        os.chown(swapped, 65534, 65534)
+        proc.stdin.write(b"y\n")
+        proc.stdin.close()
+        rest = proc.stderr.read().decode()
+        assert proc.wait(timeout=10) == 1, rest
+        assert rest == f"rm: cannot remove '{swapped}': Not a directory\n", rest
+        assert swapped.read_bytes() == b"swapped in"
+        swapped.unlink()
+        print("PASS: -d removes an unlistable directory with rmdir(2) alone")
+
         # Unprivileged, real rm -r of an excluded tree needs no read access
         # to its parent, and removes an empty directory it cannot list, as rm
         # does. A tree it could not retire after a cross-device copy (an
@@ -1214,6 +1448,23 @@ def main():
         lines = log.read_text().splitlines()
         assert len(lines) == 1 and "and 2 more items" in lines[0], lines
         print("PASS: one desktop notification per invocation")
+
+        # A walk raises its descriptor limit for its own plan only: what is
+        # spawned afterwards (notify-send) gets the caller's limit (shim-7).
+        limits = root / "notify-limits.log"
+        (fake_bin / "notify-send").write_text(f"#!/bin/sh\nulimit -Sn >> {limits}\n")
+        tree = root / "notify-walk"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "sub/f").write_bytes(b"x")
+        result = subprocess.run([str(binary), "-r", "--one-file-system", str(tree)], env=gui, cwd=root,
+                                capture_output=True, text=True, timeout=10, preexec_fn=usual_fd_limit)
+        assert result.returncode == 0 and not tree.exists(), result.stderr
+        for _ in range(50):
+            if limits.exists():
+                break
+            time.sleep(0.1)
+        assert limits.read_text() == "1024\n", limits.read_text()
+        print("PASS: a walk's raised descriptor limit is not inherited by what it spawns")
 
 
 if __name__ == "__main__":

@@ -229,6 +229,41 @@
   nothing, can write releases and tags. CI's checkout no longer persists
   its token either. (#478)
 
+- The shim asks about a write-protected file only when stdin is a
+  terminal and `-f` is not in effect, as GNU rm and POSIX do: `xargs rm`
+  and `while read` loops no longer keep read-only files with exit 0 or
+  swallow the caller's piped input; `-i` still asks without a terminal.
+  (#512)
+
+- The shim decides "write-protected" with the kernel's own check
+  (`faccessat(W_OK, AT_EACCESS)`), like GNU rm: files writable through a
+  supplementary group or an ACL are no longer asked about, and a file
+  whose group bits deny the user is. (#513)
+
+- `rm -d` of a directory the user cannot list, and the last step of a
+  walk over an excluded directory, remove with rmdir(2) only: a regular
+  file swapped in meanwhile is refused with "Not a directory" instead of
+  being permanently unlinked. (#514)
+
+- Passthrough (`--permanent`, `TRASH_BYPASS=1`, bypassed callers,
+  `--help`) runs the real rm as `rm`, so GNU's usage lines, `Try 'rm
+  --help'` hints and `-i` prompts no longer show the internal stash
+  path. (#515)
+
+- `--preserve-root=all` is no longer dropped by a later plain
+  `--preserve-root` (an alias plus an explicit flag): mount-point
+  operands stay refused instead of being emptied into the trash. (#516)
+
+- `rm -ri` no longer refuses trees of more than 256 directories after
+  every question was answered: the walk raises its soft open-file limit
+  toward the hard limit (up to 65536, about 21,800 directories) while it
+  plans, and restores it before spawning anything. (#517)
+
+- `rm -f` of a file that another process removes while the shim is
+  trashing it exits 0 silently, and plain `rm` reports GNU's "No such
+  file or directory"; neither prints the misleading "refusing permanent
+  removal; use --permanent" hint any more. (#518)
+
 ### Documentation
 
 - Rewrote `README.md` to be reader-first: a 30-second demo and quick start

@@ -176,7 +176,7 @@ Good to know:
 
 - **Interactivity matches GNU `rm`.** `-i`, `-I`, `--interactive=never|once|always`, `-f/--force`, `-r/-R/--recursive`, `-d/--dir`, `-v/--verbose`, `--one-file-system`, and `--preserve-root` (including the refusal to recursively remove `/`) behave as `rm` users expect — except the outcome is "moved to trash" instead of "deleted".
 - **A declined prompt deletes nothing.** If you answer "no" at a confirmation prompt, that file stays where it is. Files created inside a directory *while* you are being asked about it are never swept up: each confirmed subtree is trashed as exactly what you confirmed.
-- **Very large recursive deletes are planned safely.** Before mutating anything, the shim pins the directories it walked (32 MiB planning budget per operand, depth limit 128). If an operand is too large to plan safely, that operand is refused *before* anything is removed — never half-trashed.
+- **Very large recursive deletes are planned safely.** Before mutating anything, the shim pins the directories it walked (32 MiB planning budget per operand, depth limit 128, one open file descriptor per directory; for the walk it raises its soft open-file limit toward the hard limit, up to 65536, which leaves room for about 21,000 directories). If an operand is too large to plan safely, that operand is refused *before* anything is removed — never half-trashed.
 - **In a desktop session** (`$DISPLAY` or `$WAYLAND_DISPLAY` set), trashing shows a desktop notification via `notify-send` when available.
 - **Bad flags fail safe.** An unrecognised `rm` flag is an error and deletes nothing. It never falls through to a permanent delete.
 
