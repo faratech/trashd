@@ -16,7 +16,7 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
     if dry_run {
         let entries = match store.list(None) {
             Ok(e) => e,
-            Err(e) => fatal(e),
+            Err(e) => fatal_untrusted(e),
         };
 
         let now = chrono::Local::now();
@@ -43,7 +43,7 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
 
         let pending = match store.pending_cleanup() {
             Ok(pending) => pending,
-            Err(error) => fatal(error),
+            Err(error) => fatal_untrusted(error),
         };
         if count == 0 && pending == 0 {
             println!("{}", "Nothing would be deleted.".dimmed());
@@ -67,7 +67,7 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
     // "Nothing to empty." and exited 0 without deleting anything (#147).
     let selected = match store.entries_older_than(days) {
         Ok(entries) => entries,
-        Err(e) => fatal(e),
+        Err(e) => fatal_untrusted(e),
     };
     if selected.is_empty() {
         if cleanup_unfinished(store) == 0 {
@@ -118,7 +118,7 @@ pub fn run(store: &TrashStore, older: Option<&str>, dry_run: bool, yes: bool) {
 fn cleanup_unfinished(store: &TrashStore) -> usize {
     let report = match store.cleanup_unfinished() {
         Ok(report) => report,
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     };
     if report.removed > 0 {
         println!(

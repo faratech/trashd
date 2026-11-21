@@ -5,24 +5,13 @@
 //! watchdog's SIBLING; the watchdog's waitpid got ECHILD immediately, causing
 //! a fake failover and two supervisors racing on one notification fd.)
 //!
-//! If the supervisor dies:
-//!   1. Start draining notifications with CONTINUE (fail-safe)
-//!   2. Fork a new supervisor
-//!   3. Stop draining, let the new supervisor take over
+//! If the supervisor dies, a new one is forked at once and receives the
+//! notifications still queued. A crash loop backs off, and once several
+//! replacements in a row die at once, the queue is declined (CONTINUE, or
+//! ENOSYS for a deferring preload) before each further attempt.
 
 use crate::supervisor;
 use std::io;
-use std::sync::atomic::{AtomicI32, Ordering};
-
-static SUPERVISOR_PID: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn forward_term_and_exit(sig: libc::c_int) {
-    let pid = SUPERVISOR_PID.load(Ordering::Relaxed);
-    if pid > 0 {
-        unsafe { libc::kill(pid, sig) };
-    }
-    unsafe { libc::_exit(0) };
-}
 
 /// The start time (clock ticks since boot) of `pid` from /proc, or None.
 /// Distinguishes a process from a later process reusing its PID.
@@ -78,16 +67,12 @@ pub fn run_watchdog(
     // Workers never use the launch directory; holding it as their cwd kept
     // its filesystem busy for the whole session (#323).
     unsafe { libc::chdir(c"/".as_ptr()) };
-    // Teardown only: the orchestrator sends TERM once the command exits.
-    // Terminal and job signals are ignored (SignalWait::reset_for_worker):
-    // Ctrl-C used to end both workers while the command kept running, so
-    // its cleanup deletes then failed with ENOSYS.
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            forward_term_and_exit as *const () as libc::sighandler_t,
-        );
-    }
+    // Terminal and job signals, SIGTERM included, are ignored
+    // (SignalWait::reset_for_worker): Ctrl-C, and later a process-group
+    // SIGTERM (seccomp-orch-1), ended both workers while the command kept
+    // running, so its cleanup deletes failed with ENOSYS. The orchestrator
+    // tears this process down with SIGKILL once the command exits; the
+    // supervisor follows through PR_SET_PDEATHSIG.
 
     // Spawn OUR OWN supervisor so waitpid below targets a real child (#5).
     let pid = unsafe { libc::fork() };
@@ -115,15 +100,52 @@ pub fn run_watchdog(
         }
         supervisor_pid => {
             unsafe { libc::close(ready_fd) };
-            SUPERVISOR_PID.store(supervisor_pid, Ordering::Relaxed);
             report!("trashd-exec: watchdog: supervisor spawned (pid {supervisor_pid})");
             supervise_loop(supervisor_pid, notif_fd, broker_fd)
         }
     }
 }
 
+/// How a dead supervisor is replaced. The replacement inherits the listener
+/// and receives every notification still queued, so failover forks it at
+/// once: declining the queue first answered CONTINUE, a permanent delete for
+/// a raw-syscall caller, moments before a replacement could have trashed it
+/// (seccomp-orch-5). Only a crash loop backs off, and only one that keeps
+/// dying declines the queue, so no delete waits forever.
+#[derive(Default)]
+struct Failover {
+    /// Consecutive supervisors that died before serving `HEALTHY`.
+    rapid_deaths: u32,
+}
+
+impl Failover {
+    /// A supervisor that lived this long was not part of a crash loop.
+    const HEALTHY: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Rapid deaths in a row after which the queue is declined.
+    const DECLINE_AFTER: u32 = 3;
+    /// Bounded backoff (#121): a persistent startup error (e.g. socketpair
+    /// failure under fd pressure) would otherwise produce a tight
+    /// fork/respawn loop with stderr spam. 250 ms keeps failover snappy
+    /// while bounding the loop rate.
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// After a supervisor that ran for `lifetime` died: whether to decline
+    /// the queued notifications first, and how long to wait before forking
+    /// the replacement.
+    fn after_death(&mut self, lifetime: std::time::Duration) -> (bool, std::time::Duration) {
+        if lifetime >= Self::HEALTHY {
+            self.rapid_deaths = 0;
+            return (false, std::time::Duration::ZERO);
+        }
+        self.rapid_deaths = self.rapid_deaths.saturating_add(1);
+        (self.rapid_deaths >= Self::DECLINE_AFTER, Self::BACKOFF)
+    }
+}
+
 /// Wait for our supervisor child; on death, fail over to a fresh one.
 fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32) -> ! {
+    let mut failover = Failover::default();
+    let mut started = std::time::Instant::now();
     loop {
         let mut status: libc::c_int = 0;
         let waited = unsafe { libc::waitpid(supervisor_pid, &mut status, 0) };
@@ -139,11 +161,6 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
             "unknown status".to_string()
         };
 
-        // Our child was reaped — clear the global before any fork so a
-        // SIGTERM landing between here and the new spawn can't hit a
-        // recycled PID.
-        SUPERVISOR_PID.store(0, Ordering::Relaxed);
-
         // Every filtered task has exited: there is nothing left to
         // supervise, and a replacement would only exit again every 250 ms.
         if supervisor::listener_done(notif_fd, 0) {
@@ -155,15 +172,14 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
             exit_info
         );
 
-        // Phase 1: Drain pending notifications with CONTINUE.
-        set_nonblocking(notif_fd, true);
-        drain_declining(notif_fd);
-
-        // Bounded backoff (#121): a persistent startup error (e.g. socketpair
-        // failure under fd pressure) would otherwise produce a tight
-        // fork/respawn loop with stderr spam. 250 ms keeps failover snappy
-        // while bounding the loop rate.
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        let (decline, delay) = failover.after_death(started.elapsed());
+        if decline {
+            // Replacements keep dying: answer what is queued (CONTINUE, or
+            // ENOSYS for a deferring preload) rather than let it wait.
+            set_nonblocking(notif_fd, true);
+            drain_declining(notif_fd);
+        }
+        std::thread::sleep(delay);
 
         // Phase 2: Fork a new supervisor.
         let pid = unsafe { libc::fork() };
@@ -194,8 +210,8 @@ fn supervise_loop(mut supervisor_pid: libc::pid_t, notif_fd: i32, broker_fd: i32
             child_pid => {
                 // Watchdog continues — restore blocking mode and loop
                 set_nonblocking(notif_fd, false);
-                SUPERVISOR_PID.store(child_pid, Ordering::Relaxed);
                 supervisor_pid = child_pid;
+                started = std::time::Instant::now();
                 report!(
                     "trashd-exec: watchdog: new supervisor spawned (pid {})",
                     child_pid
@@ -287,6 +303,34 @@ mod tests {
         let stat = "1 (weird ) name) S 0 1 1 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 98765 1234";
         assert_eq!(parse_start_time(stat), Some(98765));
         assert!(proc_start_time(unsafe { libc::getpid() }).is_some());
+    }
+
+    // seccomp-orch-5: failover declined every queued notification, which is
+    // CONTINUE, a permanent delete for a raw-syscall caller, although the
+    // replacement forked moments later can receive them. Only a crash loop
+    // backs off, and only one that keeps dying declines the queue, so no
+    // delete waits forever.
+    #[test]
+    fn failover_hands_queued_deletes_to_the_replacement() {
+        use std::time::Duration;
+        let mut failover = Failover::default();
+        // A supervisor that served a while is replaced at once.
+        assert_eq!(
+            failover.after_death(Duration::from_secs(60)),
+            (false, Duration::ZERO)
+        );
+        // Replacements dying at once back off, then decline the queue.
+        let rapid = Duration::from_millis(10);
+        assert_eq!(failover.after_death(rapid), (false, Failover::BACKOFF));
+        assert_eq!(failover.after_death(rapid), (false, Failover::BACKOFF));
+        assert_eq!(failover.after_death(rapid), (true, Failover::BACKOFF));
+        assert_eq!(failover.after_death(rapid), (true, Failover::BACKOFF));
+        // One that lasts ends the crash loop.
+        assert_eq!(
+            failover.after_death(Duration::from_secs(5)),
+            (false, Duration::ZERO)
+        );
+        assert_eq!(failover.after_death(rapid), (false, Failover::BACKOFF));
     }
 
     #[test]

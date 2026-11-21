@@ -7,11 +7,15 @@
 //! instead of deleting them. A watchdog process ensures crash recovery.
 //!
 //! Architecture:
-//!   trashd-exec (orchestrator)
-//!     ├── child: installs seccomp filter, exec's command
-//!     └── watchdog: monitors supervisor, failover with CONTINUE
-//!          └── supervisor: handles notifications, trashes files
-//! The orchestrator brokers memory/fd access as the stable target ancestor.
+//!   trashd-exec (wrapper: relays signals, exits with the command's status)
+//!     └── keeper (orchestrator)
+//!          ├── child: installs seccomp filter, exec's command
+//!          └── watchdog: monitors supervisor, forks a replacement
+//!               └── supervisor: handles notifications, trashes files
+//! The keeper brokers memory/fd access as the stable target ancestor. It
+//! reports to the wrapper once the command and every descendant still in
+//! its session have exited, and goes on serving descendants that left the
+//! session (setsid daemons) until they exit too.
 
 /// `eprintln!` that never panics. The orchestrator and its workers outlive
 /// their terminal; a panic on a closed stderr unwound into guards that kill
@@ -95,19 +99,260 @@ fn main() -> ExitCode {
 }
 
 /// Run `command` protected, or unprotected when protection cannot start.
+///
+/// This process, the one the session waits for, forks a keeper that runs
+/// the protection and the command, and reports how the command ended. A
+/// keeper outlives it while descendants that left the session (tmux, agents,
+/// services started from a root login) keep the filter: waiting for those
+/// here hung `exit` from ssh, `sudo -i` and `su -` until they died
+/// (seccomp-orch-3).
 fn wrap(command: &[OsString], preserve_privileges: bool, signals: &SignalWait) -> ExitCode {
-    match run(command, preserve_privileges, signals) {
-        Ok(status) => status.finish(),
-        // Nothing has run yet: become the unprotected command rather than
-        // fail a login whose shell this wrapper was asked to start (#313).
-        Err(Failure::Startup(e)) => {
-            report!("trashd-exec: {e}");
-            report!("trashd-exec: continuing with preload/shim fallback, if available");
-            fallback(command, signals)
+    let pair = seqpacket_pair();
+    let keeper = match &pair {
+        Ok(_) => unsafe { libc::fork() },
+        Err(_) => -1,
+    };
+    if keeper < 0 {
+        let e = pair.err().unwrap_or_else(io::Error::last_os_error);
+        report!("trashd-exec: {e}");
+        report!("trashd-exec: continuing with preload/shim fallback, if available");
+        fallback(command, signals)
+    }
+    let (wrapper_end, keeper_end) = pair.expect("a forked keeper has its link");
+    if keeper == 0 {
+        // --- KEEPER ---
+        drop(wrapper_end);
+        let mut parent = Parent::attached(keeper_end);
+        let report = match run(command, preserve_privileges, signals, &mut parent) {
+            Ok(status) => Report::Exited(status),
+            // Nothing has run yet: the wrapper becomes the unprotected command
+            // rather than fail a login whose shell it was asked to start (#313).
+            Err(Failure::Startup(e)) => {
+                report!("trashd-exec: {e}");
+                report!("trashd-exec: continuing with preload/shim fallback, if available");
+                Report::Fallback
+            }
+            Err(Failure::Fallback) => Report::Fallback,
+            Err(Failure::Running(e)) => {
+                report!("trashd-exec: {e}");
+                Report::Exited(CommandStatus::Exited(1))
+            }
+        };
+        parent.report(report);
+        unsafe { libc::_exit(0) }
+    }
+    // --- WRAPPER ---
+    drop(keeper_end);
+    match relay(keeper, &wrapper_end, signals) {
+        Report::Exited(status) => status.finish(),
+        Report::Fallback => fallback(command, signals),
+    }
+}
+
+/// What the keeper reports to the wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Report {
+    /// Protection did not start and nothing ran: the wrapper becomes the
+    /// unprotected command.
+    Fallback,
+    /// The command ended so, and nothing left in the session is protected.
+    Exited(CommandStatus),
+}
+
+/// Wrapper/keeper messages: a tag, then three words.
+const MESSAGE_LEN: usize = 16;
+const TAG_FALLBACK: u32 = 1;
+const TAG_EXITED: u32 = 2;
+const TAG_SIGNALED: u32 = 3;
+const TAG_SIGNAL: u32 = 4;
+
+fn encode(tag: u32, words: [u32; 3]) -> [u8; MESSAGE_LEN] {
+    let mut message = [0u8; MESSAGE_LEN];
+    for (chunk, word) in message
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(std::iter::once(tag).chain(words))
+    {
+        *chunk = word.to_ne_bytes();
+    }
+    message
+}
+
+/// The next message on `fd`; None once the other end is gone. A
+/// non-blocking read with nothing pending fails with `WouldBlock`.
+fn decode(fd: i32, flags: i32) -> io::Result<Option<(u32, [u32; 3])>> {
+    let mut message = [0u8; MESSAGE_LEN];
+    let n = loop {
+        let n = unsafe { libc::recv(fd, message.as_mut_ptr().cast(), MESSAGE_LEN, flags) };
+        if n >= 0 {
+            break n;
         }
-        Err(Failure::Running(e)) => {
-            report!("trashd-exec: {e}");
-            ExitCode::from(1)
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    if n != MESSAGE_LEN as isize {
+        return Ok(None);
+    }
+    let word = |i: usize| u32::from_ne_bytes(message[i * 4..i * 4 + 4].try_into().unwrap());
+    Ok(Some((word(0), [word(1), word(2), word(3)])))
+}
+
+fn send_message(fd: i32, message: &[u8; MESSAGE_LEN]) -> bool {
+    unsafe {
+        libc::send(
+            fd,
+            message.as_ptr().cast(),
+            MESSAGE_LEN,
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+        ) == MESSAGE_LEN as isize
+    }
+}
+
+fn seqpacket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut sv = [0i32; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) })
+}
+
+/// The keeper's side of its link to the wrapper. While attached, the
+/// wrapper relays every signal sent to it, the job's group signals included,
+/// so the keeper forwards those and drops its own copies. Detached (the
+/// wrapper reported or is gone), the keeper handles its own signals.
+struct Parent(Option<OwnedFd>);
+
+impl Parent {
+    fn attached(link: OwnedFd) -> Self {
+        Self(Some(link))
+    }
+
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self(None)
+    }
+
+    fn fd(&self) -> Option<i32> {
+        self.0.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// Tell the wrapper how the command ended, once; it then exits.
+    fn report(&mut self, report: Report) {
+        let Some(link) = self.0.take() else {
+            return;
+        };
+        let message = match report {
+            Report::Fallback => encode(TAG_FALLBACK, [0; 3]),
+            Report::Exited(CommandStatus::Exited(code)) => encode(TAG_EXITED, [code.into(), 0, 0]),
+            Report::Exited(CommandStatus::Signaled(signal)) => {
+                encode(TAG_SIGNALED, [signal as u32, 0, 0])
+            }
+        };
+        send_message(link.as_raw_fd(), &message);
+    }
+
+    /// Signals the wrapper relayed since the last call. Its end of the link
+    /// closing detaches.
+    fn relayed(&mut self) -> Vec<Received> {
+        let mut signals = Vec::new();
+        while let Some(fd) = self.fd() {
+            match decode(fd, libc::MSG_DONTWAIT) {
+                Ok(Some((TAG_SIGNAL, [signal, code, sender]))) => {
+                    signals.push((signal, code as i32, sender))
+                }
+                Ok(Some(_)) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Ok(None) | Err(_) => self.0 = None,
+            }
+        }
+        signals
+    }
+
+    /// In a worker: the link is the wrapper's to watch, and a worker must not
+    /// keep it open past the keeper.
+    fn close_in_worker(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// Wait in the wrapper for the keeper's report, relaying every signal sent
+/// to this process. Signals relayed before a fallback are raised again, so
+/// the unprotected command receives them as the wrapper did.
+fn relay(keeper: libc::pid_t, link: &OwnedFd, signals: &SignalWait) -> Report {
+    let mut relayed = Vec::new();
+    let report = loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: signals.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: link.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break None;
+        }
+        while fds[0].revents != 0
+            && let Some((signal, code, sender)) = signals.next()
+        {
+            if signal == libc::SIGCHLD as u32 || own_signal(signal, code == libc::SI_KERNEL, sender)
+            {
+                continue;
+            }
+            if !relayed.contains(&signal) {
+                relayed.push(signal);
+            }
+            send_message(
+                link.as_raw_fd(),
+                &encode(TAG_SIGNAL, [signal, code as u32, sender]),
+            );
+        }
+        if fds[1].revents != 0 {
+            break match decode(link.as_raw_fd(), 0) {
+                Ok(Some((TAG_FALLBACK, _))) => Some(Report::Fallback),
+                Ok(Some((TAG_EXITED, [code, ..]))) => {
+                    Some(Report::Exited(CommandStatus::Exited(code as u8)))
+                }
+                Ok(Some((TAG_SIGNALED, [signal, ..]))) => Some(Report::Exited(
+                    CommandStatus::Signaled(signal as libc::c_int),
+                )),
+                _ => None,
+            };
+        }
+    };
+    match report {
+        // A keeper that leaves descendants protected lives on: never wait.
+        Some(Report::Exited(status)) => Report::Exited(status),
+        Some(Report::Fallback) => {
+            // It exits at once; the command must not inherit its zombie.
+            ChildProcess(keeper).terminate(0);
+            for signal in relayed {
+                unsafe { libc::kill(libc::getpid(), signal as libc::c_int) };
+            }
+            Report::Fallback
+        }
+        None => {
+            ChildProcess(keeper).terminate(0);
+            report!("trashd-exec: the protection keeper ended without a status");
+            Report::Exited(CommandStatus::Exited(1))
         }
     }
 }
@@ -117,6 +362,8 @@ enum Failure {
     /// Before the filtered child was released to exec the command; its
     /// tree is torn down when `run` returns.
     Startup(io::Error),
+    /// A startup failure the child already reported: fall back silently.
+    Fallback,
     /// While the command ran or after it exited.
     Running(io::Error),
 }
@@ -131,6 +378,7 @@ fn run(
     command_args: &[OsString],
     preserve_privileges: bool,
     signals: &SignalWait,
+    parent: &mut Parent,
 ) -> Result<CommandStatus, Failure> {
     // Keep orphaned target descendants in our ancestry: Yama authorizes the
     // stable ancestor broker even when a target forks and its parent exits.
@@ -249,10 +497,10 @@ fn run(
     // hang every delete, so kill + reap it before bailing (#13).
     let notif_fd = recv_fd(startup.as_raw_fd())?;
     if notif_fd < 0 {
-        // The failed child is exiting on its own; reap it before replacing
-        // this process so it never lingers as the command's zombie.
+        // The failed child is exiting on its own (it said why); reap it
+        // before the wrapper becomes the command.
         child.terminate(libc::SIGKILL);
-        fallback(command_args, signals);
+        return Err(Failure::Fallback);
     }
     let listener = unsafe { OwnedFd::from_raw_fd(notif_fd) };
 
@@ -267,11 +515,11 @@ fn run(
         child.terminate(libc::SIGKILL);
         drop(listener);
         drop(startup);
-        report!("trashd-exec: cannot inspect protected child: {e}");
-        report!("trashd-exec: continuing with preload/shim fallback, if available");
         // A filter cannot be removed. Replace the waiting filtered child
-        // with this unfiltered process.
-        fallback(command_args, signals);
+        // with the unfiltered wrapper.
+        return Err(Failure::Startup(io::Error::other(format!(
+            "cannot inspect protected child: {e}"
+        ))));
     }
     // The waiting child holds its own copy for the command.
     drop(directory);
@@ -300,6 +548,7 @@ fn run(
         0 => {
             // --- WATCHDOG PROCESS ---
             signals.reset_for_worker();
+            parent.close_in_worker();
             drop(startup);
             drop(broker_server);
             drop(ready_server);
@@ -319,10 +568,11 @@ fn run(
     }
     let mut watchdog = ChildProcess(watchdog_pid);
     drop(ready_client);
-    // A startup failure from here on retires the watchdog (and with it the
-    // supervisor) before the command runs unprotected.
+    // A startup failure from here on retires the watchdog (and with it, by
+    // PR_SET_PDEATHSIG, the supervisor) before the command runs unprotected.
+    // Workers ignore SIGTERM (seccomp-orch-1): teardown is SIGKILL.
     let startup_failed = |watchdog: &mut ChildProcess, error: io::Error| {
-        watchdog.terminate(libc::SIGTERM);
+        watchdog.terminate(libc::SIGKILL);
         Failure::Startup(error)
     };
     match wait_for_startup(ready_server.as_raw_fd(), &mut child, signals) {
@@ -370,12 +620,13 @@ fn run(
         Some(broker_server.as_raw_fd()),
         signals,
         Some(watchdog_pid),
+        parent,
     );
 
-    // Child is done — tear down the protection tree. The watchdog forwards
-    // SIGTERM to its supervisor child before exiting (#5), so one TERM here
-    // retires both.
-    watchdog.terminate(libc::SIGTERM);
+    // Child is done — tear down the protection tree. Workers ignore SIGTERM
+    // (seccomp-orch-1), so the watchdog is killed; its supervisor follows by
+    // PR_SET_PDEATHSIG. Nothing filtered is left for the listener to serve.
+    watchdog.terminate(libc::SIGKILL);
 
     result.map_err(Failure::Running)
 }
@@ -401,8 +652,8 @@ fn raise_descriptor_limit() {
 /// Become the unprotected command. With no supervisor there is nothing for a
 /// resident wrapper to do: exec in place leaves no wait loop to spin, keeps
 /// signals and exit status native, and lets `exit` close a terminal while
-/// daemons the shell started keep running. The failed child must already be
-/// reaped.
+/// daemons the shell started keep running. The keeper and the failed child
+/// must already be reaped.
 fn fallback(command_args: &[OsString], signals: &SignalWait) -> ! {
     signals.restore_for_exec();
     unprotected_exec(command_args)
@@ -426,7 +677,7 @@ struct ChildProcess(libc::pid_t);
 impl ChildProcess {
     #[cfg(test)]
     fn wait(&mut self, broker: Option<i32>, signals: &SignalWait) -> io::Result<CommandStatus> {
-        wait_for_children(self, broker, signals, None)
+        wait_for_children(self, broker, signals, None, &mut Parent::detached())
     }
 
     fn terminate(&mut self, signal: i32) {
@@ -483,6 +734,35 @@ fn own_signal(sig: u32, from_kernel: bool, sender: u32) -> bool {
         && (from_kernel || sender == unsafe { libc::getpid() } as u32)
 }
 
+/// A received signal: its number, siginfo code and sender.
+type Received = (u32, i32, u32);
+
+/// Whether a signal the orchestrator received goes on to the command.
+fn forwards((sig, code, sender): Received, original: i32, original_alive: bool) -> bool {
+    let from_kernel = code == libc::SI_KERNEL;
+    if own_signal(sig, from_kernel, sender) {
+        return false;
+    }
+    // The command shares our process group: a signal sent to that group
+    // reached it as well as us, and forwarding would deliver it twice.
+    let same_job = || original_alive && unsafe { libc::getpgid(original) == libc::getpgid(0) };
+    if from_kernel && matches!(sig as libc::c_int, libc::SIGINT | libc::SIGQUIT) && same_job() {
+        // The terminal signalled our whole process group.
+        return false;
+    }
+    // A user signal from a member of that group (`kill 0`, a script's `trap
+    // 'kill 0' EXIT`) is taken as sent to the group, as sudo does: forwarding
+    // it again was a second interrupt, which many tools take as "force quit"
+    // (seccomp-orch-6). One we sent ourselves was meant for us alone. A group
+    // signal sent from outside the job cannot be told from one sent to the
+    // wrapper alone, so that one is still forwarded.
+    !(code == libc::SI_USER
+        && sender > 0
+        && sender != unsafe { libc::getpid() } as u32
+        && same_job()
+        && unsafe { libc::getpgid(sender as libc::pid_t) == libc::getpgid(0) })
+}
+
 /// What the orchestrator waits for: the job signals, the real-time range
 /// and SIGCHLD.
 fn waited_signals() -> impl Iterator<Item = libc::c_int> {
@@ -492,12 +772,14 @@ fn waited_signals() -> impl Iterator<Item = libc::c_int> {
         .chain([libc::SIGCHLD])
 }
 
-/// What the watchdog and supervisor ignore: every job signal but TERM (their
-/// teardown), the real-time range, and terminal stops.
+/// What the watchdog and supervisor ignore: every job signal, the real-time
+/// range, and terminal stops. SIGTERM too: a process-group SIGTERM (bash
+/// `kill %1`, GNU timeout, a systemd control-group stop) ended both workers
+/// while the command ran its cleanup, whose deletes then failed with ENOSYS
+/// (seccomp-orch-1). The orchestrator tears them down with SIGKILL.
 fn worker_ignored_signals() -> impl Iterator<Item = libc::c_int> {
     JOB_SIGNALS
         .into_iter()
-        .filter(|&sig| sig != libc::SIGTERM)
         .chain(libc::SIGRTMIN()..=libc::SIGRTMAX())
         .chain([libc::SIGTSTP, libc::SIGTTOU])
 }
@@ -561,8 +843,8 @@ impl SignalWait {
     }
 
     /// Internal workers (watchdog, supervisor) never inherit the wrapper's
-    /// mask: teardown relies on SIGTERM reaching them, and SIGCHLD stays at
-    /// the default so their waitpid() observes real exits.
+    /// mask, and SIGCHLD stays at the default so their waitpid() observes
+    /// real exits.
     fn reset_for_worker(&self) {
         unsafe {
             let mut empty: libc::sigset_t = std::mem::zeroed();
@@ -570,17 +852,17 @@ impl SignalWait {
             libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
             // Workers live until the orchestrator tears them down after the
             // command exits. Signals aimed at the job (Ctrl-C/Ctrl-\, a
-            // hangup, `kill -USR1 %1`, Ctrl-Z, tostop output) must not end or
-            // stop them while the command still deletes.
+            // hangup, `kill %1`, Ctrl-Z, tostop output) must not end or stop
+            // them while the command still deletes.
             for sig in worker_ignored_signals() {
                 libc::signal(sig, libc::SIG_IGN);
             }
         }
     }
 
-    /// The next pending signal, whether the kernel generated it (the
-    /// terminal, a timer, a resource limit), and its sender.
-    fn next(&self) -> Option<(u32, bool, u32)> {
+    /// The next pending signal, its siginfo code (SI_KERNEL: the terminal,
+    /// a timer, a resource limit), and its sender.
+    fn next(&self) -> Option<Received> {
         let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
         let n = unsafe {
             libc::read(
@@ -591,7 +873,7 @@ impl SignalWait {
         };
         (n == std::mem::size_of_val(&info) as isize).then_some((
             info.ssi_signo,
-            info.ssi_code == libc::SI_KERNEL,
+            info.ssi_code,
             info.ssi_pid,
         ))
     }
@@ -665,8 +947,8 @@ fn wait_for_startup(
             }
             return Err(e);
         }
-        while let Some((sig, from_kernel, sender)) = signals.next() {
-            if own_signal(sig, from_kernel, sender) {
+        while let Some((sig, code, sender)) = signals.next() {
+            if own_signal(sig, code == libc::SI_KERNEL, sender) {
                 continue;
             }
             if sig != libc::SIGCHLD as u32 {
@@ -810,6 +1092,7 @@ fn wait_for_children(
     broker_fd: Option<i32>,
     signals: &SignalWait,
     watchdog_pid: Option<i32>,
+    parent: &mut Parent,
 ) -> io::Result<CommandStatus> {
     let original = child.0;
     let mut original_status = None;
@@ -907,6 +1190,21 @@ fn wait_for_children(
             {
                 return Ok(status);
             }
+            // Only descendants that left the session remain (tmux, agents,
+            // services started from a root login): the wrapper reports the
+            // command's status and exits, and the session can end. They keep
+            // the filter, so this keeper goes on serving them, without the
+            // terminal (seccomp-orch-3).
+            if parent.fd().is_some()
+                && let Some(status) = original_status
+                && targets
+                    .keys()
+                    .chain(&untracked)
+                    .all(|&pid| unsafe { libc::getsid(pid) != libc::getsid(0) })
+            {
+                parent.report(Report::Exited(status));
+                release_terminal();
+            }
             refresh = false;
         }
         for sig in pending_signals.drain(..) {
@@ -927,6 +1225,11 @@ fn wait_for_children(
             },
             libc::pollfd {
                 fd: broker_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: parent.fd().unwrap_or(-1),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -951,29 +1254,32 @@ fn wait_for_children(
         // Read the signalfd only when it is ready: every broker request woke
         // this loop and paid a read that found nothing.
         while fds[0].revents != 0
-            && let Some((sig, from_terminal, sender)) = signals.next()
+            && let Some(received) = signals.next()
         {
             refresh = true;
-            if sig == libc::SIGCHLD as u32 {
+            if received.0 == libc::SIGCHLD as u32 {
                 parked.clear();
-            } else if own_signal(sig, from_terminal, sender) {
-            } else if from_terminal
-                && matches!(sig as libc::c_int, libc::SIGINT | libc::SIGQUIT)
-                && original_status.is_none()
-                && unsafe { libc::getpgid(original) == libc::getpgid(0) }
-            {
-                // The terminal signalled our whole process group, the
-                // command included: forwarding would deliver it twice.
-            } else {
+            } else if parent.fd().is_some() {
+                // The wrapper relays what reached it, the job's group signals
+                // included: forwarding our own copy would double them.
+            } else if forwards(received, original, original_status.is_none()) {
                 // Refresh before forwarding: the original may have just
                 // exited, in which case its adopted roots receive the signal.
-                pending_signals.push(sig);
+                pending_signals.push(received.0);
+            }
+        }
+        if fds[2].revents != 0 {
+            refresh = true;
+            for received in parent.relayed() {
+                if forwards(received, original, original_status.is_none()) {
+                    pending_signals.push(received.0);
+                }
             }
         }
         fired.extend(
             polled
                 .iter()
-                .zip(fds.iter().skip(2))
+                .zip(fds.iter().skip(3))
                 .filter(|(_, fd)| fd.revents != 0)
                 .map(|(&pid, _)| pid),
         );
@@ -999,6 +1305,18 @@ fn wait_for_children(
             report!("trashd-exec: broker socket failed; continuing without it");
             broker_fd = None;
         }
+    }
+}
+
+/// Point stdin, stdout and stderr at /dev/null, so a keeper that outlives
+/// its session holds no terminal open.
+fn release_terminal() {
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if null >= 0 {
+        for fd in 0..=2 {
+            unsafe { libc::dup2(null, fd) };
+        }
+        unsafe { libc::close(null) };
     }
 }
 
@@ -1426,9 +1744,8 @@ mod tests {
     #[test]
     fn internal_workers_start_with_default_signal_state() {
         isolated_case(|| {
-            // A blocked SIGTERM inherited by trashd-exec would make the
-            // watchdog immune to teardown, and an ignored SIGCHLD would hide
-            // its supervisor's exit status.
+            // An inherited mask must not carry over to the workers, and an
+            // ignored SIGCHLD would hide the supervisor's exit status.
             unsafe {
                 let mut term: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut term);
@@ -1449,8 +1766,11 @@ mod tests {
                 action.sa_sigaction
             };
             assert_eq!(disposition(libc::SIGCHLD), libc::SIG_DFL);
-            // Teardown stays possible; job and terminal signals are ignored.
-            assert_eq!(disposition(libc::SIGTERM), libc::SIG_DFL);
+            // Job and terminal signals are ignored, SIGTERM included: a
+            // process-group SIGTERM (`kill %1`, timeout, a systemd stop) ended
+            // both workers while the command ran its cleanup (seccomp-orch-1).
+            // Teardown is SIGKILL.
+            assert_eq!(disposition(libc::SIGTERM), libc::SIG_IGN);
             for sig in worker_ignored_signals() {
                 assert_eq!(disposition(sig), libc::SIG_IGN, "signal {sig}");
             }
@@ -1556,6 +1876,176 @@ mod tests {
         });
     }
 
+    /// Run `case` in a fresh single-threaded process (forked from a
+    /// re-executed harness), failing the test unless it returns true.
+    fn in_fresh_process(test: &str, variable: &str, case: impl FnOnce() -> bool) {
+        if std::env::var_os(variable).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--test-threads=1", "--nocapture"])
+                .env(variable, "1")
+                .env("TRASH_BYPASS", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{test}: {status}");
+            return;
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::alarm(20) };
+            let passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+            unsafe { libc::_exit(i32::from(!matches!(passed, Ok(true)))) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0, "{test} failed in its fresh process");
+    }
+
+    // seccomp-orch-3: the wrapper of a root login waited for every adopted
+    // descendant, setsid daemons included (tmux, ssh-agent, services), so
+    // `exit` hung ssh, `sudo -i` and `su -` until they died. Once only
+    // descendants that left the session remain, the keeper reports the
+    // command's status, and goes on protecting them until they exit.
+    #[test]
+    fn keeper_reports_once_only_other_sessions_remain() {
+        const CHILD: &str = "TRASHD_TEST_KEEPER_DETACH";
+        const TEST: &str = "tests::keeper_reports_once_only_other_sessions_remain";
+        in_fresh_process(TEST, CHILD, || {
+            let (wrapper_end, keeper_end) = seqpacket_pair().unwrap();
+            let start = std::time::Instant::now();
+            let keeper = unsafe { libc::fork() };
+            assert!(keeper >= 0);
+            if keeper == 0 {
+                drop(wrapper_end);
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+                    0
+                );
+                let signals = SignalWait::new().unwrap();
+                let original = unsafe { libc::fork() };
+                assert!(original >= 0);
+                if original == 0 {
+                    if unsafe { libc::fork() } == 0 {
+                        unsafe {
+                            libc::setsid();
+                            libc::usleep(800_000);
+                            libc::_exit(0);
+                        }
+                    }
+                    unsafe { libc::_exit(7) };
+                }
+                let status = wait_for_children(
+                    &mut ChildProcess(original),
+                    None,
+                    &signals,
+                    None,
+                    &mut Parent::attached(keeper_end),
+                );
+                // It kept waiting for the daemon after reporting.
+                let waited = start.elapsed() >= std::time::Duration::from_millis(700);
+                let ok = matches!(status, Ok(CommandStatus::Exited(7))) && waited;
+                unsafe { libc::_exit(i32::from(!ok)) };
+            }
+            drop(keeper_end);
+            let report = decode(wrapper_end.as_raw_fd(), 0).ok().flatten();
+            let reported_at = start.elapsed();
+            let keeper_alive = unsafe { libc::kill(keeper, 0) } == 0;
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(keeper, &mut status, 0) }, keeper);
+            assert_eq!(report, Some((TAG_EXITED, [7, 0, 0])), "no report");
+            assert!(
+                reported_at < std::time::Duration::from_millis(600),
+                "{reported_at:?}"
+            );
+            assert!(keeper_alive, "the keeper stopped protecting the daemon");
+            assert_eq!(status, 0, "the keeper did not wait for the daemon");
+            true
+        });
+    }
+
+    // A wrapper that is gone (killed before any report) detaches the keeper,
+    // which keeps serving and handles its own signals, without spinning on
+    // the closed link.
+    #[test]
+    fn keeper_outlives_a_vanished_wrapper_without_spinning() {
+        const CHILD: &str = "TRASHD_TEST_KEEPER_ORPHANED";
+        const TEST: &str = "tests::keeper_outlives_a_vanished_wrapper_without_spinning";
+        in_fresh_process(TEST, CHILD, || {
+            let signals = SignalWait::new().unwrap();
+            let (wrapper_end, keeper_end) = seqpacket_pair().unwrap();
+            drop(wrapper_end);
+            let original = unsafe { libc::fork() };
+            assert!(original >= 0);
+            if original == 0 {
+                unsafe {
+                    libc::usleep(400_000);
+                    libc::_exit(5);
+                }
+            }
+            let cpu = || {
+                let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+                let time = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+                time(usage.ru_utime) + time(usage.ru_stime)
+            };
+            let before = cpu();
+            let mut parent = Parent::attached(keeper_end);
+            let status = wait_for_children(
+                &mut ChildProcess(original),
+                None,
+                &signals,
+                None,
+                &mut parent,
+            );
+            assert_eq!(status.unwrap(), CommandStatus::Exited(5));
+            assert!(parent.fd().is_none(), "still attached to a closed link");
+            assert!(cpu() - before < 0.2, "the keeper spun on the closed link");
+            true
+        });
+    }
+
+    // seccomp-orch-3: the wrapper exits with the reported status at once,
+    // without waiting for a keeper that lives on, and on a fallback reaps the
+    // keeper before it becomes the command.
+    #[test]
+    fn wrapper_returns_the_report_without_waiting_for_the_keeper() {
+        const CHILD: &str = "TRASHD_TEST_WRAPPER_RELAY";
+        const TEST: &str = "tests::wrapper_returns_the_report_without_waiting_for_the_keeper";
+        in_fresh_process(TEST, CHILD, || {
+            let signals = SignalWait::new().unwrap();
+            for report in [
+                Report::Exited(CommandStatus::Signaled(15)),
+                Report::Fallback,
+            ] {
+                let (wrapper_end, keeper_end) = seqpacket_pair().unwrap();
+                let keeper = unsafe { libc::fork() };
+                assert!(keeper >= 0);
+                if keeper == 0 {
+                    drop(wrapper_end);
+                    Parent::attached(keeper_end).report(report);
+                    unsafe {
+                        libc::usleep(400_000);
+                        libc::_exit(0);
+                    }
+                }
+                drop(keeper_end);
+                let start = std::time::Instant::now();
+                assert_eq!(relay(keeper, &wrapper_end, &signals), report);
+                let took = start.elapsed();
+                let reaped = unsafe { libc::waitpid(keeper, std::ptr::null_mut(), libc::WNOHANG) };
+                if report == Report::Fallback {
+                    assert_eq!(reaped, -1, "the keeper was left behind");
+                    assert!(took >= std::time::Duration::from_millis(300), "{took:?}");
+                } else {
+                    assert_eq!(reaped, 0, "the keeper should still run");
+                    assert!(took < std::time::Duration::from_millis(300), "{took:?}");
+                    unsafe { libc::waitpid(keeper, std::ptr::null_mut(), 0) };
+                }
+            }
+            true
+        });
+    }
+
     // Regression (#231): once the original command exited, HUP/INT/TERM went
     // to every adopted descendant, including daemons that called setsid()
     // and would never receive the terminal's hangup without this wrapper.
@@ -1640,6 +2130,91 @@ mod tests {
         }
     }
 
+    // seccomp-orch-6: a signal sent to the whole job from inside it (`kill
+    // 0`, a script's `trap 'kill 0' EXIT`) already reached the command, which
+    // shares our process group; forwarding delivered it a second time, and
+    // many tools take a second interrupt as "force quit". A signal sent to
+    // the wrapper alone is still forwarded once. A real-time signal stands
+    // in for SIGTERM: it queues, so a second copy is never merged away.
+    #[test]
+    fn group_signals_from_inside_the_job_reach_the_command_once() {
+        const CHILD: &str = "TRASHD_TEST_GROUP_SIGNAL_CHILD";
+        const TEST: &str = "tests::group_signals_from_inside_the_job_reach_the_command_once";
+        if let Ok(to_group) = std::env::var(CHILD) {
+            // A fresh single-threaded process in a process group of its own,
+            // so the group signal reaches no test harness.
+            let harness_child = unsafe { libc::fork() };
+            assert!(harness_child >= 0);
+            if harness_child > 0 {
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(harness_child, &mut status, 0) },
+                    harness_child
+                );
+                assert_eq!(status, 0, "group signal case failed");
+                return;
+            }
+            // A panic must fail this process: unwinding out of a forked
+            // harness thread ends it with status 0.
+            let case = std::panic::catch_unwind(|| {
+                assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+                let signals = SignalWait::new().unwrap();
+                let child = unsafe { libc::fork() };
+                assert!(child >= 0);
+                if child == 0 {
+                    static DELIVERED: std::sync::atomic::AtomicI32 =
+                        std::sync::atomic::AtomicI32::new(0);
+                    extern "C" fn counted(_: libc::c_int) {
+                        DELIVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    signals.restore_for_exec();
+                    unsafe {
+                        libc::signal(
+                            libc::SIGRTMIN() + 2,
+                            counted as *const () as libc::sighandler_t,
+                        )
+                    };
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_millis(500) {
+                        unsafe { libc::usleep(10_000) };
+                    }
+                    unsafe { libc::_exit(DELIVERED.load(std::sync::atomic::Ordering::Relaxed)) };
+                }
+                let wrapper = unsafe { libc::getpid() };
+                let sender = unsafe { libc::fork() };
+                assert!(sender >= 0);
+                if sender == 0 {
+                    unsafe {
+                        libc::signal(libc::SIGRTMIN() + 2, libc::SIG_IGN);
+                        libc::usleep(50_000);
+                        if to_group == "1" {
+                            libc::kill(0, libc::SIGRTMIN() + 2);
+                        } else {
+                            // From outside the job, to the wrapper alone.
+                            libc::setpgid(0, 0);
+                            libc::kill(wrapper, libc::SIGRTMIN() + 2);
+                        }
+                        // Stay alive while the wrapper inspects the sender.
+                        libc::usleep(200_000);
+                        libc::_exit(0);
+                    }
+                }
+                let status = ChildProcess(child).wait(None, &signals).unwrap();
+                unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
+                assert_eq!(status, CommandStatus::Exited(1), "deliveries");
+            });
+            unsafe { libc::_exit(i32::from(case.is_err())) };
+        }
+        for to_group in ["1", "0"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, to_group)
+                .status()
+                .unwrap();
+            assert!(status.success(), "group: {to_group}");
+        }
+    }
+
     #[test]
     fn forwards_hup_int_term_without_recycled_pids() {
         const CHILD: &str = "TRASHD_TEST_SIGNAL_CHILD";
@@ -1654,36 +2229,44 @@ mod tests {
                     unsafe { libc::waitpid(harness_child, &mut status, 0) },
                     harness_child
                 );
-                assert_eq!(status, 0);
+                assert_eq!(status, 0, "signal case failed");
                 return;
             }
-            let signal: i32 = signal.parse().unwrap();
-            let signals = SignalWait::new().unwrap();
-            let child = unsafe { libc::fork() };
-            assert!(child >= 0);
-            if child == 0 {
-                unsafe { libc::signal(signal, libc::SIG_DFL) };
-                signals.restore_for_exec();
-                loop {
-                    unsafe { libc::pause() };
+            // A panic must fail this process: unwinding out of a forked
+            // harness thread ends it with status 0.
+            let case = std::panic::catch_unwind(|| {
+                let signal: i32 = signal.parse().unwrap();
+                let signals = SignalWait::new().unwrap();
+                let child = unsafe { libc::fork() };
+                assert!(child >= 0);
+                if child == 0 {
+                    unsafe { libc::signal(signal, libc::SIG_DFL) };
+                    signals.restore_for_exec();
+                    loop {
+                        unsafe { libc::pause() };
+                    }
                 }
-            }
-            let wrapper = unsafe { libc::getpid() };
-            let sender = unsafe { libc::fork() };
-            assert!(sender >= 0);
-            if sender == 0 {
-                unsafe {
-                    libc::usleep(20_000);
-                    libc::kill(wrapper, signal);
-                    libc::_exit(0);
+                let wrapper = unsafe { libc::getpid() };
+                let sender = unsafe { libc::fork() };
+                assert!(sender >= 0);
+                if sender == 0 {
+                    unsafe {
+                        libc::usleep(20_000);
+                        // From outside the job: a member of the command's
+                        // process group signals the whole group
+                        // (seccomp-orch-6).
+                        libc::setpgid(0, 0);
+                        libc::kill(wrapper, signal);
+                        libc::_exit(0);
+                    }
                 }
-            }
-            assert_eq!(
-                ChildProcess(child).wait(None, &signals).unwrap(),
-                CommandStatus::Signaled(signal)
-            );
-            unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
-            unsafe { libc::_exit(0) };
+                assert_eq!(
+                    ChildProcess(child).wait(None, &signals).unwrap(),
+                    CommandStatus::Signaled(signal)
+                );
+                unsafe { libc::waitpid(sender, std::ptr::null_mut(), 0) };
+            });
+            unsafe { libc::_exit(i32::from(case.is_err())) };
         }
         // #350: ALRM (GNU `timeout -s ALRM`), timer and real-time signals too.
         for signal in [
@@ -1704,5 +2287,20 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "signal {signal}");
         }
+        // A failed assertion in the forked case must fail the rerun: its
+        // panic used to end the forked process with status 0, so no
+        // assertion above could fail this test.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::forwards_hup_int_term_without_recycled_pids",
+                "--nocapture",
+            ])
+            .env(CHILD, "not a signal")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "a panic in the forked case passed");
     }
 }

@@ -96,10 +96,17 @@ fn check_trash_dir_with_listing<I: Iterator<Item = std::io::Result<std::fs::DirE
     mut listing: impl FnMut(&std::path::Path, &mut usize) -> Option<I>,
 ) -> Findings {
     let guard = if fix {
-        match store.lock_trash_root(trash_dir) {
+        // A root that lost its info/ is put back together first: the lock
+        // refused it, and the data stranded in its files/ could not be
+        // repaired away (store-metadata-4).
+        match store.lock_trash_root_repaired(trash_dir) {
             Ok(g) => Some(g),
             Err(e) => {
-                eprintln!("Could not lock {}: {e}", printable_path(trash_dir));
+                eprintln!(
+                    "Could not lock {}: {}",
+                    printable_path(trash_dir),
+                    printable(&e.to_string())
+                );
                 return Findings {
                     unchecked: 1,
                     ..Findings::default()
@@ -244,7 +251,7 @@ fn check_trash_dir_with_listing<I: Iterator<Item = std::io::Result<std::fs::DirE
                 match res {
                     Ok(()) => println!("    {}", "removed".green()),
                     Err(e) => {
-                        println!("    {} {e}", "failed:".red());
+                        println!("    {} {}", "failed:".red(), printable(&e.to_string()));
                         unresolved += 1;
                     }
                 }
@@ -690,5 +697,54 @@ mod tests {
             "symlinked sidecar is not usable"
         );
         assert!(!sidecar_is_usable(&dir.path().join("missing.trashinfo")));
+    }
+
+    // Regression (store-metadata-4): a root that lost its info/ could not
+    // be locked, so --fix reported it unchecked and could not remove the
+    // data stranded in its files/ (#403).
+    #[test]
+    fn fix_purges_data_stranded_in_a_root_without_info() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "TRASHD_FSCK_NO_INFO_CHILD_ROOT";
+
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = std::path::PathBuf::from(root);
+            let store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+            fs::remove_dir(root.join("info")).unwrap();
+            assert_eq!(
+                check_trash_dir(&store, &root, true),
+                Findings {
+                    orphaned_files: 1,
+                    ..Findings::default()
+                }
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Trash");
+        let _store = TrashStore::open_isolated(&root, trashd_common::Config::default()).unwrap();
+        fs::write(root.join("files/stranded"), b"data").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::fsck::tests::fix_purges_data_stranded_in_a_root_without_info",
+                "--nocapture",
+            ])
+            .env(CHILD, &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!root.join("files/stranded").exists());
+        let info = fs::symlink_metadata(root.join("info")).unwrap();
+        assert!(info.is_dir());
+        assert_eq!(info.permissions().mode() & 0o7777, 0o700);
     }
 }

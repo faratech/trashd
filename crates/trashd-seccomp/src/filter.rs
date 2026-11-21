@@ -1,7 +1,9 @@
 //! BPF filter construction for seccomp.
 //!
 //! Builds a BPF program that traps unlink(2), unlinkat(2), and rmdir(2)
-//! with SECCOMP_RET_USER_NOTIF, allowing all other syscalls.
+//! with SECCOMP_RET_USER_NOTIF, allowing all other syscalls. The compat
+//! ABIs (i386 and x32 on x86_64, AArch32 on aarch64) have their deletion,
+//! io_uring and Landlock syscalls refused with ENOSYS, and run otherwise.
 
 use std::io;
 
@@ -22,9 +24,8 @@ const BPF_TAX: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 // x32 processes report arch == AUDIT_ARCH_X86_64 but OR 0x40000000 into every
-// syscall number, so the arch check alone cannot catch them (#123). Numbers
-// with that bit set are rejected outright — same loud-fail policy as a
-// non-native architecture.
+// syscall number, so the arch check alone cannot catch them (#123). Their
+// deletion numbers are refused like a compat architecture's.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
@@ -38,6 +39,18 @@ const OFFSET_IP: u32 = 8; // offsetof(seccomp_data, instruction_pointer)
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+// The compat ABI a native kernel runs beside its own.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_COMPAT: u32 = 0x4000_0003; // AUDIT_ARCH_I386
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_COMPAT: u32 = 0x4000_0028; // AUDIT_ARCH_ARM
+
+// The compat ABI's unlink, rmdir and unlinkat. Its io_uring and
+// landlock_restrict_self numbers are the generic ones below.
+#[cfg(target_arch = "x86_64")]
+const COMPAT_DELETES: [u32; 3] = [10, 40, 301];
+#[cfg(target_arch = "aarch64")]
+const COMPAT_DELETES: [u32; 3] = [10, 40, 328];
 
 // x86_64 syscall numbers
 #[cfg(target_arch = "x86_64")]
@@ -114,72 +127,207 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
+/// What a compat ABI may not do: delete (the supervisor serves only the
+/// native ABI, so these fail loudly instead of passing as real deletes),
+/// use io_uring (#90), or enter a Landlock domain the supervisor would not
+/// learn of (#390). Everything else runs: refusing every compat syscall left
+/// 32-bit programs unable even to write or exit (seccomp-orch-4).
+const COMPAT_REFUSALS: [u32; 7] = [
+    COMPAT_DELETES[0],
+    COMPAT_DELETES[1],
+    COMPAT_DELETES[2],
+    SYS_IO_URING_SETUP,
+    SYS_IO_URING_ENTER,
+    SYS_IO_URING_REGISTER,
+    SYS_LANDLOCK_RESTRICT_SELF,
+];
+
 /// Build the BPF filter program that traps delete-related syscalls.
 #[cfg(target_arch = "x86_64")]
 fn build_base_filter() -> Vec<SockFilter> {
+    // x32 numbers carry X32_SYSCALL_BIT on the native arch token, so its
+    // refusals are the x86_64 deletion numbers with that bit (#123).
+    const X32_REFUSALS: [u32; 7] = [
+        SYS_UNLINK | X32_SYSCALL_BIT,
+        SYS_RMDIR | X32_SYSCALL_BIT,
+        SYS_UNLINKAT | X32_SYSCALL_BIT,
+        SYS_IO_URING_SETUP | X32_SYSCALL_BIT,
+        SYS_IO_URING_ENTER | X32_SYSCALL_BIT,
+        SYS_IO_URING_REGISTER | X32_SYSCALL_BIT,
+        SYS_LANDLOCK_RESTRICT_SELF | X32_SYSCALL_BIT,
+    ];
     //  [0] LD arch
-    //  [1] JEQ native -> [2], else ERRNO[13]
+    //  [1] JEQ x86_64 -> [2], else i386 [12]
     //  [2] LD nr
-    //  [3] JGE x32-bit           -> ERRNO[13]
-    //  [4] JEQ unlink        -> NOTIF[12]
-    //  [5] JEQ unlinkat      -> NOTIF[12]
-    //  [6] JEQ rmdir         -> NOTIF[12]
-    //  [7] JEQ landlock_restrict_self -> NOTIF[12]
-    //  [8] JEQ io_uring_setup    -> ERRNO[13]
-    //  [9] JEQ io_uring_enter    -> ERRNO[13]
-    // [10] JEQ io_uring_register -> ERRNO[13]
-    // [11] RET ALLOW   [12] RET USER_NOTIF   [13] RET ERRNO|ENOSYS
-    vec![
+    //  [3] JGE x32-bit           -> x32 [22]
+    //  [4] JEQ unlink        -> NOTIF[30]
+    //  [5] JEQ unlinkat      -> NOTIF[30]
+    //  [6] JEQ rmdir         -> NOTIF[30]
+    //  [7] JEQ landlock_restrict_self -> NOTIF[30]
+    //  [8] JEQ io_uring_setup    -> ERRNO[31]
+    //  [9] JEQ io_uring_enter    -> ERRNO[31]
+    // [10] JEQ io_uring_register -> ERRNO[31]
+    // [11] RET ALLOW
+    // [12] JEQ i386 -> [13], else ERRNO[31] (an unknown architecture)
+    // [13] LD nr
+    // [14..20] JEQ i386 refusals -> ERRNO[31]
+    // [21] RET ALLOW
+    // [22..28] JEQ x32 refusals -> ERRNO[31]
+    // [29] RET ALLOW   [30] RET USER_NOTIF   [31] RET ERRNO|ENOSYS
+    const COMPAT: usize = 12;
+    const X32: usize = 22;
+    const NOTIF: usize = 30;
+    const ENOSYS: usize = 31;
+    let to = |from: usize, target: usize| (target - from - 1) as u8;
+    let mut program = vec![
         // [0] Load architecture
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
-        // [1] Native arch → continue; anything else → ERRNO|ENOSYS (a 32-bit
-        // process under the 64-bit supervisor used to get silent ALLOWs)
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 11),
+        // [1] Native arch → continue; anything else → the compat checks
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            AUDIT_ARCH_X86_64,
+            0,
+            to(1, COMPAT),
+        ),
         // [2] Load syscall number
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
         // [3] x32 syscalls carry this bit and reuse the native arch token, so
         // the arch check cannot catch them; without this they would silently
-        // ALLOW every delete (#123). Reject them like a foreign architecture.
-        bpf_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 9, 0),
-        // [4..7] unlink/unlinkat/rmdir and landlock_restrict_self → NOTIF [12]
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINK, 7, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 6, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_RMDIR, 5, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_LANDLOCK_RESTRICT_SELF, 4, 0),
-        // [8..10] io_uring → ERRNO|ENOSYS [13]
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_SETUP, 4, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_ENTER, 3, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_REGISTER, 2, 0),
-        // [10] No match → ALLOW
+        // ALLOW every delete (#123).
+        bpf_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, to(3, X32), 0),
+        // [4..7] unlink/unlinkat/rmdir and landlock_restrict_self → NOTIF
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINK, to(4, NOTIF), 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, to(5, NOTIF), 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_RMDIR, to(6, NOTIF), 0),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_LANDLOCK_RESTRICT_SELF,
+            to(7, NOTIF),
+            0,
+        ),
+        // [8..10] io_uring → ERRNO|ENOSYS
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_IO_URING_SETUP,
+            to(8, ENOSYS),
+            0,
+        ),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_IO_URING_ENTER,
+            to(9, ENOSYS),
+            0,
+        ),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_IO_URING_REGISTER,
+            to(10, ENOSYS),
+            0,
+        ),
+        // [11] No match → ALLOW
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        // [11] delete syscalls trap to the supervisor
+        // [12] i386 continues; an unknown architecture fails loudly
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            AUDIT_ARCH_COMPAT,
+            0,
+            to(COMPAT, ENOSYS),
+        ),
+        // [13] Load syscall number
+        bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+    ];
+    for nr in COMPAT_REFUSALS {
+        let at = program.len();
+        program.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, to(at, ENOSYS), 0));
+    }
+    // [21] Any other i386 syscall → ALLOW
+    program.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    debug_assert_eq!(program.len(), X32);
+    for nr in X32_REFUSALS {
+        let at = program.len();
+        program.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, to(at, ENOSYS), 0));
+    }
+    program.extend([
+        // [29] Any other x32 syscall → ALLOW
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        // [30] delete syscalls trap to the supervisor
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-        // [12] io_uring, wrong-arch, and x32 syscalls fail loudly
+        // [31] io_uring, compat deletes and an unknown arch fail loudly
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO_ENOSYS),
-    ]
+    ]);
+    debug_assert_eq!(program.len(), ENOSYS + 1);
+    program
 }
 
 /// Build the BPF filter for aarch64 (only unlinkat exists).
 #[cfg(target_arch = "aarch64")]
 fn build_base_filter() -> Vec<SockFilter> {
-    //  [0] LD arch    [3] JEQ unlinkat -> NOTIF[9]
-    //  [1] JEQ native -> [2], else ERRNO[10]
-    //  [2] LD nr      [4] JEQ landlock_restrict_self -> NOTIF[9]
-    //                 [5..7] JEQ io_uring_* -> ERRNO[10]
-    //                 [8] RET ALLOW  [9] RET USER_NOTIF  [10] RET ERRNO|ENOSYS
-    vec![
+    //  [0] LD arch    [3] JEQ unlinkat -> NOTIF[19]
+    //  [1] JEQ native -> [2], else AArch32 [9]
+    //  [2] LD nr      [4] JEQ landlock_restrict_self -> NOTIF[19]
+    //                 [5..7] JEQ io_uring_* -> ERRNO[20]
+    //                 [8] RET ALLOW
+    //  [9] JEQ AArch32 -> [10], else ERRNO[20] (an unknown architecture)
+    // [10] LD nr     [11..17] JEQ AArch32 refusals -> ERRNO[20]
+    // [18] RET ALLOW  [19] RET USER_NOTIF  [20] RET ERRNO|ENOSYS
+    const COMPAT: usize = 9;
+    const NOTIF: usize = 19;
+    const ENOSYS: usize = 20;
+    let to = |from: usize, target: usize| (target - from - 1) as u8;
+    let mut program = vec![
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 8),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            AUDIT_ARCH_AARCH64,
+            0,
+            to(1, COMPAT),
+        ),
         bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, 5, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_LANDLOCK_RESTRICT_SELF, 4, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_SETUP, 4, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_ENTER, 3, 0),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_IO_URING_REGISTER, 2, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_UNLINKAT, to(3, NOTIF), 0),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_LANDLOCK_RESTRICT_SELF,
+            to(4, NOTIF),
+            0,
+        ),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_IO_URING_SETUP,
+            to(5, ENOSYS),
+            0,
+        ),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_IO_URING_ENTER,
+            to(6, ENOSYS),
+            0,
+        ),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            SYS_IO_URING_REGISTER,
+            to(7, ENOSYS),
+            0,
+        ),
+        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            AUDIT_ARCH_COMPAT,
+            0,
+            to(COMPAT, ENOSYS),
+        ),
+        bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+    ];
+    for nr in COMPAT_REFUSALS {
+        let at = program.len();
+        program.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, to(at, ENOSYS), 0));
+    }
+    program.extend([
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
         bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO_ENOSYS),
-    ]
+    ]);
+    debug_assert_eq!(program.len(), ENOSYS + 1);
+    program
 }
 
 /// Identify this filter with a cookie in otherwise unused getpid arguments.
@@ -601,6 +749,187 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+
+    // seccomp-orch-4: every syscall of a 32-bit process failed ENOSYS, so
+    // under a wrapped login a 32-bit program could not even write or exit.
+    // Only the compat ABIs' deletion, io_uring and Landlock numbers are
+    // refused; the deletions still fail loudly instead of being allowed.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compat_abis_refuse_only_their_deletes() {
+        let cookie = [1, 2, 3, 4];
+        let prog = build_filter(cookie);
+        // i386: read, write, brk, mmap2, exit_group, openat, getpid, execve
+        for nr in [3, 4, 45, 192, 252, 295, 20, 11] {
+            assert_eq!(
+                run_filter(&prog, AUDIT_ARCH_I386, nr),
+                SECCOMP_RET_ALLOW,
+                "i386 {nr}"
+            );
+        }
+        // i386 unlink, rmdir, unlinkat, io_uring_*, landlock_restrict_self
+        for nr in [10, 40, 301, 425, 426, 427, 446] {
+            assert_eq!(
+                run_filter(&prog, AUDIT_ARCH_I386, nr),
+                SECCOMP_RET_ERRNO_ENOSYS,
+                "i386 {nr}"
+            );
+        }
+        // x32: the native numbers with the x32 bit set.
+        for nr in [0, 1, 2, 12, 59, 60, 231, 257] {
+            assert_eq!(
+                run_filter(&prog, NATIVE_ARCH, nr | X32_SYSCALL_BIT),
+                SECCOMP_RET_ALLOW,
+                "x32 {nr}"
+            );
+        }
+        for nr in [87, 84, 263, 425, 426, 427, 446] {
+            assert_eq!(
+                run_filter(&prog, NATIVE_ARCH, nr | X32_SYSCALL_BIT),
+                SECCOMP_RET_ERRNO_ENOSYS,
+                "x32 {nr}"
+            );
+        }
+        // An unknown architecture is still refused outright.
+        assert_eq!(run_filter(&prog, 0, 3), SECCOMP_RET_ERRNO_ENOSYS);
+        // A compat getpid never proves the filter's identity.
+        assert_eq!(
+            run_filter_args(&prog, AUDIT_ARCH_I386, 20, cookie),
+            SECCOMP_RET_ALLOW
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compat_abis_refuse_only_their_deletes() {
+        const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
+        let cookie = [1, 2, 3, 4];
+        let prog = build_filter(cookie);
+        // AArch32: read, write, brk, exit_group, openat, getpid, execve
+        for nr in [3, 4, 45, 248, 322, 20, 11] {
+            assert_eq!(
+                run_filter(&prog, AUDIT_ARCH_ARM, nr),
+                SECCOMP_RET_ALLOW,
+                "arm {nr}"
+            );
+        }
+        for nr in [10, 40, 328, 425, 426, 427, 446] {
+            assert_eq!(
+                run_filter(&prog, AUDIT_ARCH_ARM, nr),
+                SECCOMP_RET_ERRNO_ENOSYS,
+                "arm {nr}"
+            );
+        }
+        assert_eq!(run_filter(&prog, 0, 3), SECCOMP_RET_ERRNO_ENOSYS);
+        assert_eq!(
+            run_filter_args(&prog, AUDIT_ARCH_ARM, 20, cookie),
+            SECCOMP_RET_ALLOW
+        );
+    }
+
+    /// A static i386 program: write(1, "ok\n", 3), then unlink("victim"),
+    /// then exit with the negated unlink result (its errno, or 0).
+    #[cfg(target_arch = "x86_64")]
+    fn i386_probe() -> Vec<u8> {
+        const BASE: u32 = 0x0804_8000;
+        const CODE: u32 = 52 + 32; // ELF header + one program header
+        let mov = |opcode: u8, value: u32| {
+            let mut bytes = vec![opcode];
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes
+        };
+        let message = BASE + CODE + 45;
+        let victim = message + 3;
+        let mut code = Vec::new();
+        code.extend(mov(0xB8, 4)); // eax = write
+        code.extend(mov(0xBB, 1)); // ebx = stdout
+        code.extend(mov(0xB9, message)); // ecx
+        code.extend(mov(0xBA, 3)); // edx
+        code.extend([0xCD, 0x80]); // int 0x80
+        code.extend(mov(0xB8, 10)); // eax = unlink
+        code.extend(mov(0xBB, victim)); // ebx
+        code.extend([0xCD, 0x80]);
+        code.extend([0xF7, 0xD8, 0x89, 0xC3]); // neg eax; mov ebx, eax
+        code.extend(mov(0xB8, 1)); // eax = exit
+        code.extend([0xCD, 0x80]);
+        assert_eq!(code.len(), 45);
+        code.extend(b"ok\nvictim\0");
+        let total = CODE + code.len() as u32;
+        let mut image = b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+        for half in [2u16, 3] {
+            image.extend(half.to_le_bytes()); // ET_EXEC, EM_386
+        }
+        for word in [1u32, BASE + CODE, 52, 0, 0] {
+            image.extend(word.to_le_bytes()); // version, entry, phoff, shoff, flags
+        }
+        for half in [52u16, 32, 1, 0, 0, 0] {
+            image.extend(half.to_le_bytes()); // ehsize, phentsize, phnum, sh*
+        }
+        for word in [1u32, 0, BASE, BASE, total, total, 5, 0x1000] {
+            image.extend(word.to_le_bytes()); // PT_LOAD, R+X
+        }
+        image.extend(code);
+        image
+    }
+
+    // seccomp-orch-4, against the kernel: a 32-bit program runs under the
+    // real filter and its deletion fails ENOSYS, leaving the file in place.
+    // No listener is involved; trapped native deletes are refused here.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_runs_32_bit_programs_and_refuses_their_deletes() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let probe = fixture.path().join("probe32");
+        std::fs::write(&probe, i386_probe()).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(fixture.path().join("victim"), b"stays").unwrap();
+        let mut instructions = build_filter([1, 2, 3, 4]);
+        for instruction in &mut instructions {
+            if instruction.code == BPF_RET | BPF_K && instruction.k == SECCOMP_RET_USER_NOTIF {
+                instruction.k = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+            }
+        }
+        let mut command = std::process::Command::new(&probe);
+        command.current_dir(fixture.path());
+        unsafe {
+            command.pre_exec(move || {
+                let program = SockFprog {
+                    len: instructions.len() as u16,
+                    filter: instructions.as_ptr(),
+                };
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) if error.raw_os_error() == Some(libc::ENOEXEC) => {
+                eprintln!("SKIP: this kernel runs no 32-bit programs");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        if output.status.code() == Some(libc::EACCES) {
+            // An emulator (binfmt qemu-i386) issued native syscalls instead.
+            eprintln!("SKIP: 32-bit programs run under an emulator here");
+            return;
+        }
+        assert_eq!(output.stdout, b"ok\n", "{output:?}");
+        assert_eq!(output.status.code(), Some(libc::ENOSYS), "{output:?}");
+        assert_eq!(
+            std::fs::read(fixture.path().join("victim")).unwrap(),
+            b"stays"
+        );
+    }
+
     // Regression (#90, #91): the delete syscalls trap, io_uring is refused
     // with ENOSYS, wrong-arch tokens are refused with ENOSYS, and everything
     // else is allowed.
@@ -629,9 +958,15 @@ mod tests {
                 "io_uring syscall {io_uring_nr} must be refused"
             );
         }
-        // Wrong arch is never ALLOW: e.g. an i386 token (AUDIT_ARCH_I386)
-        // under the 64-bit supervisor gets ENOSYS instead of silent passage.
-        assert_eq!(run_filter(&prog, 0x4000_0003, 87), SECCOMP_RET_ERRNO_ENOSYS);
+        // A wrong arch never deletes: an unknown token gets ENOSYS, and so do
+        // a compat ABI's deletes (seccomp-orch-4: only those) instead of
+        // silent passage.
+        assert_eq!(run_filter(&prog, 0, 87), SECCOMP_RET_ERRNO_ENOSYS);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            run_filter(&prog, AUDIT_ARCH_I386, 10),
+            SECCOMP_RET_ERRNO_ENOSYS
+        );
         // Regression (#123): x32 syscalls reuse the native arch token with
         // 0x40000000 ORed into the number — they must fail loudly, not fall
         // through to ALLOW.

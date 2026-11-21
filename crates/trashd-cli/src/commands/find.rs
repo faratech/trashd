@@ -12,7 +12,7 @@ pub fn run(store: &TrashStore, query: &str) {
     let has_glob = has_glob_chars(query);
     let matches = match store.list_for_query(|entry| matches_query(entry, query, has_glob)) {
         Ok(entries) => entries,
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     };
 
     if matches.is_empty() {

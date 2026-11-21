@@ -44,6 +44,6 @@ pub fn run(store: &TrashStore) {
                 println!("  Location: {}", printable_path(&ps.trash_dir));
             }
         }
-        Err(e) => fatal(e),
+        Err(e) => fatal_untrusted(e),
     }
 }

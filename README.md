@@ -120,7 +120,7 @@ cd trashd
 sudo ./install.sh
 ```
 
-Run the installer with `sudo` from your normal (non-root) account that owns the checkout. It compiles as your user in a private staging area — never as root — using the committed `Cargo.lock`, then installs:
+Run the installer with `sudo` from your normal (non-root) account that owns the checkout. It compiles as your user in a private staging area under `$TMPDIR` (default `/tmp`; if that is mounted `noexec`, run `sudo TMPDIR=<dir> ./install.sh` with a root-owned directory that allows running programs) — never as root — using the committed `Cargo.lock`, then installs:
 
 1. The `trash` command and helpers into `/usr/local/bin/` and `/usr/local/lib/trashd/`.
 2. An `rm` shim that shadows the real `rm` on your `PATH` (the real `rm` is kept safely at `/usr/local/lib/trashd/real/rm`).
@@ -176,7 +176,7 @@ Good to know:
 
 - **Interactivity matches GNU `rm`.** `-i`, `-I`, `--interactive=never|once|always`, `-f/--force`, `-r/-R/--recursive`, `-d/--dir`, `-v/--verbose`, `--one-file-system`, and `--preserve-root` (including the refusal to recursively remove `/`) behave as `rm` users expect — except the outcome is "moved to trash" instead of "deleted".
 - **A declined prompt deletes nothing.** If you answer "no" at a confirmation prompt, that file stays where it is. Files created inside a directory *while* you are being asked about it are never swept up: each confirmed subtree is trashed as exactly what you confirmed.
-- **Very large recursive deletes are planned safely.** Before mutating anything, the shim pins the directories it walked (32 MiB planning budget per operand, depth limit 128). If an operand is too large to plan safely, that operand is refused *before* anything is removed — never half-trashed.
+- **Very large recursive deletes are planned safely.** Before mutating anything, the shim pins the directories it walked (32 MiB planning budget per operand, depth limit 128, one open file descriptor per directory; for the walk it raises its soft open-file limit toward the hard limit, up to 65536, which leaves room for about 21,000 directories). If an operand is too large to plan safely, that operand is refused *before* anything is removed — never half-trashed.
 - **In a desktop session** (`$DISPLAY` or `$WAYLAND_DISPLAY` set), trashing shows a desktop notification via `notify-send` when available.
 - **Bad flags fail safe.** An unrecognised `rm` flag is an error and deletes nothing. It never falls through to a permanent delete.
 
@@ -295,8 +295,8 @@ Trash Status
 | `trash empty --older <dur>` | With `empty`: only entries older than the duration. Still retries interrupted-cleanup jobs. |
 | `trash empty --dry-run` | Preview the selection (and any pending cleanup retries) without deleting anything. |
 | `trash empty -y` / `--yes` | Skip the confirmation prompt. Intended for scripts and the cleanup timer. |
-| `trash compress [--older <dur>]` | Compress entries older than the duration in place with zstd (default `7d`). Restoring a compressed entry decompresses it transparently. |
-| `trash compress --dry-run` | Preview what would be compressed. |
+| `trash compress [--older <dur>]` | Compress entries older than the duration in place with zstd (default `7d`). `trash restore` decompresses them transparently; other file managers restore the compressed bytes as they are. Exits non-zero when every attempt failed. |
+| `trash compress --dry-run` | Preview what would be compressed. Writes nothing, not even temporary files. |
 | `trash fsck` | Check every trash directory for orphaned metadata, orphaned files, and corrupt `.trashinfo` files. Exits non-zero if any problem (or an unreadable trash root) is found, so scripts can gate on it. |
 | `trash fsck --fix` | Repair: removes orphaned `.trashinfo` files; asks before removing each orphaned data file. Corrupt metadata is never auto-deleted — the data file is preserved for manual recovery. Exits non-zero if anything remains broken afterwards. |
 
@@ -304,7 +304,7 @@ Notes that save surprises:
 
 - **`trash purge` and `trash empty` are permanent.** There is no undo for an undo. `empty` asks first (unless `-y`); `purge` does not, because you named a single item.
 - **Orphaned files** (data in trash with no metadata, shown by `trash ls` as `? (orphaned: name)`) can happen if a trash operation was interrupted or another tool wrote to the trash. `trash fsck` explains them; `trash fsck --fix` offers to clean them up.
-- **Compressed files restore normally.** trashd detects compression by the zstd magic bytes, decompresses on restore, and verifies the integrity hash against the *decompressed* bytes. You never handle `.zst` files yourself.
+- **Compressed files restore normally.** trashd records compression in the entry's metadata (`X-Trashd-Compressed`), decompresses on restore, and verifies the integrity hash against the *decompressed* bytes. You never handle `.zst` files yourself with `trash restore`; other file managers ignore that metadata and restore the compressed bytes. Decompression is bounded by the size the entry recorded when it was trashed (at most 4 GiB), not by `max_file_size_mb`, so lowering that limit later never strands a compressed entry.
 - **`trash ls` performance:** listings stream output and only retain matches when filtering or sorting, so a very large trash stays responsive. `find` and `du` avoid filesystem stats they do not need.
 
 ### Configuring and updating from the CLI
@@ -324,7 +324,7 @@ Notes that save surprises:
 
 `trash self-update` only manages installs in a root-owned prefix (the normal `install.sh` layout). If trashd came from your distribution's package manager (paths under `/usr`), it leaves the install alone and tells you to use the package manager. `trash config …`, `trash log`, and `trash self-update` never create or require a usable trash directory, so they keep working even if your trash is broken — `self-update` is deliberately usable as a recovery path.
 
-Valid keys for `get`/`set`/`add`/`remove`: `retention.max_age_days`, `retention.max_size_gb`, `retention.disk_pressure_percent`, `max_file_size_mb`, `max_dir_size_mb`, `sha256_max_size_mb`, `auto_purge_interval_secs`, `hash_algorithm`, plus the list keys `never_trash`, `only_trash`, `bypass_processes`, `bypass_paths`. Scalars use `set`; lists use `add`/`remove` (each command tells you if you pick the wrong one). Values are validated before they are written — an out-of-range number is rejected rather than saved into a config that would then fail to load. Config writes are atomic (temporary file + rename), preserve symlinked dotfile targets, and keep the existing file mode.
+Valid keys for `get`/`set`/`add`/`remove`: `retention.max_age_days`, `retention.max_size_gb`, `retention.disk_pressure_percent`, `retention.auto_compress`, `max_file_size_mb`, `max_dir_size_mb`, `sha256_max_size_mb`, `auto_purge_interval_secs`, `hash_algorithm`, plus the list keys `never_trash`, `only_trash`, `bypass_processes`, `bypass_paths`. Scalars use `set`; lists use `add`/`remove` (each command tells you if you pick the wrong one). Values are validated before they are written — an out-of-range number is rejected rather than saved into a config that would then fail to load. Config writes are atomic (temporary file + rename), preserve symlinked dotfile targets, and keep the existing file mode.
 
 ---
 
@@ -403,7 +403,7 @@ trash config add only_trash '*.py'
 trash config add bypass_processes 'my-build-tool'
 ```
 
-A note on quoting: `trash config add` stores the value you pass as one pattern. Quote it so your shell does not expand `*` into filenames first (`'*.iso'`, not `*.iso`). Patterns are validated on add — a pattern the loader would ignore (for example one using unsupported `{a,b}` brace expansion) is rejected with an explanation instead of being saved as a silent no-op.
+A note on quoting: `trash config add` stores the value you pass as one pattern. Quote it so your shell does not expand `*` into filenames first (`'*.iso'`, not `*.iso`). Patterns are validated on add — a pattern the loader would ignore (for example one using unsupported `{a,b}` brace expansion) is rejected with an explanation instead of being saved as a silent no-op — and stored as the loader matches them (`src/` is saved as `src/*`). In a hand-edited config, a value of the wrong type is ignored for that one key, with a warning; the rest of the file still applies.
 
 ### Full configuration reference
 
@@ -443,19 +443,22 @@ bypass_processes = [
 ]
 
 # Executables whose deletions bypass trash, matched by path prefix
-# against /proc/self/exe. More precise than bypass_processes.
+# against the deleting program's executable (for `rm`, the program that
+# ran it). More precise than bypass_processes.
 bypass_paths = []
 
 max_file_size_mb = 1024        # single files larger than this skip trash (0 = no limit)
-max_dir_size_mb = 0            # directories larger than this skip trash (0 = no limit, default)
+max_dir_size_mb = 0            # directories larger than this skip trash (0 = no limit, default);
+                               # the preload sees a tree file by file and caps each file by max_file_size_mb only
 hash_algorithm = "xxhash"      # "xxhash" (XXH3-128, fast) or "sha256" (cryptographic)
 sha256_max_size_mb = 1         # only files up to this size get an integrity hash (0 = no hashing)
 auto_purge_interval_secs = 60  # minimum seconds between automatic retention scans
 
 [retention]
 max_age_days = 30              # auto-purge items older than this
-max_size_gb = 10.0             # auto-purge oldest items beyond this total size
+max_size_gb = 10.0             # auto-purge oldest items beyond this total size (home filesystem)
 disk_pressure_percent = 90     # when the trash disk is fuller than this, purge oldest items
+auto_compress = false          # zstd-compress items older than 7 days (other file managers restore them compressed)
 ```
 
 The shipped template at [`config/trashd.toml`](config/trashd.toml) carries the same defaults with explanatory comments, and `install.sh` installs it to `/etc/trashd/config.toml` without overwriting an existing admin config on reinstall.
@@ -479,6 +482,8 @@ Fine print worth knowing:
 
 - Relative patterns such as `src/*` can begin matching at any path-component boundary, so they work wherever the project sits on disk.
 - A single `*` already spans `/` in this syntax; `**` is accepted for familiarity and behaves the same way.
+- A pattern written as a directory, `dir/`, means everything under it (`dir/*`), and a leading `./` is dropped. Patterns that can never match a path (`a//b`, `a/./b`) and `/` or `~/` on their own are rejected like brace patterns.
+- `~/` patterns match your home both as written and with its symlinks resolved, so a home reached through a symlink still matches.
 - Brace expansion (`*.{jpg,png}`) is **not** supported. `trash config add` rejects such patterns, and hand-edited configs log a warning and ignore them — they never silently match nothing while looking correct.
 - Matching is on the absolute path with symlinks in parent components resolved for policy checks, so a symlinked directory cannot smuggle an excluded path past `never_trash`.
 
@@ -506,7 +511,7 @@ When a file is deleted, trashd walks up from the file's directory to `/` and use
 | `TRASH_BYPASS=1` | Disable interception entirely (shim, preload, and seccomp all honour it). The main "off switch" — see [Delete permanently on purpose](#delete-permanently-on-purpose). |
 | `TRASHD_SECCOMP_AUTO=0` | Stop login shells from auto-wrapping root shells with `trashd-exec`. Set in your shell profile if you only want explicit wrapping. |
 | `TRASHD_SECCOMP_ACTIVE` | Read-only status set by `trashd-exec` once kernel protection is live (`1` = active). Check it with `echo $TRASHD_SECCOMP_ACTIVE`; do not set it yourself — the preload verifies a matching cookie before trusting it. |
-| `TRASHD_PRELOAD_LOG=1` | Make the `LD_PRELOAD` layer log every interception to stderr (e.g. `[trashd-preload] trashed: /path -> …`). The first tool to reach for when a deletion was (or was not) caught unexpectedly. |
+| `TRASHD_PRELOAD_LOG=1` | Make the `LD_PRELOAD` layer log every interception to stderr (e.g. `[trashd-preload] trashed: /path -> …`). The first tool to reach for when a deletion was (or was not) caught unexpectedly. Ignored in setuid programs. |
 | `EDITOR` | Editor used by `trash config edit` (default `vi`). May include arguments, e.g. `EDITOR="code --wait"`. |
 | `DISPLAY` / `WAYLAND_DISPLAY` | When either is set, the shim sends a desktop notification (via `notify-send`) after trashing. Unset in SSH/cron sessions, where notifications are skipped. |
 
@@ -545,7 +550,7 @@ The one-sentence version: **four independent safety nets watch for deletions at 
   └─────────────────────────────┘
 
   ┌─────────────────────────────┐
-  │ 3 · fanotify daemon         │  watches ALL deletions system-wide
+  │ 3 · fanotify daemon         │  watches deletions on the filesystems it can mark
   │    trashd (audit only)      │  Cannot stop a deletion — it logs it
   └─────────────────────────────┘
 ```
@@ -558,7 +563,7 @@ Layer numbering follows the order the layers were built, not the order above: La
 | --- | --- | --- | --- |
 | **1 — PATH shim** (`trashd-rm`) | The `rm` program on your `PATH` is replaced by a trash-aware twin. Your shell, scripts, and `find -exec rm` all run it without knowing. | Every `rm` invocation, with full GNU `rm` flag behaviour plus prompts and `--permanent`. | Programs that delete without ever running `rm`. |
 | **2 — `LD_PRELOAD` hook** (`libtrashd_preload.so`) | A small library loaded into every dynamically-linked program that quietly redirects the standard "delete this file" library calls (`unlink`, `unlinkat`, `rmdir`, `remove`) to the trash. | Deletions from almost any normal program: Python `os.remove()`, Perl `unlink`, `os.Remove` in Go, C programs, file managers' helpers… no code changes needed. | Statically-linked binaries (no library calls to hook), and setuid programs (the system strips `LD_PRELOAD` for safety). Needs the library registered in `/etc/ld.so.preload` for system-wide coverage. |
-| **3 — fanotify daemon** (`trashd`) | A background service that asks the kernel to *report* every file deletion on the system. It cannot intervene. | Nothing is intercepted — instead you get an audit trail of deletions that bypassed every other layer, with PID, process name, and path. | By design it prevents nothing. Think smoke detector, not sprinkler. |
+| **3 — fanotify daemon** (`trashd`) | A background service that asks the kernel to *report* file deletions on the filesystems it can mark (not tmpfs, overlay, FUSE or btrfs subvolume mounts). It cannot intervene. | Nothing is intercepted — instead you get an audit trail of deletions that bypassed every other layer, with PID, process name, and path. | By design it prevents nothing. Think smoke detector, not sprinkler. |
 | **4 — seccomp supervisor** (`trashd-exec`) | A wrapper that runs a command under a kernel filter: every raw "delete" system call pauses and asks a supervisor "trash this, or let it through?" before the kernel acts. | The hardest cases: statically-linked binaries, programs that clear `LD_PRELOAD`, code issuing raw syscalls. The last line of defence. | Only protects commands actually run under it: explicit `trashd-exec <cmd>`, plus root login shells that auto-wrap (see below). A wrapped command cannot elevate privileges (`NoNewPrivs`) — see caveats. |
 
 After a default `install.sh` install: Layers 1 and 2 are active for everyone (shells, cron, services), Layer 3 runs as a systemd service, and Layer 4 auto-activates only for **interactive root login shells** (non-root shells keep full `sudo` behaviour via Layers 1–2). Anyone can opt into Layer 4 for a specific command with `trashd-exec`. Distribution packages built from [`packaging/`](packaging/) install the Layer 2 library *without* registering it — add its path to `/etc/ld.so.preload` yourself to enable that layer there.
@@ -573,7 +578,7 @@ After a default `install.sh` install: Layers 1 and 2 are active for everyone (sh
 | `python3 -c "import os; os.remove('x')"` | Layer 2 (preload) | Library call hooked inside the Python process |
 | A systemd service calling `unlink()` | Layer 2 | Services inherit `/etc/ld.so.preload` (unless the unit explicitly bypasses trashd) |
 | Statically-linked binary deleting files | Layer 4 only, and only under `trashd-exec` | No `rm`, no library calls — only the kernel sees it |
-| setuid program deleting files | Layer 4 only, and only under `trashd-exec` | The loader strips `LD_PRELOAD` from setuid binaries |
+| setuid program deleting files | Layer 2, in a restricted mode | `/etc/ld.so.preload` loads the library there too (an `LD_PRELOAD` variable alone is ignored). It then trusts only `/etc/trashd/config.toml` and trashes into the home of the user the program runs as |
 | `rm --permanent …`, `TRASH_BYPASS=1 …` | Nothing — on purpose | You asked for a real delete |
 | `git clean`, `make clean`, package managers | Nothing — on purpose | Listed in `bypass_processes` by default; their deletions are real deletes |
 
@@ -606,29 +611,32 @@ Safety mechanisms inside the `.so`:
 - **Trash-directory skip:** paths inside any trash folder (`~/.local/share/Trash/`, `.Trash-$UID/`, `.Trash/`) are never intercepted, so trash maintenance (`trash empty`, restores) cannot recurse into itself.
 - **Config change detection:** the config file's mtime is re-checked at most every 60 seconds and changes are logged. A full reload still requires process restart — mutating global state inside a preload library is unsafe, so long-running processes keep the policy they started with.
 - **Unsafe-trash refusal:** a trash directory another user could control is rejected with `EACCES` rather than used. A home that simply cannot host a trash (e.g. a service account with `HOME=/nonexistent`) falls through to the real syscall, and root running with another user's `HOME` uses root's own trash instead.
+- **Privileged programs:** `/etc/ld.so.preload` loads the library into setuid, setgid and file-capability programs too, whose environment belongs to whoever ran them. There the library ignores `HOME`, `XDG_*` and `TRASHD_PRELOAD_LOG`: it reads only `/etc/trashd/config.toml` and trashes into the home of the program's effective user (from `/etc/passwd`), or lets the real syscall run when that home does not exist.
+- **Pinned operand:** an entry is checked, moved, copied and removed in the directory the caller named — its directory descriptor, or the directory its pathname led to, opened once — never through a path resolved again. A directory swapped for a symlink in mid-delete cannot redirect the deletion, and `rm -r`, `find -delete` and `shutil.rmtree` are trashed even where no `/proc` is mounted.
 
 </details>
 
 <details>
 <summary><strong>Deep dive — Layer 3: the fanotify audit daemon</strong> (implementation detail; skip unless debugging)</summary>
 
-Watches all real filesystems for `FAN_DELETE` / `FAN_DELETE_SELF` (files and directories, `FAN_ONDIR`) using `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Deleted paths are reconstructed from the parent directory's file handle plus the event's filename, resolved with `open_by_handle_at()` on the matching mount; no directory descriptors are held open, so mounts can still be unmounted cleanly. Virtual filesystems (tmpfs, ramfs, devtmpfs, overlay, squashfs) are skipped, I/O is non-blocking with a 1-second poll, and with nothing markable the daemon idles and re-scans mounts every second. It runs under systemd with `AmbientCapabilities=CAP_SYS_ADMIN` (unit: [`install/systemd/trashd.service`](install/systemd/trashd.service)) and logs PID, process name, and path for every deletion it sees — including deletions that deliberately bypassed trashd.
+Watches all real filesystems for `FAN_DELETE` / `FAN_DELETE_SELF` (files and directories, `FAN_ONDIR`) using `FAN_REPORT_FID | FAN_REPORT_DFID_NAME` (Linux 5.9+). Deleted paths are reconstructed from the parent directory's file handle plus the event's filename, resolved with `open_by_handle_at()` on the matching mount; no directory descriptors are held open, so mounts can still be unmounted. A lookup opens its mount for a few microseconds, and an `umount` at that instant reports the target busy, so lookups are kept few: none for a directory the same read of events shows removed, and at most one per directory every 20 ms (a rename can take that long to show in logged paths). Virtual filesystems (tmpfs, ramfs, devtmpfs, overlay, squashfs) and FUSE filesystems (whose server the kernel would ask for statfs on every mount change, though their marks always fail) are skipped, I/O is non-blocking with a 1-second poll, and with nothing markable the daemon idles and re-scans mounts every second. btrfs subvolume mounts (the default `/` and `/home` on Fedora, openSUSE and Ubuntu-on-btrfs) cannot be audited: with FID reporting the kernel refuses whole-filesystem marks on them (`EXDEV`). The daemon names them in one `WARNING` line at startup and excludes them from its "monitoring N filesystem(s)" count; Layers 1, 2 and 4 still protect files there. Two mounted filesystems sharing an fsid (a cloned or snapshotted ext4 keeps its UUID) cannot be told apart in an event, so deletions on them are logged by file name only, after one warning. It runs under systemd with `AmbientCapabilities=CAP_SYS_ADMIN` (unit: [`install/systemd/trashd.service`](install/systemd/trashd.service)) and logs PID, process name, and path for every deletion it sees — including deletions that deliberately bypassed trashd.
 
-One shared ordering guarantee spans layers: trash publication, compression, and retirement all take a persistent private lock (`.trashd/store.lock`) per trash root, and cleanup re-validates an entry's data identity and metadata version before mutating it, so a recycled ID can never inherit a previous entry's purge/compress decision. Install all rebuilt components from the same release together — older writers do not participate in this lock (existing IDs and `.trashinfo` files remain compatible, no migration needed).
+One shared ordering guarantee spans layers: trash publication, compression, and retirement all take a persistent private lock (`.trashd/store.lock`) per trash root, and cleanup re-validates an entry's data identity and metadata version before mutating it, so a recycled ID can never inherit a previous entry's purge/compress decision. The lock is held for one publication, sidecar write or detach, never for a copy, and nobody waits for it without end: a writer that finds it held for 10 seconds (its holder was stopped, or hangs on its filesystem) reports the trash busy, `EBUSY`, and deletes nothing. Install all rebuilt components from the same release together — older writers do not participate in this lock (existing IDs and `.trashinfo` files remain compatible, no migration needed).
 
 </details>
 
 <details>
 <summary><strong>Deep dive — Layer 4: the seccomp supervisor</strong> (process architecture, Landlock, namespaces; skip unless debugging)</summary>
 
-`trashd-exec` runs four cooperating processes:
+`trashd-exec` runs five cooperating processes:
 
 1. **Child** — installs a BPF seccomp filter (`SECCOMP_RET_USER_NOTIF`), hands the notification descriptor to its parent over a Unix socketpair (`SCM_RIGHTS`), waits for a startup acknowledgement, publishes `TRASHD_SECCOMP_ACTIVE=1` plus a random session cookie, and only then `exec`s your command. Explicit wrapping sets `PR_SET_NO_NEW_PRIVS`; `--preserve-privileges` (used for auto-wrapped root shells) installs via `CAP_SYS_ADMIN` instead and falls back cleanly when unavailable.
 2. **Supervisor** — receives syscall notifications, asks the orchestrator (below) to read the target's path arguments and duplicate its directory descriptors, resolves every path through those *pinned* descriptors, applies config policy, then either trashes the file (success reply) or lets the real syscall run (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`). Absolute paths are confined to the target's pinned root. Relative paths escaping a pinned cwd/dirfd via `..` or symlinks resolve normally only when the target shares the supervisor's root mount and namespace; for chrooted or namespaced targets they are handed back to the target's kernel — the supervisor never retries them through a host-namespace path. When trashing requires a copy (different filesystem, or no `RENAME_NOREPLACE` as on NFS), the copy is made from the pinned parent, exactly as the store's `trash()` does. trashd's own `trash` CLI and shim are never intercepted (their deletes are store-internal). Notification IDs are validated against TOCTOU races.
-3. **Watchdog** — holds a duplicate of the notification descriptor and supervises the supervisor. If the supervisor dies, the watchdog immediately drains pending notifications through a shared "decline" handler (marked preload handoffs get `ENOSYS` so the preload trashes in-process; unmarked deletes continue in the target's kernel; Landlock setup attempts are recorded before continuing), then forks a replacement supervisor. If forking fails, the handler serves notifications itself until no filtered task remains. When every filtered task has exited, the listener reports hangup and both processes exit instead of retrying forever.
-4. **Orchestrator** — stays an ancestor and subreaper of your command and all its descendants. It brokers `process_vm_readv()` and `pidfd_getfd()` over a private socket so the supervisor keeps working under Yama `ptrace_scope=1`, across forks and supervisor restarts. It forwards `SIGHUP`/`SIGINT`/`SIGTERM` via pidfds, reaps exited children, and finally returns your command's original exit status. Background descendants keep the wrapper alive until they finish. It deliberately waits with the default `SIGCHLD` disposition even when it inherited `SIG_IGN` (WSL's `login` passes one to every shell — inheriting it once spun this loop at 100% CPU), and restores the inherited disposition for your command.
+3. **Watchdog** — holds a duplicate of the notification descriptor and supervises the supervisor. If the supervisor dies, the watchdog forks a replacement at once, which receives the notifications still queued. Replacements dying in quick succession back off, and after three in a row the queue is answered through a shared "decline" handler before each further attempt (marked preload handoffs get `ENOSYS` so the preload trashes in-process; unmarked deletes continue in the target's kernel; Landlock setup attempts are recorded before continuing). If forking fails, the handler serves notifications itself until no filtered task remains. When every filtered task has exited, the listener reports hangup and both processes exit instead of retrying forever. Both workers ignore job signals, `SIGTERM` included, so a process-group `SIGTERM` (`kill %1`, GNU `timeout`, a systemd stop) leaves your command's cleanup protected; they are torn down with `SIGKILL` once it exits.
+4. **Keeper** (the orchestrator) — stays an ancestor and subreaper of your command and all its descendants. It brokers `process_vm_readv()` and `pidfd_getfd()` over a private socket so the supervisor keeps working under Yama `ptrace_scope=1`, across forks and supervisor restarts; requests carry no descriptors and time out after 5 seconds, and a late reply never answers another request. It forwards signals via pidfds and reaps exited children. Once your command and every descendant still in its session have exited, it reports the command's exit status; descendants that left the session (`setsid` daemons such as a tmux server, `ssh-agent`, or a service started from a root login) keep it running, detached from the terminal and still protected, until they exit. It deliberately waits with the default `SIGCHLD` disposition even when it inherited `SIG_IGN` (WSL's `login` passes one to every shell — inheriting it once spun this loop at 100% CPU), and restores the inherited disposition for your command.
+5. **Wrapper** — the process your shell started. It relays every signal it receives to the keeper and exits with the status the keeper reports, so `exit` from a wrapped root login is not held up by daemons it started. A signal a member of your command's process group sends to the group (`kill 0`) already reached the command and is not forwarded again; one sent to the group from outside it cannot be told apart from one sent to the wrapper alone, so the command may receive that one twice.
 
-The BPF filter is architecture-specific: x86-64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84); aarch64 traps only `SYS_unlinkat` (35), the only one of the three that exists there. Both also trap `SYS_landlock_restrict_self` (446) to record restriction attempts before the kernel executes them.
+The BPF filter is architecture-specific: x86-64 traps `SYS_unlink` (87), `SYS_unlinkat` (263), and `SYS_rmdir` (84); aarch64 traps only `SYS_unlinkat` (35), the only one of the three that exists there. Both also trap `SYS_landlock_restrict_self` (446) to record restriction attempts before the kernel executes them. 32-bit processes (i386 and x32 on x86-64, AArch32 on aarch64) run normally, but their deletes, `io_uring` and `landlock_restrict_self` fail with `ENOSYS` instead of being trashed; the i686 preload trashes in-process for dynamically linked ones.
 
 Upgrade note: install `trashd-exec` and `libtrashd_preload.so` from the same release, then restart wrapped sessions and long-running preloaded processes. Inherited filters and already-loaded libraries do not update in place; the cookie check stops new preload code deferring to an incompatible old wrapper, but only a restart completes the upgrade.
 
@@ -636,7 +644,7 @@ Failure behaviour: if filter installation succeeds but memory access, root/cwd/d
 
 Landlock: any `landlock_restrict_self` attempt after startup (even one the kernel then rejects) sets a session-wide flag shared by the watchdog and every supervisor, surviving supervisor replacement and the restricting task's exit, with no per-task limit. From then on, deletions stay in the target's own security context: a deferring preload trashes in-process under that context, while static binaries and raw syscalls proceed to the kernel — which may permanently delete what the policy permits, and refuses what it forbids. Domains inherited at startup are shared with the supervisor, whose renames the kernel already checks. If restriction tracking is unavailable, the supervisor declines mutations and refuses untracked restriction setup. (This behaviour resolves the Landlock privilege issue tracked as #390.)
 
-Credential rule: the supervisor declines a trapped delete when the target's filesystem UID/GID, groups, or effective capabilities differ from its own (for example `su`/`sudo` to another user inside a wrapped root shell, or a process that dropped capabilities). The target's own layers and kernel permissions decide instead — a privileged supervisor never spends credentials the caller does not have.
+Credential rule: the supervisor declines a trapped delete when the target's filesystem UID/GID, groups, effective capabilities, or LSM label (SELinux, AppArmor, Smack) differ from its own (for example `su`/`sudo` to another user inside a wrapped root shell, a process that dropped capabilities, or one confined by `aa-exec` or an SELinux domain). The target's own layers and kernel permissions decide instead — a privileged supervisor never spends credentials or a security context the caller does not have.
 
 </details>
 
@@ -654,8 +662,9 @@ The guiding rule: **a file is trashed on the same filesystem it was deleted from
 | Another filesystem with a valid shared trash (`$topdir/.Trash/` exists, is a real directory, has the sticky bit) | `$topdir/.Trash/$UID/` (created for you with mode `0700` when needed) |
 | Another filesystem without a valid shared trash | `$topdir/.Trash-$UID/` (private per-user directory) |
 | No usable topdir trash at all | Falls back to the home trash, copying across filesystems (see below) |
+| A FUSE mount served by another user's daemon (its `user_id=` mount option is not yours) | Never a topdir trash: that daemon answers every lookup and could show trashd a private trash for its checks and a symlink to `/etc` afterwards. Deletes there are copied to the home trash, and listing skips the mount |
 
-Filesystem boundaries are found by comparing device IDs (`st_dev`) and parsing `/proc/mounts` for the longest matching mount prefix. You never pick a location yourself: `trash ls`, `restore`, `purge`, `empty`, `status`, and `du` all scan *every* trash root automatically, and `trash info` tells you which one holds a given entry.
+Filesystem boundaries are found by comparing device IDs (`st_dev`) and parsing `/proc/mounts` for the longest matching mount prefix. Once a trash root is locked, everything inside it is reached through the directory descriptors the lock validated, never by its path again. You never pick a location yourself: `trash ls`, `restore`, `purge`, `empty`, `status`, and `du` all scan *every* trash root automatically, and `trash info` tells you which one holds a given entry.
 
 Inside each trash root:
 
@@ -667,6 +676,7 @@ Inside each trash root:
 └── .trashd/
     ├── operations.log   # audit log shown by `trash log`
     ├── store.lock       # cross-process lock for publish/compress/retire
+    ├── copy.lock        # held while a copy from another filesystem is staged
     └── last_purge       # throttle marker for automatic retention scans
 ```
 
@@ -675,10 +685,12 @@ Inside each trash root:
 A rename only works within one filesystem and only when the filesystem supports no-replace rename. When it cannot (`EXDEV` across filesystems, or `EINVAL`/`ENOSYS` where `RENAME_NOREPLACE` is unsupported, e.g. NFS or 9p), trashd copies instead — carefully, and never by re-resolving a path an attacker could swap:
 
 1. **Snapshot:** every node in the tree (device, inode, mode, size, mtime, ctime) is recorded first.
-2. **Copy:** regular files, symlinks (recreated, never followed), directories, and FIFOs are copied with exclusive creation through pinned descriptors; each file is verified unchanged afterwards and synced. Owner/group/mode are preserved where permitted; set-id bits are dropped when the owner cannot be preserved. Device nodes and sockets cannot be reproduced and abort the copy. Depth is capped at 100 levels.
+2. **Copy:** regular files, symlinks (recreated, never followed), directories, and FIFOs are copied with exclusive creation through pinned descriptors; each file is verified unchanged afterwards and synced. Owner/group/mode are preserved where permitted; set-id bits are dropped when the owner cannot be preserved, and a file copied off a `nosuid` filesystem (every user's FUSE mount is one) keeps neither set-id bits nor file capabilities. Device nodes and sockets cannot be reproduced and abort the copy. Depth is capped at 100 levels.
 3. **Retire:** only source nodes still matching the snapshot are removed. Anything created or changed during the copy stays put, and the operation reports itself incomplete while keeping the complete, valid trash entry.
 
-If a copy fails part-way, the orphaned `.trashinfo` and partial copy are cleaned up before the error returns. Any *other* rename error (`EACCES`, `EPERM`, `EROFS`) is reported as-is — the source could not be removed either, so pretending otherwise would lose track of the file. Restores that need a staged copy publish with atomic no-replace semantics and refuse (keeping the trashed source) on filesystems that cannot provide them, rather than risk overwriting a competing directory; regular files may publish via exclusive hard-link where supported.
+The copy itself runs without the trash root's lock, so a large tree (or a copier stopped with Ctrl-Z) does not hold up the user's other deletes. Until the copy is published the entry's `.trashinfo` is locked, which tells `trash empty`, retention and `trash fsck` that its data is still on the way, and the staged copy is covered by `.trashd/copy.lock`, which keeps cleanup from taking it for an abandoned one. Both locks end with the copying process.
+
+If a copy fails part-way, the orphaned `.trashinfo` and partial copy (its read-only directories included) are cleaned up before the error returns. Any *other* rename error (`EACCES`, `EPERM`, `EROFS`) is reported as-is — the source could not be removed either, so pretending otherwise would lose track of the file. A staged copy is published with atomic no-replace semantics. Where the filesystem cannot provide them (NFS, 9p), a regular file is published by exclusive hard link; a directory going *into* the trash is renamed over an empty directory created exclusively for it in the trash's private `files/`, and a directory being *restored* is refused (keeping the trashed source) rather than risk overwriting a competing directory. A restore by copy makes its destination durable (an fsync of the directory, a syncfs for a tree) before it removes the trash copy.
 
 ---
 
@@ -688,12 +700,14 @@ A trash that grows forever is just a second disk-full problem. trashd keeps it b
 
 ### Automatic retention (after every trash operation)
 
-After each trash operation, trashd runs a retention pass — throttled to at most once per `auto_purge_interval_secs` (default 60s, tracked via the `last_purge` marker) so a script deleting 10,000 files does not scan the trash 10,000 times. Each pass runs four phases, gentlest first:
+After each trash operation, trashd runs a retention pass — throttled to at most once per `auto_purge_interval_secs` (default 60s, tracked via the `last_purge` marker) so a script deleting 10,000 files does not scan the trash 10,000 times. The pass never looks at trash on network or FUSE mounts (NFS, CIFS/SMB, 9p, sshfs and the like): a stat of a mount whose server is gone can wait forever, and it ran inside `rm`. Empty those with `trash empty`, which still includes them. Each pass runs four phases, gentlest first:
 
 1. **Age:** permanently delete entries older than `retention.max_age_days` (default 30).
-2. **Compress:** shrink surviving entries older than 7 days with zstd (level 3) *before* deleting anything for space — reclaiming room without losing data often makes phase 3 unnecessary. Only trashd's own entries are compressed (entries other tools created stay readable by them). Already-compressed data (zstd magic), files under 1 KB, files with extended attributes, and directories are skipped; a file is only replaced when compression actually shrank it, keeping its original timestamps.
-3. **Size:** if the trash still exceeds `retention.max_size_gb` (default 10 GB), purge the oldest survivors until it fits. Sizes claimed by metadata on removable media are never trusted beyond what is actually on disk.
+2. **Compress (off by default):** with `retention.auto_compress = true`, shrink surviving entries older than 7 days with zstd (level 3) *before* deleting anything for space — reclaiming room without losing data often makes phase 3 unnecessary. It is opt-in because other file managers restore an entry's stored bytes as they are, so a compressed entry would come back from them as zstd data. Only trashd's own entries are compressed (entries other tools created stay readable by them). Already-compressed data (zstd magic), files under 1 KB, files with extended attributes, and directories are skipped; a file is only replaced when compression actually shrank it, keeping its original timestamps.
+3. **Size:** if the trash on your home filesystem still exceeds `retention.max_size_gb` (default 10 GB), purge the oldest survivors that are at least an hour old until it fits — and only when that can make it fit. Trash on other filesystems (removable media, whose sizes and dates whoever wrote it controls) is not counted, and foreign trash is measured by the space its files actually occupy. A single item larger than the cap is refused at deletion time (`rm` keeps it; use `rm --permanent`), and one already in the trash is left to the age limit rather than trimmed along with everything else.
 4. **Disk pressure:** if the home-trash filesystem is fuller than `retention.disk_pressure_percent` (default 90%), purge the oldest 10% of survivors that are at least an hour old. The one-hour grace means a file you *just* deleted is never pressure-purged — `trash undo` right after a delete always works.
+
+A program that held an `flock` on a file when you deleted it still holds it on the trashed copy. Retention skips such a busy entry and retries it on its next pass; `trash purge`, `empty`, `restore` and `compress` wait up to 5 seconds for it and then report it busy instead of hanging.
 
 ### Scheduled cleanup (optional)
 
@@ -747,7 +761,7 @@ trashd is engineered so that *trashd's own bugs should not become your data loss
 
 - **Interception preserves your permissions.** Trashing happens with the deleting process's own kernel credentials. A file you could not delete, trashd cannot delete for you — and (for the seccomp supervisor) a privileged supervisor never spends credentials the caller lacks: when the target's filesystem UID/GID, groups, or capabilities differ from the supervisor's, the supervisor declines and the target's own layers and kernel decide.
 - **Symlinks are never followed for metadata.** Trashing a symlink trashes the link, not its target. Dangling symlinks trash normally. In cross-filesystem copies, symlinks are recreated as symlinks.
-- **No silent overwrites.** Trash IDs are claimed atomically (`O_CREAT|O_EXCL` on the `.trashinfo` file — simultaneous deletes of the same name each get a unique ID, with file names truncated to 223 bytes to stay within filesystem limits). Restores refuse to overwrite an existing destination unless you pass `--force`. The `directorysizes` cache is replaced by atomic rename; config writes are atomic too.
+- **No silent overwrites.** Trash IDs are claimed atomically (`O_CREAT|O_EXCL` on the `.trashinfo` file — simultaneous deletes of the same name each get a unique ID, with file names truncated to fit the trash filesystem's own name limit: 223 bytes where it takes 255, less on eCryptfs). Restores refuse to overwrite an existing destination unless you pass `--force`. The `directorysizes` cache is replaced by atomic rename; config writes are atomic too.
 - **Prompts mean what they say.** Confirmation answers apply only to the exact entries confirmed (see Layer 1 deep dive); nothing created afterwards is swept up.
 - **Corruption is surfaced, not hidden.** Hash mismatches warn on restore; `trash fsck` exits non-zero on any problem (orphaned `.trashinfo`, orphaned data file, corrupt metadata, unreadable trash root) so scripts notice; corrupt metadata is never auto-deleted because the data file may still be recoverable by hand.
 
@@ -756,14 +770,16 @@ trashd is engineered so that *trashd's own bugs should not become your data loss
 | Situation | What happens | How to change it |
 | --- | --- | --- |
 | `rm --permanent`, `--no-trash`, or `TRASH_BYPASS=1` | Real delete | That is the request — no change needed |
-| Path matches `never_trash` (yours, admin's, or a project's) | Real delete | `trash config show` to see the merged list; user entries via `trash config remove` |
-| `only_trash` is set and the path does not match | Real delete | Add the pattern, or clear the whitelist |
+| Path matches `never_trash` (yours, admin's, or a project's) | Real delete. For a directory, that is its entries the patterns also name (`/tmp/*`, `*/.git/*`); the rest of a `backup~` directory is trashed | `trash config show` to see the merged list; user entries via `trash config remove` |
+| `only_trash` is set and the path does not match | Real delete. A directory is judged entry by entry: whatever inside it matches is still trashed | Add the pattern, or clear the whitelist |
 | File larger than `max_file_size_mb` / directory larger than `max_dir_size_mb` | Real delete (directories whose size cannot be fully checked — the walk caps at 10,000 entries — are refused rather than guessed at when `max_dir_size_mb` is set) | Raise or zero (`0` = unlimited) the limit |
+| Single item larger than `retention.max_size_gb` whose trash is on your home filesystem | The `rm` shim refuses and keeps it; under `trashd-exec` the kernel deletes it, as for the other size caps | `rm --permanent`, or raise the cap |
 | Deleting process (or an ancestor) is in `bypass_processes`, or its executable matches `bypass_paths` | Real delete | Remove the entry, or exempt one invocation with an explicit `trash`-side workflow |
 | Deletion by a statically-linked binary *not* run under `trashd-exec` | Real delete (Layers 1–2 cannot see it) | Run it as `trashd-exec <cmd>` |
 | Deletion inside a wrapped session after a Landlock restriction attempt | Preload trashes in-process where loaded; static/raw-syscall deletions proceed to the kernel and may permanently delete what policy permits | Expected: the kernel enforces the target's own Landlock policy; trashd never overrides it |
 | Trash storage is unsafe (e.g. another user could control the trash directory) | Preload refuses with `EACCES`; the shim reports an error and deletes nothing | Fix ownership/permissions on the trash directory |
 | Trash cannot be created at all (e.g. service account with `HOME=/nonexistent`) | Preload lets the real `unlink`/`rmdir` run; root with a foreign `HOME` uses root's own trash | Give the account a real home, or accept real deletes for it |
+| The trash is on another filesystem and the file cannot be copied there: the deleting user may not read it, or the finished copy cannot be synced | Preload fails the delete (`EACCES`, `EIO`) and keeps the file, as the shim does | Make the file readable, or delete it on purpose with `TRASH_BYPASS=1` |
 | Other operational failure inside preload (after safety checks) | The result of the real syscall is returned so the calling program still works | Check `TRASHD_PRELOAD_LOG=1` output and `trash log` |
 
 The pattern: trashd prefers **keeping the caller's program working** over hard-failing every deletion, except where using the trash would itself be unsafe (controllable-by-others trash directory, unplannable recursive delete, unpublishable cross-device restore), where it refuses instead. The seccomp wrapper follows the same philosophy — setup failures run your command unwrapped with a clear report rather than not at all; only a supervisor that cannot start aborts the launch, because running behind a dead listener would strand syscalls.
@@ -795,7 +811,7 @@ Work through these in order:
 
 ### "My program's deletions are not trashed, but `rm` works"
 
-Almost always one of: the program is statically linked (use `trashd-exec ./your-program`), it runs setuid (same answer), it is — or descends from — a `bypass_processes` entry, or on a packaging-based install the preload library was never registered in `/etc/ld.so.preload`. `TRASHD_PRELOAD_LOG=1 ./your-program` confirms whether the hooks fire at all.
+Almost always one of: the program is statically linked (use `trashd-exec ./your-program`), it runs setuid (its deletions went to the trash of the user it runs as, see *Privileged programs* in the Layer 2 deep dive), it is — or descends from — a `bypass_processes` entry, or the preload library is not listed in `/etc/ld.so.preload` (or that file is not readable by the user running the program). `TRASHD_PRELOAD_LOG=1 ./your-program` confirms whether the hooks fire at all.
 
 ### "How do I see why the seccomp layer is or is not active?"
 
@@ -816,7 +832,7 @@ Automatic wrapping applies to interactive **root** login shells only; non-root s
 
 ### "Does trashd work with my desktop's trash?"
 
-Yes — same folders, same spec. Files trashed from the terminal appear in GNOME Files / Dolphin / Thunar / Nemo and can be restored there; files trashed from the desktop appear in `trash ls` and can be restored with `trash restore`. trashd-only metadata (`X-Trashd-*` fields) is ignored by other implementations, as the spec requires, and auto-compression only touches trashd's own entries so other tools' files stay byte-identical.
+Yes — same folders, same spec. Files trashed from the terminal appear in GNOME Files / Dolphin / Thunar / Nemo and can be restored there; files trashed from the desktop appear in `trash ls` and can be restored with `trash restore`. trashd-only metadata (`X-Trashd-*` fields) is ignored by other implementations, as the spec requires. For the same reason automatic compression is off by default (`retention.auto_compress`): another file manager would restore a compressed entry as zstd data. When enabled, it only touches trashd's own entries, so other tools' files stay byte-identical.
 
 ### "Will `trash empty` in a script hang waiting for input?"
 
@@ -851,7 +867,7 @@ echo $TRASHD_SECCOMP_ACTIVE    # "1" while wrapping is live
 Use it for statically-linked binaries, programs that scrub `LD_PRELOAD`, and anything making raw syscalls. Know the costs before wrapping long-lived or privileged work:
 
 - The wrapped command runs with **`NoNewPrivs` set, irreversibly**: setuid binaries and file capabilities inside it cannot elevate. (`--preserve-privileges` avoids this using `CAP_SYS_ADMIN`, which is why auto-wrapped root shells use it; it falls back cleanly when the capability is unavailable.)
-- The wrapper stays alive until **all descendants** exit — background daemons spawned by the command keep `trashd-exec` running and return the *command's* exit status only at the end.
+- The wrapper stays alive until the command and **all descendants still in its session** exit, then returns the *command's* exit status. Descendants that left the session (`setsid` daemons) do not hold it up; a detached keeper process keeps protecting them until they exit.
 - Protection is published (`TRASHD_SECCOMP_ACTIVE=1` plus cookie) only *after* memory access, root/cwd pinning, and supervisor readiness all succeed; on setup failure your command runs unwrapped instead of failing (supervisor startup failure is the one abort case).
 - Upgrade hygiene: wrapper and preload must come from the same release; restart wrapped sessions after upgrading.
 
@@ -890,7 +906,7 @@ sudo make uninstall          # removes the install; your trash contents are pres
 
 ### Distribution packages
 
-Templates live in [`packaging/`](packaging/): an RPM spec (`trashd.spec`) and an Arch `PKGBUILD`. They build with `cargo build --release --locked` and install via `make install PREFIX=/usr`. Two behavioural notes: packages install the preload library **without** registering it in `/etc/ld.so.preload` (enable Layer 2 by adding the library path there), and the admin config is preserved across upgrades (`%config(noreplace)` / `backup=`). `trash self-update` deliberately refuses to manage package-owned `/usr` installs.
+Templates live in [`packaging/`](packaging/): an RPM spec (`trashd.spec`) and an Arch `PKGBUILD`. They build with `cargo build --release --locked` and install via `make install PREFIX=/usr`. Two behavioural notes: packages register the preload library in `/etc/ld.so.preload` on install (RPM `%post`, Arch `post_install` in `trashd.install`) and remove the entry before their files are erased (`%preun`, `pre_remove`), and the admin config is preserved across upgrades (`%config(noreplace)` / `backup=`). `trash self-update` deliberately refuses to manage package-owned `/usr` installs.
 
 ### Manual install (what the scripts do, by hand)
 
@@ -982,7 +998,7 @@ Every trash, restore, purge, and empty operation appends one line to `~/.local/s
 2026-03-19T22:51:22 pid=20598 RESTORE id=report.pdf to=/home/user/report.pdf
 ```
 
-Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastest way to answer "what deleted this, and when?" after the fact.
+Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastest way to answer "what deleted this, and when?" after the fact. The recorded command is capped at 256 bytes, as in `.trashinfo` files, so one `rm` of thousands of files cannot rotate away the log's history.
 
 ---
 
@@ -994,12 +1010,12 @@ Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastes
 | --- | --- | --- |
 | Linux, any kernel | Layers 1–2 (shim + preload) | The protection most users rely on |
 | Linux 5.6+ | Layer 4 (seccomp user-notification, `openat2` pinning) | Older kernels simply lack kernel trapping |
-| Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts |
+| Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts; on an older kernel, or without fanotify, it exits with status 78 and systemd does not restart it. It cannot audit btrfs subvolume mounts and warns about them |
 | `CAP_SYS_ADMIN` (via systemd ambient capabilities) | Layer 3 daemon | Granted by the shipped unit; you do not set it by hand |
 | Rust 1.99.1+ | Building from source only | Runtime has no Rust dependency |
 | systemd | Daemon + cleanup timer (optional conveniences) | Layers 1, 2, and 4 work without systemd |
 
-Architectures: x86-64 is the primary target (including an optional i686 preload for 32-bit processes on multilib systems); aarch64 is supported for Layers 1–3 and for Layer 4's `unlinkat`-only filter. Release artifacts are built against a glibc 2.28 floor, so they run on older enterprise distributions.
+Architectures: x86-64 is the primary target (including an optional i686 preload for 32-bit processes on multilib systems, used where the system's loaders report their `$LIB` directories, glibc 2.33+); aarch64 is supported for Layers 1–3 and for Layer 4's `unlinkat`-only filter. Release artifacts are built against a glibc 2.28 floor, so they run on older enterprise distributions.
 
 ### FreeDesktop.org Trash specification v1.0
 

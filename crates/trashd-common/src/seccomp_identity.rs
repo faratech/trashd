@@ -26,6 +26,33 @@ pub const RETIRE_GUARD: u64 = 0x736f_7572_6365_6f6b;
 /// # Safety
 /// `pathname` must point to a valid NUL-terminated pathname for this call.
 pub unsafe fn retire_unlink(pathname: *const libc::c_char) -> std::io::Result<()> {
+    unsafe { retire_unlink_in(libc::AT_FDCWD, pathname) }
+}
+
+/// `retire_unlink` of `name` in the directory `dirfd`, where the retirement
+/// syscall takes one: a source is retired from the directory its deletion
+/// pinned, never through a path resolved again (preload-3). x86-64 retires
+/// with unlink, which has no directory argument, so its callers name a
+/// pinned directory through a path instead.
+///
+/// # Safety
+/// `name` must point to a valid NUL-terminated pathname for this call.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn retire_unlink_at(
+    dirfd: libc::c_int,
+    name: *const libc::c_char,
+) -> std::io::Result<()> {
+    unsafe { retire_unlink_in(dirfd, name) }
+}
+
+/// The retirement syscall. `dirfd` is its directory where that syscall is
+/// unlinkat; x86-64's unlink has none.
+unsafe fn retire_unlink_in(
+    dirfd: libc::c_int,
+    pathname: *const libc::c_char,
+) -> std::io::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    let _ = dirfd;
     #[cfg(target_arch = "aarch64")]
     let result: isize = {
         let result;
@@ -35,7 +62,7 @@ pub unsafe fn retire_unlink(pathname: *const libc::c_char) -> std::io::Result<()
                 "svc #0",
                 "2:",
                 in("x8") libc::SYS_unlinkat,
-                inlateout("x0") libc::AT_FDCWD as isize => result,
+                inlateout("x0") dirfd as isize => result,
                 in("x1") pathname,
                 in("x2") 0usize,
                 in("x3") RETIRE_MARK,
@@ -74,7 +101,7 @@ pub unsafe fn retire_unlink(pathname: *const libc::c_char) -> std::io::Result<()
     return if unsafe {
         libc::syscall(
             libc::SYS_unlinkat,
-            libc::AT_FDCWD as libc::c_long,
+            dirfd as libc::c_long,
             pathname,
             0 as libc::c_long,
         )

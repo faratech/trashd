@@ -5,7 +5,7 @@ use trashd_common::TrashStore;
 pub fn run(store: &TrashStore, top: usize) {
     let mut entries = match store.list_for_query(|_| true) {
         Ok(e) => e,
-        Err(e) => fatal(e),
+        Err(e) => fatal_untrusted(e),
     };
 
     if entries.is_empty() {

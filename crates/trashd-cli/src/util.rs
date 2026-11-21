@@ -179,27 +179,7 @@ fn local_instant(naive: chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono
     })
 }
 
-/// `s` for human output, with control and bidi-override characters escaped:
-/// names and sidecar fields come from the filesystem, and could otherwise
-/// move the cursor, clear the screen, or reorder a line (#230).
-pub fn printable(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_control()
-            || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
-            out.extend(c.escape_unicode());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// A path for human output; see [`printable`].
-pub fn printable_path(path: &std::path::Path) -> String {
-    printable(&path.to_string_lossy())
-}
+pub use trashd_common::display::{printable, printable_path};
 
 /// Serialize rows directly instead of duplicating all entries as Values and
 /// a complete JSON String. Keep the historical pretty format and key order.
@@ -280,6 +260,14 @@ pub fn fatal(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// [`fatal`] for an error that can carry a name or sidecar field from the
+/// trash, such as a store error naming a recorded path or an ID: escaped
+/// like all other human output (#230, cli-2). `fatal` itself stays raw for
+/// messages that need their line breaks, such as self-update's.
+pub fn fatal_untrusted(msg: impl std::fmt::Display) -> ! {
+    fatal(printable(&msg.to_string()))
+}
+
 /// Shared error-exit for store operations.
 pub fn open_store() -> trashd_common::TrashStore {
     match trashd_common::TrashStore::open() {
@@ -289,6 +277,26 @@ pub fn open_store() -> trashd_common::TrashStore {
 }
 
 pub use std::path::PathBuf;
+
+/// Run one test of this binary again in a child process with `variable` set
+/// to `value`, for commands that end the process (`fatal`, a non-zero exit).
+/// Colors are off, so the output holds only what the command wrote.
+#[cfg(test)]
+pub(crate) fn rerun_test(
+    test: &str,
+    variable: &str,
+    value: &std::ffi::OsStr,
+) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env(variable, value)
+        .env("TRASH_BYPASS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
 
 #[cfg(test)]
 mod tests {

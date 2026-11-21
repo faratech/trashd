@@ -5,7 +5,7 @@ use trashd_common::TrashStore;
 pub fn run(store: &TrashStore) {
     match store.undo() {
         Ok(path) => println!("{}", restored_confirmation(&path)),
-        Err(e) => fatal(e),
+        Err(e) => fatal_untrusted(e),
     }
 }
 

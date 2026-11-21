@@ -14,10 +14,13 @@ on:
     tags:
       - 'v*'
 
+# Least privilege per job (install-7): the build job runs every dependency's
+# build scripts, proc macros and tests, plus PyPI tooling, so it gets a
+# read-only token that is not persisted into .git/config. Only the attest job
+# (first-party actions on the uploaded tarballs) can sign provenance, and
+# only the release job, which builds nothing, can write releases and tags.
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -92,10 +95,13 @@ jobs:
             arch: aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
@@ -180,16 +186,6 @@ jobs:
           tar czf "${STAGING}.tar.gz" "${STAGING}"
           sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
 
-      - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v4
-        # Deliberately NO continue-on-error: the release notes tell users to
-        # verify assets with `gh attestation verify`, so a silently missing
-        # attestation would break verification of the published release (#102).
-        with:
-          subject-path: |
-            trashd-*.tar.gz
-            trashd-*.tar.gz.sha256
-
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -198,15 +194,44 @@ jobs:
             trashd-*.tar.gz
             trashd-*.tar.gz.sha256
 
-  # Create GitHub Release with all artifacts
-  release:
-    needs: [version, build]
+  # Sign provenance for the built tarballs in a job that runs no build code
+  # (install-7).
+  attest:
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        # Deliberately NO continue-on-error: the release notes tell users to
+        # verify assets with `gh attestation verify`, so a silently missing
+        # attestation would break verification of the published release (#102).
+        with:
+          subject-path: |
+            artifacts/trashd-linux-*/trashd-*.tar.gz
+            artifacts/trashd-linux-*/trashd-*.tar.gz.sha256
+
+  # Create GitHub Release with all artifacts, only once they are attested
+  release:
+    needs: [version, build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Determine version
         id: version

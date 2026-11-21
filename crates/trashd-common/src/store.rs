@@ -1,4 +1,5 @@
 use crate::config::Config;
+pub use crate::config::ExclusionKind;
 use crate::mounts;
 use crate::store_lock::RootMutationGuard;
 use crate::trashinfo::TrashInfo;
@@ -13,7 +14,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -26,8 +27,10 @@ pub enum TrashError {
     Io(#[from] io::Error),
     #[error("path does not exist: {0}")]
     NotFound(PathBuf),
-    #[error("path is in never-trash list: {0}")]
-    Excluded(PathBuf),
+    /// Configured to be deleted for real, for `kind`: a verdict for this
+    /// path alone, never for what a directory holds (common-policy-1).
+    #[error("path is {kind}: {path}")]
+    Excluded { path: PathBuf, kind: ExclusionKind },
     #[error("file too large ({size_mb} MB > {limit_mb} MB limit): {path}")]
     TooLarge {
         path: PathBuf,
@@ -82,6 +85,21 @@ pub struct TrashStore {
     scan_data_stats: std::cell::Cell<usize>,
     #[cfg(test)]
     accounting_walks: std::cell::Cell<usize>,
+    /// Runs once between a scan's info/ and files/ passes, as a writer
+    /// racing the unlocked listing would.
+    #[cfg(test)]
+    between_scan_passes: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once right before `trash` or `trash_at` moves its operand, as a
+    /// process replacing the operand after it was sized would.
+    #[cfg(test)]
+    before_move: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+    /// Runs once between a conflicting restore and its first `--force`
+    /// retry, as a process changing the destination's directories would.
+    #[cfg(test)]
+    before_forced_retry: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+    /// The cross-device move's durability steps, in order.
+    #[cfg(test)]
+    durability_events: std::cell::RefCell<Vec<&'static str>>,
     /// Trash roots whose parent chain this store validated recently, with
     /// the validating UID and time (#307).
     trusted_parents: std::cell::RefCell<Vec<(PathBuf, u32, std::time::Instant)>>,
@@ -94,6 +112,12 @@ pub struct TrashStore {
     purge_not_due_until: std::cell::Cell<Option<std::time::Instant>>,
     /// Identities of each trash root and its ancestors (`trash_ancestry`).
     trash_ancestry: std::cell::RefCell<Vec<TrashAncestry>>,
+    /// How long an explicit purge, empty or restore waits for an entry lock
+    /// before it reports the entry busy ([`ENTRY_LOCK_WAIT`]).
+    entry_lock_wait: std::time::Duration,
+    /// How long this store waits for a trash root's lock before it reports
+    /// the root busy.
+    root_lock_wait: std::time::Duration,
 }
 
 /// A single entry in the trash.
@@ -158,6 +182,55 @@ fn entry_paths_match(entry: &TrashEntry) -> bool {
         && data_name != OsStr::new("..")
 }
 
+/// An entry's data name in files/ and sidecar name in info/, raw bytes.
+fn entry_names(entry: &TrashEntry) -> Result<(CString, CString), TrashError> {
+    let name = |path: &Path| {
+        path.file_name()
+            .and_then(|name| CString::new(name.as_bytes()).ok())
+            .ok_or_else(|| TrashError::EntryNotFound(entry.id.clone()))
+    };
+    Ok((name(&entry.trashed_path)?, name(&entry.info_path)?))
+}
+
+/// Where a restore puts an entry, which decides how far the path is
+/// trusted.
+#[derive(Clone, Copy)]
+enum RestoreTarget<'a> {
+    /// The path the entry's sidecar records. That is text anyone who can
+    /// write the medium may have crafted: it stays below its topdir and is
+    /// reached through no symlink.
+    Recorded,
+    /// A free name beside the recorded path, for a `--force` retry. It is
+    /// derived from the same text, so it is confined like it: passed on as
+    /// a destination the user chose, it left the topdir and followed
+    /// symlinks (store-core-8, cli-6).
+    BesideRecorded(&'a Path),
+    /// A destination the user named: trusted, symlinks included.
+    Explicit(&'a Path),
+}
+
+impl<'a> RestoreTarget<'a> {
+    fn of(target: Option<&'a Path>) -> Self {
+        target.map_or(Self::Recorded, Self::Explicit)
+    }
+}
+
+/// `name` (files/ or info/) of the trash root at `root`, opened following
+/// no symlink in the root or in `name`, and on the root's own device
+/// (EXDEV otherwise): how an unlocked caller reaches a topdir root's store
+/// (security-1).
+fn open_store_child(root: &Path, name: &CStr) -> io::Result<fs::File> {
+    let root_dir = crate::fdops::open_dir_nofollow_at(
+        libc::AT_FDCWD,
+        &CString::new(root.as_os_str().as_bytes())?,
+    )?;
+    let child = crate::fdops::open_dir_nofollow_at(root_dir.as_raw_fd(), name)?;
+    if stat_fd(child.as_raw_fd())?.st_dev != stat_fd(root_dir.as_raw_fd())?.st_dev {
+        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Ok(child)
+}
+
 impl TrashStore {
     pub fn open() -> Result<Self, TrashError> {
         Self::open_with_config(Config::load())
@@ -176,6 +249,12 @@ impl TrashStore {
 
     pub fn home_dir(&self) -> &Path {
         &self.home
+    }
+
+    /// Wait at most `wait` for a trash root's lock before reporting the
+    /// root busy, instead of `store_lock::ROOT_LOCK_WAIT`.
+    pub fn set_root_lock_wait(&mut self, wait: std::time::Duration) {
+        self.root_lock_wait = wait;
     }
 
     /// Stop running retention inside mutations: the caller runs it with
@@ -206,7 +285,9 @@ impl TrashStore {
         // The guard validates the root, files/ and info/ through descriptors;
         // path checks first only repeated that (#307). They still classify a
         // failure: an unsafe or incomplete root is refused, as before.
-        RootMutationGuard::acquire_as(root, uid).map_err(|error| {
+        // A root whose lock stays held is busy (EBUSY), never waited for
+        // without end (store-metadata-6).
+        RootMutationGuard::acquire_within(root, uid, self.root_lock_wait).map_err(|error| {
             if mounts::is_safe_trash_root(root, uid) {
                 TrashError::Io(error)
             } else {
@@ -221,6 +302,23 @@ impl TrashStore {
         match self.lock_trash_root(root) {
             Err(TrashError::Refused(_)) => {
                 self.ensure_trash_dir(root)?;
+                self.lock_trash_root(root)
+            }
+            result => result,
+        }
+    }
+
+    /// `lock_trash_root` for a purge or a repair. A root that lost its
+    /// info/ holds only data nothing describes, which the listing shows as
+    /// orphans (#403); the lock validates info/ too and refused the root,
+    /// so no purge could remove them and `empty` left them there on every
+    /// run (store-metadata-4). The missing info/ is put back first.
+    pub fn lock_trash_root_repaired(&self, root: &Path) -> Result<RootMutationGuard, TrashError> {
+        match self.lock_trash_root(root) {
+            Err(TrashError::Refused(_)) => {
+                // Whoever put it back, a concurrent purge included: the
+                // lock judges what is there now.
+                let _ = restore_missing_info_dir(root, unsafe { libc::geteuid() });
                 self.lock_trash_root(root)
             }
             result => result,
@@ -268,13 +366,21 @@ impl TrashStore {
         if guard.root() != entry.trash_root || !entry_paths_match(entry) || entry.id.is_empty() {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        let read_metadata = |path: &Path| match fs::symlink_metadata(path) {
+        // Through the directories the lock validated, never the entry's
+        // paths: a FUSE or NFS server can answer files/ or info/ with a
+        // symlink once the lock checked them, and the paths then named
+        // whatever it points at, /etc/shadow included (security-1).
+        let (data_name, info_name) = entry_names(entry)?;
+        let read_metadata = |dir: &fs::File, name: &CStr| match crate::fdops::metadata_nofollow_at(
+            dir.as_raw_fd(),
+            name,
+        ) {
             Ok(metadata) => Ok(Some(metadata)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(TrashError::Io(error)),
         };
-        let data = read_metadata(&entry.trashed_path)?;
-        let sidecar = read_metadata(&entry.info_path)?;
+        let data = read_metadata(guard.files(), &data_name)?;
+        let sidecar = read_metadata(guard.info(), &info_name)?;
         let identity = data
             .as_ref()
             .map(|metadata| (metadata.dev(), metadata.ino()));
@@ -286,6 +392,17 @@ impl TrashStore {
             }
         });
         if identity != entry.identity || version != entry.sidecar_version {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
+        // An orphan snapshot whose sidecar now parses came from a listing
+        // that raced the entry's publication. Writers publish the sidecar
+        // and then the data under this lock, so the sidecar is complete here
+        // and the entry is live (store-core-1).
+        if entry.orphaned
+            && sidecar.as_ref().is_some_and(fs::Metadata::is_file)
+            && crate::trashinfo::read_sidecar_at(guard.info().as_raw_fd(), &info_name)
+                .is_ok_and(|content| TrashInfo::from_trashinfo(&content).is_some())
+        {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
         Ok((data, sidecar))
@@ -330,6 +447,8 @@ impl TrashStore {
             maintenance_due: std::cell::Cell::new(false),
             purge_not_due_until: std::cell::Cell::new(None),
             trash_ancestry: std::cell::RefCell::new(Vec::new()),
+            entry_lock_wait: ENTRY_LOCK_WAIT,
+            root_lock_wait: crate::store_lock::ROOT_LOCK_WAIT,
             home,
             isolated,
             #[cfg(test)]
@@ -340,6 +459,14 @@ impl TrashStore {
             scan_data_stats: std::cell::Cell::new(0),
             #[cfg(test)]
             accounting_walks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            between_scan_passes: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            before_move: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            before_forced_retry: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            durability_events: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -499,9 +626,17 @@ impl TrashStore {
         let meta =
             fs::symlink_metadata(&abs_path).map_err(|_| TrashError::NotFound(abs_path.clone()))?;
 
-        // Check never-trash list
-        if self.should_skip(&abs_path) {
-            return Err(TrashError::Excluded(abs_path));
+        // Check never-trash list. The trash itself, anything in it and its
+        // ancestors stay refused even so: excluded first, a whitelist miss
+        // on `~/.local` deleted the trash for real (cross-layer-5).
+        if let Some(kind) = self.exclusion(&abs_path) {
+            let trash_dir = self.existing_trash_dir(&abs_path, meta.dev());
+            let identity = meta.is_dir().then(|| (meta.dev(), meta.ino()));
+            self.refuse_trash_itself(&abs_path, identity, &trash_dir)?;
+            return Err(TrashError::Excluded {
+                path: abs_path,
+                kind,
+            });
         }
 
         // Check size limit (for files only)
@@ -536,20 +671,11 @@ impl TrashStore {
             }
         }
 
-        // Check bypass_paths — if the calling process exe matches, skip trash
-        if !self.config.bypass_paths.is_empty()
-            && let Ok(exe) = fs::read_link("/proc/self/exe")
-        {
-            let exe_str = exe.to_string_lossy();
-            if self
-                .config
-                .bypass_paths
-                .iter()
-                .any(|p| exe_str.starts_with(p))
-            {
-                return Err(TrashError::Excluded(abs_path));
-            }
-        }
+        // bypass_paths names the deleting program, which only the caller
+        // knows: matched here against /proc/self/exe, inside the shim it
+        // named the shim, and a prefix covering trashd's install directory
+        // made every rm a real delete (cross-layer-4). The shim checks its
+        // caller instead, before opening the store.
 
         // Pick the right trash directory (same-device preferred). The
         // operand's device is already known; selection need not stat it.
@@ -562,30 +688,206 @@ impl TrashStore {
             mounts::existing_trash_dir_for_path_on(&abs_path, Some(meta.dev()), &self.home)
         };
 
-        // Refuse to trash the trash directory itself, anything inside it, or
-        // any ancestor of it: rename would fail (dest inside src), the
-        // cross-device fallback would copy the store into itself until the
-        // depth cap. `rm -rf ~/.local/share/Trash` must
-        // never destroy the trash. Callers treat Refused as a hard stop —
-        // NOT Excluded, which means "real-delete on purpose".
-        if abs_path == trash_dir
-            || abs_path.starts_with(&trash_dir)
-            || trash_dir.starts_with(&abs_path)
-        {
-            return Err(TrashError::Refused(abs_path));
-        }
-        // The same directory reached under another name (a bind mount of
-        // ~/.local/share, say) compares by identity: moving it would carry
-        // the trash, or its info/ into its files/ (#362).
-        if meta.is_dir()
-            && self
-                .trash_ancestry(&trash_dir)
-                .contains(&(meta.dev(), meta.ino()))
-        {
-            return Err(TrashError::Refused(abs_path));
+        let identity = meta.is_dir().then(|| (meta.dev(), meta.ino()));
+        self.refuse_trash_itself(&abs_path, identity, &trash_dir)?;
+        // A directory is checked once its tree has been surveyed.
+        if meta.is_file() {
+            self.check_retention_cap(&abs_path, meta.size(), &trash_dir)?;
         }
 
         Ok((abs_path, meta, trash_dir))
+    }
+
+    /// The trash `path` (on `dev`) would go to, without preparing one.
+    fn existing_trash_dir(&self, path: &Path, dev: u64) -> PathBuf {
+        if self.isolated {
+            self.home.clone()
+        } else {
+            mounts::existing_trash_dir_for_path_on(path, Some(dev), &self.home)
+        }
+    }
+
+    /// Refuse to trash the trash directory itself, anything inside it, or
+    /// any ancestor of it: rename would fail (dest inside src), the
+    /// cross-device fallback would copy the store into itself until the
+    /// depth cap. `rm -rf ~/.local/share/Trash` must never destroy the
+    /// trash. Callers treat Refused as a hard stop — NOT Excluded, which
+    /// means "real-delete on purpose". A directory's `identity` is compared
+    /// too: the same directory reached under another name (a bind mount of
+    /// ~/.local/share, say) would carry the trash, or its info/ into its
+    /// files/ (#362).
+    fn refuse_trash_itself(
+        &self,
+        path: &Path,
+        identity: Option<(u64, u64)>,
+        trash_dir: &Path,
+    ) -> Result<(), TrashError> {
+        if path == trash_dir
+            || path.starts_with(trash_dir)
+            || trash_dir.starts_with(path)
+            || identity.is_some_and(|identity| self.trash_ancestry(trash_dir).contains(&identity))
+        {
+            return Err(TrashError::Refused(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    /// Make a new entry's sidecar and its info/ entry durable before a
+    /// cross-device source is retired, after which the trash copy is the
+    /// only copy: torn by a crash, it came back an orphan without its
+    /// original path (store-core-5). A same-device rename skips this; every
+    /// trapped unlink of an `rm -rf` would pay two more fsyncs.
+    fn sync_new_sidecar(&self, claim: &fs::File, info: &fs::File) -> io::Result<()> {
+        claim.sync_data()?;
+        #[cfg(test)]
+        self.durability_events.borrow_mut().push("sidecar");
+        info.sync_all()?;
+        #[cfg(test)]
+        self.durability_events.borrow_mut().push("info");
+        Ok(())
+    }
+
+    /// The copy fallback of `trash` and `trash_at`: bring `src_parent/name`
+    /// (lstat `source`) into the locked root as `files/<id>`, the entry
+    /// whose sidecar `claim` is `info/<info_name>`. Returns the copy's
+    /// identity, with the root locked.
+    ///
+    /// A file or tree is staged in the state directory WITHOUT the root
+    /// lock, which is taken again only to publish it. Held through the copy,
+    /// it made every other delete of the user wait for a large tree, and
+    /// without end for a copier that was stopped (store-metadata-6). Two
+    /// things protect the copy meanwhile, and both end with this process:
+    /// the claimed sidecar is locked (`claim_in_flight`), so a purge or an
+    /// `fsck --fix` that finds it without data leaves it alone, and the
+    /// stage is leased, so no sweep takes it for abandoned.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_into_claim(
+        &self,
+        trash_dir: &Path,
+        guard: &mut Option<RootMutationGuard>,
+        files: RawFd,
+        info: RawFd,
+        info_name: &CStr,
+        claim: &fs::File,
+        src_parent: RawFd,
+        name: &CStr,
+        id: &CStr,
+        source: &libc::stat,
+    ) -> io::Result<(u64, u64)> {
+        let locked = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        if !matches!(source.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
+            // A symlink or a FIFO is made in place: there is no copy to
+            // wait for.
+            return copy_source_at(
+                src_parent,
+                name,
+                files,
+                id,
+                locked.state().as_raw_fd(),
+                source,
+            );
+        }
+        // Staged in the root's private state directory, never in files/, so
+        // an interrupted copy cannot pose as an entry.
+        let state = locked.state().try_clone()?;
+        let _lease = locked.lease_stages()?;
+        claim_in_flight(claim)?;
+        drop(guard.take());
+        let (stage, identity) = stage_copy_at(src_parent, name, state.as_raw_fd(), source)?;
+        let published = (|| {
+            let relocked = self
+                .lock_trash_root(trash_dir)
+                .map_err(|error| match error {
+                    TrashError::Io(error) => error,
+                    other => io::Error::other(other.to_string()),
+                })?;
+            // This lock covers the copy only if it validated the very
+            // directories the entry was claimed and staged in.
+            for (pinned, validated) in [
+                (files, relocked.files()),
+                (info, relocked.info()),
+                (state.as_raw_fd(), relocked.state()),
+            ] {
+                if stat_identity(&stat_fd(pinned)?)
+                    != stat_identity(&stat_fd(validated.as_raw_fd())?)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "the trash was replaced during the copy",
+                    ));
+                }
+            }
+            // The id is this entry's only while the claim is still its
+            // sidecar: a trashd older than the in-flight lock strips one
+            // whose data it cannot see yet, and the id may be claimed again.
+            if !claim_is_current(info, info_name, claim) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the trash entry's record was removed during the copy",
+                ));
+            }
+            publish_staged_at(
+                state.as_raw_fd(),
+                &stage,
+                files,
+                id,
+                source,
+                identity,
+                Publication::PrivateRoot,
+                rename_noreplace_at,
+            )?;
+            Ok(relocked)
+        })();
+        match published {
+            Ok(relocked) => {
+                *guard = Some(relocked);
+                // With its data the entry is an ordinary one.
+                unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_UN) };
+                Ok(identity)
+            }
+            Err(error) => {
+                let _ = remove_created_tree_at(state.as_raw_fd(), &stage, identity);
+                Err(error)
+            }
+        }
+    }
+
+    /// retention.max_size_gb in bytes; 0 means no size limit.
+    fn retention_size_cap(&self) -> u64 {
+        (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64
+    }
+
+    /// Whether `root` is on the home trash's filesystem: the only trash the
+    /// size cap governs (store-core-3).
+    fn on_home_filesystem(&self, root: &Path) -> bool {
+        if root == self.home {
+            return true;
+        }
+        let home = mounts::device_id_or_parent(&self.home);
+        home.is_some() && mounts::device_id_or_parent(root) == home
+    }
+
+    /// Refuse an operand larger than the size cap of the trash it would land
+    /// in. Retention could only fit it by purging it, and first every other
+    /// entry; the delete that just succeeded became permanent (store-core-2).
+    /// Like the other size caps, this is a refusal: nothing moves (#10).
+    fn check_retention_cap(
+        &self,
+        path: &Path,
+        size: u64,
+        trash_dir: &Path,
+    ) -> Result<(), TrashError> {
+        let cap = self.retention_size_cap();
+        if cap == 0 || size <= cap || !self.on_home_filesystem(trash_dir) {
+            return Ok(());
+        }
+        Err(TrashError::TooLarge {
+            path: path.to_path_buf(),
+            size_mb: size / (1024 * 1024),
+            limit_mb: cap / (1024 * 1024),
+        })
     }
 
     /// Move a file or directory to the trash. Returns the trash entry ID.
@@ -604,20 +906,19 @@ impl TrashStore {
         let mut sizes = if meta.is_dir() {
             // A mount inside would move with the tree, out of its place and
             // into the trash: rm leaves mounts where they are (#366).
-            let survey = CString::new(abs_path.as_os_str().as_bytes())
-                .ok()
-                .and_then(|name| open_directory_at(libc::AT_FDCWD, &name, true, false).ok())
-                .map_or_else(TreeSurvey::unwalked, |dir| {
-                    tree_survey(dir.as_raw_fd(), true)
-                });
+            let survey = match CString::new(abs_path.as_os_str().as_bytes()) {
+                Ok(name) => tree_survey_at(libc::AT_FDCWD, &name, true),
+                Err(error) => TreeSurvey::unwalked(error.into()),
+            };
             if let Some(mount) = survey.mount_in(&abs_path) {
                 return Err(TrashError::HoldsMount(mount));
             }
-            (survey.apparent, survey.allocated)
+            self.check_retention_cap(&abs_path, survey.apparent, &trash_dir)?;
+            survey.sizes()
         } else {
-            (meta.size(), 0)
+            EntrySizes::of_file(meta.size())
         };
-        info.size = Some(sizes.0);
+        info.size = sizes.apparent;
 
         // Compute file hash for small files only (configurable, default 1 MB).
         // Hashing reads the entire file — too expensive for large files on every rm.
@@ -638,33 +939,46 @@ impl TrashStore {
             info.sha256 = Some(hash);
         }
 
-        let mut guard = Some(self.lock_trash_root_prepared(&trash_dir)?);
+        let locked = self.lock_trash_root_prepared(&trash_dir)?;
+        // Every step below that touches the store goes through the
+        // descriptors this lock validated, kept past it (the copy fallback
+        // releases the lock to retire its source): resolved again by path,
+        // files/ or info/ could be a symlink a FUSE or NFS server answered
+        // once the lock checked them (security-2).
+        let files = locked.files().try_clone()?;
+        let info_dir = locked.info().try_clone()?;
         // Generate unique trash ID within that trash dir (atomic)
         let file_name = abs_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unnamed".into());
-        let (id, info_file, claim) = unique_id_atomic(&trash_dir, &file_name)?;
-
-        let dest = trash_dir.join("files").join(&id);
+        let (id, _, claim) = unique_id_atomic(&trash_dir, &locked, &file_name)?;
+        let mut guard = Some(locked);
+        let id_name = CString::new(id.as_bytes()).map_err(io::Error::from)?;
+        let info_name = CString::new(format!("{id}.trashinfo")).map_err(io::Error::from)?;
+        let release_claim = || release_claim_at(info_dir.as_raw_fd(), &info_name, &claim);
 
         // Write .trashinfo content through the descriptor that claimed it.
         // On failure, release the claim so an ENOSPC cannot strand an
         // invisible 0-byte sidecar that also reserves the id stem (#109).
-        if let Err(e) = write_claimed_sidecar(claim, &info) {
-            let _ = raw_unlink_path(&info_file);
+        if let Err(e) = write_claimed_sidecar(&claim, &info) {
+            release_claim();
             return Err(TrashError::Io(e));
         }
 
         // Try rename (fast, same filesystem — should always work with topdir trash)
         let mut copy_done = false;
         let mut created_identity = None;
+        let mut copy_lock = None;
         let move_result: Result<(), TrashError> = (|| {
             let source_name =
                 CString::new(abs_path.as_os_str().as_bytes()).map_err(io::Error::from)?;
-            let dest_name = CString::new(dest.as_os_str().as_bytes()).map_err(io::Error::from)?;
+            #[cfg(test)]
+            if let Some(hook) = self.before_move.borrow_mut().take() {
+                hook();
+            }
             if let Err(rename_error) =
-                rename_noreplace_at(libc::AT_FDCWD, &source_name, libc::AT_FDCWD, &dest_name)
+                rename_noreplace_at(libc::AT_FDCWD, &source_name, files.as_raw_fd(), &id_name)
             {
                 if is_conflict_error(&rename_error) {
                     return Err(rename_error.into());
@@ -693,10 +1007,6 @@ impl TrashStore {
                     CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::from)?;
                 // O_PATH: removing needs no read access to the parent.
                 let source_parent = open_directory_at(libc::AT_FDCWD, &parent, false, true)?;
-                let files_dir = CString::new(trash_dir.join("files").as_os_str().as_bytes())
-                    .map_err(io::Error::from)?;
-                let files = open_directory_at(libc::AT_FDCWD, &files_dir, true, false)?;
-                let id_name = CString::new(id.as_bytes()).map_err(io::Error::from)?;
                 let source = stat_at(source_parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)?;
                 if stat_identity(&source) != (meta.dev(), meta.ino()) {
                     return Err(io::Error::new(
@@ -710,34 +1020,41 @@ impl TrashStore {
                     &name,
                     stat_identity(&source),
                 )?;
-                // Staged in the root's private state directory, never in
-                // files/, so an interrupted copy cannot pose as an entry.
-                let state_dir = CString::new(trash_dir.join(".trashd").as_os_str().as_bytes())
-                    .map_err(io::Error::from)?;
-                let staging = open_directory_at(libc::AT_FDCWD, &state_dir, true, false)?;
-                created_identity = Some(copy_source_at(
+                // Staged without the root lock, published under it
+                // (store-metadata-6).
+                created_identity = Some(self.copy_into_claim(
+                    &trash_dir,
+                    &mut guard,
+                    files.as_raw_fd(),
+                    info_dir.as_raw_fd(),
+                    &info_name,
+                    &claim,
                     source_parent.as_raw_fd(),
                     &name,
-                    files.as_raw_fd(),
                     &id_name,
-                    staging.as_raw_fd(),
                     &source,
                 )?);
                 // The copy's data is synced; make its directory entry durable
                 // before the source can disappear.
                 files.sync_all()?;
+                #[cfg(test)]
+                self.durability_events.borrow_mut().push("files");
+                self.sync_new_sidecar(&claim, &info_dir)?;
                 copy_done = true;
-                // Source retirement can trap into a seccomp supervisor that
-                // needs this same root lock, so only under an active seccomp
-                // filter is the lock released before retiring. Otherwise the
-                // lock is held through retirement: dropping it let a waiting
-                // purge delete the fresh trash copy, after which retiring
-                // the source destroyed both copies (#243).
-                if std::env::var_os("TRASHD_SECCOMP_ACTIVE").is_some_and(|v| v == "1") {
-                    drop(guard.take());
-                }
+                // Source retirement unlinks, which trap into a seccomp
+                // supervisor that may be waiting for this same root lock, so
+                // the lock is released before retiring (store-core-4). The
+                // environment cannot say whether this process is filtered
+                // (`sudo` resets it inside a wrapped session), and retiring a
+                // large tree held every trash writer of this user. The fresh
+                // copy keeps its entry lock instead: a purge must not delete
+                // it while retiring the source destroys the other copy (#243).
+                copy_lock = lock_published_copy(files.as_raw_fd(), &id_name);
+                drop(guard.take());
                 // Raw syscalls throughout: the system-wide preload would
                 // otherwise trash the source a second time (#104).
+                #[cfg(test)]
+                self.durability_events.borrow_mut().push("retire");
                 let complete = match &snapshot {
                     Some(before) => retire_directory_snapshot_at(
                         source_parent.as_raw_fd(),
@@ -769,12 +1086,12 @@ impl TrashStore {
                 // copy of that data. Keep the entry (data + .trashinfo) fully
                 // intact and surface the error; the caller can clean up the
                 // leftover source once the underlying problem is fixed.
-                eprintln!(
+                crate::report_note(&format!(
                     "trashd: warning: copied '{p}' to the trash but could not remove the \
                      original ({e}); keeping the complete trashed copy — the leftover \
                      source can be removed manually",
                     p = abs_path.display()
-                );
+                ));
                 // The kept copy is only "complete" with its sidecar: the copy
                 // spanned the same data-absence window as a normal move, so a
                 // concurrent purge may have stripped the sidecar mid-copy
@@ -784,18 +1101,14 @@ impl TrashStore {
                     "copied to trash but failed to remove original: {e}"
                 ))));
             }
-            // The copy itself failed — nothing was moved; roll back cleanly.
-            let _ = raw_unlink_path(&info_file);
-            if created_identity.is_some()
-                && file_identity(&dest) == created_identity
-                && let Ok(meta) = fs::symlink_metadata(&dest)
+            // The copy itself failed — nothing was moved; roll back cleanly,
+            // through the descriptors it was made in.
+            release_claim();
+            if let Some(created) = created_identity
+                && stat_at(files.as_raw_fd(), &id_name, libc::AT_SYMLINK_NOFOLLOW)
+                    .is_ok_and(|copy| stat_identity(&copy) == created)
             {
-                if meta.is_dir() && !meta.file_type().is_symlink() {
-                    let _ = fs::remove_dir_all(&dest);
-                } else {
-                    // Symlinks, regular files, etc.
-                    let _ = raw_unlink_path(&dest);
-                }
+                let _ = remove_tree_at(files.as_raw_fd(), &id_name, 0);
             }
             return Err(e);
         }
@@ -803,35 +1116,42 @@ impl TrashStore {
         // The move completed: make sure a concurrent purge did not strip the
         // sidecar while the data was absent mid-move (#169).
 
-        // On the seccomp path the root lock was released before retirement
-        // (#243): re-acquire it and verify the entry survived. Reporting
-        // success for a copy a purge already deleted would hide data loss.
-        if guard.is_none() {
-            let _verify_guard = self.lock_trash_root(&trash_dir)?;
-            if fs::symlink_metadata(&dest).is_err() || !info_file.exists() {
+        // The copy path released the root lock before retirement: re-acquire
+        // it and verify the entry survived. Reporting success for a copy a
+        // purge already deleted would hide data loss.
+        let verify_guard = if guard.is_none() {
+            let verify_guard = self.lock_trash_root(&trash_dir)?;
+            if stat_at(files.as_raw_fd(), &id_name, libc::AT_SYMLINK_NOFOLLOW).is_err()
+                || stat_at(info_dir.as_raw_fd(), &info_name, libc::AT_SYMLINK_NOFOLLOW).is_err()
+            {
                 return Err(TrashError::EntryNotFound(id.clone()));
             }
-        }
+            Some(verify_guard)
+        } else {
+            None
+        };
+        drop(copy_lock);
 
         // Post-move identity refresh for the rename path (#246, mirroring
         // trash_at): the final component may have been replaced between the
         // hash/size reads and the rename, so the sidecar must describe the
         // inode that actually landed in the trash.
         if !copy_done {
-            match fs::symlink_metadata(&dest) {
+            match crate::fdops::metadata_nofollow_at(files.as_raw_fd(), &id_name) {
                 Ok(dest_meta) if (dest_meta.dev(), dest_meta.ino()) != (meta.dev(), meta.ino()) => {
                     sizes = if dest_meta.is_dir() {
-                        tree_sizes(&dest)
+                        tree_sizes_at(files.as_raw_fd(), &id_name)
                     } else {
-                        (dest_meta.size(), 0)
+                        EntrySizes::of_file(dest_meta.size())
                     };
-                    info.size = Some(sizes.0);
+                    info.size = sizes.apparent;
                     info.sha256 = if dest_meta.is_file()
                         && hash_limit > 0
                         && dest_meta.size() <= hash_limit
                     {
-                        hash_file_verified(
-                            &dest,
+                        hash_file_verified_at(
+                            files.as_raw_fd(),
+                            &id_name,
                             &self.config.hash_algorithm,
                             (dest_meta.dev(), dest_meta.ino()),
                         )
@@ -839,25 +1159,30 @@ impl TrashStore {
                     } else {
                         None
                     };
-                    let _ = write_trashinfo_atomic(&info_file, &info);
+                    let _ = replace_sidecar_at(info_dir.as_raw_fd(), &info_name, &info);
                 }
                 Ok(_) => {}
                 Err(_) => {
                     info.sha256 = None;
-                    let _ = write_trashinfo_atomic(&info_file, &info);
+                    let _ = replace_sidecar_at(info_dir.as_raw_fd(), &info_name, &info);
                 }
             }
         }
 
-        // Update directorysizes cache if we just trashed a directory
-        if guard.is_some() && meta.is_dir() {
-            let _ = crate::directorysizes::record_directory(&trash_dir, OsStr::new(&id), sizes.1);
+        // Update the directorysizes cache if a directory landed: `sizes`
+        // describes what did, which a race can make another type than the
+        // operand had before the move (recent-changes-9).
+        if let Some(allocated) = sizes.allocated
+            && let Some(locked) = guard.as_ref().or(verify_guard.as_ref())
+        {
+            let _ = crate::directorysizes::record_directory(locked, OsStr::new(&id), allocated);
         }
 
-        // Log operation
-        crate::oplog::log_trash_in(&self.home, &abs_path, &id, command);
-
         drop(guard);
+        drop(verify_guard);
+        // The log is not part of publication: write it after releasing the
+        // lock every trash writer waits on (store-metadata-3).
+        crate::oplog::log_trash_in(&self.home, &abs_path, &id, command);
         // Run auto-purge if enough time has passed since the last one.
         // Scanning the entire trash on every deletion is O(n) — throttle it.
         self.after_mutation();
@@ -962,8 +1287,15 @@ impl TrashStore {
         let file_dev = stat.st_dev as u64;
 
         // Eligibility on the display path (config semantics are path-based).
-        if self.should_skip(&display_path) {
-            return Err(TrashError::Excluded(display_path.clone()));
+        // The trash, anything in it and its ancestors stay refused even
+        // where excluded, as in prepare_source (cross-layer-5).
+        if let Some(kind) = self.exclusion(&display_path) {
+            let trash_dir = self.existing_trash_dir(&display_path, file_dev);
+            self.refuse_trash_itself(&display_path, None, &trash_dir)?;
+            return Err(TrashError::Excluded {
+                path: display_path,
+                kind,
+            });
         }
 
         // Size limits — parity with trash().
@@ -1021,6 +1353,10 @@ impl TrashStore {
         {
             return Err(TrashError::Refused(display_path.clone()));
         }
+        // The retention size cap, as in trash(); a tree after its survey.
+        if fmt == libc::S_IFREG {
+            self.check_retention_cap(&display_path, stat.st_size as u64, &trash_dir)?;
+        }
 
         // A trash on another filesystem cannot take a rename; the copy
         // fallback below handles it instead of continuing the target's
@@ -1046,32 +1382,28 @@ impl TrashStore {
         if files_fd < 0 {
             return Err(TrashError::Io(io::Error::last_os_error()));
         }
-        let mut fstat_files: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(files_fd, &mut fstat_files) } != 0 {
-            unsafe { libc::close(files_fd) };
-            return Err(TrashError::Io(io::Error::last_os_error()));
-        }
-        let cross_device = fstat_files.st_dev as u64 != file_dev;
 
         let trashinfo_path = Self::compute_trashinfo_path(&trash_dir, &display_path, &home_trash);
         let mut info = TrashInfo::new(trashinfo_path);
         info.command = command.map(|s| s.to_string());
         info.pid = Some(std::process::id());
         // Directory size: walk OUR fd of the victim dir, not any name.
-        let victim_sizes = if !is_dir {
-            (stat.st_size as u64, 0)
+        let mut victim_sizes = if !is_dir {
+            EntrySizes::of_file(stat.st_size as u64)
         } else {
-            let survey = open_directory_at(parent_fd, &cname, true, false).map_or_else(
-                |_| TreeSurvey::unwalked(),
-                |dir| tree_survey(dir.as_raw_fd(), true),
-            );
+            let survey = tree_survey_at(parent_fd, &cname, true);
             if let Some(mount) = survey.mount_in(&display_path) {
                 unsafe { libc::close(files_fd) };
                 return Err(TrashError::HoldsMount(mount));
             }
-            (survey.apparent, survey.allocated)
+            if let Err(error) = self.check_retention_cap(&display_path, survey.apparent, &trash_dir)
+            {
+                unsafe { libc::close(files_fd) };
+                return Err(error);
+            }
+            survey.sizes()
         };
-        info.size = Some(victim_sizes.0);
+        info.size = victim_sizes.apparent;
 
         // Hash small regular files — read via an fd opened under the pinned
         // parent.
@@ -1104,13 +1436,35 @@ impl TrashStore {
             }
         }
 
-        let guard = match self.lock_trash_root_prepared(&trash_dir) {
+        let locked = match self.lock_trash_root_prepared(&trash_dir) {
             Ok(g) => g,
             Err(e) => {
                 unsafe { libc::close(files_fd) };
                 return Err(e);
             }
         };
+        // From here on the store is reached only through the descriptors
+        // this lock validated: files/ was opened by path above only to tell
+        // a cross-device move early, and a FUSE or NFS server could have
+        // answered that lookup, or any later one, with a symlink
+        // (security-2).
+        let pinned = locked
+            .files()
+            .try_clone()
+            .and_then(|files| Ok((files, locked.info().try_clone()?)));
+        unsafe { libc::close(files_fd) };
+        let (files_fd, info_dir) = match pinned {
+            Ok((files, info)) => (files.into_raw_fd(), info),
+            Err(e) => return Err(TrashError::Io(e)),
+        };
+        let cross_device = match stat_fd(files_fd) {
+            Ok(files) => files.st_dev != file_dev,
+            Err(e) => {
+                unsafe { libc::close(files_fd) };
+                return Err(TrashError::Io(e));
+            }
+        };
+        let mut guard = Some(locked);
         if !may_commit() {
             unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(io::Error::from_raw_os_error(
@@ -1121,13 +1475,25 @@ impl TrashStore {
         // data fidelity comes from the move itself and the raw-bytes
         // percent-encoding in the .trashinfo).
         let base_name = name.to_string_lossy();
-        let (id, info_file, claim) = match unique_id_atomic(&trash_dir, &base_name) {
-            Ok(v) => v,
+        let claimed = match guard.as_ref() {
+            Some(locked) => unique_id_atomic(&trash_dir, locked, &base_name),
+            None => Err(TrashError::Io(io::Error::from_raw_os_error(libc::EBADF))),
+        };
+        let (id, claim) = match claimed {
+            Ok((id, _, claim)) => (id, claim),
             Err(e) => {
                 unsafe { libc::close(files_fd) };
                 return Err(e);
             }
         };
+        let info_name = match CString::new(format!("{id}.trashinfo")) {
+            Ok(name) => name,
+            Err(_) => {
+                unsafe { libc::close(files_fd) };
+                return Err(TrashError::NotFound(display_path.clone()));
+            }
+        };
+        let release_claim = || release_claim_at(info_dir.as_raw_fd(), &info_name, &claim);
 
         let cid = match std::ffi::CString::new(id.as_bytes()) {
             Ok(c) => c,
@@ -1140,43 +1506,36 @@ impl TrashStore {
         // Write .trashinfo BEFORE opening files_fd / moving — same ordering
         // as trash(). On write failure release the claimed sidecar so we do
         // not strand an empty orphan in info/ (review finding).
-        if let Err(e) = write_claimed_sidecar(claim, &info) {
-            let _ = raw_unlink_path(&info_file);
+        if let Err(e) = write_claimed_sidecar(&claim, &info) {
+            release_claim();
             unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(e));
         }
 
         if !may_commit() {
-            let _ = raw_unlink_path(&info_file);
+            release_claim();
             unsafe { libc::close(files_fd) };
             return Err(TrashError::Io(io::Error::from_raw_os_error(
                 libc::ECANCELED,
             )));
         }
+        #[cfg(test)]
+        if let Some(hook) = self.before_move.borrow_mut().take() {
+            hook();
+        }
         // THE MOVE (#6): kernel-resolved against pinned inodes on both sides.
         let moved = if cross_device {
             Err(io::Error::from_raw_os_error(libc::EXDEV))
-        } else if unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                parent_fd,
-                cname.as_ptr(),
-                files_fd,
-                cid.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } == 0
-        {
-            Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            rename_noreplace_at(parent_fd, &cname, files_fd, &cid)
         };
         let mut copied = false;
+        let mut copy_lock = None;
         if let Err(e) = moved {
             // Nothing partial was created at dest (rename is atomic).
             if !is_copy_fallback_error(&e) {
                 unsafe { libc::close(files_fd) };
-                let _ = raw_unlink_path(&info_file);
+                release_claim();
                 return Err(TrashError::Io(e));
             }
             // Another filesystem, or one without RENAME_NOREPLACE (NFS, 9p):
@@ -1187,37 +1546,47 @@ impl TrashStore {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     unsafe { libc::close(files_fd) };
-                    let _ = raw_unlink_path(&info_file);
+                    release_claim();
                     return Err(error);
                 }
             };
             let copy = (|| {
-                let state_dir =
-                    std::ffi::CString::new(trash_dir.join(".trashd").as_os_str().as_bytes())
-                        .map_err(io::Error::from)?;
-                let staging = open_directory_at(libc::AT_FDCWD, &state_dir, true, false)?;
-                copy_source_at(
+                // Staged in the state directory the lock validated, without
+                // the lock, and published under it (store-metadata-6).
+                self.copy_into_claim(
+                    &trash_dir,
+                    &mut guard,
+                    files_fd,
+                    info_dir.as_raw_fd(),
+                    &info_name,
+                    &claim,
                     parent_fd,
                     &cname,
-                    files_fd,
                     &cid,
-                    staging.as_raw_fd(),
                     &stat,
                 )?;
                 if unsafe { libc::fsync(files_fd) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                Ok(())
+                #[cfg(test)]
+                self.durability_events.borrow_mut().push("files");
+                self.sync_new_sidecar(&claim, &info_dir)
             })();
             if let Err(e) = copy {
                 unsafe { libc::close(files_fd) };
-                let _ = raw_unlink_path(&info_file);
+                release_claim();
                 return Err(TrashError::Io(e));
             }
             copied = true;
             // The entry is complete from here on. A failed or partial source
             // removal keeps it: the target's own syscall then decides, and at
-            // worst a duplicate remains in the trash.
+            // worst a duplicate remains in the trash. Retirement unlinks, so
+            // it runs without the root lock, as in trash() (store-core-4):
+            // the shim calls this inside filtered sessions.
+            copy_lock = lock_published_copy(files_fd, &cid);
+            drop(guard.take());
+            #[cfg(test)]
+            self.durability_events.borrow_mut().push("retire");
             let retired = match &snapshot {
                 Some(before) => retire_directory_snapshot_at(
                     parent_fd,
@@ -1230,10 +1599,10 @@ impl TrashStore {
             };
             match retired {
                 Ok(true) => {}
-                Ok(false) => eprintln!(
+                Ok(false) => crate::report_note(&format!(
                     "trashd: warning: parts of '{}' changed while being moved and were left in place",
                     display_path.display()
-                ),
+                )),
                 Err(e) => {
                     unsafe { libc::close(files_fd) };
                     return Err(TrashError::Io(io::Error::other(format!(
@@ -1245,6 +1614,28 @@ impl TrashStore {
 
         // The move completed: make sure a concurrent purge did not strip the
         // sidecar while the data was absent mid-move (#169).
+
+        // Retirement ran without the root lock: re-acquire it and verify the
+        // entry survived, as trash() does.
+        let verify_guard = if guard.is_none() {
+            let verify_guard = match self.lock_trash_root(&trash_dir) {
+                Ok(verify_guard) => verify_guard,
+                Err(e) => {
+                    unsafe { libc::close(files_fd) };
+                    return Err(e);
+                }
+            };
+            if stat_at(files_fd, &cid, libc::AT_SYMLINK_NOFOLLOW).is_err()
+                || stat_at(info_dir.as_raw_fd(), &info_name, libc::AT_SYMLINK_NOFOLLOW).is_err()
+            {
+                unsafe { libc::close(files_fd) };
+                return Err(TrashError::EntryNotFound(id.clone()));
+            }
+            Some(verify_guard)
+        } else {
+            None
+        };
+        drop(copy_lock);
 
         // POST-MOVE IDENTITY CHECK (audit review): the final component could
         // have been replaced between our metadata/hash reads and the rename —
@@ -1273,11 +1664,14 @@ impl TrashStore {
                     // directory inode's st_size (~4 KiB) as the tree's size:
                     // mirror trash() and re-survey what actually landed, or
                     // retention accounting undercounts a large tree (#414).
-                    info.size = if is_dir {
-                        Some(tree_sizes(&files_dir.join(&id)).0)
+                    // By the type that landed: the replacement need not be
+                    // of the operand's (recent-changes-9).
+                    victim_sizes = if moved_stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                        tree_sizes_at(files_fd, &cid)
                     } else {
-                        Some(moved_stat.st_size as u64)
+                        EntrySizes::of_file(moved_stat.st_size as u64)
                     };
+                    info.size = victim_sizes.apparent;
                     info.sha256 = None;
                     persisted_refresh = true;
                 }
@@ -1292,19 +1686,20 @@ impl TrashStore {
         // as the source of truth, so a hash/size corrected only in memory
         // would cry wolf on every restore of a raced entry.
         if persisted_refresh {
-            let _ = write_trashinfo_atomic(&info_file, &info);
+            let _ = replace_sidecar_at(info_dir.as_raw_fd(), &info_name, &info);
         }
         unsafe { libc::close(files_fd) };
 
-        if is_dir {
-            let _ = crate::directorysizes::record_directory(
-                &trash_dir,
-                OsStr::new(&id),
-                victim_sizes.1,
-            );
+        // A row for the directory that landed, as in trash().
+        if let Some(allocated) = victim_sizes.allocated
+            && let Some(locked) = guard.as_ref().or(verify_guard.as_ref())
+        {
+            let _ = crate::directorysizes::record_directory(locked, OsStr::new(&id), allocated);
         }
-        crate::oplog::log_trash_in(&self.home, &display_path, &id, command);
         drop(guard);
+        drop(verify_guard);
+        // After releasing the lock every trash writer waits on, as in trash().
+        crate::oplog::log_trash_in(&self.home, &display_path, &id, command);
         self.after_mutation();
 
         Ok(id)
@@ -1317,7 +1712,7 @@ impl TrashStore {
         target: Option<&Path>,
     ) -> Result<PathBuf, TrashError> {
         let mut entry = self.find_entry(id_or_pattern)?;
-        self.restore_resolved(&mut entry, target, true)
+        self.restore_resolved(&mut entry, RestoreTarget::of(target), true)
     }
 
     /// Restore one resolved entry with immediate directorysizes maintenance.
@@ -1328,7 +1723,52 @@ impl TrashStore {
         entry: &mut TrashEntry,
         target: Option<&Path>,
     ) -> Result<PathBuf, TrashError> {
-        self.restore_resolved(entry, target, true)
+        self.restore_resolved(entry, RestoreTarget::of(target), true)
+    }
+
+    /// `restore_entry` that, where the destination is taken, restores beside
+    /// it under the first free `.N` suffix (`restore --force`).
+    pub fn restore_entry_renamed(
+        &self,
+        entry: &mut TrashEntry,
+        target: Option<&Path>,
+    ) -> Result<PathBuf, TrashError> {
+        self.restore_resolved_renamed(entry, target, true)
+    }
+
+    fn restore_resolved_renamed(
+        &self,
+        entry: &mut TrashEntry,
+        target: Option<&Path>,
+        maintain: bool,
+    ) -> Result<PathBuf, TrashError> {
+        let mut result = self.restore_resolved(entry, RestoreTarget::of(target), maintain);
+        if let Err(TrashError::RestoreConflict(ref destination)) = result {
+            // Off a normalized base, so a trailing-slash `--to backup/`
+            // yields the sibling "backup.1", not a hidden "backup/.1"
+            // inside the directory (#158).
+            let destination = normalize_conflict_base(destination);
+            #[cfg(test)]
+            if let Some(hook) = self.before_forced_retry.borrow_mut().take() {
+                hook();
+            }
+            for i in 1..1000 {
+                let mut candidate = destination.as_os_str().to_os_string();
+                candidate.push(format!(".{i}"));
+                let candidate = PathBuf::from(candidate);
+                // Beside the recorded path only what that path may be;
+                // beside the caller's own target, the caller's choice.
+                let beside = match target {
+                    None => RestoreTarget::BesideRecorded(&candidate),
+                    Some(_) => RestoreTarget::Explicit(&candidate),
+                };
+                result = self.restore_resolved(entry, beside, maintain);
+                if !matches!(result, Err(TrashError::RestoreConflict(_))) {
+                    break;
+                }
+            }
+        }
+        result
     }
 
     /// Restore a previously resolved batch without re-enumerating the store.
@@ -1347,19 +1787,11 @@ impl TrashStore {
                 let mut entry = listed.clone();
                 let was_directory =
                     fs::symlink_metadata(&entry.trashed_path).is_ok_and(|meta| meta.is_dir());
-                let mut result = self.restore_resolved(&mut entry, target, false);
-                if force && let Err(TrashError::RestoreConflict(ref destination)) = result {
-                    let destination = normalize_conflict_base(destination);
-                    for i in 1..1000 {
-                        let mut candidate = destination.as_os_str().to_os_string();
-                        candidate.push(format!(".{i}"));
-                        let candidate = PathBuf::from(candidate);
-                        result = self.restore_resolved(&mut entry, Some(&candidate), false);
-                        if !matches!(result, Err(TrashError::RestoreConflict(_))) {
-                            break;
-                        }
-                    }
-                }
+                let result = if force {
+                    self.restore_resolved_renamed(&mut entry, target, false)
+                } else {
+                    self.restore_resolved(&mut entry, RestoreTarget::of(target), false)
+                };
                 if result.is_ok() {
                     cache.note_removal(&entry, was_directory);
                 }
@@ -1398,7 +1830,7 @@ impl TrashStore {
     fn restore_resolved(
         &self,
         entry: &mut TrashEntry,
-        target: Option<&Path>,
+        target: RestoreTarget<'_>,
         maintain: bool,
     ) -> Result<PathBuf, TrashError> {
         if (self.isolated && entry.trash_root != self.home) || !entry_paths_match(entry) {
@@ -1411,19 +1843,22 @@ impl TrashStore {
             return Err(TrashError::OrphanedEntry(entry.id.clone()));
         }
 
-        let restore_to = target
-            .map(|t| t.to_path_buf())
-            .unwrap_or_else(|| entry.info.original_path.clone());
+        let (restore_to, recorded) = match target {
+            RestoreTarget::Recorded => (entry.info.original_path.clone(), true),
+            RestoreTarget::BesideRecorded(path) => (path.to_path_buf(), true),
+            RestoreTarget::Explicit(path) => (path.to_path_buf(), false),
+        };
 
-        // When restoring to the entry's OWN recorded original path (target is
-        // None), that path comes from the .trashinfo, which on removable/shared
-        // media an attacker may have crafted. Refuse destinations that escape
-        // via ".." and, for topdir trashes, require the destination to stay
-        // under that topdir. This blocks path-traversal that would let a
-        // malicious .trashinfo overwrite arbitrary files (~/.bashrc, cron, …)
-        // during an ordinary `restore`/`undo`. An explicit user-supplied
-        // target is trusted and not constrained.
-        if target.is_none() {
+        // When restoring to the entry's OWN recorded original path, or to a
+        // name derived from it, that path comes from the .trashinfo, which on
+        // removable/shared media an attacker may have crafted. Refuse
+        // destinations that escape via ".." and, for topdir trashes, require
+        // the destination to stay under that topdir. This blocks
+        // path-traversal that would let a malicious .trashinfo overwrite
+        // arbitrary files (~/.bashrc, cron, …) during an ordinary
+        // `restore`/`undo`. An explicit user-supplied target is trusted and
+        // not constrained.
+        if recorded {
             if restore_to
                 .components()
                 .any(|c| c == std::path::Component::ParentDir)
@@ -1432,7 +1867,13 @@ impl TrashStore {
             }
             if entry.trash_root != self.home {
                 let topdir = Self::topdir_for_trash(&entry.trash_root);
-                if !restore_to.starts_with(&topdir) {
+                // Strictly below it: an empty `Path=` names the topdir
+                // itself, which conflicts, and the `.N` name beside it is
+                // outside (cli-6).
+                if !restore_to
+                    .strip_prefix(&topdir)
+                    .is_ok_and(|below| below.file_name().is_some())
+                {
                     return Err(TrashError::RestoreTraversal(restore_to));
                 }
             }
@@ -1444,16 +1885,13 @@ impl TrashStore {
         // symlinks. Explicit --to paths are user-selected and may follow
         // symlinks, but the directory reached here is still pinned against a
         // later ancestor swap.
-        let destination =
-            resolve_restore_destination(&restore_to, target.is_none()).map_err(|e| {
-                if target.is_none()
-                    && matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
-                {
-                    TrashError::RestoreTraversal(restore_to.clone())
-                } else {
-                    TrashError::Io(e)
-                }
-            })?;
+        let destination = resolve_restore_destination(&restore_to, recorded).map_err(|e| {
+            if recorded && matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+                TrashError::RestoreTraversal(restore_to.clone())
+            } else {
+                TrashError::Io(e)
+            }
+        })?;
 
         // Check before decoding so a normal conflict never rewrites the entry.
         if destination_exists(&destination)? {
@@ -1484,14 +1922,8 @@ impl TrashStore {
             .as_ref()
             .is_some_and(|metadata| metadata.is_file());
         if entry.info.compressed.as_deref() == Some("zstd") && stored_is_regular {
-            let configured = self.config.max_file_size_mb.saturating_mul(1024 * 1024);
-            const HARD_DECOMPRESS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
-            let max_output = if configured == 0 {
-                HARD_DECOMPRESS_LIMIT
-            } else {
-                configured.min(HARD_DECOMPRESS_LIMIT)
-            };
-            decompress_zstd_entry(entry, max_output)?;
+            let max_output = self.restore_decompress_limit(entry.info.size);
+            decompress_zstd_entry(entry, max_output, self.entry_lock_deadline())?;
         }
 
         // Re-check through the pinned parent after decompression. The publish
@@ -1501,20 +1933,38 @@ impl TrashStore {
             return Err(TrashError::RestoreConflict(restore_to));
         }
 
-        // Serialize against compressors (auto-purge and CLI both flock the
-        // same path before validating): without this lock a compressor could
-        // swap zstd bytes into the stat→rename window below and the rename
-        // would publish compressed bytes as the restored file (#168). Held
-        // through the publish; compressors hold it for milliseconds.
-        let _compress_lock = lock_entry_file(&entry.trashed_path)
-            .map_err(|_| TrashError::EntryNotFound(entry.id.clone()))?;
+        // Serialize against compressors and purges (auto-purge, the CLI and
+        // purge all flock the entry before validating): without this lock a
+        // compressor could swap zstd bytes into the stat→rename window below
+        // and the rename would publish compressed bytes as the restored file
+        // (#168), and a purge could delete an entry being copied across
+        // filesystems without the root lock. Held through the publish. A
+        // busy entry is reported as such, never as already gone (cli-5).
+        // Through a files/ that follows no symlink, as purge does
+        // (security-1).
+        let entry_lock = entry_names(entry)
+            .map_err(trash_to_io)
+            .and_then(|(data_name, _)| {
+                let files = open_store_child(&entry.trash_root, c"files")?;
+                lock_entry_file_at(files.as_raw_fd(), &data_name, self.entry_lock_deadline())
+            })
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    TrashError::Io(error)
+                } else {
+                    TrashError::EntryNotFound(entry.id.clone())
+                }
+            })?;
 
         let root_guard = self.lock_trash_root(&entry.trash_root)?;
         // Refresh after decompression and all lock waits. The validator checks
         // both the data identity and complete sidecar version under this guard.
         self.validate_entry_locked(entry, &root_guard)?;
 
-        let source_parent = open_directory_nofollow(&entry.trash_root.join("files"))?;
+        // The files/ the lock validated: opened again by path, it could be
+        // a symlink a FUSE or NFS server answered after the check
+        // (security-1 follow-up). Kept past the lock for a copy.
+        let source_parent = root_guard.files().try_clone()?;
         // Raw filename bytes, not the lossy String ID: a non-UTF-8 entry's
         // on-disk name differs from its display ID (#247).
         let source_name = CString::new(
@@ -1542,33 +1992,68 @@ impl TrashStore {
         // is deliberately no plain-rename fallback: every path either uses
         // RENAME_NOREPLACE or creates the destination with an exclusive *at
         // syscall before streaming a copy.
-        match rename_noreplace_at(
+        let copy = match rename_noreplace_at(
             source_parent.as_raw_fd(),
             &source_name,
             destination.parent.as_raw_fd(),
             &destination.name,
         ) {
-            Ok(()) => {}
+            Ok(()) => false,
             Err(e) if is_conflict_error(&e) => {
                 return Err(TrashError::RestoreConflict(restore_to));
             }
-            Err(e) if is_copy_fallback_error(&e) => {
-                publish_copy_noreplace(
-                    source_parent.as_raw_fd(),
-                    &source_name,
-                    destination.parent.as_raw_fd(),
-                    &destination.name,
-                    expected_identity,
-                )
-                .map_err(|copy_error| {
-                    if is_conflict_error(&copy_error) {
-                        TrashError::RestoreConflict(restore_to.clone())
-                    } else {
-                        TrashError::Io(copy_error)
-                    }
-                })?;
-            }
+            Err(e) if is_copy_fallback_error(&e) => true,
             Err(e) => return Err(TrashError::Io(e)),
+        };
+        let root_guard = if copy {
+            // The copy and the retirement of the trash copy run without the
+            // root lock, under the entry lock alone: retirement unlinks, which
+            // trap into a seccomp supervisor that may be waiting for this
+            // lock (store-core-4), and a long copy held every trash writer of
+            // this user meanwhile (store-metadata-6).
+            drop(root_guard);
+            publish_copy_noreplace(
+                source_parent.as_raw_fd(),
+                &source_name,
+                destination.parent.as_raw_fd(),
+                &destination.name,
+                expected_identity,
+            )
+            .map_err(|copy_error| {
+                if is_conflict_error(&copy_error) {
+                    TrashError::RestoreConflict(restore_to.clone())
+                } else {
+                    TrashError::Io(copy_error)
+                }
+            })?;
+            // The restore is complete: a root that can no longer be locked
+            // only keeps the sidecar, which purge retires as data-absent.
+            self.lock_trash_root(&entry.trash_root).ok()
+        } else {
+            Some(root_guard)
+        };
+        // Remove the trashinfo: detach it under the root lock if it is still
+        // the version restored, and delete it after releasing the lock.
+        // Through the lock's info/ descriptor, never the path (security-1).
+        let sidecar = root_guard.as_ref().and_then(|guard| {
+            let (_, info_name) = entry_names(entry).ok()?;
+            let current = crate::fdops::metadata_nofollow_at(guard.info().as_raw_fd(), &info_name)
+                .ok()
+                .filter(fs::Metadata::is_file)
+                .map(|metadata| SidecarVersion::from_metadata(&metadata));
+            if current != entry.sidecar_version {
+                return None;
+            }
+            let mut detached = Detached::open_in(guard).ok()?;
+            detached
+                .take_at(guard.info().as_raw_fd(), &info_name)
+                .ok()?;
+            Some(detached)
+        });
+        drop(root_guard);
+        drop(entry_lock);
+        if let Some(sidecar) = sidecar {
+            let _ = sidecar.remove();
         }
 
         // (Decompression already happened in-trash, before the move above.)
@@ -1592,11 +2077,6 @@ impl TrashStore {
             None
         };
 
-        // Remove trashinfo
-        if sidecar_version(&entry.info_path) == entry.sidecar_version {
-            let _ = raw_unlink_path(&entry.info_path);
-        }
-
         if maintain {
             self.refresh_cache_after_removal(
                 entry,
@@ -1607,18 +2087,39 @@ impl TrashStore {
         // Log operation
         crate::oplog::log_restore_in(&self.home, &entry.id, &restore_to);
 
-        // Report hash mismatch as a warning after successful restore
+        // Report hash mismatch as a warning after successful restore. The
+        // path and digest come from the sidecar: escape them (cli-2).
         if let Some((expected, actual)) = hash_warning {
-            eprintln!(
+            crate::report_note(&format!(
                 "trashd: warning: hash mismatch for restored file {}",
-                restore_to.display()
-            );
-            eprintln!("  expected: {expected}");
-            eprintln!("  actual:   {actual}");
-            eprintln!("  file may be corrupted — verify contents before use");
+                crate::display::printable_path(&restore_to)
+            ));
+            crate::report_note(&format!(
+                "  expected: {}",
+                crate::display::printable(&expected)
+            ));
+            crate::report_note(&format!("  actual:   {actual}"));
+            crate::report_note("  file may be corrupted — verify contents before use");
         }
 
         Ok(restore_to)
+    }
+
+    /// How many bytes restore lets a compressed entry decompress to: what
+    /// `decompress_limit` allows its recorded size. `max_file_size_mb` was
+    /// the bound, but it only says what may enter the trash: lowering it
+    /// left every larger entry compressed before unrestorable, and
+    /// automatic compression never looked at it (store-core-7). It can
+    /// still widen the bound, as before, for an entry whose recorded size
+    /// is missing or stale.
+    fn restore_decompress_limit(&self, recorded_size: Option<u64>) -> u64 {
+        let configured = match self.config.max_file_size_mb {
+            0 => HARD_DECOMPRESS_LIMIT,
+            limit => limit.saturating_mul(1024 * 1024),
+        };
+        decompress_limit(recorded_size)
+            .max(configured)
+            .min(HARD_DECOMPRESS_LIMIT)
     }
 
     /// Restore the most recently trashed item.
@@ -1637,7 +2138,7 @@ impl TrashStore {
         let mut entry = newest.clone();
         // Only the entry undo restores needs its data identity.
         entry.identity = file_identity(&entry.trashed_path);
-        self.restore_resolved(&mut entry, None, true)
+        self.restore_resolved(&mut entry, RestoreTarget::Recorded, true)
     }
 
     /// Permanently delete a trash entry.
@@ -1675,10 +2176,16 @@ impl TrashStore {
         // Age is known from the sidecar alone: filter before the data stat
         // so a mostly-young trash does not stat every data inode (and
         // retain every entry) just to discard it.
-        self.list_mutation_filtered(|info| match max_age_days {
+        let mut entries = self.list_mutation_filtered(|info| match max_age_days {
             Some(days) => now.signed_duration_since(info.deletion_date).num_days() >= days as i64,
             None => true,
-        })
+        })?;
+        // Data whose metadata cannot be parsed has no known age; the purge
+        // refuses it too, so the preview matches what is deleted.
+        if max_age_days.is_some() {
+            entries.retain(|entry| !has_unparsed_sidecar(entry));
+        }
+        Ok(entries)
     }
 
     /// Permanently delete exactly `entries`, e.g. the listing a user just
@@ -1706,22 +2213,34 @@ impl TrashStore {
             // that was resolved in another store's trash root.
             if self.isolated && entry.trash_root != self.home {
                 failed += 1;
-                eprintln!(
+                crate::report_note(&format!(
                     "trashd: warning: refusing to delete '{}': it belongs to another trash root",
-                    entry.trashed_path.display()
-                );
+                    crate::display::printable_path(&entry.trashed_path)
+                ));
                 continue;
             }
-            match self.purge_reporting_kind(entry) {
+            let deadline = self.entry_lock_deadline();
+            match self.purge_reporting_kind(entry, max_age_days.is_some(), deadline) {
                 Ok(was_directory) => cache.note_removal(entry, was_directory),
                 Err(e) => {
-                    if !matches!(e, TrashError::EntryNotFound(_)) {
-                        eprintln!(
-                            "trashd: warning: could not delete '{}': {e}",
-                            entry.trashed_path.display()
-                        );
-                        failed += 1;
-                    }
+                    // A refused snapshot is not always a vanished entry: one
+                    // compressed or touched since the listing is still in
+                    // the trash, and is not deleted (#217) (store-core-6).
+                    let reason = match e {
+                        TrashError::EntryNotFound(_) if !Self::entry_outlived_snapshot(entry) => {
+                            continue;
+                        }
+                        TrashError::EntryNotFound(_) => {
+                            "it changed after it was selected; run `trash empty` again".into()
+                        }
+                        e => e.to_string(),
+                    };
+                    crate::report_note(&format!(
+                        "trashd: warning: could not delete '{}': {}",
+                        crate::display::printable_path(&entry.trashed_path),
+                        crate::display::printable(&reason)
+                    ));
+                    failed += 1;
                     continue;
                 }
             }
@@ -1734,6 +2253,27 @@ impl TrashStore {
         // Only roots whose cache the removals affected (#336).
         cache.apply(self);
         (count, failed)
+    }
+
+    /// Whether the entry a refused snapshot names is still in the trash:
+    /// its sidecar still records the same original path and deletion date,
+    /// so it changed (was compressed, its sidecar rewritten or touched)
+    /// rather than vanished. A sidecar recording anything else belongs to a
+    /// different entry trashed under the same ID since (store-core-6).
+    fn entry_outlived_snapshot(entry: &TrashEntry) -> bool {
+        let Some(mut info) = crate::trashinfo::read_sidecar(&entry.info_path)
+            .ok()
+            .and_then(|content| TrashInfo::from_trashinfo(&content))
+        else {
+            return false;
+        };
+        if !info.original_path.is_absolute() {
+            info.original_path =
+                Self::topdir_for_trash(&entry.trash_root).join(&info.original_path);
+        }
+        !entry.orphaned
+            && info.original_path == entry.info.original_path
+            && info.deletion_date == entry.info.deletion_date
     }
 
     /// Run auto_purge only if enough time has passed since the last run.
@@ -1841,18 +2381,24 @@ impl TrashStore {
     /// Single scan — all three phases work on the same in-memory list.
     fn auto_purge(&self) -> Result<(), TrashError> {
         // Finish deleting trees an interrupted or failed purge detached. One
-        // mount scan serves the sweep and the listing (#353).
-        let roots: Vec<PathBuf> = self
-            .all_trash_dirs()
-            .into_iter()
-            .map(|(root, _)| root)
-            .collect();
+        // mount scan serves the sweep and the listing (#353). It probes no
+        // network or FUSE mount: retention runs inside rm and the seccomp
+        // supervisor, which a stat waiting on a dead server hung
+        // (security-4).
+        let roots: Vec<PathBuf> = if self.isolated {
+            vec![self.home.clone()]
+        } else {
+            mounts::retention_trash_dirs(&self.home)
+                .into_iter()
+                .map(|(root, _)| root)
+                .collect()
+        };
         self.auto_purge_in_roots(&roots)
     }
 
     fn auto_purge_in_roots(&self, roots: &[PathBuf]) -> Result<(), TrashError> {
         let max_age = self.config.retention.max_age_days;
-        let max_size_bytes = (self.config.retention.max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        let max_size_bytes = self.retention_size_cap();
         let pressure_pct = self.config.retention.disk_pressure_percent;
         // Failure to finish earlier cleanup must not prevent retention of
         // ordinary entries. Explicit cleanup reports these failures instead.
@@ -1860,15 +2406,25 @@ impl TrashStore {
 
         let mut entries = Vec::new();
         self.list_roots(roots, None, &mut entries)?;
+        let now = chrono::Local::now();
+        // A DeletionDate in the future (clock skew, or media whose author
+        // chose it) orders as "just deleted", never as newer than every real
+        // entry (store-core-3). Only this pass's snapshots change.
+        for entry in &mut entries {
+            entry.info.deletion_date = entry.info.deletion_date.min(now);
+        }
         newest_first(&mut entries);
         if entries.is_empty() {
             return Ok(());
         }
 
-        let now = chrono::Local::now();
+        // Every entry lock this pass waits for shares one budget: a busy
+        // entry is skipped and retried on the next pass (store-core-9).
+        let lock_deadline =
+            std::time::Instant::now() + self.entry_lock_wait.min(RETENTION_ENTRY_LOCK_BUDGET);
         let cache = std::cell::RefCell::new(CacheRefresh::default());
         let purge = |entry: &TrashEntry| {
-            let was_directory = self.purge_reporting_kind(entry)?;
+            let was_directory = self.purge_reporting_kind(entry, true, lock_deadline)?;
             cache.borrow_mut().note_removal(entry, was_directory);
             Ok::<(), TrashError>(())
         };
@@ -1896,14 +2452,16 @@ impl TrashStore {
         }
 
         // Phase 2a: auto-compress old uncompressed items before purging by size.
-        // Cap how much we slurp into RAM — this runs (throttled) on routine
-        // deletions, and reading a multi-hundred-MB trashed file fully into a
-        // Vec could OOM the process (and a killed supervisor degrades to
-        // passthrough). Skip anything above the cap.
-        const COMPRESS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+        // Opt-in: other file managers restore files/<id> byte for byte, so a
+        // compressed entry came back from them as zstd data (store-metadata-5).
+        // Cap how much we slurp into RAM (COMPRESS_MAX_BYTES) — this runs
+        // (throttled) on routine deletions, and reading a multi-hundred-MB
+        // trashed file fully into a Vec could OOM the process (and a killed
+        // supervisor degrades to passthrough). Skip anything above the cap.
+        let auto_compress = self.config.retention.auto_compress;
         let mut incompressible = IncompressibleData::load(&self.home);
         for i in (0..entries.len()).rev() {
-            if purged[i] || entries[i].orphaned {
+            if !auto_compress || purged[i] || entries[i].orphaned {
                 continue;
             }
             let age = now.signed_duration_since(entries[i].info.deletion_date);
@@ -1932,7 +2490,8 @@ impl TrashStore {
             // atomic_write swaps a new one in, and a restorer that then opens
             // the path sees the new inode/sidecar version and aborts cleanly
             // post-lock.
-            let mut input = match lock_entry_file(&path) {
+            // A busy entry is skipped until the next pass.
+            let mut input = match lock_entry_file_until(&path, lock_deadline) {
                 Ok(Some(f)) => f,
                 _ => continue,
             };
@@ -1993,99 +2552,117 @@ impl TrashStore {
             }
         }
 
-        incompressible.save();
+        if auto_compress {
+            incompressible.save();
+        }
 
-        // Phase 2b: trim by total size (purge oldest surviving until under limit)
+        // Size and pressure trimming act only on roots on the home
+        // filesystem. Pressure is measured there, so only those entries can
+        // relieve it (#113); and bytes in a root elsewhere (removable media,
+        // whose author controls sizes and dates) must never justify purging
+        // the home trash (store-core-3). One device lookup per root.
+        let home_device = mounts::device_id_or_parent(&self.home);
+        let root_devices = std::cell::RefCell::new(std::collections::HashMap::new());
+        let on_home_filesystem = |root: &Path| {
+            home_device.is_some()
+                && *root_devices
+                    .borrow_mut()
+                    .entry(root.to_path_buf())
+                    .or_insert_with(|| mounts::device_id_or_parent(root))
+                    == home_device
+        };
+        // Recent entries are never eligible: moving a file into the trash
+        // frees nothing, and purging the entry an `rm` just created turned it
+        // into a permanent delete (#201, store-core-2). Nor is data whose
+        // metadata cannot be parsed: its age is unknown.
+        let eligible = |entry: &TrashEntry| {
+            now.signed_duration_since(entry.info.deletion_date) >= PRESSURE_MIN_AGE
+                && on_home_filesystem(&entry.trash_root)
+                && !has_unparsed_sidecar(entry)
+        };
+
+        // Phase 2b: trim by total size (purge oldest eligible until under limit)
         // max_size_gb == 0 means "no size limit", not "trim everything to 0";
         // without a limit nothing needs sizing (foreign trees are walked).
         // Keep these measurements for this pass only. Foreign trees may need
         // a full walk; measuring them again when choosing victims doubled
         // that work without providing a coherent newer snapshot (#384).
-        let mut sizes = if max_size_bytes > 0 {
-            vec![0; entries.len()]
-        } else {
-            Vec::new()
-        };
-        let mut total_size = 0u64;
         if max_size_bytes > 0 {
+            let mut sizes = vec![0; entries.len()];
+            let mut total_size = 0u64;
             for (i, entry) in entries.iter().enumerate() {
-                if !purged[i] {
+                if !purged[i] && on_home_filesystem(&entry.trash_root) {
                     sizes[i] = self.entry_disk_size(entry);
-                    total_size = total_size.saturating_add(sizes[i]);
+                    // An entry larger than the whole cap could only fit by
+                    // purging it alone: counting it purged every other entry
+                    // and then it too (store-core-2). Trashing one is refused;
+                    // one already here (a lowered cap, another tool's) is
+                    // left to age-based retention.
+                    if sizes[i] <= max_size_bytes {
+                        total_size = total_size.saturating_add(sizes[i]);
+                    }
                 }
             }
-        }
-        if max_size_bytes > 0 && total_size > max_size_bytes {
-            let mut freed = 0u64;
-            let excess = total_size - max_size_bytes;
-            for i in (0..entries.len()).rev() {
-                if purged[i] {
-                    continue;
-                }
-                if freed >= excess {
-                    break;
-                }
-                // Only count a purge that actually happened: a failed removal
-                // must stay in the accounting (and out of the freed total), or
-                // the trash silently exceeds max_size_gb (#106).
-                if purge(&entries[i]).is_ok() {
-                    freed = freed.saturating_add(sizes[i]);
-                    purged[i] = true;
-                    purge_count += 1;
+            let excess = total_size.saturating_sub(max_size_bytes);
+            let victims: Vec<usize> = if excess > 0 {
+                (0..entries.len())
+                    .rev()
+                    .filter(|&i| !purged[i] && sizes[i] <= max_size_bytes && eligible(&entries[i]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Purging older entries that cannot bring the trash under the cap
+            // only loses them; wait until enough entries are old enough.
+            let available = victims
+                .iter()
+                .fold(0u64, |sum, &i| sum.saturating_add(sizes[i]));
+            if excess > 0 && available >= excess {
+                let mut freed = 0u64;
+                for i in victims {
+                    if freed >= excess {
+                        break;
+                    }
+                    // Only count a purge that actually happened: a failed
+                    // removal must stay in the accounting (and out of the
+                    // freed total), or the trash silently exceeds
+                    // max_size_gb (#106).
+                    if purge(&entries[i]).is_ok() {
+                        freed = freed.saturating_add(sizes[i]);
+                        purged[i] = true;
+                        purge_count += 1;
+                    }
                 }
             }
         }
 
         // Phase 3: disk pressure — purge oldest 10% of surviving items.
-        // Pressure is measured on the HOME filesystem, so only entries on that
-        // same filesystem can relieve it; purging other partitions' entries
-        // would delete data without fixing the pressure (#113).
-        if pressure_pct > 0 {
-            let home = self.home.clone();
-            if let Some(usage_pct) = disk_usage_percent(&home)
-                && usage_pct >= pressure_pct as f64
-            {
-                // Recent entries are never eligible: moving a file into the
-                // trash frees nothing, and purging the entry an `rm` just
-                // created turned it into a permanent delete (#201).
-                // One device lookup per root, not two lstats per entry and pass.
-                let home_device = mounts::device_id_or_parent(&home);
-                let root_devices = std::cell::RefCell::new(std::collections::HashMap::new());
-                let on_home_filesystem = |root: &Path| {
-                    home_device.is_some()
-                        && *root_devices
-                            .borrow_mut()
-                            .entry(root.to_path_buf())
-                            .or_insert_with(|| mounts::device_id_or_parent(root))
-                            == home_device
-                };
-                let eligible = |entry: &TrashEntry| {
-                    now.signed_duration_since(entry.info.deletion_date) >= PRESSURE_MIN_AGE
-                        && on_home_filesystem(&entry.trash_root)
-                };
-                let candidates = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, entry)| !purged[*i] && eligible(entry))
-                    .count();
-                let to_purge = if candidates == 0 {
-                    0
-                } else {
-                    std::cmp::max(1, candidates / 10)
-                };
-                let mut purged_count = 0;
-                for i in (0..entries.len()).rev() {
-                    if purged_count >= to_purge {
-                        break;
-                    }
-                    if purged[i] || !eligible(&entries[i]) {
-                        continue;
-                    }
-                    if purge(&entries[i]).is_ok() {
-                        purged[i] = true;
-                        purge_count += 1;
-                        purged_count += 1;
-                    }
+        if pressure_pct > 0
+            && let Some(usage_pct) = disk_usage_percent(&self.home)
+            && usage_pct >= pressure_pct as f64
+        {
+            let candidates = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, entry)| !purged[*i] && eligible(entry))
+                .count();
+            let to_purge = if candidates == 0 {
+                0
+            } else {
+                std::cmp::max(1, candidates / 10)
+            };
+            let mut purged_count = 0;
+            for i in (0..entries.len()).rev() {
+                if purged_count >= to_purge {
+                    break;
+                }
+                if purged[i] || !eligible(&entries[i]) {
+                    continue;
+                }
+                if purge(&entries[i]).is_ok() {
+                    purged[i] = true;
+                    purge_count += 1;
+                    purged_count += 1;
                 }
             }
         }
@@ -2151,7 +2728,9 @@ impl TrashStore {
         // marker. Revert it when the atomic data swap fails (#28).
         let mut info = entry.info.clone();
         info.compressed = Some("zstd".into());
-        set_compression_marker(&entry.info_path, Some("zstd"))?;
+        // Marker and data through the directories the lock validated
+        // (security-1 follow-up).
+        set_compression_marker_locked(&guard, entry, Some("zstd"))?;
         before_persist();
         let result = (|| -> io::Result<bool> {
             // Recording the marker also syncs a file and can block. Check
@@ -2159,7 +2738,7 @@ impl TrashStore {
             if !compression_source_matches(expected, &input.metadata()?) {
                 return Ok(false);
             }
-            staging.persist(&entry.trashed_path).map_err(|e| e.error)?;
+            publish_data_stage(&guard, entry, staging)?;
             Ok(true)
         })();
         let result = match result {
@@ -2167,14 +2746,13 @@ impl TrashStore {
                 entry.info = info;
                 Ok(true)
             }
-            Ok(false) => set_compression_marker(&entry.info_path, None).map(|()| false),
+            Ok(false) => set_compression_marker_locked(&guard, entry, None).map(|()| false),
             Err(error) => {
-                let _ = set_compression_marker(&entry.info_path, None);
+                let _ = set_compression_marker_locked(&guard, entry, None);
                 Err(error)
             }
         };
-        entry.identity = file_identity(&entry.trashed_path);
-        entry.sidecar_version = sidecar_version(&entry.info_path);
+        (entry.identity, entry.sidecar_version) = locked_versions(&guard, entry);
         result.map_err(TrashError::Io)
     }
 
@@ -2199,59 +2777,88 @@ impl TrashStore {
         if self.isolated && entry.trash_root != self.home {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
-        let was_directory = self.purge_reporting_kind(entry)?;
+        let was_directory = self.purge_reporting_kind(entry, false, self.entry_lock_deadline())?;
         if maintain {
             self.refresh_cache_after_removal(entry, was_directory);
         }
         Ok(())
     }
 
-    /// Purge one validated entry; true when its data was a directory.
-    fn purge_reporting_kind(&self, entry: &TrashEntry) -> Result<bool, TrashError> {
-        let _data_lock = match lock_entry_file(&entry.trashed_path) {
+    /// When an explicit command stops waiting for an entry lock.
+    fn entry_lock_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.entry_lock_wait
+    }
+
+    /// Purge one validated entry; true when its data was a directory. A purge
+    /// `by_age` (retention, `empty --older`) never takes data whose sidecar
+    /// exists but cannot be parsed: its age is unknown (`has_unparsed_sidecar`).
+    /// An entry still locked at `lock_deadline` is busy (`WouldBlock`).
+    fn purge_reporting_kind(
+        &self,
+        entry: &TrashEntry,
+        by_age: bool,
+        lock_deadline: std::time::Instant,
+    ) -> Result<bool, TrashError> {
+        let (data_name, info_name) = entry_names(entry)?;
+        // The entry lock goes through a files/ that follows no symlink too:
+        // by path it opened and locked whatever a symlink named (security-1).
+        let _data_lock = match open_store_child(&entry.trash_root, c"files")
+            .and_then(|files| lock_entry_file_at(files.as_raw_fd(), &data_name, lock_deadline))
+        {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let guard = self.lock_trash_root(&entry.trash_root)?;
+        let guard = self.lock_trash_root_repaired(&entry.trash_root)?;
         let (data, sidecar) = self.validated_entry_metadata_locked(entry, &guard)?;
+        // The lock serializes this purge only if it holds the data the root
+        // lock just validated.
+        if let (Some(lock), Some(data)) = (&_data_lock, &data)
+            && stat_identity(&stat_fd(lock.as_raw_fd())?) != (data.dev(), data.ino())
+        {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
+        if by_age && entry.orphaned && sidecar.as_ref().is_some_and(fs::Metadata::is_file) {
+            return Err(TrashError::EntryNotFound(entry.id.clone()));
+        }
         // A phantom entry (neither data nor sidecar on disk) must not
         // report a successful purge of nothing (#247).
         if data.is_none() && sidecar.is_none() {
             return Err(TrashError::EntryNotFound(entry.id.clone()));
         }
         let was_directory = data.as_ref().is_some_and(|metadata| metadata.is_dir());
-        // Raw syscalls throughout: the libc wrappers are hooked by the
-        // system-wide preload, which multiplied a large purge's syscalls by
-        // ~13 while only deciding to leave trash internals alone (#335).
-        let mut detached = None;
+        // Detach data and sidecar under the lock; delete them after releasing
+        // it (`Detached`, store-core-4). Raw syscalls throughout: the libc
+        // wrappers are hooked by the system-wide preload, which multiplied a
+        // large purge's syscalls by ~13 while only deciding to leave trash
+        // internals alone (#335).
+        // Detached through the lock's descriptors (security-1).
+        let mut detached = Detached::open_in(&guard)?;
         match data {
-            Some(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                // Detach the tree under the lock; delete it after releasing
-                // it. Deleting in place held every trash writer (all deletes
-                // of this user) for the whole removal of a large tree.
-                detached = Some(detach_for_removal(entry)?);
+            Some(_) => detached.take_at(guard.files().as_raw_fd(), &data_name)?,
+            None if data_absence_is_retired_at(guard.info().as_raw_fd(), &info_name) => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "it is still being moved into the trash",
+                )
+                .into());
             }
-            Some(_) => raw_unlink_path(&entry.trashed_path)?,
-            None if data_absence_is_retired(&entry.info_path) => {}
-            None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
         }
-        match raw_unlink_path(&entry.info_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        let sidecar = match detached.take_at(guard.info().as_raw_fd(), &info_name) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
         drop(guard);
         drop(_data_lock);
-        if let Some((state, name)) = detached
-            && let Err(error) = remove_tree_at(state.as_raw_fd(), &name, 0)
-        {
+        if let Err(error) = detached.remove() {
             // Retention retries it; the entry itself is gone.
-            eprintln!(
+            crate::report_note(&format!(
                 "trashd: warning: purged '{}' but could not delete all of its data yet ({error}); it is retried later",
-                entry.id
-            );
+                crate::display::printable(&entry.id)
+            ));
         }
+        sidecar?;
         Ok(was_directory)
     }
 
@@ -2351,8 +2958,16 @@ impl TrashStore {
                 }
                 #[cfg(test)]
                 self.accounting_walks.set(self.accounting_walks.get() + 1);
-                directory_accounted_size(&entry.trashed_path, entry.info.size)
+                directory_accounted_size(
+                    &entry.trashed_path,
+                    entry.info.size,
+                    entry.trash_root != self.home,
+                )
             }
+            // A sparse file claims any apparent size while occupying nothing:
+            // in a root others may write, count no more than its allocated
+            // blocks (store-core-3).
+            Some(m) if entry.trash_root != self.home => m.len().min(m.blocks().saturating_mul(512)),
             Some(m) => m.len(),
             // No data, nothing occupies the disk.
             None => 0,
@@ -2368,11 +2983,11 @@ impl TrashStore {
         }
     }
 
-    fn should_skip(&self, path: &Path) -> bool {
+    fn exclusion(&self, path: &Path) -> Option<ExclusionKind> {
         if self.isolated {
-            self.config.should_skip_configured(path)
+            self.config.exclusion_configured(path)
         } else {
-            self.config.should_skip(path)
+            self.config.exclusion(path)
         }
     }
 
@@ -2411,46 +3026,119 @@ pub struct PartitionStatus {
 /// data when the new file is renamed into `files/<id>`.
 /// Write a new entry's record into the sidecar its id claim created,
 /// instead of closing the claim and reopening it with O_TRUNC (#307).
-fn write_claimed_sidecar(mut claim: fs::File, info: &TrashInfo) -> io::Result<()> {
+fn write_claimed_sidecar(mut claim: &fs::File, info: &TrashInfo) -> io::Result<()> {
     claim.write_all(info.to_trashinfo_string().as_bytes())
 }
 
+/// Mark a claimed sidecar's entry as in flight: its data is being copied
+/// in without the root lock, so a purge finds the sidecar alone for as long
+/// as the copy takes. `data_absence_is_retired` honors this lock where the
+/// sidecar's age is no evidence. It is released when the data is published,
+/// and when this process ends. Never waits: nobody else locks a sidecar.
+fn claim_in_flight(claim: &fs::File) -> io::Result<()> {
+    loop {
+        if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Whether `info/<name>` is still the sidecar `claim` created.
+fn claim_is_current(info: RawFd, name: &CStr, claim: &fs::File) -> bool {
+    match (
+        stat_at(info, name, libc::AT_SYMLINK_NOFOLLOW),
+        stat_fd(claim.as_raw_fd()),
+    ) {
+        (Ok(sidecar), Ok(claim)) => stat_identity(&sidecar) == stat_identity(&claim),
+        _ => false,
+    }
+}
+
+/// Give up an id claim that got no data: unlink its sidecar, unless the
+/// name holds another one by now (a claim whose copy ran without the root
+/// lock can have been stripped and its id taken again by a trashd that
+/// predates the in-flight lock).
+fn release_claim_at(info: RawFd, name: &CStr, claim: &fs::File) {
+    if claim_is_current(info, name, claim) {
+        let _ = raw_unlinkat(info, name, 0);
+    }
+}
+
+/// The claim goes through the directories `guard` validated (security-2);
+/// `trash_dir` only names the returned sidecar path.
 fn unique_id_atomic(
     trash_dir: &Path,
+    guard: &RootMutationGuard,
     base_name: &str,
 ) -> Result<(String, PathBuf, fs::File), TrashError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    let name_max = crate::trash_id::name_max(&trash_dir.join("info"));
+    unique_id_atomic_within(trash_dir, guard, base_name, name_max)
+}
 
+/// `unique_id_atomic` with ids sized for a NAME_MAX of `name_max`. A name
+/// the filesystem still refuses as too long is claimed again shorter: it is
+/// no storage failure (cross-layer-6).
+fn unique_id_atomic_within(
+    trash_dir: &Path,
+    guard: &RootMutationGuard,
+    base_name: &str,
+    mut name_max: usize,
+) -> Result<(String, PathBuf, fs::File), TrashError> {
+    loop {
+        match claim_unique_id(trash_dir, guard, base_name, name_max) {
+            Err(TrashError::Io(error)) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                name_max =
+                    crate::trash_id::smaller_name_max(name_max).ok_or(TrashError::Io(error))?;
+            }
+            claimed => return claimed,
+        }
+    }
+}
+
+fn claim_unique_id(
+    trash_dir: &Path,
+    guard: &RootMutationGuard,
+    base_name: &str,
+    name_max: usize,
+) -> Result<(String, PathBuf, fs::File), TrashError> {
     let info_dir = trash_dir.join("info");
-    let files_dir = trash_dir.join("files");
+    let (files, info) = (guard.files().as_raw_fd(), guard.info().as_raw_fd());
+    let occupied = |data: &CStr| stat_at(files, data, libc::AT_SYMLINK_NOFOLLOW).is_ok();
 
-    // Truncate base_name if it would exceed filesystem filename limits.
-    // ".trashinfo" = 10 chars, ".YYYYMMDDHHMMSS.NNNNN" = 21 chars max.
-    // Most filesystems cap at 255 bytes. Reserve 32 for suffix.
-    let max_base = 223;
-    let base_name = if base_name.len() > max_base {
-        &base_name[..base_name.floor_char_boundary(max_base)]
-    } else {
-        base_name
-    };
+    // Room for ".trashinfo" and a collision suffix within NAME_MAX.
+    let base_name = crate::trash_id::base_within(base_name, name_max);
 
     // Claim `candidate`: create info/<candidate>.trashinfo with O_EXCL AND
     // verify files/<candidate> is free. Ok(Some) = claimed; Ok(None) = taken,
     // try another; Err = fatal IO error.
     let try_claim = |candidate: &str| -> Result<Option<(PathBuf, fs::File)>, io::Error> {
-        let info_path = info_dir.join(format!("{candidate}.trashinfo"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&info_path)
-        {
+        // An orphaned data file occupying files/<candidate> is skipped before
+        // its info name is claimed: releasing a claim unlinks, which under
+        // the root lock traps into a seccomp supervisor that may be waiting
+        // for that lock (store-core-4).
+        let data = CString::new(candidate)?;
+        if occupied(&data) {
+            return Ok(None);
+        }
+        let sidecar = format!("{candidate}.trashinfo");
+        let sidecar_name = CString::new(sidecar.as_bytes())?;
+        let info_path = info_dir.join(&sidecar);
+        match crate::fdops::create_excl_at(info, &sidecar_name, 0o600) {
             Ok(claim) => {
-                if files_dir.join(candidate).symlink_metadata().is_ok() {
-                    // The info name was free but an orphaned data file already
-                    // occupies files/<candidate>. Release the info we claimed
-                    // and try a different id rather than overwrite it.
-                    let _ = raw_unlink_path(&info_path);
+                if occupied(&data) {
+                    // Data appeared at files/<candidate> after the check
+                    // (another tool). Release the info we claimed and try a
+                    // different id rather than overwrite it: detached, it is
+                    // deleted by the next sweep, outside the lock.
+                    let released = Detached::open_in(guard)
+                        .and_then(|mut released| released.take_at(info, &sidecar_name));
+                    if released.is_err() {
+                        let _ = raw_unlinkat(info, &sidecar_name, 0);
+                    }
                     Ok(None)
                 } else {
                     Ok(Some((info_path, claim)))
@@ -2469,7 +3157,7 @@ fn unique_id_atomic(
     // Keep the first timestamped ID, then advance without rescanning the
     // existing counter range or exhausting a fixed naming namespace (#399).
     let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
-    let mut names = crate::trash_id::CollisionNames::new(base_name, &ts);
+    let mut names = crate::trash_id::CollisionNames::new(base_name, &ts, name_max);
     loop {
         let candidate = names.next();
         if let Some((info_path, claim)) = try_claim(&candidate)? {
@@ -2509,7 +3197,17 @@ fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
         ));
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        #[cfg(test)]
+        crate::fdops::repair_probe::run(path);
+        // Through the directory just checked, never by path: chmod(2)
+        // follows a symlink that a FUSE or NFS server can answer for the
+        // next lookup, which made the caller chmod any file (security-3).
+        crate::fdops::fchmod_pinned_dir(
+            libc::AT_FDCWD,
+            &CString::new(path.as_os_str().as_bytes())?,
+            (meta.dev(), meta.ino()),
+            0o700,
+        )?;
         meta = fs::symlink_metadata(path)?;
     }
     if !meta.is_dir()
@@ -2521,6 +3219,37 @@ fn ensure_private_dir(path: &Path, uid: u32, create: bool) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             format!("{} is not a private trash directory", path.display()),
         ));
+    }
+    Ok(())
+}
+
+/// Put back the info/ of the trash root at `root`, where the root and its
+/// files/ are real directories of `uid` with mode 0700 and nothing is at
+/// info/. Nothing else is created or repaired: a purge never makes a store,
+/// and an info/ that is there but is not private stays for the lock to
+/// refuse. Through a descriptor of the validated root, never its path.
+fn restore_missing_info_dir(root: &Path, uid: u32) -> io::Result<()> {
+    let private = |directory: &fs::File| {
+        directory
+            .metadata()
+            .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700)
+    };
+    let root_dir = crate::fdops::open_dir_nofollow_at(
+        libc::AT_FDCWD,
+        &CString::new(root.as_os_str().as_bytes())?,
+    )?;
+    let files = crate::fdops::open_dir_nofollow_at(root_dir.as_raw_fd(), c"files")?;
+    if !private(&root_dir) || !private(&files) {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    // Fails on anything already there, a dangling symlink included.
+    if unsafe { libc::mkdirat(root_dir.as_raw_fd(), c"info".as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Whatever the umask left of the mode.
+    let info = crate::fdops::open_dir_nofollow_at(root_dir.as_raw_fd(), c"info")?;
+    if unsafe { libc::fchmod(info.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -2650,16 +3379,38 @@ fn lexically_normalized(path: &Path) -> PathBuf {
     normalized
 }
 
+/// The most plaintext retention's automatic compression reads into memory.
+const COMPRESS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// No entry decompresses to more than this, whatever its sidecar records.
+const HARD_DECOMPRESS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+
+/// How many bytes a compressed entry may decompress to under any
+/// configuration: the size its sidecar recorded when it was trashed, at
+/// least what automatic compression accepts and at most 4 GiB. A compressor
+/// leaves alone what is larger.
+pub fn decompress_limit(recorded_size: Option<u64>) -> u64 {
+    recorded_size
+        .unwrap_or(0)
+        .clamp(COMPRESS_MAX_BYTES, HARD_DECOMPRESS_LIMIT)
+}
+
 /// Decompress a marked entry with bounded memory and bounded output. The
 /// compressed source remains untouched until a complete plaintext sibling has
 /// been written, synced, and the entry identity has been revalidated.
-fn decompress_zstd_entry(entry: &mut TrashEntry, max_output: u64) -> io::Result<()> {
-    decompress_before_commit(entry, max_output, || {})
+/// An entry lock still held at `lock_deadline` makes the entry busy.
+fn decompress_zstd_entry(
+    entry: &mut TrashEntry,
+    max_output: u64,
+    lock_deadline: std::time::Instant,
+) -> io::Result<()> {
+    decompress_before_commit(entry, max_output, lock_deadline, || {})
 }
 
 fn decompress_before_commit(
     entry: &mut TrashEntry,
     max_output: u64,
+    lock_deadline: std::time::Instant,
     before_commit: impl FnOnce(),
 ) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
@@ -2683,7 +3434,7 @@ fn decompress_before_commit(
             "trash entry was replaced during decompression",
         ));
     }
-    input.lock()?;
+    lock_entry_data_until(&input, lock_deadline)?;
     if file_identity(&entry.trashed_path) != Some(expected_identity)
         || sidecar_version(&entry.info_path) != Some(expected_sidecar)
         || !compression_source_matches(&metadata, &input.metadata()?)
@@ -2706,9 +3457,8 @@ fn decompress_before_commit(
     cleared.compressed = None;
     if !has_zstd_magic {
         before_commit();
-        let _guard = RootMutationGuard::acquire(&entry.trash_root)?;
-        if file_identity(&entry.trashed_path) != Some(expected_identity)
-            || sidecar_version(&entry.info_path) != Some(expected_sidecar)
+        let guard = RootMutationGuard::acquire(&entry.trash_root)?;
+        if locked_versions(&guard, entry) != (Some(expected_identity), Some(expected_sidecar))
             || !compression_source_matches(&metadata, &input.metadata()?)
         {
             return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -2716,9 +3466,9 @@ fn decompress_before_commit(
         // Compression records the marker first. A crash in that narrow window
         // leaves ordinary plaintext plus a stale marker; clear only that known
         // state. A payload with real zstd magic must decode successfully.
-        set_compression_marker(&entry.info_path, None)?;
+        set_compression_marker_locked(&guard, entry, None)?;
         entry.info = cleared;
-        entry.sidecar_version = sidecar_version(&entry.info_path);
+        entry.sidecar_version = locked_versions(&guard, entry).1;
         return Ok(());
     }
 
@@ -2756,12 +3506,20 @@ fn decompress_before_commit(
         return Err(io::Error::last_os_error());
     }
     staging.as_file().set_permissions(metadata.permissions())?;
+    // The restored data keeps the compressed file's times, which are the
+    // original's (#202).
+    staging.as_file().set_times(
+        fs::FileTimes::new()
+            .set_accessed(metadata.accessed()?)
+            .set_modified(metadata.modified()?),
+    )?;
     staging.as_file().sync_all()?;
 
     before_commit();
-    let _guard = RootMutationGuard::acquire(&entry.trash_root)?;
-    if file_identity(&entry.trashed_path) != Some(expected_identity)
-        || sidecar_version(&entry.info_path) != Some(expected_sidecar)
+    // Checked and published through the directories the lock validated
+    // (security-1 follow-up).
+    let guard = RootMutationGuard::acquire(&entry.trash_root)?;
+    if locked_versions(&guard, entry) != (Some(expected_identity), Some(expected_sidecar))
         || !compression_source_matches(&metadata, &input.metadata()?)
     {
         return Err(io::Error::new(
@@ -2769,18 +3527,15 @@ fn decompress_before_commit(
             "trash entry changed before decompression commit",
         ));
     }
-    staging
-        .persist(&entry.trashed_path)
-        .map_err(|error| error.error)?;
-    let _ = keep_times(&entry.trashed_path, &metadata);
-    entry.identity = file_identity(&entry.trashed_path);
+    publish_data_stage(&guard, entry, staging)?;
+    entry.identity = locked_versions(&guard, entry).0;
 
     // Treat marker retirement as part of the transaction. If it fails, leave
     // the recoverable plaintext+marker state; the next restore recognizes the
     // missing magic and retries this write without decoding the file again.
-    set_compression_marker(&entry.info_path, None)?;
+    set_compression_marker_locked(&guard, entry, None)?;
     entry.info = cleared;
-    entry.sidecar_version = sidecar_version(&entry.info_path);
+    entry.sidecar_version = locked_versions(&guard, entry).1;
     Ok(())
 }
 
@@ -2819,6 +3574,23 @@ fn sidecar_snapshot(path: &Path) -> Option<SidecarVersion> {
     Some(SidecarVersion::from_metadata(&m))
 }
 
+/// Whether `path` is a regular sidecar that parses as trash metadata.
+fn sidecar_parses(path: &Path) -> bool {
+    crate::trashinfo::read_sidecar(path)
+        .ok()
+        .and_then(|content| TrashInfo::from_trashinfo(&content))
+        .is_some()
+}
+
+/// An orphan whose sidecar path holds a regular file: its metadata exists
+/// but could not be parsed (a corrupt file, a claim torn by a crash), so its
+/// age is unknown and the data may be recoverable by hand. Retention never
+/// purges it, matching fsck; an explicit purge still may.
+fn has_unparsed_sidecar(entry: &TrashEntry) -> bool {
+    entry.orphaned
+        && fs::symlink_metadata(&entry.info_path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Hash a file using the configured algorithm.
 /// "xxhash" (default): XXH3-128 — extremely fast, non-cryptographic.
 /// "sha256": SHA-256 — cryptographic, slower.
@@ -2838,10 +3610,32 @@ fn hash_file(path: &Path, algorithm: &str) -> io::Result<String> {
 /// (hashing is best-effort metadata) instead of hanging or reading through a
 /// link.
 fn hash_file_verified(path: &Path, algorithm: &str, expect: (u64, u64)) -> io::Result<String> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    hash_file_verified_at(
+        libc::AT_FDCWD,
+        &CString::new(path.as_os_str().as_bytes())?,
+        algorithm,
+        expect,
+    )
+}
+
+/// `hash_file_verified` of the entry `name` of the directory `dir`.
+fn hash_file_verified_at(
+    dir: RawFd,
+    name: &CStr,
+    algorithm: &str,
+    expect: (u64, u64),
+) -> io::Result<String> {
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
     let m = file.metadata()?;
     if !m.is_file() || (m.dev(), m.ino()) != expect {
         return Err(io::Error::new(
@@ -2900,15 +3694,54 @@ const DIR_SIZE_MAX_FILES: u64 = 10_000;
 /// one walk. The file-capped walk recorded a quarter of a 40,000-file tree,
 /// hiding it from retention's size limit and status, and the cache then
 /// walked the same tree again (#336). Symlinks are not followed or counted.
-fn tree_sizes(path: &Path) -> (u64, u64) {
-    let Some(dir) = CString::new(path.as_os_str().as_bytes())
-        .ok()
-        .and_then(|name| open_directory_at(libc::AT_FDCWD, &name, true, false).ok())
-    else {
-        return (0, 0);
-    };
-    let sizes = tree_survey(dir.as_raw_fd(), false);
-    (sizes.apparent, sizes.allocated)
+/// The tree is `name` in the directory `dir`.
+fn tree_sizes_at(dir: RawFd, name: &CStr) -> EntrySizes {
+    tree_survey_at(dir, name, false).sizes()
+}
+
+/// Allocated bytes of the tree at `path`, for a directorysizes row: the
+/// survey's, so a rebuilt row equals the one recorded with the entry
+/// (store-metadata-9).
+#[cfg(test)]
+pub(crate) fn tree_allocated_bytes(path: &Path) -> u64 {
+    CString::new(path.as_os_str().as_bytes()).map_or(0, |name| {
+        tree_survey_at(libc::AT_FDCWD, &name, false).allocated
+    })
+}
+
+/// `tree_allocated_bytes` of the entry `name` of the open directory `dir`.
+pub(crate) fn tree_allocated_bytes_at(dir: RawFd, name: &CStr) -> u64 {
+    tree_survey_at(dir, name, false).allocated
+}
+
+/// Replace the sidecar `name` of a locked root's info/ (`dir`, the lock's
+/// descriptor) with `info`, through a temporary file beside it: the
+/// `write_trashinfo_atomic` of a freshly published entry, which by path
+/// wrote wherever a symlinked info/ pointed (security-2).
+fn replace_sidecar_at(dir: RawFd, name: &CStr, info: &TrashInfo) -> io::Result<()> {
+    for attempt in 0u32..64 {
+        let staged = CString::new(format!(
+            ".trashd-sidecar-{}-{attempt}.tmp",
+            std::process::id()
+        ))?;
+        let mut file = match crate::fdops::create_excl_at(dir, &staged, 0o600) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            opened => opened?,
+        };
+        let published = file
+            .write_all(info.to_trashinfo_string().as_bytes())
+            .and_then(|()| {
+                if unsafe { libc::renameat(dir, staged.as_ptr(), dir, name.as_ptr()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        if published.is_err() {
+            let _ = raw_unlinkat(dir, &staged, 0);
+        }
+        return published;
+    }
+    Err(io::Error::from(io::ErrorKind::AlreadyExists))
 }
 
 /// A directory tree's apparent and allocated sizes and, when looked for,
@@ -2916,20 +3749,49 @@ fn tree_sizes(path: &Path) -> (u64, u64) {
 /// the walk.
 #[derive(Default)]
 struct TreeSurvey {
+    /// The lengths of the tree's files.
     apparent: u64,
+    /// The blocks of its files and of its directories themselves, the root
+    /// included, as `du -B1` counts them (store-metadata-9).
     allocated: u64,
     mount: Option<PathBuf>,
-    /// Part of the tree could not be walked (too deep, unreadable): a mount
-    /// there was not seen.
+    /// Part of the tree could not be walked (unreadable, out of
+    /// descriptors): a mount there was not seen.
     incomplete: bool,
+    /// The walk ran out of descriptors, so the sizes lack an unknown part
+    /// of a tree that can be measured (store-fs-1).
+    exhausted: bool,
 }
 
 impl TreeSurvey {
     /// A tree whose root could not even be opened.
-    fn unwalked() -> Self {
-        Self {
-            incomplete: true,
-            ..Self::default()
+    fn unwalked(error: io::Error) -> Self {
+        let mut survey = Self::default();
+        survey.unseen(error);
+        survey.incomplete = true;
+        survey
+    }
+
+    /// Note a part of the tree that could not be walked. A name that
+    /// vanished after it was listed is no part of it.
+    fn unseen(&mut self, error: io::Error) {
+        match error.raw_os_error() {
+            Some(libc::ENOENT) => {}
+            Some(libc::EMFILE | libc::ENFILE) => {
+                self.incomplete = true;
+                self.exhausted = true;
+            }
+            _ => self.incomplete = true,
+        }
+    }
+
+    /// The sizes an entry records. A walk that ran out of descriptors
+    /// records none: X-Trashd-Size is trusted as it stands for the life of
+    /// a home-trash entry, and without one accounting measures the tree.
+    fn sizes(&self) -> EntrySizes {
+        EntrySizes {
+            apparent: (!self.exhausted).then_some(self.apparent),
+            allocated: (!self.exhausted).then_some(self.allocated),
         }
     }
 
@@ -2944,6 +3806,25 @@ impl TreeSurvey {
     }
 }
 
+/// What a new entry records of its size: `X-Trashd-Size` (apparent bytes)
+/// and, for a directory, its directorysizes row (allocated bytes). None
+/// where they are not known.
+#[derive(Clone, Copy)]
+struct EntrySizes {
+    apparent: Option<u64>,
+    allocated: Option<u64>,
+}
+
+impl EntrySizes {
+    /// Anything but a directory: its length, and no directorysizes row.
+    fn of_file(length: u64) -> Self {
+        Self {
+            apparent: Some(length),
+            allocated: None,
+        }
+    }
+}
+
 /// Walk the open directory `dir` once for `TreeSurvey`. Every lookup is
 /// relative to the directory's descriptor: an absolute path cost a lookup
 /// of each component per file (#368). Files are measured with the one statx
@@ -2952,17 +3833,27 @@ impl TreeSurvey {
 /// followed nor counted.
 fn tree_survey(dir: RawFd, find_mounts: bool) -> TreeSurvey {
     let mut survey = TreeSurvey::default();
-    let dev = if find_mounts {
-        stat_fd(dir).map_or(0, |stat| stat.st_dev)
-    } else {
-        0
+    let dev = match stat_fd(dir) {
+        Ok(root) => {
+            survey.allocated = (root.st_blocks as u64).saturating_mul(512);
+            root.st_dev
+        }
+        Err(_) => 0,
     };
     survey_directory(dir, dev, find_mounts, &mut survey);
     survey
 }
 
-/// One directory on the survey worklist: the tree root (borrowed from the
-/// caller) or an opened descendant (owned; closed when popped).
+/// `tree_survey` of the tree `name` in the directory `dir`.
+fn tree_survey_at(dir: RawFd, name: &CStr, find_mounts: bool) -> TreeSurvey {
+    match open_directory_at(dir, name, true, false) {
+        Ok(root) => tree_survey(root.as_raw_fd(), find_mounts),
+        Err(error) => TreeSurvey::unwalked(error),
+    }
+}
+
+/// A directory of the survey: the tree root (borrowed from the caller) or
+/// an opened descendant (owned; closed when its level is done).
 enum SurveyDir {
     Root(RawFd),
     Owned(fs::File),
@@ -2977,90 +3868,166 @@ impl SurveyDir {
     }
 }
 
-fn survey_directory(dir: RawFd, dev: u64, find_mounts: bool, survey: &mut TreeSurvey) {
-    use std::ops::ControlFlow::{Break, Continue};
-    let unseen = |error: io::Error, survey: &mut TreeSurvey| {
-        if error.raw_os_error() != Some(libc::ENOENT) {
-            survey.incomplete = true;
+/// One directory the survey is in: its descriptor, and the subdirectories
+/// listed in it that are still to be walked, by name.
+struct SurveyLevel {
+    directory: SurveyDir,
+    dev: u64,
+    /// The directory's path from the tree's root, to report a mount.
+    relative: PathBuf,
+    own_mount: std::cell::OnceCell<i32>,
+    /// Last one first, each with the identity its statx reported, if it
+    /// took one.
+    subdirectories: Vec<(CString, Option<(u64, u64)>)>,
+    /// The directory was read to its end.
+    listed: bool,
+}
+
+impl SurveyLevel {
+    fn new(directory: SurveyDir, dev: u64, relative: PathBuf) -> Self {
+        Self {
+            directory,
+            dev,
+            relative,
+            own_mount: std::cell::OnceCell::new(),
+            subdirectories: Vec::new(),
+            listed: false,
         }
-    };
-    // An explicit worklist instead of recursion: no depth cap can truncate a
-    // real tree's size (#429). Depth stays self-limiting — each level holds
-    // one open directory descriptor — so a pathological tree exhausts the
-    // descriptor limit and degrades to `incomplete` exactly like an
-    // unreadable directory, without unbounded stack or memory.
-    let mut pending: Vec<(SurveyDir, u64, PathBuf)> =
-        vec![(SurveyDir::Root(dir), dev, PathBuf::new())];
-    while let Some((handle, dir_dev, relative)) = pending.pop() {
-        let dir = handle.as_raw_fd();
-        let own_mount = std::cell::OnceCell::new();
-        let mut descend: Vec<(SurveyDir, u64, PathBuf)> = Vec::new();
-        let listed = for_each_entry(dir, |name, kind| {
-            if kind == libc::DT_LNK {
-                return Continue(());
+    }
+
+    /// Read on in the directory: measure what is not a directory and queue
+    /// the subdirectories. It reads until some are queued and then one
+    /// batch more, which finds the end of all but huge directories, so the
+    /// walk knows when it descends into the last one. Break on a mount.
+    fn list(
+        &mut self,
+        find_mounts: bool,
+        buffer: &mut Vec<u8>,
+        batch: &mut Vec<(CString, u8)>,
+        survey: &mut TreeSurvey,
+    ) -> std::ops::ControlFlow<()> {
+        let dir = self.directory.as_raw_fd();
+        while !self.listed {
+            let queued = !self.subdirectories.is_empty();
+            match read_entry_batch(dir, buffer, batch) {
+                Ok(true) => {}
+                Ok(false) => self.listed = true,
+                Err(error) => {
+                    survey.unseen(error);
+                    self.listed = true;
+                }
             }
-            // A directory needs a statx only to be told from a mount.
-            let info = if kind == libc::DT_DIR && !find_mounts {
-                None
-            } else {
-                let mask = if kind == libc::DT_DIR {
-                    libc::STATX_TYPE
+            for (name, kind) in batch.drain(..) {
+                if kind == libc::DT_LNK {
+                    continue;
+                }
+                // A directory needs a statx only to be told from a mount.
+                let info = if kind == libc::DT_DIR && !find_mounts {
+                    None
                 } else {
-                    libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_BLOCKS
+                    let mut mask = libc::STATX_TYPE;
+                    if kind != libc::DT_DIR {
+                        mask |= libc::STATX_SIZE | libc::STATX_BLOCKS;
+                    }
+                    if find_mounts {
+                        mask |= libc::STATX_INO;
+                    }
+                    match mounts::entry_info_at(dir, &name, mask) {
+                        Ok(info) => Some(info),
+                        Err(error) => {
+                            survey.unseen(error);
+                            continue;
+                        }
+                    }
                 };
-                match mounts::entry_info_at(dir, name, mask) {
-                    Ok(info) => Some(info),
-                    Err(error) => {
-                        unseen(error, survey);
-                        return Continue(());
+                let format = info
+                    .as_ref()
+                    .map_or(libc::S_IFDIR, |info| info.mode & libc::S_IFMT);
+                if format == libc::S_IFLNK {
+                    continue;
+                }
+                if let Some(info) = &info {
+                    if find_mounts && survey_mount(dir, self.dev, &self.own_mount, &name, info) {
+                        survey.mount = Some(self.relative.join(OsStr::from_bytes(name.to_bytes())));
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    if format != libc::S_IFDIR {
+                        survey.apparent = survey.apparent.saturating_add(info.size);
+                        survey.allocated = survey
+                            .allocated
+                            .saturating_add(info.blocks.saturating_mul(512));
+                        continue;
                     }
                 }
-            };
-            let format = info
-                .as_ref()
-                .map_or(libc::S_IFDIR, |info| info.mode & libc::S_IFMT);
-            if format == libc::S_IFLNK {
-                return Continue(());
+                let identity = info
+                    .filter(|_| find_mounts)
+                    .map(|info| (info.dev, info.ino));
+                self.subdirectories.push((name, identity));
             }
-            if let Some(info) = &info {
-                if find_mounts && survey_mount(dir, dir_dev, &own_mount, name, info) {
-                    survey.mount = Some(relative.join(OsStr::from_bytes(name.to_bytes())));
-                    return Break(());
-                }
-                if format != libc::S_IFDIR {
-                    survey.apparent = survey.apparent.saturating_add(info.size);
-                    survey.allocated = survey
-                        .allocated
-                        .saturating_add(info.blocks.saturating_mul(512));
-                    return Continue(());
-                }
+            if queued {
+                break;
             }
-            let child = match open_directory_at(dir, name, true, false) {
-                Ok(child) => child,
-                Err(error) => {
-                    unseen(error, survey);
-                    return Continue(());
-                }
-            };
-            let child_dev = info.map_or(0, |info| info.dev);
-            descend.push((
-                SurveyDir::Owned(child),
-                child_dev,
-                relative.join(OsStr::from_bytes(name.to_bytes())),
-            ));
-            Continue(())
-        });
-        if let Err(error) = listed {
-            unseen(error, survey);
         }
-        if survey.mount.is_some() {
-            // The tree's mount ended the walk (or the walk stopped inside
-            // this directory): nothing below the pending worklist counts.
-            return;
+        // Depth-first in listing order: the first-listed subdirectory's
+        // whole subtree completes before its siblings.
+        self.subdirectories.reverse();
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn survey_directory(dir: RawFd, dev: u64, find_mounts: bool, survey: &mut TreeSurvey) {
+    // An explicit stack instead of recursion: no depth cap can truncate a
+    // real tree's size (#429). A directory's subdirectories wait as names
+    // and each is opened when the walk reaches it. Opened while their
+    // parent was listed, a directory with more subdirectories than the
+    // descriptor limit was sized without most of them (store-fs-1). A level
+    // holds its one descriptor only while something is left to list in it,
+    // so a chain of directories needs one however deep. A tree both deep
+    // and branching at every level can still exhaust the limit: it degrades
+    // to `incomplete`, like an unreadable directory, and to `exhausted`.
+    let mut levels = vec![SurveyLevel::new(SurveyDir::Root(dir), dev, PathBuf::new())];
+    let mut buffer = Vec::with_capacity(DIRENT_BUFFER);
+    let mut batch = Vec::new();
+    while let Some(level) = levels.last_mut() {
+        let Some((name, listed_as)) = level.subdirectories.pop() else {
+            if level.listed {
+                levels.pop();
+            } else if level
+                .list(find_mounts, &mut buffer, &mut batch, survey)
+                .is_break()
+            {
+                // The tree's mount ended the walk: nothing else counts.
+                return;
+            }
+            continue;
+        };
+        let opened = open_directory_at(level.directory.as_raw_fd(), &name, true, false)
+            .and_then(|child| Ok((stat_fd(child.as_raw_fd())?, child)));
+        let (stat, child) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                survey.unseen(error);
+                continue;
+            }
+        };
+        // The name can be replaced between its statx and the open: only the
+        // directory found not to be a mount is walked.
+        if listed_as.is_some_and(|identity| identity != stat_identity(&stat)) {
+            survey.incomplete = true;
+            continue;
         }
-        // Depth-first like the old recursion: the first-listed child's whole
-        // subtree completes before its siblings.
-        pending.extend(descend.into_iter().rev());
+        survey.allocated = survey
+            .allocated
+            .saturating_add((stat.st_blocks as u64).saturating_mul(512));
+        let child = SurveyLevel::new(
+            SurveyDir::Owned(child),
+            stat.st_dev,
+            level.relative.join(OsStr::from_bytes(name.to_bytes())),
+        );
+        if level.listed && level.subdirectories.is_empty() {
+            levels.pop();
+        }
+        levels.push(child);
     }
 }
 
@@ -3099,7 +4066,9 @@ fn survey_mount(
 /// Descriptor-relative lookups avoid repeatedly resolving every ancestor;
 /// batched directory reads and an explicit stack bound memory by depth.
 /// Symlinks and mounted subtrees are excluded, as for a tree we can purge.
-fn directory_accounted_size(path: &Path, ceiling: Option<u64>) -> u64 {
+/// With `allocated`, a file counts no more than its allocated blocks, so
+/// sparse files in a root others may write cannot inflate it (store-core-3).
+fn directory_accounted_size(path: &Path, ceiling: Option<u64>, allocated: bool) -> u64 {
     let limit = ceiling.unwrap_or(u64::MAX);
     if limit == 0 {
         return 0;
@@ -3149,7 +4118,7 @@ fn directory_accounted_size(path: &Path, ceiling: Option<u64>) -> u64 {
         let Ok(info) = mounts::entry_info_at(
             directory,
             &name,
-            libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_INO,
+            libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_INO | libc::STATX_BLOCKS,
         ) else {
             continue;
         };
@@ -3159,7 +4128,12 @@ fn directory_accounted_size(path: &Path, ceiling: Option<u64>) -> u64 {
             continue;
         }
         if format != libc::S_IFDIR {
-            total = total.saturating_add(info.size);
+            let size = if allocated {
+                info.size.min(info.blocks.saturating_mul(512))
+            } else {
+                info.size
+            };
+            total = total.saturating_add(size);
             if total >= limit {
                 return limit;
             }
@@ -3511,6 +4485,12 @@ fn prepare_tree_removal(
             result => result.map(|()| None),
         };
     }
+    #[cfg(test)]
+    TREE_STATUS_PROBE.with_borrow(|probe| {
+        if let Some(probe) = probe {
+            probe(name);
+        }
+    });
     // A mount point that travelled into the trash with its directory (rm -r
     // of a tree holding one) is never touched: purging through it deleted
     // the mounted filesystem's data, and even its mode stays as it is. It
@@ -3537,16 +4517,28 @@ fn prepare_tree_removal(
     if depth > REMOVE_TREE_MAX_DEPTH {
         return Err(io::Error::other("directory tree too deep to remove"));
     }
+    // Another remover may finish this directory first: the sweep of detached
+    // jobs runs unlocked beside a purge still removing its tree. A detached
+    // tree is private and only shrinks, so a directory gone since its status
+    // was read is already removed, not a failure (store-metadata-10).
+    let gone = |error: io::Error| match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(None),
+        _ => Err(error),
+    };
+    // Through a descriptor of the directory just statted, never by name: a
+    // process that kept a descriptor in a group-writable directory of a
+    // trashed tree can still swap entries there, and the path-following
+    // retry this replaced chmodded whatever a swapped-in symlink named
+    // (store-fs-2). A swapped entry fails here; the next sweep unlinks it.
     if mode & 0o700 != 0o700
-        && unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        && let Err(error) = crate::fdops::fchmod_pinned_dir(parent, name, identity, 0o700)
     {
-        // Linux rejects AT_SYMLINK_NOFOLLOW for fchmodat; lstat proved this
-        // is a directory, which nobody else can swap inside a private root.
-        if unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, 0) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        return gone(error);
     }
-    let directory = open_directory_at(parent, name, true, false)?;
+    let directory = match open_directory_at(parent, name, true, false) {
+        Ok(directory) => directory,
+        Err(error) => return gone(error),
+    };
     if stat_identity(&stat_fd(directory.as_raw_fd())?) != identity {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -3940,19 +4932,44 @@ fn remove_entry(
     })
 }
 
-/// unlink(2) of an absolute path as a raw syscall (see `raw_unlinkat`).
-fn raw_unlink_path(path: &Path) -> io::Result<()> {
-    raw_unlinkat(
-        libc::AT_FDCWD,
-        &CString::new(path.as_os_str().as_bytes())?,
-        0,
-    )
+/// A test hook called with the name a store operation is about to act on.
+#[cfg(test)]
+type NameProbe = std::cell::RefCell<Option<Box<dyn Fn(&CStr)>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs before every store-internal unlink on this thread, with the
+    /// name being unlinked: tests check which locks are held (store-core-4).
+    static UNLINK_PROBE: NameProbe = const { std::cell::RefCell::new(None) };
+    /// Runs once a tree removal has read a directory's status, before it
+    /// changes or opens it: tests act as a concurrent remover there.
+    static TREE_STATUS_PROBE: NameProbe = const { std::cell::RefCell::new(None) };
+    /// The errno every RENAME_NOREPLACE fails with on this thread, as on a
+    /// filesystem without the flag (NFS, 9p).
+    static NOREPLACE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// What a restore by copy did on this thread, in order: "sync" once the
+    /// destination was made durable, "retire" before the trash copy goes.
+    static RESTORE_COPY_EVENTS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The errno making a restored copy durable fails with on this thread.
+    static DESTINATION_SYNC_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+    /// Runs once a copy is staged complete, before it is published, with
+    /// the stage's name: tests act as the other writers of the root there
+    /// (store-metadata-6).
+    static STAGE_PROBE: NameProbe = const { std::cell::RefCell::new(None) };
 }
 
 /// unlinkat(2) as a raw syscall. Store-internal removals must never go
 /// through the interposable libc wrapper: under a system-wide LD_PRELOAD the
 /// hook would trash them again (#104, #192, #196).
 fn raw_unlinkat(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+    #[cfg(test)]
+    UNLINK_PROBE.with_borrow(|probe| {
+        if let Some(probe) = probe {
+            probe(name);
+        }
+    });
     if unsafe { libc::syscall(libc::SYS_unlinkat, parent, name.as_ptr(), flags) } == 0 {
         Ok(())
     } else {
@@ -4060,44 +5077,160 @@ fn prepare_atomic_write_replacement(
 
 /// True when a data-absent entry is old enough for purge/empty to treat as
 /// fully retired. `trash()` writes the sidecar BEFORE the data lands, so a
-/// freshly-written data-absent sidecar may be an in-flight trash (the
-/// cross-device copy window spans seconds) — stripping its sidecar
-/// would strand the completed move as an unrestorable orphan (#169).
+/// freshly-written data-absent sidecar may be an in-flight trash —
+/// stripping its sidecar would strand the completed move as an unrestorable
+/// orphan (#169). A copy from another filesystem takes as long as it takes
+/// and runs without the root lock: its sidecar is locked for that time
+/// (`claim_in_flight`), and a locked sidecar is in flight whatever its age
+/// (store-metadata-6).
 pub fn data_absence_is_retired(info_path: &Path) -> bool {
+    let Ok(path) = CString::new(info_path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    data_absence_is_retired_at(libc::AT_FDCWD, &path)
+}
+
+/// `data_absence_is_retired` for the sidecar `name` of the directory
+/// `info`: a purge asks through the info/ its root lock validated.
+fn data_absence_is_retired_at(info: RawFd, name: &CStr) -> bool {
     const GRACE_SECS: u64 = 5;
-    let sidecar_age = fs::symlink_metadata(info_path)
+    // O_NONBLOCK: whatever a racer puts at the name must not hang the open.
+    let fd = unsafe {
+        libc::openat(
+            info,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        // Unreadable sidecar: nothing in flight to protect; purge semantics
+        // for a genuinely missing sidecar still apply.
+        return true;
+    }
+    let sidecar = unsafe { fs::File::from_raw_fd(fd) };
+    // A shared lock conflicts with the writer's exclusive one and works on
+    // a read-only descriptor on NFS too. Only a lock that is held says "in
+    // flight"; a filesystem without locks leaves the age to decide.
+    if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            return false;
+        }
+    } else {
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+    }
+    let sidecar_age = sidecar
+        .metadata()
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
         .map(|d| d.as_secs());
     match sidecar_age {
         Some(age) => age >= GRACE_SECS,
-        // Unreadable sidecar: nothing in flight to protect; purge semantics
-        // for a genuinely missing sidecar still apply.
         None => true,
     }
 }
 
-/// Take an exclusive flock on an entry's data file. Restore holds it across
-/// its identity check → rename and both compressors hold it across their
+/// How long an explicit command (purge, empty, restore, compress) waits for
+/// an entry lock before it reports the entry busy. trashd's own holders keep
+/// it for at most a few seconds (encoding up to 64 MiB and syncing it); a
+/// longer hold is a process that flock()ed the file before it was deleted:
+/// the lock moved into the trash with the inode (store-core-9, cli-8).
+pub const ENTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most one retention pass waits for entry locks in total. Retention
+/// skips a busy entry and retries it on its next pass; in the seccomp
+/// supervisor it runs on the thread that answers every trapped delete.
+const RETENTION_ENTRY_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// flock(LOCK_EX) on `file`, retrying a contended lock until `deadline`.
+/// At least one attempt is made; expiry is a `WouldBlock` error. Polling
+/// rather than blocking: a blocking flock waited forever on a holder outside
+/// trashd (store-core-9).
+pub(crate) fn lock_file_until(file: &fs::File, deadline: std::time::Instant) -> io::Result<()> {
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(error);
+        }
+        std::thread::sleep(pause.min(left));
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
+/// [`lock_file_until`] on an entry's data, which reports expiry as a busy
+/// entry. Public for the CLI compressor, which serializes on the same lock.
+pub fn lock_entry_data_until(file: &fs::File, deadline: std::time::Instant) -> io::Result<()> {
+    lock_file_until(file, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the trash entry is busy: another process holds a lock on it",
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// Take an exclusive flock on an entry's data. Restore holds it across its
+/// identity check → publication and both compressors hold it across their
 /// validate → swap (through the marker write and data swap, #170), so
 /// "validated" can never interleave with "renamed" — the #105 revalidations
-/// alone left that window open (#168). Blocking is fine: the other side
-/// holds it for milliseconds. Non-regular entries (symlinks, dirs) are
-/// never swapped by compressors, so there is nothing to serialize —
-/// Ok(None). Any open error means the entry vanished or changed; callers
-/// map that to EntryNotFound.
-fn lock_entry_file(path: &Path) -> io::Result<Option<fs::File>> {
-    if !fs::symlink_metadata(path)?.is_file() {
-        return Ok(None);
-    }
+/// alone left that window open (#168). Purge takes it too, so a directory
+/// entry is locked as well: restore copies one across filesystems, and the
+/// copy fallbacks retire their source, without the root lock (store-core-4).
+/// The wait ends at `deadline` with a busy (`WouldBlock`) error, never an
+/// indefinite block (store-core-9). Symlinks and special files are never
+/// opened: Ok(None). Any open error means the entry vanished or changed;
+/// callers map that to EntryNotFound.
+fn lock_entry_file_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<Option<fs::File>> {
+    lock_entry_file_at(
+        libc::AT_FDCWD,
+        &CString::new(path.as_os_str().as_bytes())?,
+        deadline,
+    )
+}
+
+/// `lock_entry_file_until` for the entry `name` of the directory `dir`.
+fn lock_entry_file_at(
+    dir: RawFd,
+    name: &CStr,
+    deadline: std::time::Instant,
+) -> io::Result<Option<fs::File>> {
+    let metadata = stat_at(dir, name, libc::AT_SYMLINK_NOFOLLOW)?;
+    let directory = match metadata.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::O_DIRECTORY,
+        libc::S_IFREG => 0,
+        _ => return Ok(None),
+    };
     // O_NONBLOCK like every other entry-data open (#111): a FIFO swapped
     // into the path in the TOCTOU window must not hang the caller.
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let opened = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | directory,
+        )
+    };
+    let opened = if opened < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(opened) })
+    };
+    let file = match opened {
         Ok(file) => file,
         // Data its owner cannot read (mode 000/200/300) cannot be compressed
         // either, so there is nothing to serialize against; refusing made
@@ -4107,16 +5240,50 @@ fn lock_entry_file(path: &Path) -> io::Result<Option<fs::File>> {
         }
         Err(error) => return Err(error),
     };
-    // File::lock is flock(LOCK_EX) without an EINTR retry (std uses cvt, not
-    // cvt_r), so a handled signal while blocked would surface as an error —
-    // retry instead (#170).
-    loop {
-        match file.lock() {
-            Ok(()) => return Ok(Some(file)),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+    match lock_entry_data_until(&file, deadline) {
+        Ok(()) => Ok(Some(file)),
+        // Where a directory cannot be locked (NFS emulates flock with write
+        // locks, and a directory is never open for writing), it is purged
+        // and restored unlocked, as before directories took this lock.
+        Err(error)
+            if directory != 0
+                && matches!(
+                    error.raw_os_error(),
+                    Some(libc::EBADF | libc::ENOLCK | libc::EOPNOTSUPP | libc::EINVAL)
+                ) =>
+        {
+            Ok(None)
         }
+        Err(error) => Err(error),
     }
+}
+
+/// Lock the data a copy fallback just published as `files/<id>` before it
+/// releases the root lock to retire the source: purge waits for (and then
+/// reports busy) an entry whose source is still being retired, so it can
+/// never delete the fresh copy and leave the retirement to delete the only
+/// other one (#243). Never waits: a holder already queued for the root lock
+/// would deadlock with us. Without the lock the retirement proceeds as a
+/// move followed by that purge.
+fn lock_published_copy(files: RawFd, id: &CStr) -> Option<fs::File> {
+    let status = stat_at(files, id, libc::AT_SYMLINK_NOFOLLOW).ok()?;
+    let directory = match status.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::O_DIRECTORY,
+        libc::S_IFREG => 0,
+        _ => return None,
+    };
+    let fd = unsafe {
+        libc::openat(
+            files,
+            id.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | directory,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    (unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(file)
 }
 
 /// Strip redundant separators and `.` components from a conflict destination
@@ -4140,6 +5307,151 @@ pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<
 /// restore once the drive was mounted elsewhere (#218).
 pub fn set_compression_marker(info_path: &Path, algorithm: Option<&str>) -> io::Result<()> {
     let original = crate::trashinfo::read_sidecar_bytes(info_path)?;
+    atomic_write(info_path, &with_compression_marker(&original, algorithm))
+}
+
+/// `set_compression_marker` for an entry of the root `guard` holds, through
+/// the info/ it validated: by path, a FUSE or NFS server could answer info/
+/// with a symlink once the lock had checked it, and the rewritten sidecar
+/// replaced whatever file of that name it led to (security-1 follow-up).
+pub fn set_compression_marker_locked(
+    guard: &RootMutationGuard,
+    entry: &TrashEntry,
+    algorithm: Option<&str>,
+) -> io::Result<()> {
+    let (_, info_name) = entry_names(entry).map_err(trash_to_io)?;
+    let info = guard.info().as_raw_fd();
+    let original = crate::trashinfo::read_sidecar_bytes_at(info, &info_name)?;
+    replace_bytes_at(
+        info,
+        &info_name,
+        &with_compression_marker(&original, algorithm),
+    )
+}
+
+/// Publish a finished data stage (`create_data_stage`) as the data of an
+/// entry of the root `guard` holds: renamed out of the state directory the
+/// lock validated into the files/ it validated, once the stage is checked
+/// to be that directory's entry of its name. Renamed onto the entry's path,
+/// a symlink a FUSE or NFS server answered for files/ after the check had
+/// the staged bytes replace whatever file it led to (security-1 follow-up).
+pub fn publish_data_stage(
+    guard: &RootMutationGuard,
+    entry: &TrashEntry,
+    stage: tempfile::NamedTempFile,
+) -> io::Result<()> {
+    let (data_name, _) = entry_names(entry).map_err(trash_to_io)?;
+    let stage_name = CString::new(
+        stage
+            .path()
+            .file_name()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
+            .as_bytes(),
+    )?;
+    let state = guard.state().as_raw_fd();
+    let named = stat_at(state, &stage_name, libc::AT_SYMLINK_NOFOLLOW)?;
+    if stat_identity(&named) != stat_identity(&stat_fd(stage.as_file().as_raw_fd())?) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the data stage is not in the trash's state directory",
+        ));
+    }
+    if unsafe {
+        libc::renameat(
+            state,
+            stage_name.as_ptr(),
+            guard.files().as_raw_fd(),
+            data_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // Published: the stage's name is gone and must not be removed later.
+    let (_, path) = stage.into_parts();
+    let _ = path.keep();
+    Ok(())
+}
+
+fn trash_to_io(error: TrashError) -> io::Error {
+    match error {
+        TrashError::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::NotFound, other.to_string()),
+    }
+}
+
+/// The data identity and sidecar version of an entry of the root `guard`
+/// holds, read through the directories it validated.
+fn locked_versions(
+    guard: &RootMutationGuard,
+    entry: &TrashEntry,
+) -> (Option<(u64, u64)>, Option<SidecarVersion>) {
+    let Ok((data_name, info_name)) = entry_names(entry) else {
+        return (None, None);
+    };
+    let identity = crate::fdops::metadata_nofollow_at(guard.files().as_raw_fd(), &data_name)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    let version = crate::fdops::metadata_nofollow_at(guard.info().as_raw_fd(), &info_name)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|metadata| SidecarVersion::from_metadata(&metadata));
+    (identity, version)
+}
+
+/// Atomically replace the regular file `name` of the open directory `dir`
+/// with `data`, keeping its owner, mode and times: `atomic_write` relative
+/// to a descriptor.
+fn replace_bytes_at(dir: RawFd, name: &CStr, data: &[u8]) -> io::Result<()> {
+    let meta = crate::fdops::metadata_nofollow_at(dir, name)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic replacement requires a regular file",
+        ));
+    }
+    for attempt in 0u32..64 {
+        let staged = CString::new(format!(
+            ".trashd-sidecar-{}-{attempt}.tmp",
+            std::process::id()
+        ))?;
+        let mut file = match crate::fdops::create_excl_at(dir, &staged, 0o600) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            created => created?,
+        };
+        let published = (|| {
+            file.write_all(data)?;
+            let staged_meta = file.metadata()?;
+            if (staged_meta.uid(), staged_meta.gid()) != (meta.uid(), meta.gid())
+                && unsafe { libc::fchown(file.as_raw_fd(), meta.uid(), meta.gid()) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            file.set_permissions(meta.permissions())?;
+            // A rewritten sidecar keeps the mtime that orders entries
+            // without a deletion stamp (#345).
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_accessed(meta.accessed()?)
+                    .set_modified(meta.modified()?),
+            )?;
+            file.sync_all()?;
+            if unsafe { libc::renameat(dir, staged.as_ptr(), dir, name.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if published.is_err() {
+            let _ = raw_unlinkat(dir, &staged, 0);
+        }
+        return published;
+    }
+    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+/// `original` with its `X-Trashd-Compressed` line replaced by one for
+/// `algorithm`, or removed for None; every other byte as it was.
+fn with_compression_marker(original: &[u8], algorithm: Option<&str>) -> Vec<u8> {
     let mut text: Vec<u8> = Vec::with_capacity(original.len() + 32);
     for line in original.split_inclusive(|&b| b == b'\n') {
         if !line.starts_with(b"X-Trashd-Compressed=") {
@@ -4152,36 +5464,7 @@ pub fn set_compression_marker(info_path: &Path, algorithm: Option<&str>) -> io::
         }
         text.extend_from_slice(format!("X-Trashd-Compressed={algorithm}\n").as_bytes());
     }
-    atomic_write(info_path, &text)
-}
-
-/// Give a swapped-in file the original's access and modification times, so
-/// compressing or decompressing an entry does not change what restore
-/// publishes (#202).
-fn keep_times(path: &Path, original: &fs::Metadata) -> io::Result<()> {
-    let times = [
-        libc::timespec {
-            tv_sec: original.atime(),
-            tv_nsec: original.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: original.mtime(),
-            tv_nsec: original.mtime_nsec(),
-        },
-    ];
-    let name = CString::new(path.as_os_str().as_bytes())?;
-    if unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            name.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    text
 }
 
 /// Whether compression may replace an entry's data inode at all: a regular
@@ -4344,6 +5627,7 @@ fn open_directory_path(path: &Path, nofollow: bool) -> io::Result<fs::File> {
     }
 }
 
+#[cfg(test)]
 fn open_directory_nofollow(path: &Path) -> io::Result<fs::File> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -4463,28 +5747,19 @@ fn destination_exists(destination: &RestoreDestination) -> io::Result<bool> {
 }
 
 /// Rename between pinned directories, failing instead of replacing anything
-/// that appeared at the destination.
+/// that appeared at the destination. The raw syscall, as the supervisor's
+/// move has always been.
 fn rename_noreplace_at(
     src_parent: RawFd,
     src_name: &CStr,
     dst_parent: RawFd,
     dst_name: &CStr,
 ) -> io::Result<()> {
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-    let ret = unsafe {
-        libc::renameat2(
-            src_parent,
-            src_name.as_ptr(),
-            dst_parent,
-            dst_name.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    #[cfg(test)]
+    if let Some(errno) = NOREPLACE_ERRNO.get() {
+        return Err(io::Error::from_raw_os_error(errno));
     }
+    crate::fdops::rename_noreplace_at(src_parent, src_name, dst_parent, dst_name)
 }
 
 fn is_conflict_error(error: &io::Error) -> bool {
@@ -4501,9 +5776,24 @@ fn is_copy_fallback_error(error: &io::Error) -> bool {
     )
 }
 
-/// Copy one source node into the trash for the cross-device path. Device
-/// nodes and sockets cannot be reproduced, so they abort the copy and nothing
-/// is retired, instead of being skipped and then deleted (#192).
+/// How a staged copy may take its final name on a filesystem without
+/// RENAME_NOREPLACE (NFS, 9p, FUSE without rename2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Publication {
+    /// Into the user's tree (restore): nothing there may be replaced, and
+    /// no directory operation guarantees that, so a directory is refused.
+    Strict,
+    /// Into the files/ of a locked private trash root, under an id its
+    /// claim in info/ reserved: nobody else creates names there, so a
+    /// directory may be renamed over one made exclusively for it.
+    PrivateRoot,
+}
+
+/// Copy one source node into the trash for the cross-device path:
+/// `dst_parent` is the files/ of a trash root whose lock the caller holds,
+/// `dst_name` an id claimed in it. Device nodes and sockets cannot be
+/// reproduced, so they abort the copy and nothing is retired, instead of
+/// being skipped and then deleted (#192).
 fn copy_source_at(
     src_parent: RawFd,
     src_name: &CStr,
@@ -4513,13 +5803,15 @@ fn copy_source_at(
     source: &libc::stat,
 ) -> io::Result<(u64, u64)> {
     match source.st_mode & libc::S_IFMT {
-        libc::S_IFREG | libc::S_IFDIR => copy_staged_at(
+        libc::S_IFREG | libc::S_IFDIR => copy_staged_at_with_rename(
             src_parent,
             src_name,
             dst_parent,
             dst_name,
             staging_parent,
             source,
+            Publication::PrivateRoot,
+            rename_noreplace_at,
         ),
         libc::S_IFLNK => copy_symlink_at(src_parent, src_name, dst_parent, dst_name, source),
         libc::S_IFIFO => {
@@ -4555,6 +5847,8 @@ fn copy_source_at(
 /// — beside a valid sidecar in the trash direction, or at the original path
 /// in the restore direction, where a retry then reported a conflict (#334).
 /// Renaming keeps the node's identity, which callers verify afterwards.
+/// This is the restore direction (`Publication::Strict`); `copy_source_at`
+/// is the trash direction.
 fn copy_staged_at(
     src_parent: RawFd,
     src_name: &CStr,
@@ -4570,10 +5864,12 @@ fn copy_staged_at(
         dst_name,
         staging_parent,
         source,
+        Publication::Strict,
         rename_noreplace_at,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_staged_at_with_rename(
     src_parent: RawFd,
     src_name: &CStr,
@@ -4581,9 +5877,33 @@ fn copy_staged_at_with_rename(
     dst_name: &CStr,
     staging_parent: RawFd,
     source: &libc::stat,
+    publication: Publication,
     rename: impl FnOnce(RawFd, &CStr, RawFd, &CStr) -> io::Result<()>,
 ) -> io::Result<(u64, u64)> {
-    let (staging, identity) = (0u32..64)
+    let (staging, identity) = stage_copy_at(src_parent, src_name, staging_parent, source)?;
+    publish_staged_at(
+        staging_parent,
+        &staging,
+        dst_parent,
+        dst_name,
+        source,
+        identity,
+        publication,
+        rename,
+    )?;
+    Ok(identity)
+}
+
+/// The first half of `copy_staged_at_with_rename`: copy a regular file or
+/// directory tree under a hidden name in `staging_parent`, returning that
+/// name and the copy's identity. Nothing else refers to the copy yet.
+fn stage_copy_at(
+    src_parent: RawFd,
+    src_name: &CStr,
+    staging_parent: RawFd,
+    source: &libc::stat,
+) -> io::Result<(CString, (u64, u64))> {
+    let staged = (0u32..64)
         .find_map(|attempt| {
             let staging = CString::new(format!(
                 "{COPY_STAGE_PREFIX}{}-{}-{attempt}",
@@ -4614,39 +5934,78 @@ fn copy_staged_at_with_rename(
             }
         })
         .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::AlreadyExists)))?;
-    let published = match rename(staging_parent, &staging, dst_parent, dst_name) {
+    #[cfg(test)]
+    STAGE_PROBE.with_borrow(|probe| {
+        if let Some(probe) = probe {
+            probe(&staged.0);
+        }
+    });
+    Ok(staged)
+}
+
+/// The second half: give the copy staged as `staging` (identity `identity`)
+/// its final name without replacing anything. A stage that cannot be
+/// published is removed.
+#[allow(clippy::too_many_arguments)]
+fn publish_staged_at(
+    staging_parent: RawFd,
+    staging: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    source: &libc::stat,
+    identity: (u64, u64),
+    publication: Publication,
+    rename: impl FnOnce(RawFd, &CStr, RawFd, &CStr) -> io::Result<()>,
+) -> io::Result<()> {
+    let published = match rename(staging_parent, staging, dst_parent, dst_name) {
         Err(error)
             if matches!(
                 error.raw_os_error(),
                 Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
             ) =>
         {
-            publish_without_noreplace(staging_parent, &staging, dst_parent, dst_name, source)
+            publish_without_noreplace(
+                staging_parent,
+                staging,
+                dst_parent,
+                dst_name,
+                source,
+                identity,
+                publication,
+            )
         }
         result => result,
     };
-    if let Err(error) = published {
-        let _ = remove_created_tree_at(staging_parent, &staging, identity);
-        return Err(error);
+    if published.is_err() {
+        let _ = remove_created_tree_at(staging_parent, staging, identity);
     }
-    Ok(identity)
+    published
 }
 
 /// Publication where RENAME_NOREPLACE is unsupported: regular files can be
 /// linked exclusively. There is no equivalent directory operation: a plain
-/// rename could replace a competing empty directory after any absence check.
+/// rename could replace a competing empty directory after any absence
+/// check, so a directory is published only into a private trash root
+/// (`Publication`). `staged` is the identity of the staged copy.
 fn publish_without_noreplace(
     staging_parent: RawFd,
     staging: &CStr,
     dst_parent: RawFd,
     dst_name: &CStr,
     source: &libc::stat,
+    staged: (u64, u64),
+    publication: Publication,
 ) -> io::Result<()> {
     if source.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "cannot publish a directory without atomic no-replace support; source retained",
-        ));
+        return match publication {
+            Publication::Strict => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot publish a directory without atomic no-replace support; source retained",
+            )),
+            Publication::PrivateRoot => {
+                publish_directory_over_claim(staging_parent, staging, dst_parent, dst_name, staged)
+            }
+        };
     }
     if unsafe {
         libc::linkat(
@@ -4661,6 +6020,54 @@ fn publish_without_noreplace(
         return Err(io::Error::last_os_error());
     }
     raw_unlinkat(staging_parent, staging, 0)
+}
+
+/// Publish a staged directory into the files/ of a private trash root
+/// without RENAME_NOREPLACE (store-fs-3). The name is taken with an
+/// exclusive mkdir, which fails on anything already there, and the staged
+/// tree is then renamed over that directory: rename(2) replaces a directory
+/// only while it is empty, so the one thing it can replace is the directory
+/// just made. Refusing instead made every recursive delete fail on an NFS
+/// or 9p home, each after a full copy.
+fn publish_directory_over_claim(
+    staging_parent: RawFd,
+    staging: &CStr,
+    dst_parent: RawFd,
+    dst_name: &CStr,
+    staged: (u64, u64),
+) -> io::Result<()> {
+    if unsafe { libc::mkdirat(dst_parent, dst_name.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let claimed = stat_identity(&stat_at(dst_parent, dst_name, libc::AT_SYMLINK_NOFOLLOW)?);
+    let published =
+        validate_created_node(dst_parent, dst_name, libc::S_IFDIR, claimed).and_then(|()| {
+            if unsafe {
+                libc::renameat(
+                    staging_parent,
+                    staging.as_ptr(),
+                    dst_parent,
+                    dst_name.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    if let Err(error) = published {
+        // Only the empty directory made above: `remove_created_at` leaves
+        // anything else, and anything in it, where it is.
+        let _ = remove_created_at(dst_parent, dst_name, claimed);
+        return Err(error);
+    }
+    if !identity_matches_at(dst_parent, dst_name, staged) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "published trash directory was replaced",
+        ));
+    }
+    Ok(())
 }
 
 /// Cross-device/unsupported-rename publication. Every destination node is
@@ -4728,14 +6135,21 @@ fn publish_copy_noreplace(
                 ));
             }
             if snapshot_directory_at(src_parent, src_name)? != before {
-                eprintln!(
-                    "trashd: warning: restored a stable snapshot but the trash directory changed during the copy; keeping the remaining trash copy as an orphan"
+                crate::report_note(
+                    "trashd: warning: restored a stable snapshot but the trash directory changed during the copy; keeping the remaining trash copy as an orphan",
                 );
                 return Ok(());
+            }
+            // Durable before the trash copy goes, or not restored at all.
+            if let Err(error) = sync_restored_copy(dst_parent, true) {
+                let _ = remove_created_tree_at(dst_parent, dst_name, destination_identity);
+                return Err(error);
             }
             // Retire only the exact source nodes captured before the copy.
             // New or replaced children are left in a residual orphan instead
             // of being deleted without ever reaching the destination.
+            #[cfg(test)]
+            RESTORE_COPY_EVENTS.with_borrow_mut(|events| events.push("retire"));
             match retire_directory_snapshot_at(
                 src_parent,
                 src_name,
@@ -4744,12 +6158,12 @@ fn publish_copy_noreplace(
                 true,
             ) {
                 Ok(true) => {}
-                Ok(false) => eprintln!(
-                    "trashd: warning: restored directory but its trash copy changed during retirement; keeping the unmatched remainder as an orphan"
+                Ok(false) => crate::report_note(
+                    "trashd: warning: restored directory but its trash copy changed during retirement; keeping the unmatched remainder as an orphan",
                 ),
-                Err(e) => eprintln!(
+                Err(e) => crate::report_note(&format!(
                     "trashd: warning: restored directory but could not completely retire its trash copy: {e}"
-                ),
+                )),
             }
             Ok(())
         }
@@ -4824,8 +6238,9 @@ fn apply_times_at(parent: RawFd, name: &CStr, source: &libc::stat) -> io::Result
 }
 
 /// Best-effort extended-attribute copy for cross-device copies (#248).
-/// Failures (unsupported fs, permissions) never fail the move itself.
-fn copy_xattrs_fd(source: RawFd, destination: RawFd) {
+/// Failures (unsupported fs, permissions) never fail the move itself. From
+/// a nosuid source, capabilities and `trusted.*` stay behind (security-2).
+fn copy_xattrs_fd(source: RawFd, destination: RawFd, nosuid_source: bool) {
     let size = unsafe { libc::flistxattr(source, std::ptr::null_mut(), 0) };
     if size <= 0 {
         return;
@@ -4834,7 +6249,10 @@ fn copy_xattrs_fd(source: RawFd, destination: RawFd) {
     if unsafe { libc::flistxattr(source, names.as_mut_ptr().cast(), names.len()) } < 0 {
         return;
     }
-    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+    for name in names
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty() && !(nosuid_source && crate::fdops::privileged_xattr(n)))
+    {
         let Ok(cname) = std::ffi::CString::new(name) else {
             continue;
         };
@@ -4881,21 +6299,90 @@ fn remove_created_tree_at(parent: RawFd, name: &CStr, expected: (u64, u64)) -> i
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return remove_created_at(parent, name, expected);
     }
+    // A copied directory has its source's mode once its children are done.
+    // Without u+wx (0555 trees: Go module caches, Nix and Bazel outputs)
+    // nothing in it can be unlinked, and the rollback of a copy that failed
+    // later left the tree where it was staged: in a restore, hidden beside
+    // the destination, where no sweep looks (store-fs-4). It is this copy's
+    // own directory: opened up through a descriptor of that very inode.
+    if stat.st_mode & 0o700 != 0o700 {
+        let _ = crate::fdops::fchmod_pinned_dir(parent, name, expected, 0o700);
+    }
     let dir = open_directory_at(parent, name, true, false)?;
     if stat_identity(&stat_fd(dir.as_raw_fd())?) != expected {
         return Ok(());
     }
+    // Every child is tried: one that stays must not keep its siblings.
+    let mut failure = None;
     for child in read_directory_names(dir.as_raw_fd())? {
-        let child_stat = stat_at(dir.as_raw_fd(), &child, libc::AT_SYMLINK_NOFOLLOW)?;
-        remove_created_tree_at(dir.as_raw_fd(), &child, stat_identity(&child_stat))?;
+        let removed =
+            stat_at(dir.as_raw_fd(), &child, libc::AT_SYMLINK_NOFOLLOW).and_then(|child_stat| {
+                remove_created_tree_at(dir.as_raw_fd(), &child, stat_identity(&child_stat))
+            });
+        if let Err(error) = removed
+            && error.raw_os_error() != Some(libc::ENOENT)
+        {
+            failure.get_or_insert(error);
+        }
     }
     drop(dir);
-    remove_created_at(parent, name, expected)
+    match failure {
+        Some(error) => Err(error),
+        None => remove_created_at(parent, name, expected),
+    }
+}
+
+/// Make a restored copy's name in `dst_parent` durable before its trash
+/// copy is retired. The copy's data is synced under its staging name, but
+/// the rename to its final name is not, and the trash is on another
+/// filesystem, which commits on its own: a crash could keep the trash
+/// copy's unlink and lose the rename (store-fs-7). A `tree` syncs its
+/// filesystem, for the entries of the directories inside it too.
+/// `dst_parent` is pinned with O_PATH, which fsync refuses, so the
+/// directory is reopened as itself. Where that cannot be done at all (a
+/// directory its user may write but not read, a filesystem that syncs no
+/// directories) the restore goes on as it did before; a sync that fails
+/// is an error.
+fn sync_restored_copy(dst_parent: RawFd, tree: bool) -> io::Result<()> {
+    let synced = (|| {
+        #[cfg(test)]
+        if let Some(errno) = DESTINATION_SYNC_ERRNO.get() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        let directory = crate::fdops::open_dir_nofollow_at(dst_parent, c".")?;
+        let synced = if tree {
+            unsafe { libc::syncfs(directory.as_raw_fd()) }
+        } else {
+            unsafe { libc::fsync(directory.as_raw_fd()) }
+        };
+        if synced != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    match synced {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+        Ok(()) => {
+            #[cfg(test)]
+            RESTORE_COPY_EVENTS.with_borrow_mut(|events| events.push("sync"));
+            Ok(())
+        }
+    }
 }
 
 /// Publication follows the copy's own version check. Recheck the selected
 /// source here too: an in-place edit during metadata, sync or publication
-/// belongs to the source, not to our earlier restored copy (#396).
+/// belongs to the source, not to our earlier restored copy (#396). The
+/// published copy is made durable before the source goes; if it cannot be,
+/// it is removed and the source stays.
 fn unlink_source_or_rollback(
     src_parent: RawFd,
     src_name: &CStr,
@@ -4918,6 +6405,12 @@ fn unlink_source_or_rollback(
             "restore destination changed before source retirement",
         ));
     }
+    if let Err(error) = sync_restored_copy(dst_parent, false) {
+        let _ = remove_created_at(dst_parent, dst_name, destination_identity);
+        return Err(error);
+    }
+    #[cfg(test)]
+    RESTORE_COPY_EVENTS.with_borrow_mut(|events| events.push("retire"));
     if let Err(error) = raw_unlinkat(src_parent, src_name, 0) {
         let _ = remove_created_at(dst_parent, dst_name, destination_identity);
         return Err(error);
@@ -4982,8 +6475,20 @@ fn copy_regular_at(
                 "source file changed while it was being copied",
             ));
         }
-        apply_fd_metadata(destination.as_raw_fd(), expected)?;
-        copy_xattrs_fd(source.as_raw_fd(), destination.as_raw_fd());
+        // Set-id bits and capabilities copied off a nosuid filesystem would
+        // take effect here (security-2). Directories keep theirs: setgid on
+        // one only sets the group of what is created in it.
+        let mut applied = *expected;
+        let nosuid = crate::fdops::on_nosuid_filesystem(source.as_raw_fd());
+        if nosuid {
+            applied.st_mode &= !0o6000;
+        }
+        apply_fd_metadata(
+            destination.as_raw_fd(),
+            &applied,
+            source.as_raw_fd(),
+            nosuid,
+        )?;
         apply_fd_times(destination.as_raw_fd(), expected)?;
         destination.sync_all()
     })();
@@ -5245,8 +6750,12 @@ fn copy_directory_at(
                 &child_path,
             )?;
         }
-        apply_fd_metadata(destination.as_raw_fd(), expected)?;
-        copy_xattrs_fd(source.as_raw_fd(), destination.as_raw_fd());
+        apply_fd_metadata(
+            destination.as_raw_fd(),
+            expected,
+            source.as_raw_fd(),
+            crate::fdops::on_nosuid_filesystem(source.as_raw_fd()),
+        )?;
         apply_fd_times(destination.as_raw_fd(), expected)
     })();
 
@@ -5321,7 +6830,15 @@ fn copy_node_at(
     }
 }
 
-fn apply_fd_metadata(fd: RawFd, source: &libc::stat) -> io::Result<()> {
+/// Give the copy `fd` what `source` describes and the open `original` (on
+/// a nosuid filesystem or not) carries: its owner, then its extended
+/// attributes, then its mode.
+fn apply_fd_metadata(
+    fd: RawFd,
+    source: &libc::stat,
+    original: RawFd,
+    nosuid_source: bool,
+) -> io::Result<()> {
     let mut mode = source.st_mode & 0o7777;
     if unsafe { libc::fchown(fd, source.st_uid, source.st_gid) } != 0 {
         let error = io::Error::last_os_error();
@@ -5334,6 +6851,11 @@ fn apply_fd_metadata(fd: RawFd, source: &libc::stat) -> io::Result<()> {
         // someone else they would grant that owner's privileges (#203).
         mode &= !0o6000;
     }
+    // After the owner, which clears capabilities, and before the mode: a
+    // `user.*` attribute needs write permission on the inode, whatever the
+    // descriptor was opened for. Set once the copy had its source's mode,
+    // every read-only file and directory lost them (store-fs-5).
+    copy_xattrs_fd(original, fd, nosuid_source);
     // chown may clear set-id bits, so permissions are always applied last.
     if unsafe { libc::fchmod(fd, mode) } != 0 {
         return Err(io::Error::last_os_error());
@@ -5420,7 +6942,7 @@ fn read_directory_names(fd: RawFd) -> io::Result<Vec<CString>> {
 /// descriptor (its offset advances, as a dup's would). fdopendir cost a
 /// dup, an fstat and an fcntl per directory, and closedir another close
 /// (#368).
-fn for_each_entry(
+pub(crate) fn for_each_entry(
     fd: RawFd,
     mut each: impl FnMut(&CStr, u8) -> std::ops::ControlFlow<()>,
 ) -> io::Result<()> {
@@ -6086,7 +7608,8 @@ fn class_match(p: &[char], start: usize, c: char) -> ClassMatch {
     ClassMatch::Unterminated
 }
 
-/// Minimum age before disk pressure may purge an entry (#201).
+/// Minimum age before size or disk-pressure trimming may purge an entry
+/// (#201, store-core-2).
 const PRESSURE_MIN_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// Get disk usage percentage for the filesystem containing the given path.
@@ -6163,6 +7686,36 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // security-3: repairing a store directory's mode never follows a symlink
+    // swapped in after its owner and type were checked: chmod(2) of the path
+    // made the caller chmod any file to 0700.
+    #[test]
+    fn private_dir_repair_never_follows_a_swapped_symlink() {
+        let fixture = TempDir::new().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let sentinel = fixture.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = fixture.path().join("Trash");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fdops::repair_probe::swap_for_symlink(&dir, &sentinel);
+        let repaired = ensure_private_dir(&dir, uid, false);
+        crate::fdops::repair_probe::set(None);
+        assert!(repaired.is_err());
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().mode() & 0o7777,
+            0o644,
+            "the repair chmodded the symlink's target"
+        );
+        // Without a swap the repair still happens.
+        fs::remove_file(&dir).unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir, uid, false).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+    }
 
     fn test_store() -> (TrashStore, TempDir, TempDir, ()) {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-trash");
@@ -6384,15 +7937,16 @@ mod tests {
             } else {
                 b"newer content".to_vec()
             };
-            let error = decompress_before_commit(&mut entry, 16384, || {
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .unwrap()
-                    .write_all(&extra)
-                    .unwrap();
-            })
-            .unwrap_err();
+            let error =
+                decompress_before_commit(&mut entry, 16384, std::time::Instant::now(), || {
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(&extra)
+                        .unwrap();
+                })
+                .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::NotFound);
             bytes.extend_from_slice(&extra);
             assert_eq!(fs::read(&path).unwrap(), bytes, "encoded={encoded}");
@@ -7166,6 +8720,7 @@ mod tests {
                     c"restored",
                     destination_parent.as_raw_fd(),
                     &before,
+                    Publication::Strict,
                     |_, _, _, _| {
                         assert!(!destination.exists());
                         if competing {
@@ -7224,6 +8779,7 @@ mod tests {
                 c"restored",
                 parent.as_raw_fd(),
                 &before,
+                Publication::Strict,
                 |_, _, _, _| {
                     if competing {
                         fs::write(&destination, b"competing bytes").unwrap();
@@ -8021,7 +9577,9 @@ mod tests {
         let entry = store.find_entry(&id).unwrap();
 
         // Hold the flock like a compressor mid validate→swap.
-        let guard = lock_entry_file(&entry.trashed_path).unwrap().unwrap();
+        let guard = lock_entry_file_until(&entry.trashed_path, std::time::Instant::now())
+            .unwrap()
+            .unwrap();
 
         std::thread::scope(|scope| {
             let handle = scope.spawn(move || {
@@ -8098,7 +9656,9 @@ mod tests {
             // TrashStore is !Sync (internal caches): the compressor runs on
             // its own store instance over the same isolated trash root.
             let handle = scope.spawn(|| {
-                let store2 = TrashStore::open_isolated(&trash, Config::default()).unwrap();
+                let mut config = Config::default();
+                config.retention.auto_compress = true;
+                let store2 = TrashStore::open_isolated(&trash, config).unwrap();
                 store2.maybe_auto_purge()
             });
 
@@ -8447,12 +10007,32 @@ mod tests {
         let root = store.home.clone();
         fs::write(root.join("files/same"), b"orphan").unwrap();
         let mut ids = std::collections::HashSet::new();
+        let guard = RootMutationGuard::acquire(&root).unwrap();
         for _ in 0..20 {
-            let (id, _info, _claim) = unique_id_atomic(&root, "same").unwrap();
+            let (id, _info, _claim) = unique_id_atomic(&root, &guard, "same").unwrap();
             assert!(ids.insert(id));
         }
         assert_eq!(ids.len(), 20);
         assert_eq!(fs::read(root.join("files/same")).unwrap(), b"orphan");
+    }
+
+    // cross-layer-6: a sidecar name the filesystem refuses as too long is a
+    // naming problem, not a storage failure: a shorter id is claimed. The
+    // budget here is above what the filesystem takes, as a filesystem may
+    // report one.
+    #[test]
+    fn ids_shrink_to_what_the_filesystem_takes() {
+        let (store, _data, _workdir, _lock) = test_store();
+        let name = "n".repeat(254);
+        let guard = RootMutationGuard::acquire(&store.home).unwrap();
+        let (first, info, _claim) =
+            unique_id_atomic_within(&store.home, &guard, &name, 400).unwrap();
+        let (second, _, _) = unique_id_atomic_within(&store.home, &guard, &name, 400).unwrap();
+        assert_ne!(first, second);
+        assert!(info.exists());
+        for id in [first, second] {
+            assert!(id.len() + ".trashinfo".len() <= 255, "{}", id.len());
+        }
     }
 
     #[test]
@@ -8686,9 +10266,110 @@ mod tests {
         let file = create_file(workdir.path(), "temp.tmp", "data");
         let result = store.trash(&file, None);
         assert!(
-            matches!(result, Err(TrashError::Excluded(_))),
+            matches!(result, Err(TrashError::Excluded { .. })),
             "*.tmp should be excluded by never_trash"
         );
+    }
+
+    /// `test_store` with its own configuration.
+    fn configured_store(config: impl FnOnce(&mut Config)) -> (TrashStore, TempDir, TempDir) {
+        let (_, data, work, _) = test_store();
+        let mut configured = Config::default();
+        configured.retention.max_age_days = 0;
+        configured.retention.max_size_gb = 0.0;
+        configured.retention.disk_pressure_percent = 0;
+        config(&mut configured);
+        let store = TrashStore::open_isolated(&data.path().join("Trash"), configured).unwrap();
+        (store, data, work)
+    }
+
+    // common-policy-1/2, shim-1: the store says why a path stays out of the
+    // trash. A directory excluded by its own name (a whitelist miss, or a
+    // `*~` backup) is then judged entry by entry by the shim, instead of
+    // deleted for real as a whole tree.
+    #[test]
+    fn exclusions_say_why() {
+        use std::ffi::OsStr;
+        use std::os::fd::AsRawFd;
+        let (store, _data, work) = configured_store(|config| {
+            config.never_trash = vec!["*~".into()];
+            config.only_trash = vec!["src/*".into()];
+        });
+        let src = work.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("main.rs"), b"fn main() {}").unwrap();
+        let backup = work.path().join("thesis~");
+        fs::create_dir(&backup).unwrap();
+        let kind = |result: Result<String, TrashError>| match result {
+            Err(TrashError::Excluded { kind, .. }) => Some(kind),
+            other => panic!("not excluded: {other:?}"),
+        };
+        assert_eq!(
+            kind(store.trash(&src, None)),
+            Some(ExclusionKind::NotWhitelisted)
+        );
+        assert_eq!(
+            kind(store.trash(&backup, None)),
+            Some(ExclusionKind::NeverTrash)
+        );
+        let parent = fs::File::open(work.path()).unwrap();
+        assert_eq!(
+            kind(store.trash_at(parent.as_raw_fd(), OsStr::new("src"), &src, None)),
+            Some(ExclusionKind::NotWhitelisted)
+        );
+        // What the whitelist names inside it is trashed.
+        store.trash(&src.join("main.rs"), None).unwrap();
+    }
+
+    // cross-layer-5: the trash, anything in it and its ancestors are refused
+    // even where policy excludes them. Excluded first, `rm -rf ~/.local`
+    // under a whitelist deleted the trash for real with everything else.
+    #[test]
+    fn excluded_trash_and_its_ancestors_are_still_refused() {
+        use std::ffi::OsStr;
+        use std::os::fd::AsRawFd;
+        let (_, data, work, _) = test_store();
+        let share = work.path().join("share");
+        let mut config = Config {
+            only_trash: vec!["*.rs".into()],
+            ..Config::default()
+        };
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        let store = TrashStore::open_isolated(&share.join("Trash"), config).unwrap();
+        drop(data);
+        let refused =
+            |result: Result<String, TrashError>| matches!(result, Err(TrashError::Refused(_)));
+        assert!(refused(store.trash(&share, None)));
+        assert!(refused(store.trash(&share.join("Trash/files"), None)));
+        let parent = fs::File::open(work.path()).unwrap();
+        assert!(refused(store.trash_at(
+            parent.as_raw_fd(),
+            OsStr::new("share"),
+            &share,
+            None
+        )));
+        // Elsewhere the whitelist still decides.
+        let other = create_file(work.path(), "notes.txt", "x");
+        assert!(matches!(
+            store.trash(&other, None),
+            Err(TrashError::Excluded { .. })
+        ));
+    }
+
+    // cross-layer-4: bypass_paths names the deleting process. The store
+    // matched its own executable, which inside the shim is the shim: a
+    // prefix covering trashd's install directory made every shim operand a
+    // real delete while the other layers trashed it.
+    #[test]
+    fn bypass_paths_never_match_the_stores_own_executable() {
+        let exe = fs::read_link("/proc/self/exe").unwrap();
+        let prefix = format!("{}/", exe.parent().unwrap().display());
+        let (store, _data, work) = configured_store(|config| config.bypass_paths = vec![prefix]);
+        let file = create_file(work.path(), "kept.txt", "data");
+        store.trash(&file, None).expect("trashed, not excluded");
+        assert!(!file.exists());
     }
 
     // --- List pattern filter with time ---
@@ -9386,7 +11067,10 @@ mod tests {
         let outcome = as_unprivileged(
             "store::tests::raw_removal_handles_read_only_trees_and_unreadable_data",
             move || {
-                let locked = matches!(lock_entry_file(&unreadable), Ok(None));
+                let locked = matches!(
+                    lock_entry_file_until(&unreadable, std::time::Instant::now()),
+                    Ok(None)
+                );
                 let dir = fs::File::open(&parent).unwrap();
                 let removed = remove_tree_at(dir.as_raw_fd(), c"tree", 0).is_ok();
                 locked && removed && !parent.join("tree").exists()
@@ -9815,7 +11499,7 @@ mod tests {
         if let Some(root) = std::env::var_os(CHILD) {
             let store = TrashStore::open_isolated(Path::new(&root), Config::default()).unwrap();
             let mut entry = store.find_entry("data").unwrap();
-            decompress_before_commit(&mut entry, 1024 * 1024, || {
+            decompress_before_commit(&mut entry, 1024 * 1024, std::time::Instant::now(), || {
                 let stages = sweep_detached(store.home_dir());
                 assert_eq!(stages.len(), 1);
                 let state = fs::File::open(store.home.join(".trashd")).unwrap();
@@ -10352,7 +12036,9 @@ mod tests {
     fn retention_compression_keeps_original_times() {
         let base = tempfile::tempdir().unwrap();
         let trash = base.path().join("Trash");
-        let store = TrashStore::open_isolated(&trash, Config::default()).unwrap();
+        let mut config = Config::default();
+        config.retention.auto_compress = true;
+        let store = TrashStore::open_isolated(&trash, config).unwrap();
         let data = trash.join("files/old.txt");
         fs::write(&data, "compressible ".repeat(1000)).unwrap();
         let mut info = TrashInfo::new(base.path().join("old.txt"));
@@ -10415,7 +12101,7 @@ mod tests {
         let err = store
             .trash_at(parent.as_raw_fd(), OsStr::new("skipme.tmp"), &tmp, None)
             .unwrap_err();
-        assert!(matches!(err, TrashError::Excluded(_)), "got {err:?}");
+        assert!(matches!(err, TrashError::Excluded { .. }), "got {err:?}");
 
         // unknown final component → NotFound (kernel would ENOENT)
         let err = store
@@ -10488,6 +12174,9 @@ mod tests {
         );
     }
 
+    // The bound follows the entry, not max_file_size_mb (store-core-7): data
+    // that decodes to more than the entry's recorded size and more than
+    // automatic compression ever accepts is refused, and nothing changes.
     #[test]
     fn compressed_restore_rejects_output_over_limit_without_changing_entry() {
         let (mut store, _data, workdir, _lock) = test_store();
@@ -10496,7 +12185,10 @@ mod tests {
         fs::write(&file, &original).unwrap();
         let id = store.trash(&file, None).unwrap();
         let entry = store.find_entry(&id).unwrap();
-        let compressed = zstd::encode_all(original.as_slice(), 3).unwrap();
+        assert_eq!(entry.info.size, Some(original.len() as u64));
+        let oversized = vec![b'A'; COMPRESS_MAX_BYTES as usize + 1];
+        let compressed = zstd::encode_all(oversized.as_slice(), 3).unwrap();
+        drop(oversized);
         fs::write(&entry.trashed_path, &compressed).unwrap();
         let mut info = entry.info.clone();
         info.compressed = Some("zstd".into());
@@ -11212,19 +12904,19 @@ mod tests {
     #[test]
     fn empty_entries_reports_undeletable_entries() {
         let (store, _data, work, _lock) = test_store();
-        // A data path whose parent is a regular file fails every deletion
-        // attempt with ENOTDIR (and root cannot defeat that by permissions).
-        fs::write(work.path().join("blocker"), b"file").unwrap();
-        let stuck = TrashEntry {
-            identity: None,
-            sidecar_version: None,
-            id: "stuck".into(),
-            info: TrashInfo::new(work.path().join("stuck")),
-            trashed_path: work.path().join("blocker/stuck"),
-            info_path: work.path().join("stuck.trashinfo"),
-            trash_root: store.home.clone(),
-            orphaned: false,
-        };
+        // A real entry whose root no longer passes validation (a
+        // group-readable info/, which root cannot defeat by permissions):
+        // nothing in it is deleted. Purge acts only through the root's own
+        // validated directories, so an entry whose paths lie elsewhere is
+        // never deleted either (security-1).
+        let source = create_file(work.path(), "stuck", "data");
+        store.trash(&source, None).unwrap();
+        let stuck = store.find_entry("stuck").unwrap();
+        fs::set_permissions(store.home.join("info"), fs::Permissions::from_mode(0o755)).unwrap();
+        let (purged, failed) = store.empty_entries_reporting(std::slice::from_ref(&stuck), None);
+        fs::set_permissions(store.home.join("info"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!((purged, failed), (0, 1), "an undeletable entry fails");
+        assert!(stuck.trashed_path.exists());
         let vanished = TrashEntry {
             identity: None,
             sidecar_version: None,
@@ -11235,8 +12927,45 @@ mod tests {
             trash_root: store.home.clone(),
             orphaned: false,
         };
-        let (purged, failed) = store.empty_entries_reporting(&[stuck, vanished], None);
-        assert_eq!((purged, failed), (0, 1), "ENOTDIR fails, ENOENT does not");
+        let (purged, failed) = store.empty_entries_reporting(&[vanished], None);
+        assert_eq!((purged, failed), (0, 0), "a vanished entry does not fail");
+    }
+
+    // Regression (store-core-6, cli-5): an entry compressed or otherwise
+    // changed between `trash empty`'s listing and its purge was counted as
+    // already vanished, so `trash empty` reported success while the entry
+    // the user confirmed stayed in the trash.
+    #[test]
+    fn empty_counts_entries_changed_since_selection_as_failures() {
+        let (store, _data, work, _lock) = test_store();
+        let doomed = create_file(work.path(), "changed.txt", &"x".repeat(4096));
+        store.trash(&doomed, None).unwrap();
+        let selected = store.list(None).unwrap();
+        // A compressor rewrites the sidecar's marker after the listing.
+        set_compression_marker(&selected[0].info_path, Some("zstd")).unwrap();
+        let (purged, failed) = store.empty_entries_reporting(&selected, None);
+        assert_eq!((purged, failed), (0, 1), "a changed entry is not gone");
+        assert_eq!(
+            store.list(None).unwrap().len(),
+            1,
+            "it is kept, not deleted"
+        );
+
+        // The selected entry vanished and a different one reused its ID:
+        // the confirmed entry is gone, which is what was asked for.
+        let stale = store.list(None).unwrap();
+        store.purge_entry(&stale[0]).unwrap();
+        fs::create_dir(work.path().join("sub")).unwrap();
+        let other = create_file(&work.path().join("sub"), "changed.txt", "other");
+        let id = store.trash(&other, None).unwrap();
+        assert_eq!(id, stale[0].id, "the fixture must reuse the ID");
+        let (purged, failed) = store.empty_entries_reporting(&stale, None);
+        assert_eq!((purged, failed), (0, 0));
+        assert_eq!(
+            store.list(None).unwrap()[0].info.original_path,
+            other,
+            "the new entry survives"
+        );
     }
 
     // Isolation boundary (#428) through empty: an isolated store must not
@@ -11303,13 +13032,61 @@ mod tests {
         assert!(entries[0].orphaned);
         assert_eq!(entries[0].id, "stranded");
         assert_eq!(fs::read(root.join("files/stranded")).unwrap(), b"data");
+
+        // store-metadata-4: and it can be removed. The root lock validates
+        // info/ too and refused the root, so `empty` reported nothing
+        // deleted and left the data, on every run.
+        assert_eq!(store.empty(None).unwrap(), 1);
+        assert!(!root.join("files/stranded").exists());
+        let info = fs::symlink_metadata(root.join("info")).unwrap();
+        assert!(info.is_dir());
+        assert_eq!(info.mode() & 0o7777, 0o700);
+        assert!(store.list(None).unwrap().is_empty());
+    }
+
+    // store-metadata-4: only a missing info/ is put back for a purge. One
+    // that is there but is not this user's private directory keeps the root
+    // refused, and a purge never creates a root or its files/.
+    #[test]
+    fn purge_repairs_nothing_but_a_missing_info_dir() {
+        let (store, _data, work, _lock) = test_store();
+        let root = store.home.clone();
+        fs::write(root.join("files/stranded"), b"data").unwrap();
+        let mut entries = Vec::new();
+        fs::remove_dir(root.join("info")).unwrap();
+        store.list_in_dir(&root, None, &mut entries).unwrap();
+        assert_eq!(entries.len(), 1);
+        // A symlink where info/ was: nothing is created through it.
+        let elsewhere = work.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("info")).unwrap();
+        assert!(matches!(
+            store.purge_entry(&entries[0]),
+            Err(TrashError::Refused(_))
+        ));
+        assert_eq!(fs::read(root.join("files/stranded")).unwrap(), b"data");
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        fs::remove_file(root.join("info")).unwrap();
+        // files/ open to others: the root is not private, and stays as it is.
+        fs::set_permissions(root.join("files"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            store.purge_entry(&entries[0]),
+            Err(TrashError::Refused(_))
+        ));
+        assert!(!root.join("info").exists());
+        assert_eq!(fs::read(root.join("files/stranded")).unwrap(), b"data");
+        fs::set_permissions(root.join("files"), fs::Permissions::from_mode(0o700)).unwrap();
+        store.purge_entry(&entries[0]).unwrap();
+        assert!(!root.join("files/stranded").exists());
     }
 
     // Regression (#404): orphans must age. A synthetic "now" deletion date
-    // kept them forever outside age-based retention; the data's mtime gives
-    // them a meaningful age instead.
+    // kept them forever outside age-based retention. Their age starts when
+    // the data arrived in files/ (rename and copy both set its ctime), not
+    // at its content's last edit: an old file trashed just now was purged
+    // at once as a long-deleted orphan (store-metadata-1, store-core-5).
     #[test]
-    fn orphan_deletion_date_falls_back_to_data_mtime() {
+    fn orphan_deletion_date_is_when_its_data_arrived() {
         use std::fs::FileTimes;
 
         let (store, _data, _work, _lock) = test_store();
@@ -11333,10 +13110,16 @@ mod tests {
         let mut entries = Vec::new();
         store.list_in_dir(&root, None, &mut entries).unwrap();
         assert_eq!(entries.len(), 1);
+        // A fixed instant from the inode, so the orphan keeps aging.
+        let metadata = fs::symlink_metadata(&data_path).unwrap();
+        let arrived =
+            chrono::DateTime::from_timestamp(metadata.ctime(), metadata.ctime_nsec() as u32)
+                .unwrap();
+        assert_eq!(entries[0].info.deletion_date, arrived);
         let age = chrono::Local::now() - entries[0].info.deletion_date;
         assert!(
-            age > chrono::Duration::days(9),
-            "orphan must inherit the data mtime as its age, got {age:?}"
+            age < chrono::Duration::days(1),
+            "orphan aged by its content mtime: {age:?}"
         );
     }
 
@@ -11359,6 +13142,11 @@ mod tests {
         fs::write(other_trash.join("files").join(&id), b"older copy").unwrap();
         let mut other_info = TrashInfo::new(work.path().join("report.pdf"));
         other_info.deletion_date -= chrono::Duration::hours(1);
+        // Its stamp is that same instant: entries are ordered by it.
+        other_info.deletion_ns = other_info
+            .deletion_date
+            .timestamp_nanos_opt()
+            .and_then(|ns| u64::try_from(ns).ok());
         fs::write(
             other_trash.join("info").join(format!("{id}.trashinfo")),
             other_info.to_trashinfo_string(),
@@ -11373,7 +13161,9 @@ mod tests {
         // undo picks the newest — restoring it must NOT depend on ID lookup.
         newest_first(&mut entries);
         let mut chosen = entries[0].clone();
-        let restored = store.restore_resolved(&mut chosen, None, true).unwrap();
+        let restored = store
+            .restore_resolved(&mut chosen, RestoreTarget::Recorded, true)
+            .unwrap();
         assert_eq!(restored, f1);
         assert_eq!(fs::read_to_string(&f1).unwrap(), "newest");
     }
@@ -11845,8 +13635,7 @@ mod tests {
         let meta = fs::symlink_metadata(&entry.trashed_path).unwrap();
         assert!(
             meta.uid() == 65534 || meta.mode() & 0o6000 == 0,
-            "set-id bits on a copy owned by uid {}",
-            meta.uid()
+            "set-id bits on a copy owned by another user"
         );
     }
 
@@ -12148,7 +13937,8 @@ mod tests {
     // tools created; restoring those elsewhere yields zstd bytes.
     #[test]
     fn auto_compression_leaves_foreign_entries_alone() {
-        let (store, _data, _work, _) = test_store();
+        let (mut store, _data, _work, _) = test_store();
+        store.config.retention.auto_compress = true;
         let (data, info) = seed_old_entry(&store, "foreign.txt", "");
         let sidecar = fs::read(&info).unwrap();
         store.auto_purge().unwrap();
@@ -12162,7 +13952,8 @@ mod tests {
     // the drive was mounted elsewhere.
     #[test]
     fn auto_compression_preserves_mtime_and_sidecar_text() {
-        let (store, _data, _work, _) = test_store();
+        let (mut store, _data, _work, _) = test_store();
+        store.config.retention.auto_compress = true;
         let (data, info) = seed_old_entry(&store, "ours.txt", "X-Trashd-Size=13000\n");
         let mtime = fs::metadata(&data).unwrap().modified().unwrap();
         store.auto_purge().unwrap();
@@ -12570,9 +14361,10 @@ mod tests {
                 "recorded={recorded}"
             );
             // The old capped measurement plus the new file is below this
-            // limit; the complete foreign tree is above it.
-            store.config.retention.max_size_gb =
-                ((DIR_SIZE_MAX_FILES + 8) * 4) as f64 / (1024.0 * 1024.0 * 1024.0);
+            // limit; the complete foreign tree plus the new file is above
+            // it. The tree alone still fits: an entry larger than the whole
+            // cap is never size-trimmed (store-core-2).
+            store.config.retention.max_size_gb = (size + 2) as f64 / (1024.0 * 1024.0 * 1024.0);
             store.accounting_walks.set(0);
             let paths: Vec<_> = roots.iter().map(|(path, _)| path.clone()).collect();
             store.auto_purge_in_roots(&paths).unwrap();
@@ -12600,10 +14392,10 @@ mod tests {
         fs::write(deepest.join("data"), b"deep payload").unwrap();
         let target = create_file(work.path(), "EXTERNAL", &"x".repeat(10_000));
         std::os::unix::fs::symlink(&target, tree.join("link")).unwrap();
-        assert_eq!(directory_accounted_size(&tree, None), 12);
-        assert_eq!(directory_accounted_size(&tree, Some(u64::MAX)), 12);
-        assert_eq!(directory_accounted_size(&tree, Some(5)), 5);
-        assert_eq!(directory_accounted_size(&tree, Some(0)), 0);
+        assert_eq!(directory_accounted_size(&tree, None, false), 12);
+        assert_eq!(directory_accounted_size(&tree, Some(u64::MAX), false), 12);
+        assert_eq!(directory_accounted_size(&tree, Some(5), false), 5);
+        assert_eq!(directory_accounted_size(&tree, Some(0), false), 0);
         assert_eq!(fs::metadata(target).unwrap().len(), 10_000);
     }
 
@@ -12627,7 +14419,7 @@ mod tests {
                     unmount(&tree.join("mount"));
                     return false;
                 }
-                let measured = directory_accounted_size(&tree, None);
+                let measured = directory_accounted_size(&tree, None, false);
                 unmount(&tree.join("file-mount"));
                 unmount(&tree.join("mount"));
                 measured == 5 && fs::read(keep).unwrap() == b"external payload"
@@ -12700,5 +14492,2107 @@ mod tests {
             size >= 50_000,
             "foreign directory tree must be accounted at its real size, got {size}"
         );
+    }
+
+    // ---- WS-A: retention must never destroy live or legitimate entries ----
+
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    /// Set a path's mtime `age` into the past. Its ctime stays "now".
+    fn backdate_mtime(path: &Path, age: std::time::Duration) {
+        fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// Rewrite an entry's sidecar as if it had been trashed `age` ago.
+    fn backdate_entry(store: &TrashStore, id: &str, age: chrono::Duration) {
+        let entry = store.find_entry(id).unwrap();
+        let mut info = entry.info.clone();
+        info.deletion_date -= age;
+        info.deletion_ns = info
+            .deletion_date
+            .timestamp_nanos_opt()
+            .and_then(|ns| u64::try_from(ns).ok());
+        fs::write(&entry.info_path, info.to_trashinfo_string()).unwrap();
+    }
+
+    fn retention_off() -> Config {
+        let mut config = Config::default();
+        config.retention.max_age_days = 0;
+        config.retention.max_size_gb = 0.0;
+        config.retention.disk_pressure_percent = 0;
+        config
+    }
+
+    // store-metadata-1 / store-core-1: an entry published between the info/
+    // and files/ passes of an unlocked listing was synthesized as an orphan
+    // dated by its data's old mtime, and retention then deleted its data and
+    // its valid sidecar.
+    #[test]
+    fn entry_published_between_listing_passes_survives_retention() {
+        for via_empty in [false, true] {
+            let (mut store, _data, work, _) = test_store();
+            store.config.retention.max_age_days = 30;
+            let source = create_file(work.path(), "report-2023.pdf", "old report");
+            backdate_mtime(&source, std::time::Duration::from_secs(60 * 86400));
+            let root = store.home.clone();
+            let (published_tx, published_rx) = std::sync::mpsc::channel();
+            *store.between_scan_passes.borrow_mut() = Some(Box::new(move || {
+                let writer = TrashStore::open_isolated(&root, retention_off()).unwrap();
+                writer.defer_maintenance();
+                published_tx
+                    .send(writer.trash(&source, None).unwrap())
+                    .unwrap();
+            }));
+            if via_empty {
+                let selected = store.entries_older_than(Some(30)).unwrap();
+                assert!(
+                    selected.iter().all(|entry| !entry.orphaned),
+                    "a live entry was selected as an aged orphan"
+                );
+                store.empty_entries(&selected, Some(30));
+            } else {
+                let listed = store.list(None).unwrap();
+                assert!(
+                    listed.iter().all(|entry| !entry.orphaned),
+                    "a live entry was listed as an orphan"
+                );
+                store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+            }
+            let id = published_rx.recv().unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            assert!(!entry.orphaned, "via_empty={via_empty}");
+            assert_eq!(fs::read(&entry.trashed_path).unwrap(), b"old report");
+            assert!(entry.info_path.exists());
+        }
+    }
+
+    // store-core-1: the purge revalidates an orphan snapshot under the root
+    // lock. Writers publish under that lock, so a sidecar that now parses
+    // means the snapshot came from a racing listing: the entry is live.
+    #[test]
+    fn orphan_snapshot_is_not_purged_once_its_sidecar_parses() {
+        let (store, _data, work, _) = test_store();
+        let data = store.home.join("files/X");
+        fs::write(&data, b"live").unwrap();
+        let mut entry = store.find_entry("X").unwrap();
+        assert!(entry.orphaned);
+        let info_path = store.home.join("info/X.trashinfo");
+        fs::write(
+            &info_path,
+            TrashInfo::new(work.path().join("X")).to_trashinfo_string(),
+        )
+        .unwrap();
+        // The snapshot a listing records after the writer has finished.
+        entry.sidecar_version = sidecar_snapshot(&info_path);
+        entry.info.deletion_date = chrono::Local::now() - chrono::Duration::days(60);
+        assert!(matches!(
+            store.purge_resolved(&entry),
+            Err(TrashError::EntryNotFound(_))
+        ));
+        assert_eq!(
+            store.empty_entries_reporting(std::slice::from_ref(&entry), Some(30)),
+            (0, 0)
+        );
+        assert_eq!(fs::read(&data).unwrap(), b"live");
+        assert!(info_path.exists());
+        assert!(!store.find_entry("X").unwrap().orphaned);
+    }
+
+    // store-metadata-1 / store-core-5: a sidecar that exists but cannot be
+    // parsed (a claim torn by a crash, a corrupt file) leaves the data's age
+    // unknown. Age-based retention keeps it, as fsck does; an explicit purge
+    // of that one entry still works (the spec's emergency case).
+    #[test]
+    fn age_based_retention_never_purges_data_whose_sidecar_cannot_be_parsed() {
+        let (store, _data, _work, _) = test_store();
+        let data = store.home.join("files/torn");
+        fs::write(&data, b"recoverable").unwrap();
+        let info = store.home.join("info/torn.trashinfo");
+        fs::write(&info, b"").unwrap();
+        let mut entry = store.find_entry("torn").unwrap();
+        assert!(entry.orphaned);
+        assert!(
+            store.entries_older_than(Some(0)).unwrap().is_empty(),
+            "data with an unparseable sidecar was selected by age"
+        );
+        entry.info.deletion_date = chrono::Local::now() - chrono::Duration::days(60);
+        assert_eq!(
+            store.empty_entries_reporting(std::slice::from_ref(&entry), Some(30)),
+            (0, 0)
+        );
+        assert_eq!(fs::read(&data).unwrap(), b"recoverable");
+        assert!(info.exists());
+        store.purge_resolved(&entry).unwrap();
+        assert!(data.symlink_metadata().is_err());
+        assert!(info.symlink_metadata().is_err());
+    }
+
+    // store-core-5: after a crash the new sidecar can be empty while the data
+    // rename is durable. That orphan arrived just now (ctime), whatever its
+    // content's mtime says, and must not expire by age.
+    #[test]
+    fn torn_sidecar_after_a_crash_does_not_expire_old_data() {
+        let (mut store, _data, _work, _) = test_store();
+        store.config.retention.max_age_days = 30;
+        let data = store.home.join("files/old.pdf");
+        fs::write(&data, b"report").unwrap();
+        backdate_mtime(&data, std::time::Duration::from_secs(60 * 86400));
+        fs::write(store.home.join("info/old.pdf.trashinfo"), b"").unwrap();
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        assert_eq!(fs::read(&data).unwrap(), b"report");
+        let entry = store.find_entry("old.pdf").unwrap();
+        assert!(entry.orphaned);
+        assert!(chrono::Local::now() - entry.info.deletion_date < chrono::Duration::days(30));
+    }
+
+    // store-metadata-2: a legacy sidecar over the 64 KiB read cap (the full
+    // argv of a large `rm`) was treated as missing, so its data became an
+    // orphan dated by mtime and retention deleted both.
+    #[test]
+    fn legacy_oversized_sidecar_survives_retention_and_restores() {
+        let (mut store, _data, work, _) = test_store();
+        store.config.retention.max_age_days = 30;
+        let original = work.path().join("IMG_0001.jpg");
+        let data = store.home.join("files/IMG_0001.jpg");
+        fs::write(&data, b"photo").unwrap();
+        backdate_mtime(&data, std::time::Duration::from_secs(60 * 86400));
+        let mut info = TrashInfo::new(original.clone());
+        info.pid = Some(1);
+        let sidecar = info.to_trashinfo_string()
+            + &format!("X-Trashd-Command=rm {}\n", "IMG_9999.jpg ".repeat(8_000));
+        assert!(sidecar.len() > 100 * 1024);
+        fs::write(store.home.join("info/IMG_0001.jpg.trashinfo"), sidecar).unwrap();
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        assert!(store.entries_older_than(Some(30)).unwrap().is_empty());
+        let entry = store.find_entry("IMG_0001.jpg").unwrap();
+        assert!(!entry.orphaned);
+        assert_eq!(entry.info.original_path, original);
+        assert!(chrono::Local::now() - entry.info.deletion_date < chrono::Duration::hours(1));
+        let restored = store.restore("IMG_0001.jpg", None).unwrap();
+        assert_eq!(restored, original);
+        assert_eq!(fs::read(&original).unwrap(), b"photo");
+    }
+
+    // store-core-2: an operand larger than the retention size cap was trashed
+    // and then purged by the same rm's retention pass, taking every older
+    // entry with it. Caps are refusals: nothing moves.
+    #[test]
+    fn operand_larger_than_the_retention_cap_is_refused_before_moving() {
+        let (mut store, _data, work, _) = test_store();
+        let old = create_file(work.path(), "old", &"x".repeat(100));
+        let old_id = store.trash(&old, None).unwrap();
+        store.config.retention.max_size_gb = 4096.0 / GIB;
+        store.config.auto_purge_interval_secs = 0;
+        let tree = work.path().join("big");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("payload"), vec![b'x'; 8192]).unwrap();
+        let file = create_file(work.path(), "bigfile", &"y".repeat(8192));
+        let parent = fs::File::open(work.path()).unwrap();
+        for operand in [&tree, &file] {
+            assert!(
+                matches!(store.trash(operand, None), Err(TrashError::TooLarge { .. })),
+                "{operand:?}"
+            );
+            assert!(
+                matches!(
+                    store.trash_at(
+                        parent.as_raw_fd(),
+                        operand.file_name().unwrap(),
+                        operand,
+                        None
+                    ),
+                    Err(TrashError::TooLarge { .. })
+                ),
+                "{operand:?}"
+            );
+        }
+        assert_eq!(fs::read(tree.join("payload")).unwrap().len(), 8192);
+        assert_eq!(fs::read(&file).unwrap().len(), 8192);
+        let kept = store.find_entry(&old_id).unwrap();
+        assert_eq!(fs::read(kept.trashed_path).unwrap().len(), 100);
+        let small = create_file(work.path(), "small", "fits");
+        store.trash(&small, None).unwrap();
+        assert_eq!(store.list(None).unwrap().len(), 2);
+    }
+
+    // store-core-2: like disk pressure (#201), size trimming must never turn
+    // the delete that just happened into a permanent one.
+    #[test]
+    fn size_trimming_never_purges_just_trashed_entries() {
+        let (mut store, _data, work, _) = test_store();
+        let ids: Vec<String> = ["first", "second"]
+            .iter()
+            .map(|name| {
+                let file = create_file(work.path(), name, &"x".repeat(100));
+                store.trash(&file, None).unwrap()
+            })
+            .collect();
+        store.config.retention.max_size_gb = 150.0 / GIB;
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        for id in &ids {
+            assert!(store.find_entry(id).is_ok(), "{id} was purged by size");
+        }
+        // Once old enough, the oldest is trimmed as before.
+        backdate_entry(&store, &ids[0], chrono::Duration::hours(3));
+        backdate_entry(&store, &ids[1], chrono::Duration::hours(2));
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        assert!(store.find_entry(&ids[0]).is_err());
+        assert!(store.find_entry(&ids[1]).is_ok());
+    }
+
+    // store-core-2: an entry larger than the whole cap made the excess larger
+    // than every older entry together, so trimming purged all of them and
+    // then the oversized entry too.
+    #[test]
+    fn an_entry_larger_than_the_size_cap_never_drives_other_purges() {
+        let (mut store, _data, work, _) = test_store();
+        let mut ids = Vec::new();
+        for name in ["old", "mid"] {
+            let file = create_file(work.path(), name, &"x".repeat(100));
+            ids.push(store.trash(&file, None).unwrap());
+        }
+        let tree = work.path().join("big");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("payload"), vec![b'x'; 8192]).unwrap();
+        ids.push(store.trash(&tree, None).unwrap());
+        for (id, hours) in ids.iter().zip([4, 3, 2]) {
+            backdate_entry(&store, id, chrono::Duration::hours(hours));
+        }
+        // The cap was lowered after the tree was trashed.
+        store.config.retention.max_size_gb = 4096.0 / GIB;
+        store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+        for id in &ids {
+            assert!(store.find_entry(id).is_ok(), "{id} was purged by size");
+        }
+    }
+
+    // store-core-3: a foreign (topdir) root on the home filesystem was
+    // measured by apparent size, so sparse files there made the size cap
+    // purge the home trash.
+    #[test]
+    fn sparse_foreign_entries_cannot_make_the_size_cap_purge_the_home_trash() {
+        let (mut store, _data, work, _) = test_store();
+        let mut ids = Vec::new();
+        for (name, days) in [("older", 10), ("newer", 1)] {
+            let file = create_file(work.path(), name, &"h".repeat(20 * 1024));
+            let id = store.trash(&file, None).unwrap();
+            backdate_entry(&store, &id, chrono::Duration::days(days));
+            ids.push(id);
+        }
+        let foreign =
+            TrashStore::open_isolated(&work.path().join("foreign-trash"), retention_off()).unwrap();
+        for name in ["a", "b"] {
+            let file = fs::File::create(foreign.home.join("files").join(name)).unwrap();
+            file.set_len(30 * 1024).unwrap();
+            fs::write(
+                foreign.home.join("info").join(format!("{name}.trashinfo")),
+                format!("[Trash Info]\nPath={name}\nDeletionDate=2099-01-01T00:00:00\n"),
+            )
+            .unwrap();
+        }
+        store.config.retention.max_size_gb = (64 * 1024) as f64 / GIB;
+        store
+            .auto_purge_in_roots(&[store.home.clone(), foreign.home.clone()])
+            .unwrap();
+        for id in &ids {
+            let entry = store.find_entry(id).unwrap();
+            assert_eq!(fs::read(entry.trashed_path).unwrap().len(), 20 * 1024);
+        }
+    }
+
+    // store-core-3: bytes in a root on another filesystem (removable media,
+    // whose author controls sizes and dates) never justify purging the home
+    // trash. That root's entries are not size-capped at all.
+    #[test]
+    fn foreign_filesystem_roots_never_drive_size_purges_in_the_home_trash() {
+        let Some(dir) = cross_device_dir("foreign-root") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let (mut store, _data, work, _) = test_store();
+        let mut ids = Vec::new();
+        for (name, days) in [("older", 10), ("newer", 1)] {
+            let file = create_file(work.path(), name, &"h".repeat(20 * 1024));
+            let id = store.trash(&file, None).unwrap();
+            backdate_entry(&store, &id, chrono::Duration::days(days));
+            ids.push(id);
+        }
+        let foreign = dir.join(".Trash-1000");
+        for sub in ["files", "info"] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(foreign.join(sub))
+                .unwrap();
+        }
+        fs::write(foreign.join("files/a"), vec![b'f'; 30 * 1024]).unwrap();
+        fs::write(
+            foreign.join("info/a.trashinfo"),
+            "[Trash Info]\nPath=a\nDeletionDate=2099-01-01T00:00:00\n",
+        )
+        .unwrap();
+        // An orphan dated by an mtime the media author chose (2099).
+        let orphan = foreign.join("files/b");
+        fs::write(&orphan, vec![b'f'; 30 * 1024]).unwrap();
+        fs::File::options()
+            .append(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_070_908_800))
+            .unwrap();
+        store.config.retention.max_size_gb = (64 * 1024) as f64 / GIB;
+        let result = store.auto_purge_in_roots(&[store.home.clone(), foreign.clone()]);
+        let survivors: Vec<bool> = ids.iter().map(|id| store.find_entry(id).is_ok()).collect();
+        let _ = fs::remove_dir_all(&dir);
+        result.unwrap();
+        assert_eq!(survivors, [true, true], "home entries were purged");
+    }
+
+    // store-core-5: on the cross-device path the trash copy becomes the only
+    // copy once the source is retired, so its sidecar and info/ must be
+    // durable first. Same-device renames stay unsynced.
+    #[test]
+    fn cross_device_trash_makes_the_sidecar_durable_before_retiring_the_source() {
+        let Some(dir) = cross_device_dir("durable-sidecar") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let (store, _data) = cross_device_store();
+        fs::write(dir.join("file"), "payload").unwrap();
+        fs::create_dir(dir.join("tree")).unwrap();
+        fs::write(dir.join("tree/inner"), "payload").unwrap();
+        fs::write(dir.join("pinned"), "payload").unwrap();
+        let parent = fs::File::open(&dir).unwrap();
+        let mut outcomes = Vec::new();
+        for (name, pinned) in [("file", false), ("tree", false), ("pinned", true)] {
+            store.durability_events.borrow_mut().clear();
+            let result = if pinned {
+                store.trash_at(parent.as_raw_fd(), OsStr::new(name), &dir.join(name), None)
+            } else {
+                store.trash(&dir.join(name), None)
+            };
+            let events = store.durability_events.borrow().clone();
+            outcomes.push((name, result.is_ok(), events));
+        }
+        let same_device = {
+            let (store, _data, work, _) = test_store();
+            let file = create_file(work.path(), "local", "payload");
+            store.trash(&file, None).unwrap();
+            store.durability_events.borrow().clone()
+        };
+        let _ = fs::remove_dir_all(&dir);
+        for (name, ok, events) in outcomes {
+            assert!(ok, "{name}");
+            assert_eq!(events, ["files", "sidecar", "info", "retire"], "{name}");
+        }
+        assert!(same_device.is_empty(), "{same_device:?}");
+    }
+
+    // store-metadata-5: automatic compression rewrote trashd's entries to
+    // zstd in place, and other file managers restore those bytes verbatim.
+    // It is opt-in; explicit `trash compress` is unaffected.
+    #[test]
+    fn retention_compresses_only_when_auto_compress_is_enabled() {
+        for enabled in [false, true] {
+            let (mut store, _data, work, _) = test_store();
+            store.config.retention.auto_compress = enabled;
+            let text = "a line of ordinary text\n".repeat(200);
+            let file = create_file(work.path(), "notes.txt", &text);
+            let id = store.trash(&file, None).unwrap();
+            backdate_entry(&store, &id, chrono::Duration::days(8));
+            store.auto_purge_in_roots(&[store.home.clone()]).unwrap();
+            let entry = store.find_entry(&id).unwrap();
+            let stored = fs::read(&entry.trashed_path).unwrap();
+            let sidecar = fs::read_to_string(&entry.info_path).unwrap();
+            assert_eq!(stored == text.as_bytes(), !enabled, "enabled={enabled}");
+            assert_eq!(
+                sidecar.contains("X-Trashd-Compressed=zstd"),
+                enabled,
+                "enabled={enabled}"
+            );
+        }
+    }
+
+    /// Run `operation` on its own thread and fail the test if it has not
+    /// returned within `limit`. A blocked operation stays behind on its
+    /// thread; the caller releases whatever blocks it.
+    fn returns_within<T: Send + 'static>(
+        name: &str,
+        limit: std::time::Duration,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(operation());
+        });
+        receiver
+            .recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("{name} did not return within {limit:?}"))
+    }
+
+    // store-core-9 / cli-8: a process that flock()ed a file before it was
+    // deleted keeps that lock on the inode now in files/. Purge, empty,
+    // restore and retention blocked on it forever (in the supervisor, the
+    // whole session's deletes with them). They give up after a bounded wait:
+    // explicit commands report the entry busy, never already gone, and
+    // retention skips it. The entry stays intact.
+    #[test]
+    fn entry_flocks_held_by_other_processes_never_block_forever() {
+        let (store, _data, work, _) = test_store();
+        let content = "x".repeat(4096);
+        let source = create_file(work.path(), "state.dat", &content);
+        let id = store.trash(&source, None).unwrap();
+        backdate_entry(&store, &id, chrono::Duration::days(10));
+        let entry = store.find_entry(&id).unwrap();
+        let sidecar = fs::read(&entry.info_path).unwrap();
+        let holder = fs::File::open(&entry.trashed_path).unwrap();
+        holder.lock().unwrap();
+
+        // TrashStore is !Sync: each operation opens its own instance.
+        let home = store.home.clone();
+        let open = move |configure: fn(&mut Config)| {
+            let home = home.clone();
+            move || {
+                let mut config = retention_off();
+                configure(&mut config);
+                let mut store = TrashStore::open_isolated(&home, config).unwrap();
+                store.entry_lock_wait = std::time::Duration::from_millis(300);
+                store
+            }
+        };
+        let limit = std::time::Duration::from_secs(20);
+        let busy = |result: Result<(), TrashError>| match result {
+            Err(TrashError::Io(error)) => error.kind() == io::ErrorKind::WouldBlock,
+            _ => false,
+        };
+
+        let (snapshot, store) = (entry.clone(), open(|_| {}));
+        let purged = returns_within("purge", limit, move || store().purge_resolved(&snapshot));
+        assert!(busy(purged), "purge must report the entry busy");
+
+        let (snapshot, store) = (entry.clone(), open(|_| {}));
+        let emptied = returns_within("empty", limit, move || {
+            store().empty_entries_reporting(&[snapshot], None)
+        });
+        assert_eq!(emptied, (0, 1), "empty must count the busy entry failed");
+
+        let (mut snapshot, store) = (entry.clone(), open(|_| {}));
+        let restored = returns_within("restore", limit, move || {
+            store().restore_entry(&mut snapshot, None).map(|_| ())
+        });
+        assert!(busy(restored), "restore must report the entry busy");
+
+        let roots = [entry.trash_root.clone()];
+        let store = open(|config| {
+            config.retention.max_age_days = 1;
+            config.retention.auto_compress = true;
+        });
+        let retained = returns_within("retention", limit, move || {
+            store().auto_purge_in_roots(&roots).is_ok()
+        });
+        assert!(retained, "retention must skip the busy entry");
+
+        drop(holder);
+        assert!(!source.exists(), "the busy entry was restored");
+        assert_eq!(fs::read_to_string(&entry.trashed_path).unwrap(), content);
+        assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
+    }
+
+    /// Run `operation`, recording each store-internal unlink it issues while
+    /// `root`'s mutation lock is held.
+    fn unlinks_under_root_lock<T>(root: &Path, operation: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let lock = root.join(".trashd/store.lock");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = seen.clone();
+        UNLINK_PROBE.set(Some(Box::new(move |name: &CStr| {
+            // A new open file description conflicts with the store's own.
+            let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&lock) else {
+                return;
+            };
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                record
+                    .borrow_mut()
+                    .push(name.to_string_lossy().into_owned());
+            }
+        })));
+        let result = operation();
+        UNLINK_PROBE.set(None);
+        let seen = seen.borrow().clone();
+        (result, seen)
+    }
+
+    // store-metadata-6: the copy that brings an operand from another
+    // filesystem into the trash ran under the root lock, so one large tree,
+    // or a copier stopped with Ctrl-Z, held every delete of the user. It is
+    // staged without the lock. What protects it then: the claimed sidecar
+    // is locked, so no purge and no `fsck --fix` takes the entry for one
+    // whose data is gone, however old the sidecar looks; and the stage is
+    // leased, so no sweep takes it for abandoned.
+    #[test]
+    fn a_copy_into_the_trash_is_staged_without_the_root_lock() {
+        let Some(dir) = cross_device_dir("unlocked-copy") else {
+            eprintln!("SKIP: no tmpfs on another device");
+            return;
+        };
+        let (store, _data) = cross_device_store();
+        let root = store.home.clone();
+        fs::write(dir.join("file"), "payload").unwrap();
+        fs::create_dir(dir.join("tree")).unwrap();
+        fs::write(dir.join("tree/inner"), "payload").unwrap();
+        fs::write(dir.join("pinned"), "payload").unwrap();
+        let parent = fs::File::open(&dir).unwrap();
+        let shared_lock = |path: &Path| {
+            fs::File::open(path).is_ok_and(|file| unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) == 0
+            })
+        };
+        let mut outcomes = Vec::new();
+        for (name, pinned) in [("file", false), ("tree", false), ("pinned", true)] {
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let (record, home) = (seen.clone(), root.clone());
+            STAGE_PROBE.set(Some(Box::new(move |stage: &CStr| {
+                let mut seen = record.borrow_mut();
+                // A new open file description conflicts with the store's own.
+                let free = matches!(
+                    RootMutationGuard::try_acquire_as(&home, unsafe { libc::geteuid() }),
+                    Ok(Some(_))
+                );
+                seen.push(("root lock free", free));
+                if !free {
+                    // Every other writer of this root waits here.
+                    return;
+                }
+                let sidecar = home.join("info").join(format!("{name}.trashinfo"));
+                let stage = home
+                    .join(".trashd")
+                    .join(OsStr::from_bytes(stage.to_bytes()));
+                // As old as the sidecar of data that is long gone.
+                let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+                fs::File::options()
+                    .append(true)
+                    .open(&sidecar)
+                    .and_then(|file| file.set_modified(hour_ago))
+                    .unwrap();
+                seen.push(("claim in flight", !data_absence_is_retired(&sidecar)));
+                let mut config = Config::default();
+                config.never_trash.clear();
+                config.retention.max_age_days = 0;
+                config.retention.max_size_gb = 0.0;
+                config.retention.disk_pressure_percent = 0;
+                let other = TrashStore::open_isolated(&home, config).unwrap();
+                let _ = other.empty(None);
+                seen.push(("purge kept the claim", sidecar.exists()));
+                let _ = other.cleanup_unfinished();
+                seen.push(("sweep kept the stage", stage.exists()));
+            })));
+            let result = if pinned {
+                store.trash_at(parent.as_raw_fd(), OsStr::new(name), &dir.join(name), None)
+            } else {
+                store.trash(&dir.join(name), None)
+            };
+            STAGE_PROBE.set(None);
+            let landed = root.join("files").join(name).exists()
+                && shared_lock(&root.join("info").join(format!("{name}.trashinfo")));
+            let retired = !dir.join(name).exists();
+            outcomes.push((name, result, landed, retired, seen.borrow().clone()));
+        }
+        let stages: Vec<_> = fs::read_dir(root.join(".trashd"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name.as_bytes().starts_with(COPY_STAGE_PREFIX.as_bytes()))
+            .collect();
+        // Once no copy is staged, an abandoned stage is swept as before.
+        fs::write(root.join(".trashd/.trashd-copy-1-2-0"), "abandoned").unwrap();
+        store.cleanup_unfinished().unwrap();
+        let swept = !root.join(".trashd/.trashd-copy-1-2-0").exists();
+        let _ = fs::remove_dir_all(&dir);
+        for (name, result, landed, retired, seen) in outcomes {
+            assert_eq!(result.as_deref().ok(), Some(name), "{result:?}");
+            assert!(
+                landed && retired,
+                "{name}: landed {landed}, retired {retired}"
+            );
+            assert_eq!(
+                seen,
+                [
+                    ("root lock free", true),
+                    ("claim in flight", true),
+                    ("purge kept the claim", true),
+                    ("sweep kept the stage", true),
+                ],
+                "{name}"
+            );
+        }
+        assert!(stages.is_empty(), "{stages:?}");
+        assert!(swept);
+    }
+
+    // store-metadata-6: every writer waited for the root lock in a blocking
+    // flock, so behind a holder that was stopped (Ctrl-Z in a critical
+    // section) they hung until it went on. The wait is bounded and ends
+    // busy: nothing is deleted and nothing is left in the trash.
+    #[test]
+    fn a_held_root_lock_is_reported_busy() {
+        let (mut store, _data, work, _) = test_store();
+        store.root_lock_wait = std::time::Duration::from_millis(200);
+        let root = store.home.clone();
+        let file = create_file(work.path(), "kept", "payload");
+        let parent = fs::File::open(work.path()).unwrap();
+        // Another open file description, as another process has.
+        let holder = RootMutationGuard::acquire(&root).unwrap();
+        let started = std::time::Instant::now();
+        let by_path = store.trash(&file, None);
+        let pinned = store.trash_at(parent.as_raw_fd(), OsStr::new("kept"), &file, None);
+        let waited = started.elapsed();
+        drop(holder);
+        for result in [by_path, pinned] {
+            assert!(
+                matches!(&result, Err(TrashError::Io(e)) if e.raw_os_error() == Some(libc::EBUSY)),
+                "{result:?}"
+            );
+        }
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "payload");
+        assert!(store.list(None).unwrap().is_empty());
+        assert_eq!(fs::read_dir(root.join("info")).unwrap().count(), 0);
+        // Released, the same delete goes through.
+        store.trash(&file, None).unwrap();
+        assert!(!file.exists());
+    }
+
+    // store-core-4: purge, restore and the copy fallbacks' source retirement
+    // unlinked while holding the root lock. Under trashd-exec every unlink
+    // traps into the single-threaded supervisor, which may itself be waiting
+    // for that lock on another process's delete, and the whole session hung.
+    // No store-internal unlink may run under the root lock.
+    #[test]
+    fn no_store_unlink_runs_under_the_root_lock() {
+        let mut violations = Vec::new();
+        let (store, _data, work, _) = test_store();
+        let root = store.home.clone();
+        let tree = work.path().join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/inner"), "payload").unwrap();
+        let sources = [
+            create_file(work.path(), "file", "payload"),
+            tree,
+            create_file(work.path(), "emptied", "payload"),
+            create_file(work.path(), "restored", "payload"),
+        ];
+        let ids: Vec<String> = sources
+            .iter()
+            .map(|source| store.trash(source, None).unwrap())
+            .collect();
+        for id in &ids[..2] {
+            let entry = store.find_entry(id).unwrap();
+            let (result, seen) = unlinks_under_root_lock(&root, || store.purge_resolved(&entry));
+            result.unwrap();
+            violations.push(("purge", seen));
+        }
+        let entry = store.find_entry(&ids[2]).unwrap();
+        let (counts, seen) =
+            unlinks_under_root_lock(&root, || store.empty_entries_reporting(&[entry], None));
+        assert_eq!(counts, (1, 0));
+        violations.push(("empty", seen));
+        let mut entry = store.find_entry(&ids[3]).unwrap();
+        let (result, seen) =
+            unlinks_under_root_lock(&root, || store.restore_entry(&mut entry, None));
+        result.unwrap();
+        violations.push(("restore", seen));
+        // An orphan occupying the natural id makes the claim move on.
+        fs::write(root.join("files/occupied"), "orphan").unwrap();
+        let occupied = create_file(work.path(), "occupied", "payload");
+        let (result, seen) = unlinks_under_root_lock(&root, || store.trash(&occupied, None));
+        assert_ne!(result.unwrap(), "occupied");
+        violations.push(("id claim", seen));
+
+        // Cross-device: both copy fallbacks retire their source, and restore
+        // retires the trash copy.
+        if let Some(dir) = cross_device_dir("unlock-unlinks") {
+            let (store, _data) = cross_device_store();
+            let root = store.home.clone();
+            fs::write(dir.join("pinned"), "payload").unwrap();
+            fs::create_dir(dir.join("tree")).unwrap();
+            fs::write(dir.join("tree/inner"), "payload").unwrap();
+            fs::write(dir.join("moved"), "payload").unwrap();
+            let parent = fs::File::open(&dir).unwrap();
+            let mut results = Vec::new();
+            for name in ["pinned", "tree"] {
+                let (result, seen) = unlinks_under_root_lock(&root, || {
+                    store.trash_at(parent.as_raw_fd(), OsStr::new(name), &dir.join(name), None)
+                });
+                results.push(result.is_ok());
+                violations.push(("cross-device trash_at", seen));
+                if let Ok(id) = result {
+                    let mut entry = store.find_entry(&id).unwrap();
+                    let (result, seen) =
+                        unlinks_under_root_lock(&root, || store.restore_entry(&mut entry, None));
+                    results.push(result.is_ok());
+                    violations.push(("cross-device restore", seen));
+                }
+            }
+            let (result, seen) =
+                unlinks_under_root_lock(&root, || store.trash(&dir.join("moved"), None));
+            results.push(result.is_ok());
+            violations.push(("cross-device trash", seen));
+            let restored = ["pinned", "tree/inner"].map(|name| dir.join(name).exists());
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(results, [true; 5]);
+            assert_eq!(restored, [true; 2]);
+        } else {
+            eprintln!("SKIP: no tmpfs on another device for the cross-device cases");
+        }
+        violations.retain(|(_, seen)| !seen.is_empty());
+        assert!(
+            violations.is_empty(),
+            "unlinked while holding the root lock: {violations:#?}"
+        );
+    }
+
+    // ---- WS-C: untrusted topdir trashes act only through pinned descriptors ----
+
+    /// A private trash root (files/, info/, .trashd/) at `root`.
+    fn private_root(root: &Path) -> PathBuf {
+        for dir in [root.to_path_buf(), root.join("files"), root.join("info")] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root.to_path_buf()
+    }
+
+    /// The names in `dir`.
+    fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    }
+
+    // security-1: retention acts on a root only through the descriptors its
+    // lock validated. A FUSE server can answer `files` with a private
+    // directory for the lock and with a symlink to /etc for every other
+    // lookup, plus a sidecar dated long ago named after a file there: root's
+    // routine retention then purged /etc/shadow. Covered for a topdir root
+    // (listed through pinned descriptors) and the home root (listed by path,
+    // purged through the lock's descriptors).
+    #[test]
+    fn retention_never_purges_through_a_swapped_files_directory() {
+        use crate::store_lock::validation_probe;
+        for topdir in [true, false] {
+            let (mut store, _data, work, _) = test_store();
+            store.config.retention.max_age_days = 30;
+            let root = if topdir {
+                private_root(&work.path().join("top/.Trash-1000"))
+            } else {
+                store.home.clone()
+            };
+            let victim = work.path().join("etc");
+            fs::create_dir(&victim).unwrap();
+            fs::write(victim.join("shadow"), b"root:secret").unwrap();
+            let mut info = TrashInfo::new(PathBuf::from("shadow"));
+            info.deletion_date -= chrono::Duration::days(60);
+            fs::write(
+                root.join("info/shadow.trashinfo"),
+                info.to_trashinfo_string(),
+            )
+            .unwrap();
+            validation_probe::serve_files_as_symlink(&root, &victim);
+            let _ = store.auto_purge_in_roots(std::slice::from_ref(&root));
+            validation_probe::set(None);
+            assert_eq!(
+                fs::read(victim.join("shadow")).ok().as_deref(),
+                Some(&b"root:secret"[..]),
+                "retention purged through the symlink (topdir root: {topdir})"
+            );
+            assert_eq!(names_in(&victim), ["shadow"]);
+        }
+    }
+
+    /// Answer every lookup of `root/<child>` (the root itself for "") with a
+    /// symlink to `victim` from the moment a root lock has validated it, and
+    /// with the real directory while a lock validates it, as a FUSE or NFS
+    /// server can. `unswap` puts the real one back.
+    fn swap_after_validation(root: &Path, child: &str, victim: &Path) {
+        use crate::store_lock::validation_probe;
+        let (root, child, victim) = (root.to_path_buf(), child.to_owned(), victim.to_path_buf());
+        validation_probe::set(Some(Box::new(move |locked, validated| {
+            if locked != root {
+                return;
+            }
+            if validated {
+                let (target, aside) = swapped_paths(&root, &child);
+                if !aside.exists() {
+                    fs::rename(&target, &aside).unwrap();
+                    std::os::unix::fs::symlink(&victim, &target).unwrap();
+                }
+            } else {
+                unswap(&root, &child);
+            }
+        })));
+    }
+
+    fn swapped_paths(root: &Path, child: &str) -> (PathBuf, PathBuf) {
+        let target = if child.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(child)
+        };
+        let mut aside = target.clone().into_os_string();
+        aside.push(".real");
+        (target, PathBuf::from(aside))
+    }
+
+    fn unswap(root: &Path, child: &str) {
+        let (target, aside) = swapped_paths(root, child);
+        if aside.exists() {
+            fs::remove_file(&target).unwrap();
+            fs::rename(&aside, &target).unwrap();
+        }
+    }
+
+    // security-1 follow-up: the directorysizes cache was read, staged and
+    // renamed by path below the trash root, so once a lock had validated
+    // the root a server could answer its path with a symlink, and the
+    // cache, staged as root, landed in whatever directory it named. It is
+    // written through the lock's descriptors, and an unlocked rebuild opens
+    // the root following no symlink.
+    #[test]
+    fn directorysizes_are_written_only_through_the_validated_root() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        store.defer_maintenance();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        let tree = work.path().join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/file"), vec![1u8; 8192]).unwrap();
+        swap_after_validation(&store.home, "", &victim);
+        let trashed = store.trash(&tree, None);
+        validation_probe::set(None);
+        unswap(&store.home, "");
+        let cached = |dir: &Path| {
+            names_in(dir)
+                .into_iter()
+                .any(|name| name == "directorysizes" || name.to_string_lossy().starts_with(".tmp"))
+        };
+        let locked_write_escaped = cached(&victim);
+        let id = trashed.unwrap();
+        let recorded = crate::directorysizes::read_cache(&store.home).contains_key(id.as_bytes());
+        // An unlocked rebuild (after a purge) of a root that is a symlink.
+        let real = store.home.with_file_name("Trash.real");
+        fs::rename(&store.home, &real).unwrap();
+        std::os::unix::fs::symlink(&victim, &store.home).unwrap();
+        let rebuilt = crate::directorysizes::write_cache(&store.home);
+        fs::remove_file(&store.home).unwrap();
+        fs::rename(&real, &store.home).unwrap();
+        assert!(!locked_write_escaped, "{:?}", names_in(&victim));
+        assert!(recorded, "no row for {id}");
+        assert!(
+            rebuilt.is_err() && !cached(&victim),
+            "{:?}",
+            names_in(&victim)
+        );
+    }
+
+    // security-1 follow-up: compression published its staged replacement
+    // by renaming it onto the entry's path once the root was locked, so a
+    // server answering files/ with a symlink after the lock's check had the
+    // zstd bytes replace whatever file of that name the link led to.
+    #[test]
+    fn compression_publishes_only_through_the_validated_store() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let path = store.home.join("files/data");
+        let original = vec![b'x'; 8192];
+        fs::write(&path, &original).unwrap();
+        let mut info = TrashInfo::new(work.path().join("data"));
+        info.pid = Some(1);
+        fs::write(
+            store.home.join("info/data.trashinfo"),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("data"), b"decoy").unwrap();
+        let mut entry = store.find_entry("data").unwrap();
+        let input = fs::File::open(&path).unwrap();
+        let expected = input.metadata().unwrap();
+        let encoded = zstd::encode_all(original.as_slice(), 3).unwrap();
+        swap_after_validation(&store.home, "files", &victim);
+        let published = store.publish_auto_compressed(&mut entry, &input, &expected, &encoded);
+        validation_probe::set(None);
+        unswap(&store.home, "files");
+        assert_eq!(fs::read(victim.join("data")).unwrap(), b"decoy");
+        assert!(published.unwrap());
+        assert_eq!(fs::read(&path).unwrap(), encoded);
+        assert!(
+            fs::read_to_string(store.home.join("info/data.trashinfo"))
+                .unwrap()
+                .contains("X-Trashd-Compressed=zstd")
+        );
+        let entry = store.find_entry("data").unwrap();
+        assert_eq!(entry.identity, file_identity(&path));
+    }
+
+    // security-1 follow-up: decompression for a restore checked and
+    // published the decoded data by the entry's path once the root was
+    // locked; with files/ answered by a symlink it refused (or, without
+    // the identity check, would have written through it). It works on the
+    // directories the lock validated.
+    #[test]
+    fn decompression_commits_only_through_the_validated_store() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let path = store.home.join("files/data");
+        let original = vec![b'y'; 8192];
+        fs::write(&path, zstd::encode_all(original.as_slice(), 3).unwrap()).unwrap();
+        let mut info = TrashInfo::new(work.path().join("data"));
+        info.pid = Some(1);
+        info.compressed = Some("zstd".into());
+        fs::write(
+            store.home.join("info/data.trashinfo"),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("data"), b"decoy").unwrap();
+        let mut entry = store.find_entry("data").unwrap();
+        swap_after_validation(&store.home, "files", &victim);
+        let decoded = decompress_zstd_entry(
+            &mut entry,
+            1 << 20,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        validation_probe::set(None);
+        unswap(&store.home, "files");
+        assert_eq!(fs::read(victim.join("data")).unwrap(), b"decoy");
+        decoded.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            !fs::read_to_string(store.home.join("info/data.trashinfo"))
+                .unwrap()
+                .contains("X-Trashd-Compressed")
+        );
+        assert_eq!(entry.identity, file_identity(&path));
+    }
+
+    // security-1 follow-up: restore validated the entry through the lock's
+    // descriptors and then moved it out of a files/ it opened again by
+    // path, which a server could answer with a symlink: refused at best.
+    #[test]
+    fn restore_moves_only_out_of_the_validated_files_directory() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let source = create_file(work.path(), "kept", "the caller's data");
+        let id = store.trash(&source, None).unwrap();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join(&id), b"decoy").unwrap();
+        swap_after_validation(&store.home, "files", &victim);
+        let restored = store.restore(&id, None);
+        validation_probe::set(None);
+        unswap(&store.home, "files");
+        assert_eq!(fs::read(victim.join(&id)).unwrap(), b"decoy");
+        assert_eq!(restored.unwrap(), source);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "the caller's data");
+        assert!(!store.home.join("files").join(&id).exists());
+    }
+
+    // security-2: a new entry is claimed, published and verified through the
+    // descriptors the lock validated. Renamed into `root/files/<id>` by
+    // path, it landed wherever a FUSE server pointed `files` after the
+    // check (/etc/sudoers.d as root).
+    #[test]
+    fn trash_never_publishes_through_a_swapped_files_directory() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let victim = work.path().join("sudoers.d");
+        fs::create_dir(&victim).unwrap();
+        let source = create_file(work.path(), "zz-alice", "alice ALL=(ALL) NOPASSWD: ALL");
+        validation_probe::serve_files_as_symlink(&store.home, &victim);
+        let trashed = store.trash(&source, None);
+        validation_probe::set(None);
+        assert!(
+            names_in(&victim).is_empty(),
+            "published through the symlink: {:?}",
+            names_in(&victim)
+        );
+        let id = trashed.unwrap();
+        let real = validation_probe::real_files(&store.home);
+        assert_eq!(
+            fs::read(real.join(&id)).unwrap(),
+            b"alice ALL=(ALL) NOPASSWD: ALL"
+        );
+        assert!(
+            store
+                .home
+                .join("info")
+                .join(format!("{id}.trashinfo"))
+                .is_file()
+        );
+    }
+
+    // security-1: a topdir root is listed through descriptors that follow
+    // no symlink, so a symlinked files/ or info/ lists nothing instead of
+    // whatever it points at, which were synthesized as orphans.
+    #[test]
+    fn topdir_listing_never_follows_a_symlinked_store_directory() {
+        for child in ["files", "info"] {
+            let (store, _data, work, _) = test_store();
+            let root = private_root(&work.path().join("top/.Trash-1000"));
+            let victim = work.path().join("etc");
+            fs::create_dir(&victim).unwrap();
+            fs::write(victim.join("passwd"), b"root:x:0:0").unwrap();
+            fs::write(
+                victim.join("passwd.trashinfo"),
+                TrashInfo::new(PathBuf::from("passwd")).to_trashinfo_string(),
+            )
+            .unwrap();
+            fs::remove_dir(root.join(child)).unwrap();
+            std::os::unix::fs::symlink(&victim, root.join(child)).unwrap();
+            let mut entries = Vec::new();
+            let _ = store.list_in_dir(&root, None, &mut entries);
+            assert!(
+                entries.is_empty(),
+                "listed through a symlinked {child}/: {entries:?}"
+            );
+        }
+    }
+
+    // security-2 (defense in depth): a regular file copied from a nosuid
+    // filesystem keeps no set-id bits or file capabilities. There they mean
+    // nothing, and on a FUSE mount the server, not the kernel, reports owner
+    // and mode: copied out by root, it became a setuid-root binary of
+    // another user's choosing in root's trash.
+    #[test]
+    fn copies_from_nosuid_filesystems_drop_set_id_bits() {
+        let (store, _data, workdir, _lock) = test_store();
+        let mount = workdir.path().join("nosuid");
+        fs::create_dir(&mount).unwrap();
+        let verdict = crate::mounts::in_private_mounts(
+            "store::tests::copies_from_nosuid_filesystems_drop_set_id_bits",
+            || {
+                let target = CString::new(mount.as_os_str().as_bytes()).unwrap();
+                if unsafe {
+                    libc::mount(
+                        c"none".as_ptr(),
+                        target.as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        libc::MS_NOSUID,
+                        std::ptr::null(),
+                    )
+                } != 0
+                {
+                    return false;
+                }
+                let tool = mount.join("tool");
+                let kept = fs::write(&tool, b"#!/bin/sh\n").is_ok()
+                    && fs::set_permissions(&tool, fs::Permissions::from_mode(0o6755)).is_ok()
+                    && store.trash(&tool, None).is_ok_and(|id| {
+                        let mode = fs::symlink_metadata(store.home.join("files").join(&id))
+                            .map(|copy| copy.mode() & 0o7777);
+                        eprintln!("copied mode: {mode:?}");
+                        mode.is_ok_and(|mode| mode == 0o755)
+                    });
+                unmount(&mount);
+                kept
+            },
+        );
+        assert_ne!(verdict, Some(false));
+    }
+
+    // store-fs-2: a directory without u+rwx is opened up through a
+    // descriptor of the directory just statted. A process that kept a
+    // descriptor inside a group-writable directory of a trashed tree can
+    // still swap entries there; one swapped for a symlink between the status
+    // read and the chmod made the purger's path-following retry chmod the
+    // symlink's target (/etc/passwd, /usr/bin/sudo) to 0700.
+    #[test]
+    fn tree_removal_never_chmods_through_a_swapped_symlink() {
+        let fixture = TempDir::new().unwrap();
+        let sentinel = fixture.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+        let job = fixture.path().join("job");
+        fs::create_dir_all(job.join("locked")).unwrap();
+        fs::set_permissions(job.join("locked"), fs::Permissions::from_mode(0o500)).unwrap();
+        let (raced, victim) = (job.clone(), sentinel.clone());
+        TREE_STATUS_PROBE.set(Some(Box::new(move |name: &CStr| {
+            if name.to_bytes() == b"locked" {
+                fs::rename(raced.join("locked"), raced.join("aside")).unwrap();
+                std::os::unix::fs::symlink(&victim, raced.join("locked")).unwrap();
+            }
+        })));
+        let parent = fs::File::open(fixture.path()).unwrap();
+        let removed = remove_tree_at(parent.as_raw_fd(), c"job", 0);
+        TREE_STATUS_PROBE.set(None);
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().mode() & 0o7777,
+            0o644,
+            "the purge chmodded the symlink's target"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert!(
+            removed.is_err(),
+            "a swapped directory must not pass as removed"
+        );
+        // The next sweep finishes the job: the symlink is unlinked, the
+        // directory it replaced removed.
+        remove_tree_at(parent.as_raw_fd(), c"job", 0).unwrap();
+        assert!(!job.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    // store-metadata-10: the unlocked sweep of detached jobs can walk a tree
+    // that a live purge is still removing. A directory the other remover
+    // deleted between this walk's status read and its chmod or open was
+    // recorded as a failure, so the job counted as pending and `trash empty`
+    // failed although the tree was gone.
+    #[test]
+    fn a_concurrent_remover_never_leaves_a_detached_job_pending() {
+        let (store, _data, _work, _) = test_store();
+        let job = store.home.join(".trashd/purging-raced");
+        fs::create_dir_all(job.join("writable")).unwrap();
+        fs::write(job.join("writable/file"), "payload").unwrap();
+        fs::create_dir(job.join("read-only")).unwrap();
+        fs::set_permissions(job.join("read-only"), fs::Permissions::from_mode(0o555)).unwrap();
+        let raced = job.clone();
+        TREE_STATUS_PROBE.set(Some(Box::new(move |name: &CStr| {
+            if matches!(name.to_bytes(), b"writable" | b"read-only") {
+                fs::remove_dir_all(raced.join(OsStr::from_bytes(name.to_bytes()))).unwrap();
+            }
+        })));
+        let report = store.cleanup_unfinished_in_roots(std::slice::from_ref(&store.home));
+        TREE_STATUS_PROBE.set(None);
+        let report = report.unwrap();
+        assert_eq!(report.pending, 0, "{report:?}");
+        assert!(!job.exists(), "the detached job was not finished");
+    }
+
+    /// Lower this process's soft descriptor limit to `soft`, returning the
+    /// limit to restore.
+    fn lower_descriptor_limit(soft: libc::rlim_t) -> libc::rlimit {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: soft.min(limit.rlim_max),
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        limit
+    }
+
+    // store-fs-1: the survey opened every subdirectory of a directory before
+    // it descended into the first, so a directory with more subdirectories
+    // than the descriptor limit (a cargo registry, a photo library) was
+    // sized without most of them: X-Trashd-Size and the directorysizes row
+    // recorded that undercount for the life of the entry. Run in a child:
+    // the limit is the whole process's.
+    #[test]
+    fn wide_trees_are_sized_whole_under_a_low_descriptor_limit() {
+        const TEST: &str = "store::tests::wide_trees_are_sized_whole_under_a_low_descriptor_limit";
+        const CHILD: &str = "TRASHD_TEST_WIDE_SURVEY";
+        if !mounts::is_rerun_child(TEST, CHILD) {
+            assert_ne!(mounts::rerun_test(TEST, CHILD), Some(false));
+            return;
+        }
+        const DIRECTORIES: u64 = 2000;
+        let (store, _data, work, _) = test_store();
+        let tree = work.path().join("wide");
+        fs::create_dir(&tree).unwrap();
+        for index in 0..DIRECTORIES {
+            let directory = tree.join(format!("d{index}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("file"), [b'x'; 1024]).unwrap();
+        }
+        let parent = fs::File::open(work.path()).unwrap();
+        lower_descriptor_limit(256);
+        let surveyed = tree_sizes_at(parent.as_raw_fd(), c"wide");
+        let recorded = store.trash(&tree, None).map(|id| {
+            let size = store.find_entry(&id).unwrap().info.size;
+            let row = crate::directorysizes::read_cache(&store.home)
+                .get(id.as_bytes())
+                .map(|row| row.size);
+            (size, row)
+        });
+        let whole = DIRECTORIES * 1024;
+        let surveyed = (surveyed.apparent, surveyed.allocated);
+        eprintln!("surveyed {surveyed:?}, recorded {recorded:?}");
+        let _ = mounts::report_test_verdict(Some(
+            surveyed.0 == Some(whole)
+                && surveyed.1.is_some_and(|allocated| allocated >= whole)
+                && matches!(recorded, Ok((Some(size), Some(row))) if size == whole && row >= whole),
+        ));
+    }
+
+    // store-fs-1: a chain of directories is walked with one descriptor
+    // however deep, but a tree that is deep and branches at every level
+    // still needs one per level and can run out. Its partial size (the
+    // survey used to drop whichever subdirectories it could not open) is
+    // not recorded as the entry's size: without one, accounting measures
+    // the tree itself.
+    #[test]
+    fn a_tree_too_deep_to_survey_records_no_partial_size() {
+        const TEST: &str = "store::tests::a_tree_too_deep_to_survey_records_no_partial_size";
+        const CHILD: &str = "TRASHD_TEST_DEEP_SURVEY";
+        if !mounts::is_rerun_child(TEST, CHILD) {
+            assert_ne!(mounts::rerun_test(TEST, CHILD), Some(false));
+            return;
+        }
+        const PAYLOAD: u64 = 1024 * 1024;
+        const SIDE: u64 = 8192;
+        const LEVELS: u64 = 200;
+        let (store, _data, work, _) = test_store();
+        let trash_deep = |name: &str, branching: bool| {
+            let tree = work.path().join(name);
+            let mut bottom = tree.clone();
+            fs::create_dir(&bottom).unwrap();
+            for _ in 0..LEVELS {
+                fs::create_dir(bottom.join("a")).unwrap();
+                if branching {
+                    fs::create_dir(bottom.join("b")).unwrap();
+                }
+                // The walk goes down the subdirectory listed first, so a
+                // branching level keeps its descriptor for the other one,
+                // which holds a file of its own.
+                let mut listed = fs::read_dir(&bottom)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name());
+                let first = listed.next().unwrap();
+                if let Some(other) = listed.next() {
+                    fs::write(bottom.join(other).join("side"), vec![b'y'; SIDE as usize]).unwrap();
+                }
+                bottom.push(first);
+            }
+            fs::write(bottom.join("payload"), vec![b'x'; PAYLOAD as usize]).unwrap();
+            let limit = lower_descriptor_limit(64);
+            let id = store.trash(&tree, None);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            id.map(|id| store.find_entry(&id).unwrap().info.size)
+        };
+        let chain = trash_deep("chain", false);
+        let branching = trash_deep("branching", true);
+        let status = store.status().unwrap();
+        eprintln!("chain {chain:?}, branching {branching:?}, status {status:?}");
+        let _ = mounts::report_test_verdict(Some(
+            matches!(chain, Ok(Some(PAYLOAD)))
+                && matches!(branching, Ok(None))
+                && status == (2 * PAYLOAD + LEVELS * SIDE, 2),
+        ));
+    }
+
+    /// Trash `victim` through `trash_at` (`pinned`) or `trash`, replacing it
+    /// with `replacement` right before the move; the entry that landed and
+    /// its directorysizes row.
+    fn trash_replaced_operand(
+        store: &TrashStore,
+        victim: &Path,
+        replacement: &Path,
+        pinned: bool,
+    ) -> (TrashEntry, Option<u64>) {
+        let (raced, replacement) = (victim.to_path_buf(), replacement.to_path_buf());
+        *store.before_move.borrow_mut() = Some(Box::new(move || {
+            let aside = raced.with_extension("aside");
+            fs::rename(&raced, aside).unwrap();
+            fs::rename(&replacement, &raced).unwrap();
+        }));
+        let id = if pinned {
+            let parent = fs::File::open(victim.parent().unwrap()).unwrap();
+            store.trash_at(
+                parent.as_raw_fd(),
+                victim.file_name().unwrap(),
+                victim,
+                None,
+            )
+        } else {
+            store.trash(victim, None)
+        }
+        .unwrap();
+        let row = crate::directorysizes::read_cache(&store.home)
+            .get(id.as_bytes())
+            .map(|row| row.size);
+        (store.find_entry(&id).unwrap(), row)
+    }
+
+    // recent-changes-9: an operand replaced by one of another type between
+    // its sizing and the move was sized by the type it had before. A file
+    // replaced by a tree recorded the directory inode's own size (#414
+    // again) and got no directorysizes row; a directory replaced by a file
+    // recorded the size 0.
+    #[test]
+    fn a_raced_type_change_records_what_landed() {
+        const PAYLOAD: u64 = 1024 * 1024;
+        for pinned in [true, false] {
+            let (store, _data, work, _) = test_store();
+            let victim = create_file(work.path(), "victim", "small");
+            let tree = work.path().join("tree");
+            fs::create_dir(&tree).unwrap();
+            fs::write(tree.join("payload"), vec![b'x'; PAYLOAD as usize]).unwrap();
+            let (entry, row) = trash_replaced_operand(&store, &victim, &tree, pinned);
+            assert!(entry.trashed_path.join("payload").exists());
+            assert_eq!(entry.info.size, Some(PAYLOAD), "pinned={pinned}");
+            assert!(
+                row.is_some_and(|size| size >= PAYLOAD),
+                "pinned={pinned}: {row:?}"
+            );
+        }
+        for pinned in [true, false] {
+            let (store, _data, work, _) = test_store();
+            let victim = work.path().join("victim");
+            fs::create_dir(&victim).unwrap();
+            fs::write(victim.join("payload"), vec![b'x'; PAYLOAD as usize]).unwrap();
+            let file = create_file(work.path(), "file", &"y".repeat(3000));
+            let (entry, row) = trash_replaced_operand(&store, &victim, &file, pinned);
+            assert!(fs::symlink_metadata(&entry.trashed_path).unwrap().is_file());
+            assert_eq!(entry.info.size, Some(3000), "pinned={pinned}");
+            assert_eq!(row, None, "pinned={pinned}");
+        }
+    }
+
+    // store-metadata-9: a directorysizes rebuild measured each directory
+    // with a walk of its own that stopped 100 levels down, and neither it
+    // nor the survey counted a directory's own blocks. The spec's size is
+    // `du -B1`, and KDE trusts a row whose sidecar mtime matches.
+    #[test]
+    fn directorysizes_rows_measure_whole_trees_like_du() {
+        /// `du -B1`: the blocks of the directory and everything below it.
+        fn disk_usage(path: &Path) -> u64 {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let below: u64 = if metadata.is_dir() {
+                fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| disk_usage(&entry.unwrap().path()))
+                    .sum()
+            } else {
+                0
+            };
+            metadata.blocks() * 512 + below
+        }
+        let (store, _data, work, _) = test_store();
+        let root = work.path().join("deep");
+        let mut bottom = root.clone();
+        for _ in 0..105 {
+            bottom.push("d");
+        }
+        fs::create_dir_all(&bottom).unwrap();
+        fs::write(bottom.join("payload"), vec![b'x'; 4096]).unwrap();
+        let expected = disk_usage(&root);
+        let id = store.trash(&root, None).unwrap();
+        let row = || {
+            crate::directorysizes::read_cache(&store.home)
+                .get(id.as_bytes())
+                .map(|row| row.size)
+        };
+        assert_eq!(row(), Some(expected), "the row recorded with the entry");
+        fs::remove_file(store.home.join("directorysizes")).unwrap();
+        crate::directorysizes::write_cache(&store.home).unwrap();
+        assert_eq!(row(), Some(expected), "the row a rebuild measured");
+    }
+
+    /// Names in `dir` a copy staged and left behind.
+    fn leftover_copy_stages(dir: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.as_bytes().starts_with(COPY_STAGE_PREFIX.as_bytes()))
+            .collect()
+    }
+
+    // store-fs-3: where RENAME_NOREPLACE is unsupported (NFS, 9p, FUSE
+    // without rename2) the move into the trash falls back to a copy, whose
+    // publication into files/ used the same flag and then refused every
+    // directory. No directory could be trashed on such a home, each attempt
+    // after a full copy. The private files/ takes it under an exclusively
+    // created name; a restore into the user's tree stays refused.
+    #[test]
+    fn directories_reach_a_trash_without_rename_noreplace() {
+        for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            for pinned in [false, true] {
+                let (store, _data, work, _) = test_store();
+                let tree = work.path().join("tree");
+                fs::create_dir_all(tree.join("sub")).unwrap();
+                fs::write(tree.join("sub/payload"), b"recoverable bytes").unwrap();
+                fs::set_permissions(&tree, fs::Permissions::from_mode(0o750)).unwrap();
+                NOREPLACE_ERRNO.set(Some(errno));
+                let trashed = if pinned {
+                    let parent = fs::File::open(work.path()).unwrap();
+                    store.trash_at(parent.as_raw_fd(), OsStr::new("tree"), &tree, None)
+                } else {
+                    store.trash(&tree, None)
+                };
+                NOREPLACE_ERRNO.set(None);
+                let id = trashed.unwrap_or_else(|error| panic!("{errno} pinned={pinned}: {error}"));
+                assert!(!tree.exists(), "the source was left behind");
+                let entry = store.find_entry(&id).unwrap();
+                assert_eq!(
+                    fs::read(entry.trashed_path.join("sub/payload")).unwrap(),
+                    b"recoverable bytes"
+                );
+                let landed = fs::symlink_metadata(&entry.trashed_path).unwrap();
+                assert_eq!(landed.mode() & 0o7777, 0o750);
+                assert_eq!(entry.info.original_path, tree);
+                assert_eq!(
+                    leftover_copy_stages(&store.home.join(".trashd")),
+                    Vec::<std::ffi::OsString>::new()
+                );
+                // Out of the trash nothing changes: a directory is published
+                // into the user's tree only without replacing anything.
+                NOREPLACE_ERRNO.set(Some(errno));
+                let restored = store.restore(&id, None);
+                NOREPLACE_ERRNO.set(None);
+                assert!(restored.is_err(), "{restored:?}");
+                assert!(!tree.exists());
+                assert_eq!(
+                    fs::read(entry.trashed_path.join("sub/payload")).unwrap(),
+                    b"recoverable bytes"
+                );
+                assert!(entry.info_path.exists());
+            }
+        }
+    }
+
+    // store-fs-3: the name in files/ is taken with an exclusive mkdir, so
+    // even something that appeared there against every guarantee (the claim
+    // in info/, the root lock, the private mode) is never replaced.
+    #[test]
+    fn private_root_publication_never_replaces_a_competitor() {
+        for (competitor, kept) in [("directory", true), ("file", true), ("nothing", false)] {
+            let (store, _data, work, _) = test_store();
+            let tree = work.path().join("tree");
+            fs::create_dir(&tree).unwrap();
+            fs::write(tree.join("payload"), b"recoverable bytes").unwrap();
+            let parent = fs::File::open(work.path()).unwrap();
+            let files = fs::File::open(store.home.join("files")).unwrap();
+            let staging = fs::File::open(store.home.join(".trashd")).unwrap();
+            let source = stat_at(parent.as_raw_fd(), c"tree", libc::AT_SYMLINK_NOFOLLOW).unwrap();
+            let destination = store.home.join("files/tree");
+            let result = copy_staged_at_with_rename(
+                parent.as_raw_fd(),
+                c"tree",
+                files.as_raw_fd(),
+                c"tree",
+                staging.as_raw_fd(),
+                &source,
+                Publication::PrivateRoot,
+                |_, _, _, _| {
+                    match competitor {
+                        "directory" => fs::create_dir(&destination).unwrap(),
+                        "file" => fs::write(&destination, b"competing").unwrap(),
+                        _ => {}
+                    }
+                    Err(io::Error::from_raw_os_error(libc::EINVAL))
+                },
+            );
+            assert_eq!(result.is_ok(), !kept, "{competitor}: {result:?}");
+            assert_eq!(
+                fs::read(tree.join("payload")).unwrap(),
+                b"recoverable bytes",
+                "the copy never touches its source"
+            );
+            assert_eq!(
+                leftover_copy_stages(&store.home.join(".trashd")),
+                Vec::<std::ffi::OsString>::new(),
+                "{competitor}"
+            );
+            match competitor {
+                "directory" => assert_eq!(fs::read_dir(&destination).unwrap().count(), 0),
+                "file" => assert_eq!(fs::read(&destination).unwrap(), b"competing"),
+                _ => {
+                    assert_eq!(
+                        fs::read(destination.join("payload")).unwrap(),
+                        b"recoverable bytes"
+                    );
+                    let landed = fs::symlink_metadata(&destination).unwrap();
+                    assert_eq!(result.unwrap(), (landed.dev(), landed.ino()));
+                }
+            }
+        }
+    }
+
+    /// Replace an entry's data with its zstd encoding and mark the sidecar,
+    /// as a compressor does.
+    fn compress_in_place(entry: &TrashEntry, plaintext: &[u8]) {
+        fs::write(&entry.trashed_path, zstd::encode_all(plaintext, 3).unwrap()).unwrap();
+        set_compression_marker(&entry.info_path, Some("zstd")).unwrap();
+    }
+
+    // store-core-7, store-fs-8, cli-4: restore bounded a compressed entry's
+    // output by max_file_size_mb as configured at restore time, which only
+    // says what may enter the trash. Lowering it left every larger entry
+    // compressed before unrestorable ("decompressed entry exceeds N bytes").
+    #[test]
+    fn compressed_entries_restore_after_the_file_size_limit_is_lowered() {
+        let (mut store, _data, work, _) = test_store();
+        let original = b"compressible ".repeat(200_000);
+        let file = work.path().join("app.log");
+        fs::write(&file, &original).unwrap();
+        let id = store.trash(&file, None).unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        assert_eq!(entry.info.size, Some(original.len() as u64));
+        compress_in_place(&entry, &original);
+        store.config.max_file_size_mb = 1;
+        let restored = store.restore(&id, None).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), original);
+    }
+
+    // store-core-7: automatic compression takes entries up to its own cap
+    // whatever max_file_size_mb says, so with a limit below that cap it
+    // made an entry unrestorable without the user changing anything.
+    #[test]
+    fn automatic_compression_keeps_entries_over_the_file_size_limit_restorable() {
+        let (mut store, _data, work, _) = test_store();
+        store.config.retention.auto_compress = true;
+        let original = b"compressible ".repeat(200_000);
+        let file = work.path().join("old.log");
+        fs::write(&file, &original).unwrap();
+        let id = store.trash(&file, None).unwrap();
+        store.config.max_file_size_mb = 1;
+        backdate_entry(&store, &id, chrono::Duration::days(8));
+        store.auto_purge().unwrap();
+        let entry = store.find_entry(&id).unwrap();
+        assert!(
+            zstd_magic(&entry.trashed_path),
+            "the entry was not compressed"
+        );
+        let restored = store.restore(&id, None).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), original);
+    }
+
+    // store-core-7: the bound is the entry's recorded size, never less than
+    // what automatic compression accepts and never over the hard cap; the
+    // file size limit can only widen it, as it did before.
+    #[test]
+    fn decompression_is_bounded_by_the_recorded_size() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(decompress_limit(None), COMPRESS_MAX_BYTES);
+        assert_eq!(decompress_limit(Some(MIB)), COMPRESS_MAX_BYTES);
+        assert_eq!(decompress_limit(Some(300 * MIB)), 300 * MIB);
+        assert_eq!(decompress_limit(Some(u64::MAX)), HARD_DECOMPRESS_LIMIT);
+        let (mut store, _data, _work, _) = test_store();
+        for (limit_mb, recorded, expected) in [
+            (1, Some(300 * MIB), 300 * MIB),
+            (1, None, COMPRESS_MAX_BYTES),
+            (1024, Some(MIB), 1024 * MIB),
+            (1024, None, 1024 * MIB),
+            (0, None, HARD_DECOMPRESS_LIMIT),
+            (u64::MAX, Some(MIB), HARD_DECOMPRESS_LIMIT),
+        ] {
+            store.config.max_file_size_mb = limit_mb;
+            assert_eq!(
+                store.restore_decompress_limit(recorded),
+                expected,
+                "max_file_size_mb={limit_mb} recorded={recorded:?}"
+            );
+        }
+    }
+
+    /// Restore `entry` to its recorded path with `--force`, as
+    /// `restore --all --force` (`batch`) or a single `restore --force` does.
+    fn restore_forced(
+        store: &TrashStore,
+        entry: &TrashEntry,
+        batch: bool,
+    ) -> Result<PathBuf, TrashError> {
+        if batch {
+            store
+                .restore_batch(std::slice::from_ref(entry), None, true)
+                .remove(0)
+        } else {
+            store.restore_entry_renamed(&mut entry.clone(), None)
+        }
+    }
+
+    // store-core-8, cli-6: a `--force` retry passed the `.N` name it derived
+    // from the recorded path back as a destination the user chose, so the
+    // retry was not kept below the topdir. An empty `Path=` names the topdir
+    // itself: it conflicts, and the retry restored planted data to
+    // `<topdir>.1`, beside the mount point.
+    #[test]
+    fn forced_restore_keeps_a_recorded_path_below_its_topdir() {
+        let (mut store, _data, work, _) = test_store();
+        // Take entries of other roots, as a production store does.
+        store.isolated = false;
+        let top = work.path().join("mnt");
+        let root = top.join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+        let external = TrashStore::open_isolated(&root, retention_off()).unwrap();
+        fs::write(root.join("files/planted"), b"planted").unwrap();
+        fs::write(
+            root.join("info/planted.trashinfo"),
+            "[Trash Info]\nPath=\nDeletionDate=2026-01-01T00:00:00\n",
+        )
+        .unwrap();
+        let entries = external.list(None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].orphaned);
+        for batch in [true, false] {
+            let result = restore_forced(&store, &entries[0], batch);
+            assert!(
+                matches!(result, Err(TrashError::RestoreTraversal(_))),
+                "batch={batch}: {result:?}"
+            );
+            assert!(
+                fs::symlink_metadata(work.path().join("mnt.1")).is_err(),
+                "batch={batch}: restored beside the topdir"
+            );
+            assert_eq!(fs::read(root.join("files/planted")).unwrap(), b"planted");
+        }
+        // A path below the topdir still gets its `.N` name there.
+        fs::write(
+            root.join("info/planted.trashinfo"),
+            "[Trash Info]\nPath=taken\nDeletionDate=2026-01-01T00:00:00\n",
+        )
+        .unwrap();
+        fs::write(top.join("taken"), b"in the way").unwrap();
+        let entries = external.list(None).unwrap();
+        let restored = restore_forced(&store, &entries[0], true).unwrap();
+        assert_eq!(restored, top.join("taken.1"));
+        assert_eq!(fs::read(restored).unwrap(), b"planted");
+    }
+
+    // store-core-8, cli-6: the first attempt walks the recorded path through
+    // no symlink, and its `--force` retry followed them: a directory of the
+    // path swapped for a symlink between the two sent the entry wherever
+    // the link pointed. A destination the user names may still be reached
+    // through one, retry included.
+    #[test]
+    fn forced_restore_retry_follows_no_symlink_in_a_recorded_path() {
+        for batch in [true, false] {
+            let (store, _data, work, _) = test_store();
+            let recorded_parent = work.path().join("recorded-parent");
+            let outside = work.path().join("outside");
+            fs::create_dir(&recorded_parent).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let original = create_file(&recorded_parent, "payload", "trashed");
+            let id = store.trash(&original, None).unwrap();
+            create_file(&recorded_parent, "payload", "in the way");
+            let entry = store.find_entry(&id).unwrap();
+            let (swapped, link_target) = (recorded_parent.clone(), outside.clone());
+            *store.before_forced_retry.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&swapped, swapped.with_extension("moved")).unwrap();
+                std::os::unix::fs::symlink(&link_target, &swapped).unwrap();
+            }));
+            let result = restore_forced(&store, &entry, batch);
+            assert!(
+                matches!(result, Err(TrashError::RestoreTraversal(_))),
+                "batch={batch}: {result:?}"
+            );
+            assert_eq!(
+                fs::read_dir(&outside).unwrap().count(),
+                0,
+                "batch={batch}: restored through the symlink"
+            );
+            assert_eq!(fs::read(&entry.trashed_path).unwrap(), b"trashed");
+
+            create_file(&outside, "payload", "in the way too");
+            let chosen = recorded_parent.join("payload");
+            let restored = store
+                .restore_entry_renamed(&mut entry.clone(), Some(&chosen))
+                .unwrap();
+            assert_eq!(restored, recorded_parent.join("payload.1"));
+            assert_eq!(fs::read(outside.join("payload.1")).unwrap(), b"trashed");
+        }
+    }
+
+    /// The value of the extended attribute `name` of `path` itself.
+    fn xattr_of(path: &Path, name: &CStr) -> Option<Vec<u8>> {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut value = [0u8; 16];
+        let size = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        (size >= 0).then(|| value[..size as usize].to_vec())
+    }
+
+    // store-fs-5: a copy got its source's mode before its extended
+    // attributes. `user.*` attributes need write permission on the inode
+    // whatever the descriptor was opened for, so a read-only file or
+    // directory (0444, 0555) lost them on every cross-device move, silently.
+    // Root may write anyway: the case runs unprivileged.
+    #[test]
+    fn copies_of_read_only_nodes_keep_their_user_xattrs() {
+        const TEST: &str = "store::tests::copies_of_read_only_nodes_keep_their_user_xattrs";
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: unprivileged fixture setup requires root");
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let (source, copies) = (base.path().join("source"), base.path().join("copies"));
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&copies).unwrap();
+        fs::write(source.join("file"), b"data").unwrap();
+        fs::create_dir(source.join("dir")).unwrap();
+        fs::write(source.join("dir/inner"), b"inner").unwrap();
+        for (name, value, mode) in [("file", b"1", 0o444), ("dir", b"2", 0o555)] {
+            let path = CString::new(source.join(name).as_os_str().as_bytes()).unwrap();
+            if unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.test".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            } != 0
+            {
+                eprintln!("SKIP: no user extended attributes here");
+                return;
+            }
+            fs::set_permissions(source.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for path in [
+            &source,
+            &copies,
+            &source.join("file"),
+            &source.join("dir"),
+            &source.join("dir/inner"),
+        ] {
+            std::os::unix::fs::lchown(path, Some(65534), Some(65534)).unwrap();
+        }
+        let outcome = as_unprivileged(TEST, move || {
+            let from = fs::File::open(&source).unwrap();
+            let to = fs::File::open(&copies).unwrap();
+            let stat = |name| stat_at(from.as_raw_fd(), name, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+            copy_regular_at(
+                from.as_raw_fd(),
+                c"file",
+                to.as_raw_fd(),
+                c"file",
+                &stat(c"file"),
+            )
+            .unwrap();
+            copy_directory_at(
+                from.as_raw_fd(),
+                c"dir",
+                to.as_raw_fd(),
+                c"dir",
+                &stat(c"dir"),
+                0,
+                &mut TreeCopy::new(to.as_raw_fd()),
+                b"dir",
+            )
+            .unwrap();
+            let mode = |name: &str| fs::metadata(copies.join(name)).unwrap().mode() & 0o7777;
+            let kept = (
+                xattr_of(&copies.join("file"), c"user.test"),
+                xattr_of(&copies.join("dir"), c"user.test"),
+            );
+            eprintln!("xattrs of the copies: {kept:?}");
+            kept == (Some(b"1".to_vec()), Some(b"2".to_vec()))
+                && mode("file") == 0o444
+                && mode("dir") == 0o555
+                && fs::read(copies.join("dir/inner")).unwrap() == b"inner"
+        });
+        assert_ne!(outcome, Some(false));
+    }
+
+    // store-fs-4: a copied directory has its source's mode as soon as its
+    // own children are done, so the rollback of a copy that failed later
+    // could not unlink anything in a read-only one (0555: a Go module cache,
+    // Nix and Bazel trees) and gave up at the first such error. A restore
+    // stages its copy beside the destination, where no sweep ever looks:
+    // every failed attempt left a hidden `.trashd-copy-*` tree there. Root
+    // may unlink anyway: the case runs unprivileged.
+    #[test]
+    fn failed_restore_copy_removes_its_read_only_directories() {
+        const TEST: &str = "store::tests::failed_restore_copy_removes_its_read_only_directories";
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: unprivileged fixture setup requires root");
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let (trash, destination) = (base.path().join("trash"), base.path().join("destination"));
+        let vendor = trash.join("tree/vendor/pkg@v1");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("mod.go"), b"package pkg").unwrap();
+        // Something took the name while the tree was being copied.
+        fs::create_dir_all(destination.join("tree")).unwrap();
+        for path in [
+            &trash,
+            &destination,
+            &trash.join("tree"),
+            &trash.join("tree/vendor"),
+            &vendor,
+            &vendor.join("mod.go"),
+        ] {
+            std::os::unix::fs::lchown(path, Some(65534), Some(65534)).unwrap();
+        }
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(trash.join("tree/vendor"), fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = as_unprivileged(TEST, move || {
+            let from = fs::File::open(&trash).unwrap();
+            let to = fs::File::open(&destination).unwrap();
+            let entry = stat_at(from.as_raw_fd(), c"tree", libc::AT_SYMLINK_NOFOLLOW).unwrap();
+            let result = publish_copy_noreplace(
+                from.as_raw_fd(),
+                c"tree",
+                to.as_raw_fd(),
+                c"tree",
+                stat_identity(&entry),
+            );
+            let left = leftover_copy_stages(&destination);
+            eprintln!("restore: {result:?}; left behind: {left:?}");
+            result.is_err_and(|error| is_conflict_error(&error))
+                && left.is_empty()
+                && fs::read(vendor.join("mod.go")).unwrap() == b"package pkg"
+                && fs::read_dir(destination.join("tree")).unwrap().count() == 0
+        });
+        assert_ne!(outcome, Some(false));
+    }
+
+    /// Restore `source/item` (a `kind` of node) to `destination/item` by
+    /// copy, as a restore onto another filesystem does.
+    fn restore_by_copy(base: &Path, kind: &str) -> io::Result<()> {
+        let (source, destination) = (base.join("source"), base.join("destination"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let item = source.join("item");
+        match kind {
+            "file" => fs::write(&item, b"payload").unwrap(),
+            "symlink" => std::os::unix::fs::symlink("missing-target", &item).unwrap(),
+            "fifo" => {
+                let name = CString::new(item.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            _ => {
+                fs::create_dir_all(item.join("sub")).unwrap();
+                fs::write(item.join("sub/file"), b"payload").unwrap();
+            }
+        }
+        // O_PATH, as restore pins a destination's parent.
+        let from = open_directory_path(&source, true).unwrap();
+        let to = open_directory_path(&destination, true).unwrap();
+        let entry = stat_at(from.as_raw_fd(), c"item", libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        publish_copy_noreplace(
+            from.as_raw_fd(),
+            c"item",
+            to.as_raw_fd(),
+            c"item",
+            stat_identity(&entry),
+        )
+    }
+
+    // store-fs-7: a restore by copy removed the trash copy without making
+    // the destination's directory entry durable. The copy's data is synced
+    // under its staging name; the rename to its final name was not, and the
+    // trash is on another filesystem, which commits on its own: a crash
+    // could keep the unlink and lose the rename. The destination is synced
+    // first (a tree with its filesystem, for the entries inside it), and
+    // while that fails the trash copy stays.
+    #[test]
+    fn restore_by_copy_syncs_the_destination_before_retiring_the_trash_copy() {
+        for kind in ["file", "symlink", "fifo", "directory"] {
+            let base = tempfile::tempdir().unwrap();
+            RESTORE_COPY_EVENTS.take();
+            restore_by_copy(base.path(), kind).unwrap();
+            assert_eq!(RESTORE_COPY_EVENTS.take(), ["sync", "retire"], "{kind}");
+            assert!(fs::symlink_metadata(base.path().join("source/item")).is_err());
+            assert!(fs::symlink_metadata(base.path().join("destination/item")).is_ok());
+
+            let base = tempfile::tempdir().unwrap();
+            DESTINATION_SYNC_ERRNO.set(Some(libc::EIO));
+            let result = restore_by_copy(base.path(), kind);
+            DESTINATION_SYNC_ERRNO.set(None);
+            assert_eq!(
+                result.as_ref().map_err(io::Error::raw_os_error),
+                Err(Some(libc::EIO)),
+                "{kind}"
+            );
+            assert_eq!(RESTORE_COPY_EVENTS.take(), [""; 0], "{kind}");
+            assert!(
+                fs::symlink_metadata(base.path().join("source/item")).is_ok(),
+                "{kind}: the trash copy was retired"
+            );
+            assert_eq!(
+                fs::read_dir(base.path().join("destination"))
+                    .unwrap()
+                    .count(),
+                0,
+                "{kind}: the copy that could not be made durable was left"
+            );
+
+            // A filesystem that syncs no directories at all (EINVAL) is
+            // not a failed sync: the restore goes on, as it always did.
+            let base = tempfile::tempdir().unwrap();
+            DESTINATION_SYNC_ERRNO.set(Some(libc::EINVAL));
+            let result = restore_by_copy(base.path(), kind);
+            DESTINATION_SYNC_ERRNO.set(None);
+            assert!(result.is_ok(), "{kind}: {result:?}");
+            assert_eq!(RESTORE_COPY_EVENTS.take(), ["retire"], "{kind}");
+            assert!(fs::symlink_metadata(base.path().join("destination/item")).is_ok());
+        }
+    }
+
+    /// Seed the entry `id` with its sidecar's text after the `Path=` line.
+    fn seed_entry(store: &TrashStore, original: &Path, id: &str, rest: &str) {
+        fs::write(store.home.join("files").join(id), id).unwrap();
+        fs::write(
+            store.home.join(format!("info/{id}.trashinfo")),
+            format!("[Trash Info]\nPath={}\n{rest}", original.display()),
+        )
+        .unwrap();
+    }
+
+    // store-metadata-7: DeletionDate is local time without an offset. In
+    // the hour a DST fall-back repeats, both readings resolve to the later
+    // one, so a file deleted at 01:50 EDT sorted after one deleted twenty
+    // minutes later, at 01:10 EST, and `undo` restored the wrong one. The
+    // exact instant both writers record, X-Trashd-DeletedNs, only broke
+    // ties within a second. Re-exec'd: the zone is the whole process's.
+    #[test]
+    fn newest_first_orders_by_the_recorded_instant_across_a_dst_fold() {
+        const TEST: &str =
+            "store::tests::newest_first_orders_by_the_recorded_instant_across_a_dst_fold";
+        const CHILD: &str = "TRASHD_TEST_DST_FOLD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .env("TZ", "America/New_York")
+                .env("TRASH_BYPASS", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "the America/New_York child failed");
+            return;
+        }
+        use chrono::TimeZone;
+        let (store, _data, work, _) = test_store();
+        let instant = |hour, minute| {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 11, 1, hour, minute, 0)
+                .unwrap()
+                .timestamp_nanos_opt()
+                .unwrap()
+        };
+        for (id, local, stamp) in [
+            ("deleted-first", "2026-11-01T01:50:00", instant(5, 50)),
+            ("deleted-last", "2026-11-01T01:10:00", instant(6, 10)),
+        ] {
+            seed_entry(
+                &store,
+                &work.path().join(id),
+                id,
+                &format!("DeletionDate={local}\nX-Trashd-DeletedNs={stamp}\n"),
+            );
+        }
+        let listed: Vec<String> = store
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(listed, ["deleted-last", "deleted-first"]);
+        assert_eq!(store.undo().unwrap(), work.path().join("deleted-last"));
+    }
+
+    // store-metadata-7: the stamp orders entries only where it agrees with
+    // the DeletionDate it was written with (time zones are at most 26 hours
+    // apart). A sidecar whose date another tool rewrote, or a forged stamp,
+    // sorts by its date, as an entry without a stamp does.
+    #[test]
+    fn a_deletion_stamp_far_from_its_date_does_not_order_an_entry() {
+        let (store, _data, work, _) = test_store();
+        let stamp = |date: &str| {
+            TrashInfo::from_trashinfo(&format!(
+                "[Trash Info]\nPath=/original\nDeletionDate={date}\n"
+            ))
+            .unwrap()
+            .deletion_date
+            .timestamp_nanos_opt()
+            .unwrap()
+        };
+        let far = stamp("2030-01-01T00:00:00");
+        let near = stamp("2026-03-01T12:00:00") + 999_999_999;
+        for (id, rest) in [
+            (
+                "forged",
+                format!("DeletionDate=2026-01-01T12:00:00\nX-Trashd-DeletedNs={far}\n"),
+            ),
+            (
+                "unstamped",
+                "DeletionDate=2026-02-01T12:00:00\n".to_string(),
+            ),
+            ("early", "DeletionDate=2026-03-01T12:00:00\n".to_string()),
+            (
+                "late",
+                format!("DeletionDate=2026-03-01T12:00:00\nX-Trashd-DeletedNs={near}\n"),
+            ),
+        ] {
+            seed_entry(&store, &work.path().join(id), id, &rest);
+        }
+        let listed: Vec<String> = store
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(listed, ["late", "early", "unstamped", "forged"]);
+    }
+
+    // store-fs-7: a destination directory its user may write but not read
+    // cannot be opened to be synced. A restore into it still goes through,
+    // as it did before. Root may read anything: the case runs unprivileged.
+    #[test]
+    fn restore_by_copy_into_a_write_only_directory_still_succeeds() {
+        const TEST: &str =
+            "store::tests::restore_by_copy_into_a_write_only_directory_still_succeeds";
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: unprivileged fixture setup requires root");
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let (source, destination) = (base.path().join("source"), base.path().join("drop-box"));
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("item"), b"payload").unwrap();
+        for path in [&source, &destination, &source.join("item")] {
+            std::os::unix::fs::lchown(path, Some(65534), Some(65534)).unwrap();
+        }
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o300)).unwrap();
+        let outcome = as_unprivileged(TEST, move || {
+            let from = open_directory_path(&source, true).unwrap();
+            let to = open_directory_path(&destination, true).unwrap();
+            let entry = stat_at(from.as_raw_fd(), c"item", libc::AT_SYMLINK_NOFOLLOW).unwrap();
+            RESTORE_COPY_EVENTS.take();
+            let result = publish_copy_noreplace(
+                from.as_raw_fd(),
+                c"item",
+                to.as_raw_fd(),
+                c"item",
+                stat_identity(&entry),
+            );
+            let events = RESTORE_COPY_EVENTS.take();
+            eprintln!("restore: {result:?}; {events:?}");
+            result.is_ok()
+                && events == ["retire"]
+                && fs::symlink_metadata(source.join("item")).is_err()
+                && fs::read(destination.join("item")).is_ok_and(|data| data == b"payload")
+        });
+        assert_ne!(outcome, Some(false));
     }
 }

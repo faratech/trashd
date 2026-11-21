@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed
+
+- Automatic zstd compression during retention is opt-in
+  (`retention.auto_compress`, default `false`). GNOME Files, Dolphin and
+  other spec implementations restore an entry's stored bytes as they
+  are, so an auto-compressed entry came back from them as zstd data.
+  `trash compress` and `trash restore` are unchanged. (#538)
+
+- The preload limits each file by `max_file_size_mb` alone, as the shim
+  and the supervisor do; `max_dir_size_mb` bounds directories. A
+  standalone file between the two caps was deleted for real by the
+  preload and trashed by the other layers. A tree removed through the
+  preload is therefore trashed file by file even when it exceeds
+  `max_dir_size_mb`; the #412 entry above overstated what its per-file
+  check did. (#454, #548, #487)
+
+- Automatic retention no longer stats network or FUSE mounts (NFS,
+  CIFS/SMB, 9p, sshfs and the like). A dead server or an unresponsive
+  FUSE daemon hung `rm` and every delete in a wrapped root session.
+  `trash ls`, `trash empty` and `trash status` still include those
+  trashes. (#511)
+
 ### Performance
 
 - The recorded deleting command in each `.trashinfo` is capped at 256
@@ -23,7 +45,31 @@
 - Release builds strip symbols and use thin LTO with one codegen unit:
   installed binaries and the preload library shrink 25–36%.
 
+- `rm -r` of a directory that a `never_trash` pattern excludes along
+  with everything below it (`/tmp/*`, `*/node_modules`) deletes the tree
+  in one pass again, as before the per-entry sweep for excluded
+  directories: 20,200 entries in about 0.2 s instead of 0.8 to 1.9 s.
+  Exclusions that name only the directory itself (`*~`, an `only_trash`
+  miss) are still swept entry by entry. (#448, #553)
+
 ### Fixed
+
+- The preload's permission grant for an unreadable empty directory
+  (#410) also checks that the name still holds a directory, not only
+  the same device and inode number: ext4 can hand a removed directory's
+  inode number straight to a symlink created in its place, and the
+  delete then failed with `EACCES` instead of reaching the kernel.
+
+- Restore's move out of `files/`, `trash compress`'s marker and data
+  publication, and the `directorysizes` cache (read, rebuild and the
+  per-directory record) also go through the descriptors the trash lock
+  validated. They were the last store mutations still reached by path,
+  so a FUSE or NFS server could still swap `files/` or `info/` for a
+  symlink after the lock's check. (#508 follow-up)
+
+- `tests/packaging_lint.py` checks the Makefile's man page list against
+  the pages `build.rs` generates, and the install regression covers a
+  `PREFIX` with a space or a tab; #424 and #425 had no direct test.
 
 - The shim honors `--preserve-root`/`--no-preserve-root` in command-line
   order (the last flag wins, as in GNU rm) and refuses abbreviated
@@ -116,6 +162,579 @@
   symlinks per home; and uninstall/purge enumerate homes from
   `getent passwd` instead of only `/home/*` and `/root`.
   (#406, #407, #408, #420, #421, #422, #423, #424, #425, #426, #427)
+
+- Retention no longer purges an entry published while a listing ran
+  between its `info/` and `files/` passes. The entry looked like an
+  orphan dated by its data's old mtime, and auto-purge deleted it along
+  with its valid sidecar. Orphans now age from their arrival in `files/`
+  (`max(mtime, ctime)`), the orphan pass skips data whose sidecar parses
+  by then, and a purge under the root lock refuses an orphan whose
+  sidecar parses. Entries torn by a crash are kept the same way. (#534,
+  #554, #522)
+
+- Legacy sidecars larger than the 64 KiB read cap (a full argv in
+  `X-Trashd-Command`) are read line by line with the command capped, so
+  they keep their real path and date instead of turning their data into
+  an orphan that retention purged. A sidecar that still cannot be parsed
+  keeps its data listed, and neither retention nor `empty --older`
+  purges it. (#556)
+
+- An operand larger than `retention.max_size_gb` whose trash is on the
+  home filesystem is refused (`rm` keeps it; use `rm --permanent`).
+  Before, it was trashed and size trimming then purged every older entry
+  to make room. Trimming purges only entries at least an hour old,
+  leaves an entry larger than the whole cap out of the excess, and
+  purges nothing when the eligible entries cannot bring the trash under
+  the cap. (#519)
+
+- Size trimming counts and purges only trashes on the home filesystem,
+  measures other trashes by allocated size, and orders future
+  `DeletionDate`s as now, so a sparse file or a forged date on removable
+  media can no longer empty the home trash. Cross-device trashing
+  fdatasyncs the new sidecar and fsyncs `info/` before retiring the
+  source, where the trash copy becomes the only copy. (#520, #522)
+
+- install.sh and `make install` put the optional i686 preload where this
+  host's loaders actually expand `$LIB` (as `ld.so --list-diagnostics`
+  reports it, glibc 2.33+) and register the `$LIB` entry only then;
+  everywhere else they register the 64-bit library alone. The fixed
+  `lib64/` + `lib/` layout could not be resolved on Debian/Ubuntu
+  (`lib/<triplet>`) and loaded the wrong ELF class on Arch, so every
+  process printed a preload error and ran without Layer 2. A `$LIB`
+  entry that does not load cleanly after registration is replaced by the
+  flat entry, and stale per-ABI trees are deleted only after no entry
+  names them. (#469, #550, #470, #406)
+
+- install.sh and `make install` set umask 022 and create the trashd tree
+  and `/etc/trashd` with mode 0755, so `/etc/ld.so.preload` is left at
+  0644 even when sudo carries a hardened 027/077 umask. The package
+  scriptlets also chmod the list after registering. Before this, an
+  unreadable list or tree silently turned off Layers 1 and 2 for every
+  non-root user. (#473)
+
+- The Arch package ships its scriptlets in `packaging/trashd.install`
+  (`install=` in the PKGBUILD). pacman never ran the functions written
+  into the PKGBUILD, so the package never registered the preload. Both
+  packages now drop the entry before their files are erased (RPM
+  `%preun` on erase, Arch `pre_remove`) instead of afterwards, when it
+  already named a deleted library. (#474, #549, #477, #551,
+  #408)
+
+- `make install` probes the built preload and binaries with the host's
+  loader before copying anything, as install.sh does (#191). A preload
+  built against a newer glibc than the host's no longer reaches
+  `/etc/ld.so.preload`, where it would stop every dynamically linked
+  program. Its `/etc/ld.so.preload` rewrites are single `&&` chains: a
+  failed awk no longer replaces the list with a partial copy, and
+  uninstall stops before deleting a library that is still registered.
+  (#475, #471)
+
+- The root login hook no longer wraps a shell given a `-c` command, or a
+  non-login interactive shell. `bash -lic 'cmd'` used to discard `cmd`
+  and exit 0 (or run its stdin as root commands), and Fedora's
+  `/etc/bashrc` turned every interactive root bash into a login shell. A
+  busybox login shell is re-executed as `busybox sh -l`; `busybox -l`
+  failed with "applet not found" and ended the login. (#476, #472)
+
+- install.sh and the Makefile refuse a `PREFIX` containing a backslash.
+  `awk -v` unescaped it, so reinstalls duplicated the entry and
+  uninstall left it naming a deleted library. (#480)
+
+- Source installs stage the build under `$TMPDIR` instead of a hardcoded
+  `/tmp`. They stop with a clear message before any change if the stage
+  is mounted `noexec`, and as root they accept only a `TMPDIR` that
+  nobody but root can modify. (#479)
+
+- `trash self-update` run as root starts the installer with a cleared
+  environment and always an explicit, validated `PREFIX`. Before, a
+  `PREFIX` inherited through `su` or `sudo -E` decided where root
+  installed the library every process loads, bypassing the
+  root-owned-prefix check (#199). (#441)
+
+- The fanotify daemon exits with status 78 when fanotify cannot run at
+  all (kernel older than 5.9, no `CAP_SYS_ADMIN`, or no fanotify). The
+  unit's `RestartPreventExitStatus=78` stops `Restart=always` from
+  relaunching it every 5 seconds forever. (#464)
+
+- The daemon unit raises journald's per-unit rate limit from 10,000 to
+  100,000 lines per 30 s, because one large `rm -rf` dropped most of its
+  DELETE audit lines. The limit stays finite so local users cannot flood
+  the journal. (#461)
+
+- The release workflow builds with a read-only token that is not
+  persisted into `.git/config`. Provenance is attested in a separate job
+  that runs no build code, and only the release job, which builds
+  nothing, can write releases and tags. CI's checkout no longer persists
+  its token either. (#478)
+
+- The shim asks about a write-protected file only when stdin is a
+  terminal and `-f` is not in effect, as GNU rm and POSIX do: `xargs rm`
+  and `while read` loops no longer keep read-only files with exit 0 or
+  swallow the caller's piped input; `-i` still asks without a terminal.
+  (#512)
+
+- The shim decides "write-protected" with the kernel's own check
+  (`faccessat(W_OK, AT_EACCESS)`), like GNU rm: files writable through a
+  supplementary group or an ACL are no longer asked about, and a file
+  whose group bits deny the user is. (#513)
+
+- `rm -d` of a directory the user cannot list, and the last step of a
+  walk over an excluded directory, remove with rmdir(2) only: a regular
+  file swapped in meanwhile is refused with "Not a directory" instead of
+  being permanently unlinked. (#514)
+
+- Passthrough (`--permanent`, `TRASH_BYPASS=1`, bypassed callers,
+  `--help`) runs the real rm as `rm`, so GNU's usage lines, `Try 'rm
+  --help'` hints and `-i` prompts no longer show the internal stash
+  path. (#515)
+
+- `--preserve-root=all` is no longer dropped by a later plain
+  `--preserve-root` (an alias plus an explicit flag): mount-point
+  operands stay refused instead of being emptied into the trash. (#516)
+
+- `rm -ri` no longer refuses trees of more than 256 directories after
+  every question was answered: the walk raises its soft open-file limit
+  toward the hard limit (up to 65536, about 21,800 directories) while it
+  plans, and restores it before spawning anything. (#517)
+
+- `rm -f` of a file that another process removes while the shim is
+  trashing it exits 0 silently, and plain `rm` reports GNU's "No such
+  file or directory"; neither prints the misleading "refusing permanent
+  removal; use --permanent" hint any more. (#518)
+
+- The shim no longer deletes a directory tree for real because of the
+  directory's own name. A directory excluded by an `only_trash` miss
+  (`rm -r src` with `only_trash = ["src/*"]`, any project directory with
+  `only_trash = ["*.rs"]`) or by a `never_trash` suffix (`rm -rf
+  thesis~`, `export.tmp/`) is emptied entry by entry: entries that may
+  be trashed are trashed, entries excluded themselves are deleted for
+  real, and the emptied directories are removed, as `rm -ri`, the
+  preload and the supervisor already judged each entry. Whitelisted
+  files inside were destroyed with exit 0. The store now says why it
+  excludes a path (`TrashError::Excluded { path, kind }`). (#448, #553,
+  #544)
+
+- The preload drops an empty `only_trash` pattern like the other layers:
+  the #402 fix had not reached it, so `only_trash = [""]` still made
+  every delete it handled permanent. Both layers now share one set of
+  pattern rules. (#455, #547)
+
+- Patterns written for a directory or relative to `.` are normalized at
+  load time and by `trash config add`: `src/` means `src/*`, and
+  `./build/*` means `build/*`. Patterns that can never match a path
+  (`a//b`, `a/./b`) and `/` or `~/` on their own are rejected with a
+  warning; as a whitelist's only entry such a pattern made every delete
+  permanent. (#450)
+
+- `~/` patterns match the home directory both as written and with its
+  symlinks resolved. With a home reached through a symlink, `only_trash
+  = ["~/projects/*"]` matched nothing and every delete was permanent.
+  (#451)
+
+- Without any configuration directory (no usable `XDG_CONFIG_HOME` or
+  `HOME` and no passwd entry), the user config is no longer read from or
+  written to `./~/.config/trashd/config.toml` under the current
+  directory. (#452)
+
+- A config value of the wrong type drops only that key, with a warning,
+  in trashd-common and the preload alike. trashd-common used to drop the
+  whole layer over a key the preload does not read (`sha256_max_size_mb
+  = 0.5`), so the layers ran different policies. (#460)
+
+- Trash ids fit the trash filesystem's own name limit (143 bytes on
+  eCryptfs, not an assumed 255), and a name the filesystem still refuses
+  as too long is claimed again shorter. The preload turned that refusal
+  into a permanent delete. (#459)
+
+- The shim and the preload use a mount's topdir trash only for files on
+  that mount's own filesystem, as the supervisor already did. A file in
+  a nested btrfs subvolume went to a topdir trash that `trash ls`,
+  `restore`, `undo` and retention never list. (#456)
+
+- `bypass_paths` is matched against the program that ran `rm`, not
+  against the shim itself: a prefix covering trashd's install directory
+  (`/usr/local/`) made every shim delete permanent. (#457)
+
+- A recursive removal of an ancestor of the trash no longer destroys it.
+  Once a process has trashed into a trash, the preload refuses (`EBUSY`)
+  to delete anything in that trash for real, so `rm -rf ~/.local/share`
+  keeps both the entries it just moved there and the older ones. The
+  supervisor answers `EBUSY` for the trash root, its `files/` and
+  `info/`, and their ancestors instead of letting the kernel delete
+  them. The store refuses the trash and its ancestors even where policy
+  excludes them (`rm -rf ~/.local` under a whitelist). Emptying tools
+  run as their own processes and keep working. (#458)
+
+- A `trash empty`, `purge` or `restore`, or a cross-device `rm`, inside
+  a `trashd-exec` session no longer hangs the whole session when another
+  process deletes a file at the same time. These operations unlinked
+  while holding the trash root lock, and each unlink traps into the
+  session's supervisor, which may itself be waiting for that lock. Purge
+  and restore now move data and sidecars into the root's private state
+  directory under the lock and delete them after releasing it. Restore
+  copies across filesystems, and both copy fallbacks retire their
+  source, without the root lock; an entry lock keeps purges away from
+  the fresh copy. A long cross-device restore no longer holds every
+  trash writer of the user. (#521, #539)
+
+- A file another process held an `flock` on when it was deleted no
+  longer blocks trashd forever. `trash purge`, `empty`, `restore` and
+  `compress` (including `--dry-run`) wait up to 5 seconds for the entry
+  and then report it busy, and retention skips it until its next pass.
+  In a seccomp supervisor, retention stalled every delete of the session
+  behind such an entry. (#526, #447)
+
+- The operation log caps the recorded command at 256 bytes, as sidecars
+  do. The shim records its whole argv for every operand, so one `rm` of
+  thousands of files wrote gigabytes of log under the root lock, and its
+  rotations erased all earlier history. Trash records are now written
+  after the root lock is released. (#536)
+
+- Log rotation retires only the log it measured. It runs under a lock on
+  the log, and a writer whose log another writer already rotated appends
+  to the new one. Before, it renamed the new log over
+  `operations.log.1`, deleting the previous generation and losing its
+  own record. (#541)
+
+- `trash empty` no longer fails with "deletion jobs still need cleanup"
+  when its sweep of detached deletion jobs races another process still
+  removing the same tree. A directory the other remover deleted first
+  counts as removed. (#535)
+
+- Error messages and `trash compress --dry-run` lines escape control
+  characters in recorded paths and trash IDs, as listings already did. A
+  crafted `.trashinfo` on removable media (`Path=...%1B]52;...%07`)
+  could write to the clipboard or rewrite the screen through `trash
+  restore`, `undo`, `purge` or `empty` errors; the store's restore,
+  purge and empty warnings are escaped too. (#442)
+
+- `trash empty` exits non-zero when a confirmed entry changed while the
+  prompt waited (it was compressed, or its sidecar was rewritten or
+  touched). Such an entry was counted as already gone; it is kept and
+  reported. An ID reused by a different entry still counts as gone.
+  (#523, #543)
+
+- `trash compress` exits non-zero when every compression attempt failed
+  (for example an unwritable state directory or a full disk), instead of
+  printing "Nothing to compress." and exiting 0; partial failures end
+  with a count of the items that could not be compressed. (#443)
+
+- `trash compress --dry-run` measures the compressed size without
+  writing a full compressed copy of each candidate into the trash's
+  state directory, so it needs no free space or write access there and
+  leaves nothing behind when interrupted. (#490)
+
+- `trash config set/add/remove` edit the file in place and keep
+  comments, blank lines and key order, including the commented template
+  `trash config edit` seeds; they previously rewrote the file from a
+  parsed table and dropped them all. Settings promoted from a legacy
+  `[retention]` table move with their comments. (#446)
+
+- The audit daemon names btrfs subvolume mounts it cannot monitor in one
+  prominent warning, and its status line reports them as not monitored.
+  The kernel refuses whole-filesystem fanotify marks on subvolumes
+  (`EXDEV`), and the default `/` and `/home` on Fedora, openSUSE and
+  Ubuntu-on-btrfs are subvolumes; the other layers still protect them.
+  (#463)
+
+- The audit daemon keeps every directory it learned from one read until
+  that read's deletions are logged. When a read carried more removed
+  directories than the 4,096-entry cache holds, the outermost were
+  evicted first and their entries were logged as bare names. (#468)
+
+- A trash root is changed only through the directory descriptors its
+  lock validated: `files/`, `info/` and `.trashd/` are opened without
+  following a symlink, must be owned by the user with mode 0700 and must
+  be on the root's own device. Entry validation, the entry lock, purge,
+  restore's sidecar removal, new-entry claims, renames, cross-device
+  copies and sidecar rewrites all go through them, and topdir trashes
+  are listed through the same kind of descriptor. A FUSE or NFS server
+  could answer `files` with a private directory for the lock's check and
+  with a symlink to `/etc` for every later lookup. Routine retention
+  running as root then purged files there, and a root delete on such a
+  mount published its copy in `/etc/sudoers.d`. (#508, #509)
+
+- Another user's FUSE mount (its `user_id=` mount option is not the
+  caller's, or is missing) never holds a topdir trash: neither the store
+  nor the preload probes or selects one there, and deletes on it are
+  copied to the home trash. A regular file copied off a `nosuid`
+  filesystem keeps no set-id bits, file capabilities or `trusted.*`
+  attributes. (#508, #509)
+
+- Repairing a trash directory's mode (store, mount discovery and the
+  preload) goes through a descriptor of the directory just checked. It
+  used chmod(2) of the path, which followed a symlink swapped in after
+  the check and could chmod `/` or a setuid binary to 0700. (#510)
+
+- Purge opens up a directory lacking u+rwx only through a pinned
+  descriptor of the directory it statted. Its path-following retry
+  chmodded whatever a racing process had swapped in, such as
+  `/etc/passwd`, to 0700. (#528)
+
+- The fanotify daemon never marks or statfs's FUSE filesystems. Their
+  marks always fail, but only after the kernel has asked the server for
+  statfs, and a hostile or dead server never answers, which stalled the
+  daemon. Its startup resolution list now comes from the mounts it
+  marked rather than a statfs of every mount. (#462)
+
+- When two mounted filesystems share an fsid (a cloned or snapshotted
+  ext4 keeps its UUID), the daemon no longer decodes deletion handles on
+  whichever one sorted first, which could log a path on the wrong
+  filesystem or stop at its ESTALE. Such deletions are logged by file
+  name only, after one warning naming the fsid. (#466)
+
+- trashd-exec's workers ignore SIGTERM like the other job signals and
+  are torn down with SIGKILL. A process-group SIGTERM (bash `kill %1`,
+  GNU `timeout`, a systemd stop) ended both workers while the command
+  ran its cleanup, whose deletes then failed with ENOSYS. (#493)
+
+- trashd-exec no longer forwards a signal that a member of the command's
+  own process group sent to the whole group (`kill 0`, `trap 'kill 0'
+  EXIT`). The command received it twice, which many tools take as "force
+  quit". A group signal sent from outside the job still cannot be told
+  from one sent to the wrapper alone. (#498)
+
+- A wrapped root login no longer hangs `exit` (ssh, `sudo -i`, `su -`)
+  while a setsid daemon it started (tmux, ssh-agent, gpg-agent, a SysV
+  service) is alive. A keeper process reports the command's status once
+  only descendants outside the session remain, and keeps protecting them
+  until they exit. (#495)
+
+- 32-bit programs (i386 and x32 on x86-64, AArch32 on aarch64) run under
+  trashd-exec; every one of their syscalls used to fail with ENOSYS.
+  Only their deletes, io_uring and landlock_restrict_self calls are
+  refused. (#496)
+
+- The seccomp supervisor no longer hangs on a lost broker reply.
+  Requests carry no descriptor (an orchestrator at its descriptor limit
+  could not receive one), replies are matched by request id, and a
+  request times out after 5 seconds. (#494)
+
+- Watchdog failover hands queued deletes to the replacement supervisor
+  instead of continuing them, which was a permanent delete for static
+  and raw-syscall callers. Only repeated rapid supervisor deaths decline
+  the queue. (#497)
+
+- The seccomp supervisor's launch-time store defers retention until the
+  trapped syscall is answered, as reloaded stores already did. (#499)
+
+- A config load can no longer panic on a failing stderr, and a panicking
+  config reload keeps the previous store serving, so the dequeued delete
+  is still answered. (#500, #449)
+
+- The supervisor lends its credentials only to targets with the same
+  SELinux/AppArmor/Smack label. A confined process with root's
+  credentials no longer has deletions its policy denies carried out
+  under the supervisor's label. (#503)
+
+- Config reloads in a seccomp session follow symlink retargets and files
+  with normalized mtimes (Nix, home-manager), keyed on the link's and
+  the file's identity, size and ctime. (#501)
+
+- A scoped openat2 lookup that fails with a transient EAGAIN is retried
+  up to 16 times instead of declining the delete. (#505)
+
+- A parent directory on a lazily unmounted or overmounted mount is no
+  longer trusted at its /proc readlink spelling, which misdirected
+  policy, the trash choice and Path=. (#506)
+
+- An entry swapped for a directory, file or populated tree after the
+  supervisor's unlink/rmdir checks gets the kernel's
+  EISDIR/ENOTDIR/ENOTEMPTY instead of being trashed with success. (#507)
+
+- The walk that sizes a directory when it is trashed holds one
+  descriptor per level instead of one per subdirectory. A directory with
+  more subdirectories than the descriptor limit (a cargo registry, a
+  photo library) recorded a fraction of its size in `X-Trashd-Size` and
+  `directorysizes` for the life of the entry, which hid it from the size
+  cap, `trash du` and `trash status`. A walk that still runs out of
+  descriptors records no size, and accounting measures the tree itself.
+  (#527)
+
+- Directories can be trashed when the trash is on a filesystem without
+  `RENAME_NOREPLACE` (NFS, 9p, FUSE without rename2). The copy fallback
+  published into `files/` with the same flag and then refused every
+  directory, each time after a full copy. The staged copy is now renamed
+  over an empty directory created exclusively for it in the private
+  `files/`. Restoring a directory onto such a filesystem is still
+  refused. (#529)
+
+- A compressed entry restores whatever `max_file_size_mb` is set to
+  later. Restore bounded decompression by the current setting, which
+  only limits what may enter the trash: lowering it left larger
+  compressed entries unrestorable, and automatic compression never
+  looked at it. The bound is now the size the entry recorded when it was
+  trashed (at least 64 MiB, at most 4 GiB), and `trash compress` leaves
+  alone data larger than that. (#524, #555, #444)
+
+- `trash restore --force` keeps a recorded path's confinement when it
+  retries under a `.N` name: the retry stays below the entry's topdir
+  and follows no symlinked ancestor. The retry was treated as a
+  destination the user chose, so a crafted sidecar with an empty `Path=`
+  on removable media restored its data beside the mount point
+  (`<topdir>.1`). A recorded path that names the topdir itself is
+  refused. (#525, #445)
+
+- A failed cross-device copy removes everything it copied, read-only
+  directories included (0555 trees such as Go module caches). A failed
+  restore left a hidden `.trashd-copy-*` tree beside the destination on
+  every attempt. (#530)
+
+- Cross-device copies keep the `user.*` extended attributes of read-only
+  files and directories: attributes are copied before the mode is
+  applied. (#531)
+
+- A restore that has to copy makes its destination durable (an fsync of
+  the directory, a syncfs for a tree) before it removes the trash copy,
+  and keeps the trash copy if that fails. A crash could keep the removal
+  and lose the restored name. (#533)
+
+- A trash root whose `info/` is missing is enumerated on every mount,
+  and `trash empty`, retention and `trash fsck --fix` put `info/` back
+  before purging. The #403 fix listed the stranded data, but the root
+  lock refused the root, so it could never be removed, and such roots on
+  other mounts were not listed at all. (#537)
+
+- `trash undo` and `trash ls` order entries by the exact deletion
+  instant (`X-Trashd-DeletedNs`) before the local-time `DeletionDate`,
+  so entries deleted across a DST fall-back or a time zone change keep
+  their real order and `undo` restores the one deleted last. (#540)
+
+- A `directorysizes` rebuild measures trees deeper than 100 levels (it
+  wrote a size of 0 for them), and rows count the directories' own
+  blocks, as `du -B1` does. (#542)
+
+- When an operand is replaced by one of another type between sizing and
+  the move, the entry records the size of what landed, and gets a
+  `directorysizes` row only if a directory landed. (#492)
+
+- The preload ignores `HOME`, `XDG_*` and `TRASHD_PRELOAD_LOG` in a
+  setuid, setgid or file-capability program, where `/etc/ld.so.preload`
+  loads it too and the environment is the invoker's. It reads only
+  `/etc/trashd/config.toml` there and prepares a trash only below the
+  effective user's existing passwd home. `XDG_CONFIG_HOME` naming a
+  symlink to `/etc/shadow` had a setuid-root program print root's line
+  of it, and `XDG_DATA_HOME=/etc/nologin` had it create that directory.
+  (#481, #546, #545)
+
+- A bad-config warning (store, shim, supervisor and preload) gives the
+  line, the column and the parser's message, never the parser's own
+  rendering, which quotes the source line it stopped at. (#545, #481)
+
+- The preload checks, moves, copies and removes an entry as a name in
+  the directory the caller named: its directory descriptor, or the
+  directory its pathname led to, opened once. It used the absolute path,
+  with every directory resolved again after the checks, so a directory
+  swapped for a symlink in mid-delete had root move the entry of that
+  name elsewhere (`/etc/shadow`) into its trash, or unlink it for good
+  after a cross-device copy. On x86-64 a copied source is still removed
+  with `unlink`, through the descriptor's `/proc` link. (#482)
+
+- Deletions relative to a directory descriptor (`rm -r`, `find -delete`,
+  `shutil.rmtree`) are trashed where the descriptor's `/proc` link
+  cannot be read: no `/proc` in a chroot, or a path longer than
+  `PATH_MAX`. The preload then finds the directory's path by walking up
+  through `..`. It used to give up, and the kernel deleted the entries
+  for good. (#488)
+
+- A cross-device delete through the preload fails and keeps the file
+  when the trash cannot copy it: `EACCES`/`EPERM` for a file the
+  deleting user may not read (unlink needs no permission on the file
+  itself), `EIO` for a copy that cannot be synced. Both fell through to
+  the real unlink. An owner or timestamps the copy cannot reproduce no
+  longer fail it: root in a user namespace lost a file whose group the
+  namespace does not map to `fchown`'s EINVAL. Such a copy keeps no
+  set-id bits. (#485, #489)
+
+- A trash root's lock is released when its guard is dropped, not when
+  its last descriptor closes. A child forked by another thread during a
+  delete (a fork pool worker that never execs) kept the trash locked for
+  as long as it lived, and every writer of that trash waited. (#483)
+
+- The preload publishes its config, its `dlsym` results and its seccomp
+  verdict through atomics instead of `OnceLock`. A child forked while
+  another thread loaded the config waited forever on its first deletion.
+  (#484)
+
+- A process out of descriptors, locks, memory or disk space while the
+  preload locks a trash (`EMFILE`, `ENFILE`, `ENOMEM`, `ENOLCK`,
+  `ENOSPC`, `EDQUOT`, `EROFS`) gets the real delete, as when the trash
+  cannot be created. `unlink` used to fail with an errno it never
+  returns, which also kept a user from freeing a full disk. (#486)
+
+- The scan grant for `rmdir` of an unreadable directory (#410 in the
+  preload, #411 in the seccomp supervisor) is made, used and undone
+  through a pinned descriptor of the directory that was examined. Both
+  layers changed the mode by name, which follows a symlink: whoever
+  could rename entries in the parent swapped the directory for a link to
+  one of the caller's own files, which was then chmodded to the
+  directory's mode. The supervisor also left the grant on a directory
+  that policy excluded or that it declined to trash. Where the preload
+  cannot change the mode through a descriptor, `rmdir` now fails with
+  `EACCES` instead of removing the directory for real. (#552, #491,
+  #502, #504)
+
+- A delete that has to copy its operand into the trash (another
+  filesystem, or one without `RENAME_NOREPLACE`) no longer holds the
+  trash's lock while it copies. One large tree, or a copy stopped with
+  Ctrl-Z, made every other delete of the user wait: `rm` in another
+  terminal, a wrapped root shell, the preload inside any program's
+  `unlink()`. The copy is staged without the lock and published under
+  it, in the store (shim, CLI, supervisor) and in the preload's file
+  copy. Until then the entry's `.trashinfo` is locked, so `trash empty`,
+  retention and `trash fsck` leave the entry alone however long the copy
+  takes, and `.trashd/copy.lock` keeps cleanup from taking the staged
+  copy for an abandoned one. (#539)
+
+- Nothing waits for a trash's lock without end. A writer that finds it
+  held for 10 seconds reports the trash busy and deletes nothing: `rm`
+  says `Device or resource busy`, the preload fails the delete with
+  `EBUSY`, and the seccomp supervisor answers `EBUSY` instead of
+  declining, which lets the kernel delete for good. Every layer used to
+  block in `flock` for as long as the holder lived or stayed stopped. A
+  process that has waited the 10 seconds once waits 250 ms for the same
+  lock until it gets it again. (#539)
+
+- The store's remaining warnings (a source that could not be removed
+  after its copy, restore and purge notes, operation-log failures) are
+  written without `eprintln!`, which panics when stderr fails; in the
+  seccomp supervisor that panic ended the session's protection. (#500)
+
+- The unlocked cleanup sweep opens a trash's `.trashd` like the store's
+  other directories, following no symlink in the trash root and staying
+  on its device, and a purge reads the age of a sidecar without data
+  through the `info/` its lock validated. (#508)
+
+- The audit daemon opens a filesystem for far fewer handle lookups. Each
+  lookup opens the mount for a few microseconds, and an `umount` at that
+  instant fails with `target is busy`. The daemon no longer decodes a
+  directory that the same read of events shows removed (thousands of
+  lookups for the backlog of one `rm -rf`), and it reuses a decoded
+  directory path for 20 ms instead of decoding it again in every batch,
+  so a rename can take that long to show in logged paths. With the
+  daemon stopped during an `rm -rf` of 15,000 entries, the `umount` that
+  followed failed in 50 of 130 runs before and 1 of 130 after; without
+  the daemon it never failed. A directory is still looked up once when
+  it is first seen, so on a busy host an `umount` right after removing a
+  tree of many small directories can still fail. (#467)
+
+- `tests/sandbox.py --loop-device MIB` gives a suite an empty loop
+  device as `/dev/trashd-test-loop`. A terminated runner (SIGTERM,
+  SIGHUP) now cleans up like an interrupted one, and a killed runner
+  takes its sandbox with it, so neither leaves a loop device, mount or
+  image behind. `tests/daemon_umount_race.py` is the opt-in experiment
+  behind #467; no CI job runs it. (#467)
+
+- `install.sh` reports a started daemon as "auditing deletions on the
+  filesystems it can mark; see journalctl -u trashd" instead of
+  "monitoring deletions", and the README's architecture diagram no
+  longer says it watches all deletions system-wide. btrfs subvolume
+  mounts, tmpfs, overlay and FUSE are not audited. (#463 follow-up)
+
+- The seccomp unit test `forwards_hup_int_term_without_recycled_pids`
+  fails when an assertion in its forked case fails. The panic used to
+  end the forked process with status 0, so no assertion there could fail
+  the test.
 
 ### Documentation
 

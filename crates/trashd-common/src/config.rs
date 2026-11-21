@@ -53,6 +53,11 @@ pub struct RetentionConfig {
     /// Purge the oldest items once disk usage reaches this percent. `0` disables.
     #[serde(default = "default_disk_pressure")]
     pub disk_pressure_percent: u8,
+    /// Compress trashd's own entries older than 7 days with zstd during
+    /// retention. Off by default: other file managers restore the stored
+    /// bytes as they are, so a compressed entry comes back as zstd data.
+    #[serde(default)]
+    pub auto_compress: bool,
 }
 
 fn default_retention() -> RetentionConfig {
@@ -60,6 +65,7 @@ fn default_retention() -> RetentionConfig {
         max_age_days: default_max_age(),
         max_size_gb: default_max_size(),
         disk_pressure_percent: default_disk_pressure(),
+        auto_compress: false,
     }
 }
 
@@ -171,6 +177,7 @@ struct PartialRetention {
     max_age_days: Option<u32>,
     max_size_gb: Option<f64>,
     disk_pressure_percent: Option<u8>,
+    auto_compress: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -214,12 +221,25 @@ impl Config {
             Ok(c) => c,
             Err(_) => return None,
         };
+        let dropped = |key: &str, error: &toml::de::Error| {
+            crate::report_note(&format!(
+                "trashd: bad config {}: ignoring '{key}': {}",
+                path.display(),
+                error.message()
+            ));
+        };
         match legacy_config::normalize(&contents)
-            .and_then(|value| value.try_into::<PartialConfig>())
+            .and_then(|value| legacy_config::layer::<PartialConfig>(value, dropped))
         {
             Ok(partial) => Some(partial),
             Err(e) => {
-                eprintln!("trashd: bad config {}: {}", path.display(), e);
+                // Never eprintln!: it panics on a failing stderr, and a
+                // seccomp supervisor outlives its terminal (common-policy-3).
+                crate::report_note(&format!(
+                    "trashd: bad config {}: {}",
+                    path.display(),
+                    legacy_config::describe(&e, &contents)
+                ));
                 None
             }
         }
@@ -236,6 +256,9 @@ impl Config {
             }
             if let Some(v) = ret.disk_pressure_percent {
                 self.retention.disk_pressure_percent = v;
+            }
+            if let Some(v) = ret.auto_compress {
+                self.retention.auto_compress = v;
             }
         }
         if let Some(v) = partial.max_file_size_mb {
@@ -302,10 +325,7 @@ impl Config {
 
     /// User config path: ~/.config/trashd/config.toml
     pub fn user_config_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.config"))
-            .join("trashd")
-            .join("config.toml")
+        user_config_path_in(dirs::config_dir())
     }
 
     /// Legacy alias — returns user config path for backward compatibility.
@@ -314,52 +334,75 @@ impl Config {
     }
 
     /// Check if a path should skip trash (real-delete instead).
+    pub fn should_skip(&self, path: &Path) -> bool {
+        self.exclusion(path).is_some()
+    }
+
+    /// Why a path skips the trash (is deleted for real), if it does.
     ///
     /// Logic:
     ///   1. Check per-directory .trashd.toml (if present, its rules apply)
     ///   2. If path matches `never_trash` → skip (real-delete)
     ///   3. If `only_trash` is non-empty and path doesn't match → skip (real-delete)
     ///   4. Otherwise → trash it
-    pub fn should_skip(&self, path: &Path) -> bool {
+    ///
+    /// The verdict is for this path alone: a directory's entries are judged
+    /// by their own paths (common-policy-1, common-policy-2).
+    pub fn exclusion(&self, path: &Path) -> Option<ExclusionKind> {
         // Global never_trash is an unconditional veto. A local policy cannot
         // change it, so excluded paths need no filesystem policy walk.
         if pattern_matches_any(&self.never_trash, path) {
-            return true;
+            return Some(ExclusionKind::NeverTrash);
         }
         // Check per-directory .trashd.toml overrides
         if let Some(local) = Self::load_local_config(path) {
             // Local never_trash wins first
             if !local.never_trash.is_empty() && pattern_matches_any(&local.never_trash, path) {
-                return true;
+                return Some(ExclusionKind::NeverTrash);
             }
             // Local only_trash: if set, it takes precedence over global only_trash
             if !local.only_trash.is_empty() {
-                if !pattern_matches_any(&local.only_trash, path) {
-                    return true; // doesn't match local whitelist → skip
-                }
                 // The global veto already passed. Local only_trash overrides
                 // global only_trash, which must not be re-applied here.
-                return false;
+                return (!pattern_matches_any(&local.only_trash, path))
+                    .then_some(ExclusionKind::NotWhitelisted);
             }
         }
 
-        !self.only_trash.is_empty() && !pattern_matches_any(&self.only_trash, path)
+        (!self.only_trash.is_empty() && !pattern_matches_any(&self.only_trash, path))
+            .then_some(ExclusionKind::NotWhitelisted)
     }
 
     /// Evaluate only this configuration's rules, without reading local files.
     /// Useful when the caller supplies an explicit, isolated configuration.
     pub fn should_skip_configured(&self, path: &Path) -> bool {
+        self.exclusion_configured(path).is_some()
+    }
+
+    /// `exclusion` without local files (see `should_skip_configured`).
+    pub fn exclusion_configured(&self, path: &Path) -> Option<ExclusionKind> {
         // Global never_trash always wins
         if pattern_matches_any(&self.never_trash, path) {
-            return true;
+            return Some(ExclusionKind::NeverTrash);
         }
-
         // Global only_trash: if set and path doesn't match, skip
-        if !self.only_trash.is_empty() && !pattern_matches_any(&self.only_trash, path) {
-            return true;
-        }
+        (!self.only_trash.is_empty() && !pattern_matches_any(&self.only_trash, path))
+            .then_some(ExclusionKind::NotWhitelisted)
+    }
 
-        false
+    /// Whether a never_trash pattern excludes `dir` together with everything
+    /// that can ever be below it, so a recursive removal may delete the tree
+    /// for real in one pass instead of judging each entry: the pattern ends
+    /// in an unescaped `*`, which matches across `/` (`/tmp/*`,
+    /// `~/.cache/*`), or names a literal component (`*/node_modules`).
+    /// Configured never_trash is a veto no local policy can lift, so every
+    /// descendant would be excluded in turn. A suffix such as `*~` or an
+    /// only_trash miss says nothing about what a directory holds (shim-1).
+    pub fn never_trash_covers_tree(&self, dir: &Path) -> bool {
+        let path = dir.to_string_lossy();
+        self.never_trash
+            .iter()
+            .any(|pattern| pattern_covers_descendants(pattern) && pattern_matches(pattern, &path))
     }
 
     /// Look for a .trashd.toml in the file's parent directory (or ancestors).
@@ -414,6 +457,19 @@ impl Config {
     }
 }
 
+/// Without a configuration directory (no usable XDG_CONFIG_HOME or HOME,
+/// and no passwd entry) there is no user layer. The old relative fallback
+/// `~/.config` was resolved against the cwd, which anyone controlling that
+/// directory could fill with policy (common-policy-7). An absolute path that
+/// does not exist, as the preload uses, reads nothing and cannot be created
+/// by an unprivileged `trash config`.
+fn user_config_path_in(config_dir: Option<PathBuf>) -> PathBuf {
+    config_dir
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"))
+        .join("trashd")
+        .join("config.toml")
+}
+
 /// Report an unusable local policy once per process: every operand of one
 /// `rm`, and every trapped delete of a long-lived supervisor, repeated the
 /// same warning. The set is bounded so a supervisor cannot grow it forever.
@@ -435,6 +491,24 @@ fn warn_local_once(path: &Path, message: impl FnOnce() -> String) {
     warned.insert(path.to_path_buf());
     // Never panic on a closed stderr (a supervisor may outlive its terminal).
     let _ = writeln!(std::io::stderr(), "{}", message());
+}
+
+/// Why a path is kept out of the trash: deleting it for real is intended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionKind {
+    /// A never_trash pattern, global or local, names it.
+    NeverTrash,
+    /// An only_trash whitelist is in force and does not name it.
+    NotWhitelisted,
+}
+
+impl std::fmt::Display for ExclusionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExclusionKind::NeverTrash => "in the never-trash list",
+            ExclusionKind::NotWhitelisted => "not in the only-trash list",
+        })
+    }
 }
 
 /// Per-directory config (.trashd.toml).
@@ -462,16 +536,32 @@ fn pattern_matches_any(patterns: &[String], path: &Path) -> bool {
 /// Relative patterns may begin at any path-component boundary. A literal
 /// `*/name` also matches descendants of that exact component (#17).
 fn pattern_matches(pattern: &str, path: &str) -> bool {
-    let expanded;
-    let pattern = if let Some(rest) = pattern.strip_prefix("~/") {
-        let Some(home) = dirs::home_dir() else {
-            return false;
-        };
-        expanded = home.join(rest).to_string_lossy().into_owned();
-        expanded.as_str()
-    } else {
-        pattern
+    let Some(rest) = pattern.strip_prefix("~/") else {
+        return expanded_pattern_matches(pattern, path);
     };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let (raw, canonical) = crate::pattern_policy::expand_home(rest, &home);
+    expanded_pattern_matches(&raw, path)
+        || canonical.is_some_and(|canonical| expanded_pattern_matches(&canonical, path))
+}
+
+/// Whether `pattern`, once it matches a path, matches every path below it:
+/// a trailing unescaped `*` absorbs any further components, and a literal
+/// `*/name` component stays in every descendant.
+fn pattern_covers_descendants(pattern: &str) -> bool {
+    if let Some(head) = pattern.strip_suffix('*') {
+        let escapes = head.len() - head.trim_end_matches('\\').len();
+        return escapes % 2 == 0;
+    }
+    pattern.strip_prefix("*/").is_some_and(|component| {
+        !component.is_empty() && !component.contains(['/', '*', '?', '[', '\\'])
+    })
+}
+
+/// `pattern_matches` for a pattern whose `~/` is already expanded.
+fn expanded_pattern_matches(pattern: &str, path: &str) -> bool {
     // Keep common literal prefix/suffix rules allocation-free, but only
     // after excluding interior wildcard syntax (#4).
     if let Some(prefix) = pattern.strip_suffix('*')
@@ -503,44 +593,72 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
             .any(|(index, _)| crate::store::simple_glob_match(pattern, &path[index + 1..]))
 }
 
-/// Drop patterns containing syntax our matcher cannot honor (`{a,b}` brace
-/// expansion). Such patterns would otherwise silently behave wrong; in an
-/// only_trash whitelist that means nothing matches and EVERY delete becomes
-/// permanent (#4). Warn loudly so misconfiguration is visible.
-/// Whether the matcher can honour this pattern. Brace expansion is the
-/// one syntax it cannot; the loader drops such patterns (#259). The empty
-/// string matches no path at all, so in a whitelist it has the same
-/// everything-is-permanent effect (#402).
-pub fn pattern_is_supported(pattern: &str) -> bool {
-    !pattern.is_empty() && !pattern.contains(['{', '}'])
-}
+/// The rules every layer applies to configured patterns (#259, #402,
+/// common-policy-5): `config add` refuses what the loader would drop and
+/// stores what it would match.
+pub use crate::pattern_policy::{normalize_pattern, pattern_is_supported};
 
+/// Normalize configured patterns, dropping with a loud warning each one the
+/// matcher cannot honour: in an only_trash whitelist a pattern that matches
+/// nothing makes EVERY delete permanent (#4).
 fn sanitize_patterns(list: &[String], what: &str) -> Vec<String> {
-    list.iter()
-        .filter(|p| {
-            if p.is_empty() {
-                eprintln!(
-                    "trashd: WARNING: dropping empty {what} pattern '' \
-                     (it would match nothing and could real-delete everything)"
-                );
-                false
-            } else if !pattern_is_supported(p) {
-                eprintln!(
-                    "trashd: WARNING: dropping unsupported {what} pattern '{p}' \
-                     (brace expansion is not supported)"
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect()
+    crate::pattern_policy::sanitize_patterns(list, what, |warning| {
+        crate::report_note(&format!("trashd: WARNING: {warning}"));
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A tree may go in one pass only where the pattern that excludes the
+    // directory excludes everything below it too (shim-1 kept the per-entry
+    // sweep for every other exclusion).
+    #[test]
+    fn only_wildcard_tails_and_components_cover_a_tree() {
+        let config = Config {
+            never_trash: [
+                "/tmp/*",
+                "*/node_modules",
+                "*~",
+                "*.tmp",
+                "draft\\*",
+                "/srv/*/cache*",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..Config::default()
+        };
+        for covered in [
+            "/tmp/build",
+            "/tmp/a/b",
+            "/p/node_modules",
+            "/srv/x/cache.d",
+        ] {
+            assert!(
+                config.never_trash_covers_tree(Path::new(covered)),
+                "{covered}"
+            );
+            let below = Path::new(covered).join("deeper/file.rs");
+            assert!(config.should_skip_configured(&below), "{}", below.display());
+        }
+        for not_covered in [
+            "/p/thesis~",
+            "/p/export.tmp",
+            "/p/draft*",
+            "/p/src",
+            "/p/node_modules_x",
+        ] {
+            assert!(
+                !config.never_trash_covers_tree(Path::new(not_covered)),
+                "{not_covered}"
+            );
+        }
+        assert!(pattern_covers_descendants("a\\\\*"));
+        assert!(!pattern_covers_descendants("a\\*"));
+        assert!(pattern_covers_descendants("*/node*"));
+        assert!(!pattern_covers_descendants("*/node?"));
+    }
 
     // #337: an escaped `*` stays literal on the fast paths too.
     #[test]
@@ -686,6 +804,22 @@ mod tests {
         assert!(Config::load_partial(&path).is_none());
     }
 
+    // store-metadata-5: automatic compression is opt-in, set like any other
+    // retention key.
+    #[test]
+    fn auto_compress_is_off_by_default_and_layers_like_other_retention_keys() {
+        assert!(!Config::default().retention.auto_compress);
+        let mut config = Config::default();
+        config
+            .merge(toml::from_str::<PartialConfig>("[retention]\nauto_compress = true\n").unwrap());
+        assert!(config.retention.auto_compress);
+        config.merge(toml::from_str::<PartialConfig>("[retention]\nmax_age_days = 3\n").unwrap());
+        assert!(
+            config.retention.auto_compress,
+            "a later layer without it reset it"
+        );
+    }
+
     #[test]
     fn misplaced_policy_in_retention_is_rejected() {
         for key in [
@@ -773,6 +907,156 @@ mod tests {
         assert_eq!(cfg.only_trash, ["*.py"]);
         assert!(cfg.should_skip(Path::new("/home/user/main.rs")));
         assert!(!cfg.should_skip(Path::new("/home/user/script.py")));
+    }
+
+    // common-policy-5: matched paths never end in '/' nor hold '.'
+    // components, so `dir/` and `./dir/*` matched nothing; as a whitelist's
+    // only entry that made every delete permanent.
+    #[test]
+    fn directory_and_dot_relative_patterns_match_what_they_name() {
+        let home = dirs::home_dir().expect("test user has a home directory");
+        let kept = sanitize_patterns(
+            &["src/".into(), "./build/*".into(), "~/projects/".into()],
+            "only_trash",
+        );
+        assert!(
+            pattern_matches_any(&kept, Path::new("/h/p/src/x")),
+            "{kept:?}"
+        );
+        assert!(
+            pattern_matches_any(&kept, Path::new("/h/p/build/y")),
+            "{kept:?}"
+        );
+        assert!(
+            pattern_matches_any(&kept, &home.join("projects/a.rs")),
+            "{kept:?}"
+        );
+        // `~/` alone is refused rather than read as the whole home.
+        assert!(sanitize_patterns(&["~/".into()], "only_trash").is_empty());
+        let mut cfg = default_config();
+        cfg.merge(toml::from_str::<PartialConfig>("only_trash = [\"~/projects/\"]\n").unwrap());
+        assert!(!cfg.should_skip_configured(&home.join("projects/a.rs")));
+    }
+
+    // common-policy-6: policy paths have canonical parents, so a HOME
+    // reached through a symlink never matched its own `~/` patterns.
+    #[test]
+    fn home_patterns_match_through_a_symlinked_home() {
+        const CHILD: &str = "TRASHD_TEST_SYMLINKED_HOME";
+        const TEST: &str = "config::tests::home_patterns_match_through_a_symlinked_home";
+        if crate::mounts::is_rerun_child(TEST, CHILD) {
+            let base = tempfile::tempdir().unwrap();
+            let real = base.path().join("real");
+            std::fs::create_dir_all(real.join("docs")).unwrap();
+            let link = base.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            // Safety: the re-run child runs this one test on its own.
+            unsafe { std::env::set_var("HOME", &link) };
+            let canonical = std::fs::canonicalize(&real).unwrap();
+            let victim = canonical.join("docs/x");
+            let cfg = Config {
+                only_trash: vec!["~/docs/*".into()],
+                never_trash: Vec::new(),
+                ..Config::default()
+            };
+            let verdict = pattern_matches("~/docs/*", &victim.to_string_lossy())
+                && pattern_matches("~/docs/*", &link.join("docs/x").to_string_lossy())
+                && !cfg.should_skip_configured(&victim);
+            crate::mounts::report_test_verdict(Some(verdict));
+            return;
+        }
+        assert_eq!(crate::mounts::rerun_test(TEST, CHILD), Some(true));
+    }
+
+    // common-policy-7: without any configuration directory the user layer
+    // was read from (and written to) `./~/.config` under the cwd.
+    #[test]
+    fn user_config_path_is_never_relative() {
+        assert!(user_config_path_in(None).is_absolute());
+        assert_eq!(
+            user_config_path_in(Some(PathBuf::from("/c"))),
+            Path::new("/c/trashd/config.toml")
+        );
+    }
+
+    // cross-layer-7: a type error in one key dropped the whole layer here
+    // while the preload, which does not type that key, applied the rest.
+    #[test]
+    fn a_mistyped_key_drops_only_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "only_trash = [\"*.rs\"]\nmax_file_size_mb = 8192\nsha256_max_size_mb = 0.5\n\
+             hash_algorithm = 3\n[retention]\nmax_age_days = 7\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.merge(Config::load_partial(&path).expect("the valid keys still load"));
+        assert_eq!(config.only_trash, ["*.rs"]);
+        assert_eq!(config.max_file_size_mb, 8192);
+        assert_eq!(config.retention.max_age_days, 7);
+        assert_eq!(config.sha256_max_size_mb, default_sha256_limit());
+        assert_eq!(config.hash_algorithm, default_hash_algo());
+        // A file that does not parse at all still drops the layer.
+        std::fs::write(&path, "only_trash = [\"*.rs\"\n").unwrap();
+        assert!(Config::load_partial(&path).is_none());
+    }
+
+    // common-policy-4: a bad-config warning says where parsing stopped and
+    // why. The parser's own rendering quotes the offending line, and a
+    // config can be a symlink to a file that is not one.
+    #[test]
+    fn bad_config_warning_never_quotes_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "root:SECRETMARKER:19000:0:99999:7:::\n").unwrap();
+        let (loaded, notes) = crate::test_notes::of(|| Config::load_partial(&path));
+        assert!(loaded.is_none());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(!notes[0].contains("SECRETMARKER"), "{notes:?}");
+        assert!(
+            notes[0].starts_with(&format!(
+                "trashd: bad config {}: line 1, column 37: ",
+                path.display()
+            )),
+            "{notes:?}"
+        );
+    }
+
+    // common-policy-3: a seccomp supervisor outlives its terminal. A load
+    // warning written with eprintln! panicked on a stderr that fails
+    // (EIO on a hung-up pty, EPIPE, ENOSPC), outside the supervisor's guard.
+    #[test]
+    fn load_warnings_never_panic_on_a_failing_stderr() {
+        const CHILD: &str = "TRASHD_TEST_FAILING_STDERR";
+        const TEST: &str = "config::tests::load_warnings_never_panic_on_a_failing_stderr";
+        if crate::mounts::is_rerun_child(TEST, CHILD) {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, "only_trash = [\"*.{o,a}\", \"\"\nnever_trash = 3\n").unwrap();
+            let fixed = directory.path().join("fixed.toml");
+            std::fs::write(&fixed, "only_trash = [\"*.{o,a}\", \"\"]\n").unwrap();
+            // Every write to stderr now fails with ENOSPC; the verdict goes
+            // to stdout.
+            let full = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&full), 2) },
+                2
+            );
+            let survived = std::panic::catch_unwind(|| {
+                let broken = Config::load_partial(&path).is_none();
+                let mut config = Config::default();
+                config.merge(Config::load_partial(&fixed).expect("the layer parses"));
+                broken && config.only_trash.is_empty()
+            });
+            crate::mounts::report_test_verdict(Some(survived.unwrap_or(false)));
+            return;
+        }
+        assert_eq!(crate::mounts::rerun_test(TEST, CHILD), Some(true));
     }
 
     #[test]

@@ -47,6 +47,8 @@ cargo build --release --locked
 sudo ./tests/integration.sh target/release              # CLI + shim behaviour
 sudo ./tests/install_regression.sh target/release       # install.sh inside the sandbox
 sudo python3 tests/shim_regression.py target/release/trashd-rm
+python3 tests/rpm_files_check.py                         # RPM %files vs. make install
+python3 tests/packaging_lint.py                          # package scriptlets, workflow permissions
 
 # Tier 3 — seccomp under realistic Yama restrictions
 sudo env TRASH_BYPASS=1 REQUIRE_SECCOMP=1 python3 tests/sandbox.py --build-dir target/release -- \

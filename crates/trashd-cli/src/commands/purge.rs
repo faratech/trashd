@@ -7,7 +7,7 @@ pub fn run(store: &TrashStore, target: &std::ffi::OsStr) {
     let entries = match store.select_entries(target, false) {
         Ok(Some((_, entries))) => entries,
         Ok(None) => fatal(format!("trash entry not found: {label}")),
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     };
     if entries.len() > 1 {
         eprintln!(
@@ -32,6 +32,6 @@ pub fn run(store: &TrashStore, target: &std::ffi::OsStr) {
             "Purged:".green().bold(),
             label
         ),
-        Err(error) => fatal(error),
+        Err(error) => fatal_untrusted(error),
     }
 }

@@ -7,10 +7,12 @@
 //!
 //! Updated via temp file + atomic rename per spec.
 
+use crate::store_lock::RootMutationGuard;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -186,113 +188,266 @@ fn parse_cache(content: &str) -> (HashMap<Vec<u8>, DirSizeEntry>, bool) {
     (entries, malformed)
 }
 
+/// A trash root, its files/ and its info/, held open: every lookup below
+/// them starts at the directory itself, never at a path a FUSE or NFS
+/// server could answer again with a symlink once it was checked (security-1
+/// follow-up). The cache used to be staged and renamed by path, and landed
+/// wherever such a symlink pointed.
+struct Pinned<'a> {
+    root: &'a fs::File,
+    /// May be search-only (`O_PATH`) when the directory cannot be read.
+    files: Option<&'a fs::File>,
+    /// None when info/ is missing or cannot be read: no rows then.
+    info: Option<&'a fs::File>,
+}
+
+/// Open `trash_dir` and its files/ and info/ following no symlink, the
+/// children on the root's own device. An unreadable files/ is held for
+/// search only, as a path walk through it worked before.
+fn open_pinned(trash_dir: &Path) -> io::Result<(fs::File, Option<fs::File>, Option<fs::File>)> {
+    let root = crate::fdops::open_dir_nofollow_at(
+        libc::AT_FDCWD,
+        &CString::new(trash_dir.as_os_str().as_bytes())?,
+    )?;
+    let device = crate::fdops::stat_fd(root.as_raw_fd())?.st_dev;
+    let on_device = |dir: fs::File| -> io::Result<fs::File> {
+        let stat = crate::fdops::stat_fd(dir.as_raw_fd())?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        if stat.st_dev != device {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        Ok(dir)
+    };
+    let child = |name: &CStr, search_only: bool| -> io::Result<Option<fs::File>> {
+        match crate::fdops::open_dir_nofollow_at(root.as_raw_fd(), name) {
+            Ok(dir) => on_device(dir).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
+                if search_only {
+                    on_device(crate::fdops::open_path_nofollow_at(root.as_raw_fd(), name)?)
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let files = child(c"files", true)?;
+    let info = child(c"info", false)?;
+    Ok((root, files, info))
+}
+
 /// Write/update the directorysizes cache for a trash directory.
-/// Uses a unique temp file + atomic rename per spec.
+/// Uses a unique temp file + atomic rename per spec, through descriptors
+/// opened following no symlink.
 pub fn write_cache(trash_dir: &Path) -> io::Result<()> {
-    write_cache_with(trash_dir, dir_size_bytes)
+    let (root, files, info) = open_pinned(trash_dir)?;
+    let pinned = Pinned {
+        root: &root,
+        files: files.as_ref(),
+        info: info.as_ref(),
+    };
+    rebuild(&pinned, trash_dir, |files, name, _| {
+        crate::store::tree_allocated_bytes_at(files, name)
+    })
+}
+
+/// `write_cache` measuring each directory with `measure`, given its path.
+#[cfg(test)]
+fn write_cache_with(trash_dir: &Path, mut measure: impl FnMut(&Path) -> u64) -> io::Result<()> {
+    let (root, files, info) = open_pinned(trash_dir)?;
+    let pinned = Pinned {
+        root: &root,
+        files: files.as_ref(),
+        info: info.as_ref(),
+    };
+    rebuild(&pinned, trash_dir, |_, _, path| measure(path))
+}
+
+/// The names in the open directory `dir`, read through a fresh descriptor
+/// of it (a held one may have been read to its end before).
+fn for_each_name(dir: &fs::File, mut each: impl FnMut(&CStr, u8)) -> io::Result<()> {
+    let listing = crate::fdops::open_dir_nofollow_at(dir.as_raw_fd(), c".")?;
+    crate::store::for_each_entry(listing.as_raw_fd(), |name, kind| {
+        each(name, kind);
+        std::ops::ControlFlow::Continue(())
+    })
 }
 
 /// Directory-entry types let a rebuild skip unrelated regular files and
-/// symlinks without statting each one (#377). Rust falls back to metadata
-/// for DT_UNKNOWN. Keep only potential directories: their paths still need
-/// a fresh nofollow check before use, because a directory can be replaced
-/// after this scan. An incomplete scan falls back to the old sidecar walk.
-fn directory_candidates(files_dir: &Path) -> io::Result<HashSet<OsString>> {
+/// symlinks without statting each one (#377). Entries of unknown type are
+/// statted. Keep only potential directories: each still gets a fresh
+/// nofollow check before use, because a directory can be replaced after
+/// this scan. An incomplete scan (an unreadable files/) falls back to that
+/// check alone.
+fn directory_candidates(files: &fs::File) -> io::Result<HashSet<Vec<u8>>> {
     let mut directories = HashSet::new();
-    for entry in fs::read_dir(files_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            directories.insert(entry.file_name());
+    for_each_name(files, |name, kind| {
+        let is_dir = match kind {
+            libc::DT_DIR => true,
+            libc::DT_UNKNOWN => crate::fdops::stat_nofollow_at(files.as_raw_fd(), name)
+                .is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR),
+            _ => false,
+        };
+        if is_dir {
+            directories.insert(name.to_bytes().to_vec());
         }
-    }
+    })?;
     Ok(directories)
 }
 
-fn write_cache_with(trash_dir: &Path, mut measure: impl FnMut(&Path) -> u64) -> io::Result<()> {
-    let previous = read_cache(trash_dir);
-    let info_dir = trash_dir.join("info");
-    let files_dir = trash_dir.join("files");
-    let cache_path = trash_dir.join("directorysizes");
-    let mut lines = Vec::new();
-    let directories = directory_candidates(&files_dir).ok();
+fn is_directory_at(dir: RawFd, name: &CStr) -> bool {
+    crate::fdops::stat_nofollow_at(dir, name)
+        .is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+}
 
-    if let Ok(entries) = fs::read_dir(&info_dir) {
-        for entry in entries.flatten() {
-            // Raw bytes end-to-end: a lossy ID joined nowhere near its real
-            // files/ path, silently dropping non-UTF-8 directories (#258).
-            let filename = entry.file_name();
-            let id: &[u8] = match filename.as_bytes().strip_suffix(b".trashinfo") {
-                Some(id) => id,
-                None => continue,
-            };
+/// Rebuild the cache of `pinned`, measuring a directory whose row is
+/// missing or stale with `measure(files, name, path)`; `trash_dir` only
+/// names paths for it.
+fn rebuild(
+    pinned: &Pinned<'_>,
+    trash_dir: &Path,
+    mut measure: impl FnMut(RawFd, &CStr, &Path) -> u64,
+) -> io::Result<()> {
+    let previous = read_cache_at(pinned.root);
+    let mut lines = Vec::new();
+    if let (Some(files), Some(info)) = (pinned.files, pinned.info) {
+        let directories = directory_candidates(files).ok();
+        let mut sidecars = Vec::new();
+        // Raw bytes end-to-end: a lossy ID joined nowhere near its real
+        // files/ entry, silently dropping non-UTF-8 directories (#258).
+        let _ = for_each_name(info, |name, _| {
+            if name.to_bytes().ends_with(b".trashinfo") {
+                sidecars.push(name.to_owned());
+            }
+        });
+        for sidecar in sidecars {
+            let id = &sidecar.to_bytes()[..sidecar.to_bytes().len() - b".trashinfo".len()];
             if directories
                 .as_ref()
-                .is_some_and(|names| !names.contains(OsStr::from_bytes(id)))
+                .is_some_and(|names| !names.contains(id))
             {
                 continue;
             }
-
-            // Only cache directories — symlink_metadata so a trashed SYMLINK
-            // to an external directory is never walked through or cached as
-            // a directory.
-            let file_path = files_dir.join(OsStr::from_bytes(id));
-            let is_real_dir = match fs::symlink_metadata(&file_path) {
-                Ok(m) => m.is_dir(),
-                Err(_) => continue,
+            let Ok(name) = CString::new(id) else {
+                continue;
             };
-            if !is_real_dir {
+            // Only real directories: a trashed SYMLINK to an external
+            // directory is never walked through or cached as one.
+            if !is_directory_at(files.as_raw_fd(), &name) {
                 continue;
             }
-
             // mtime of the .trashinfo file per spec (NOT the directory)
-            let mtime = match entry.metadata() {
-                Ok(m) => m.mtime(),
+            let mtime = match crate::fdops::metadata_nofollow_at(info.as_raw_fd(), &sidecar) {
+                Ok(metadata) => metadata.mtime(),
                 Err(_) => continue,
             };
-
-            // Size: recursive directory size
             let size = match previous.get(id) {
                 Some(cached) if cached.mtime == mtime => cached.size,
-                _ => measure(&file_path),
+                _ => measure(
+                    files.as_raw_fd(),
+                    &name,
+                    &trash_dir.join("files").join(OsStr::from_bytes(id)),
+                ),
             };
-
             lines.push(format!("{} {} {}", size, mtime, encode_name(id)));
         }
     }
-
-    // Exclusive staging remains safe even for concurrent threads in one PID.
-    let data = lines.join("\n") + "\n";
-    let mut staging = tempfile::NamedTempFile::new_in(trash_dir)?;
-    std::io::Write::write_all(&mut staging, data.as_bytes())?;
-    staging.persist(&cache_path).map_err(|e| e.error)?;
-
-    Ok(())
+    replace_cache_at(pinned.root, (lines.join("\n") + "\n").as_bytes())
 }
 
-/// Add or refresh the row of one newly trashed directory. A full rebuild
+/// The cache of the open trash root `root`, as `read_cache` reads it.
+fn read_cache_at(root: &fs::File) -> HashMap<Vec<u8>, DirSizeEntry> {
+    match crate::trashinfo::read_regular_text_file_at(
+        root.as_raw_fd(),
+        c"directorysizes",
+        MAX_CACHE_BYTES,
+    ) {
+        Ok(content) => parse_cache(&content).0,
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Atomically replace `directorysizes` in the open trash root `root`:
+/// staged exclusively beside it and renamed over it, both relative to the
+/// root's descriptor.
+fn replace_cache_at(root: &fs::File, data: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    static STAGES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    for _ in 0..64 {
+        let staged = CString::new(format!(
+            ".directorysizes-{}-{}.tmp",
+            std::process::id(),
+            STAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))?;
+        let mut file = match crate::fdops::create_excl_at(root.as_raw_fd(), &staged, 0o600) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            created => created?,
+        };
+        let published = file.write_all(data).and_then(|()| {
+            if unsafe {
+                libc::renameat(
+                    root.as_raw_fd(),
+                    staged.as_ptr(),
+                    root.as_raw_fd(),
+                    c"directorysizes".as_ptr(),
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        if published.is_err() {
+            let _ = crate::fdops::unlink_at(root.as_raw_fd(), &staged, 0);
+        }
+        return published;
+    }
+    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+/// Add or refresh the row of one newly trashed directory, in the root
+/// `locked` holds, through the descriptors it validated. A full rebuild
 /// stats every entry of the trash for each trashed directory; rows are keyed
 /// by name and validated by sidecar mtime, so every other row stays valid
 /// (#322). A malformed or unreadable cache gets the full repair instead.
 ///
 /// `size` is the tree's allocated bytes, measured by the caller while it
 /// sized the entry (one walk serves both).
-pub(crate) fn record_directory(trash_dir: &Path, name: &OsStr, size: u64) -> io::Result<()> {
-    let cache_path = trash_dir.join("directorysizes");
-    let content = match crate::trashinfo::read_regular_text_file(&cache_path, MAX_CACHE_BYTES) {
+pub(crate) fn record_directory(
+    locked: &RootMutationGuard,
+    name: &OsStr,
+    size: u64,
+) -> io::Result<()> {
+    let pinned = Pinned {
+        root: locked.root_dir(),
+        files: Some(locked.files()),
+        info: Some(locked.info()),
+    };
+    let content = match crate::trashinfo::read_regular_text_file_at(
+        locked.root_dir().as_raw_fd(),
+        c"directorysizes",
+        MAX_CACHE_BYTES,
+    ) {
         Ok(content) => content,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(_) => return write_cache(trash_dir),
+        Err(_) => return rebuild_locked(&pinned, locked.root()),
     };
     if cache_is_malformed(&content) {
-        return write_cache(trash_dir);
+        return rebuild_locked(&pinned, locked.root());
     }
-    let directory = trash_dir.join("files").join(name);
-    if !fs::symlink_metadata(&directory).is_ok_and(|m| m.is_dir()) {
+    let directory = CString::new(name.as_bytes())?;
+    if !is_directory_at(locked.files().as_raw_fd(), &directory) {
         return Ok(());
     }
-    let mut sidecar = name.to_os_string();
-    sidecar.push(".trashinfo");
-    let mtime = fs::symlink_metadata(trash_dir.join("info").join(sidecar))?.mtime();
+    let mut sidecar = name.as_bytes().to_vec();
+    sidecar.extend_from_slice(b".trashinfo");
+    let mtime =
+        crate::fdops::metadata_nofollow_at(locked.info().as_raw_fd(), &CString::new(sidecar)?)?
+            .mtime();
     let mut data = String::with_capacity(content.len() + 64);
     for line in content.lines().filter(|line| !line.is_empty()) {
         // parse_cache accepted every line, so each has three fields.
@@ -305,45 +460,21 @@ pub(crate) fn record_directory(trash_dir: &Path, name: &OsStr, size: u64) -> io:
         "{size} {mtime} {}\n",
         encode_name(name.as_bytes())
     ));
-    let mut staging = tempfile::NamedTempFile::new_in(trash_dir)?;
-    std::io::Write::write_all(&mut staging, data.as_bytes())?;
-    staging.persist(&cache_path).map_err(|e| e.error)?;
-    Ok(())
+    replace_cache_at(locked.root_dir(), data.as_bytes())
 }
 
-/// Compute directory size recursively (bytes, like `du -B1`).
+fn rebuild_locked(pinned: &Pinned<'_>, trash_dir: &Path) -> io::Result<()> {
+    rebuild(pinned, trash_dir, |files, name, _| {
+        crate::store::tree_allocated_bytes_at(files, name)
+    })
+}
+
+/// Compute directory size recursively (bytes, like `du -B1`): the walk that
+/// sizes a directory when it is trashed, so a rebuilt row equals the one
+/// `record_directory` got (store-metadata-9). Symlinks are never followed.
+#[cfg(test)]
 fn dir_size_bytes(path: &Path) -> u64 {
-    dir_size_bytes_inner(path, 0)
-}
-
-/// Depth cap mirrors `copy_tree`'s, so a pathological deep tree can't exhaust
-/// the stack (returns a partial total once the cap is hit).
-const DIR_SIZE_MAX_DEPTH: u32 = 100;
-
-fn dir_size_bytes_inner(path: &Path, depth: u32) -> u64 {
-    if depth > DIR_SIZE_MAX_DEPTH {
-        return 0;
-    }
-    let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            // symlink_metadata / file_type(): never follow symlinks —
-            // following made the walk escape into external (possibly huge or
-            // cyclic) trees and count foreign data.
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                total = total.saturating_add(dir_size_bytes_inner(&entry.path(), depth + 1));
-            } else if !ft.is_symlink() {
-                // Count blocks * 512 for actual disk usage (like du)
-                if let Ok(meta) = entry.metadata() {
-                    total = total.saturating_add(meta.blocks().saturating_mul(512));
-                }
-            }
-        }
-    }
-    total
+    crate::store::tree_allocated_bytes(path)
 }
 
 /// Percent-encode a directory name for the cache.
@@ -403,7 +534,18 @@ fn decode_name(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::time::{Duration, SystemTime};
+
+    /// Lock `root` as a writer does (its directories made private first).
+    fn lock(root: &Path) -> RootMutationGuard {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [root.to_path_buf(), root.join("files"), root.join("info")] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        RootMutationGuard::acquire(root).unwrap()
+    }
 
     #[test]
     fn checked_cache_names_reject_malformed_encoding_without_changing_public_reads() {
@@ -800,7 +942,7 @@ mod tests {
         write_cache(root).unwrap();
         add(b"third \xff%", 20000);
         record_directory(
-            root,
+            &lock(root),
             OsStr::from_bytes(b"third \xff%"),
             dir_size_bytes(&root.join("files").join(OsStr::from_bytes(b"third \xff%"))),
         )
@@ -820,7 +962,7 @@ mod tests {
         // A reused name replaces its row instead of duplicating it.
         fs::write(root.join("files/first/more"), vec![1u8; 50000]).unwrap();
         record_directory(
-            root,
+            &lock(root),
             OsStr::new("first"),
             dir_size_bytes(&root.join("files/first")),
         )
@@ -831,12 +973,12 @@ mod tests {
         // Non-directories are not cached.
         fs::write(root.join("files/plain"), b"x").unwrap();
         fs::write(root.join("info/plain.trashinfo"), b"metadata").unwrap();
-        record_directory(root, OsStr::new("plain"), 0).unwrap();
+        record_directory(&lock(root), OsStr::new("plain"), 0).unwrap();
         assert!(!read_cache(root).contains_key(b"plain".as_slice()));
         // A malformed cache is rebuilt completely.
         fs::write(root.join("directorysizes"), "garbage\n").unwrap();
         record_directory(
-            root,
+            &lock(root),
             OsStr::new("first"),
             dir_size_bytes(&root.join("files/first")),
         )

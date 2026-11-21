@@ -9,6 +9,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const GITHUB_REPO: &str = "faratech/trashd";
+/// install.sh's own default PREFIX.
+const DEFAULT_PREFIX: &str = "/usr/local";
 
 #[derive(serde::Deserialize)]
 struct GhRelease {
@@ -312,8 +314,8 @@ pub fn run(check_only: bool, allow_unverified: bool) {
 
     // Decide where to install before downloading anything (#199).
     let prefix = match detect_install_prefix() {
-        InstallPrefix::Default => None,
-        InstallPrefix::Custom(prefix) => Some(prefix),
+        InstallPrefix::Default => PathBuf::from(DEFAULT_PREFIX),
+        InstallPrefix::Custom(prefix) => prefix,
         InstallPrefix::Refused(reason) => fatal(format!("cannot self-update: {reason}")),
     };
 
@@ -471,14 +473,7 @@ pub fn run(check_only: bool, allow_unverified: bool) {
         // is inherited by every descendant and can never be cleared. The setuid
         // sudo binary then refuses to escalate ("the 'no new privileges' flag
         // is set"). Running bash directly needs no privilege transition.
-        let mut cmd = std::process::Command::new("bash");
-        cmd.arg(&install_script)
-            .env("TRASH_BYPASS", "1")
-            .current_dir(&install_dir);
-        if let Some(prefix) = &prefix {
-            cmd.env("PREFIX", prefix);
-        }
-        cmd.status()
+        installer_command(true, &prefix, &install_script, &install_dir).status()
     } else if no_new_privs_set() {
         // Non-root and escalation is blocked by no_new_privs (same seccomp cause
         // as above). sudo/su are setuid and cannot work here — fail with a clear
@@ -495,15 +490,7 @@ pub fn run(check_only: bool, allow_unverified: bool) {
         )
     } else {
         // Non-root: escalate via sudo as before.
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.arg("env").arg("TRASH_BYPASS=1");
-        if let Some(prefix) = &prefix {
-            cmd.arg(format!("PREFIX={}", prefix.display()));
-        }
-        cmd.arg("bash")
-            .arg(&install_script)
-            .current_dir(&install_dir)
-            .status()
+        installer_command(false, &prefix, &install_script, &install_dir).status()
     };
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -518,6 +505,42 @@ pub fn run(check_only: bool, allow_unverified: bool) {
         }
         Ok(s) => fatal(format!("installer exited with {s}")),
         Err(e) => fatal(format!("run installer: {e}")),
+    }
+}
+
+/// The command that runs the release's install.sh as root: directly when
+/// already root, through sudo otherwise. `prefix` is the validated install
+/// prefix and is always passed: install.sh otherwise takes PREFIX from its
+/// environment, and a root caller's environment (`su`, `sudo -E`) could
+/// carry a user-writable one past the #199 check, along with BASH_ENV and
+/// similar variables a root bash honors (cli-1). sudo's env_reset scrubs the
+/// rest on the other path.
+fn installer_command(
+    as_root: bool,
+    prefix: &Path,
+    script: &Path,
+    dir: &Path,
+) -> std::process::Command {
+    if as_root {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(script)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("TRASH_BYPASS", "1")
+            .env("PREFIX", prefix)
+            .current_dir(dir);
+        cmd
+    } else {
+        let mut prefix_arg = OsString::from("PREFIX=");
+        prefix_arg.push(prefix);
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("env")
+            .arg("TRASH_BYPASS=1")
+            .arg(prefix_arg)
+            .arg("bash")
+            .arg(script)
+            .current_dir(dir);
+        cmd
     }
 }
 
@@ -1070,6 +1093,43 @@ mod tests {
             install_prefix_for(Path::new("/usr/lib/bin/trash")),
             InstallPrefix::Custom(prefix) if prefix == Path::new("/usr/lib")
         ));
+    }
+
+    // cli-1: as root the installer inherited the caller's whole environment.
+    // A PREFIX kept through `su` or `sudo -E` (or BASH_ENV, SHELLOPTS, ...)
+    // decided where root installed the library every process loads, past the
+    // #199 root-owned-prefix check. The installer now gets a minimal
+    // environment and always an explicit, validated PREFIX.
+    #[test]
+    fn installer_gets_a_minimal_environment_and_explicit_prefix() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("install.sh");
+        fs::write(&script, "env\n").unwrap();
+        let prefix = Path::new("/usr/local");
+        let out = installer_command(true, prefix, &script, temp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let env: BTreeMap<&str, &str> = stdout.lines().filter_map(|l| l.split_once('=')).collect();
+        // bash itself adds PWD, SHLVL and _.
+        let names: BTreeSet<&str> = env
+            .keys()
+            .copied()
+            .filter(|name| !["PWD", "SHLVL", "_"].contains(name))
+            .collect();
+        assert_eq!(names, BTreeSet::from(["PATH", "PREFIX", "TRASH_BYPASS"]));
+        assert_eq!(env["PREFIX"], "/usr/local");
+        assert_eq!(env["TRASH_BYPASS"], "1");
+
+        let sudo = installer_command(false, prefix, &script, temp.path());
+        assert_eq!(sudo.get_program(), "sudo");
+        let args: Vec<&std::ffi::OsStr> = sudo.get_args().collect();
+        assert!(
+            args.contains(&std::ffi::OsStr::new("PREFIX=/usr/local")),
+            "{args:?}"
+        );
     }
 
     #[test]

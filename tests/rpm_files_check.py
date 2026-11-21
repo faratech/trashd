@@ -27,11 +27,15 @@ MACROS = {
 
 
 def claimed_files(spec):
-    section = spec.split("\n%files\n", 1)[1].split("\n\n%", 1)[0]
+    # %files ends at the next section header, not at a blank line: the
+    # scriptlets and their comments that follow it (#408) are not paths.
+    section = spec.split("\n%files\n", 1)[1]
+    section = re.split(r"^%(?:pre|post|preun|postun|pretrans|posttrans|changelog)\b",
+                       section, maxsplit=1, flags=re.M)[0]
     files, prefixes = set(), set()
     for line in section.splitlines():
         line = line.strip()
-        if not line or line.startswith(("%license", "%doc", "%dir ")):
+        if not line or line.startswith(("#", "%license", "%doc", "%dir ")):
             continue
         line = re.sub(r"^%config\(noreplace\)\s+", "", line)
         path = re.sub(r"%\{(\w+)\}", lambda m: MACROS[m.group(1)], line)

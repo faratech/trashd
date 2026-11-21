@@ -397,6 +397,25 @@ fi
 umount /work/dedup-b /work/dedup-a
 
 # -----------------------------------------------------------------------
+# A topdir trash that lost its info/ still shows the data stranded in its
+# files/ and can be emptied (#403, store-metadata-4): such a root was never
+# enumerated, and the root lock refused it.
+# -----------------------------------------------------------------------
+mkdir -p /work/no-info
+mount -t tmpfs -o mode=755 trashd-no-info /work/no-info
+NO_INFO_ROOT="/work/no-info/.Trash-$(id -u)"
+mkdir -m 700 "$NO_INFO_ROOT" "$NO_INFO_ROOT/files"
+echo "stranded" > "$NO_INFO_ROOT/files/trashd_it_stranded"
+NO_INFO_LISTED=$(trash ls 2>&1 | grep -c "trashd_it_stranded" || true)
+if [[ "$NO_INFO_LISTED" -ge 1 ]] && trash empty -y >/dev/null 2>&1 \
+        && [[ ! -e "$NO_INFO_ROOT/files/trashd_it_stranded" ]]; then
+    pass "Topdir trash without info/ is listed and emptied"
+else
+    fail "Topdir trash without info/ is listed and emptied" "listed $NO_INFO_LISTED times, or not emptied"
+fi
+umount /work/no-info
+
+# -----------------------------------------------------------------------
 # trash config show
 # -----------------------------------------------------------------------
 if trash config show 2>&1 | grep >/dev/null "never_trash"; then
@@ -443,6 +462,118 @@ if echo "$OUTPUT" | grep -qE "would be compressed|Nothing to compress"; then
 else
     fail "trash compress --dry-run" "unexpected output: $OUTPUT"
 fi
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# A read-only state directory (WS-J): the dry run stages nothing, so it
+# still reports the entry (recent-changes-6); the real run fails every
+# attempt and must exit non-zero, not print "Nothing to compress." (cli-3).
+# -----------------------------------------------------------------------
+STATE="$XDG_DATA_HOME/Trash/.trashd"
+for i in $(seq 1 200); do echo "line $i of ordinary text that compresses well"; done > /home/test/trashd_it_rocomp.txt
+rm /home/test/trashd_it_rocomp.txt
+mount --bind "$STATE" "$STATE"
+mount -o remount,bind,ro "$STATE"
+DRY_STATUS=0
+DRY_OUT=$(trash compress --older 0d --dry-run 2>&1) || DRY_STATUS=$?
+REAL_STATUS=0
+REAL_OUT=$(trash compress --older 0d 2>&1) || REAL_STATUS=$?
+umount "$STATE"
+if [ "$DRY_STATUS" -eq 0 ] && echo "$DRY_OUT" | grep -q "1 items would be compressed"; then
+    pass "trash compress --dry-run writes nothing to the trash"
+else
+    fail "trash compress --dry-run writes nothing to the trash" "exit $DRY_STATUS: $DRY_OUT"
+fi
+if [ "$REAL_STATUS" -ne 0 ] && echo "$REAL_OUT" | grep -q "1 item(s) could not be compressed" \
+    && ! echo "$REAL_OUT" | grep -q "Nothing to compress"; then
+    pass "trash compress fails when every attempt failed"
+else
+    fail "trash compress fails when every attempt failed" "exit $REAL_STATUS: $REAL_OUT"
+fi
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# Errors naming a recorded path are escaped (cli-2): a crafted name must
+# not reach the terminal as control bytes (here OSC 52, a clipboard write).
+# -----------------------------------------------------------------------
+ESC_NAME=$'trashd_it_esc\e]52;c;QQ==\a.txt'
+echo "esc" > "/home/test/$ESC_NAME"
+rm "/home/test/$ESC_NAME"
+echo "blocker" > "/home/test/$ESC_NAME"
+ESC_ERR=$(NO_COLOR=1 trash restore "$ESC_NAME" 2>&1 >/dev/null || true)
+if [[ "$ESC_ERR" == *"already exists"* && "$ESC_ERR" != *$'\e'* && "$ESC_ERR" != *$'\a'* \
+    && "$ESC_ERR" == *'trashd_it_esc\u{1b}]52;c;QQ==\u{7}.txt'* ]]; then
+    pass "trash restore escapes recorded paths in errors"
+else
+    fail "trash restore escapes recorded paths in errors" "$(printf '%q' "$ESC_ERR")"
+fi
+rm --permanent "/home/test/$ESC_NAME" 2>/dev/null
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# trash config set/add/remove keep comments and layout (cli-7)
+# -----------------------------------------------------------------------
+CONFIG_FILE="$XDG_CONFIG_HOME/trashd/config.toml"
+mkdir -p "$(dirname "$CONFIG_FILE")"
+printf '# keep big builds out of trash (ticket 123)\nmax_dir_size_mb = 10 # per build\n' > "$CONFIG_FILE"
+trash config set max_dir_size_mb 50 >/dev/null 2>&1
+trash config add never_trash '*.iso' >/dev/null 2>&1
+trash config add never_trash '*.img' >/dev/null 2>&1
+trash config remove never_trash '*.img' >/dev/null 2>&1
+if grep -qx '# keep big builds out of trash (ticket 123)' "$CONFIG_FILE" \
+    && grep -qx 'max_dir_size_mb = 50 # per build' "$CONFIG_FILE" \
+    && [ "$(trash config get max_dir_size_mb 2>&1)" = 50 ] \
+    && trash config get never_trash 2>&1 | grep -q '\*\.iso' \
+    && ! trash config get never_trash 2>&1 | grep -q '\*\.img'; then
+    pass "trash config edits keep comments"
+else
+    fail "trash config edits keep comments" "$(cat "$CONFIG_FILE")"
+fi
+trash config reset -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# Automatic compression is opt-in (store-metadata-5): after a retention pass
+# over a week-old entry, a spec-style restore (moving files/<id> back, as
+# GNOME Files does) still yields the original bytes.
+# -----------------------------------------------------------------------
+TRASH_ROOT="$XDG_DATA_HOME/Trash"
+for i in $(seq 1 200); do echo "line $i of ordinary text that compresses well"; done > /home/test/trashd_it_autocomp.txt
+cp /home/test/trashd_it_autocomp.txt /work/trashd_it_autocomp.orig
+rm /home/test/trashd_it_autocomp.txt
+sed -i "s/^DeletionDate=.*/DeletionDate=$(date -d '10 days ago' +%Y-%m-%dT%H:%M:%S)/" \
+    "$TRASH_ROOT/info/trashd_it_autocomp.txt.trashinfo"
+/usr/bin/rm -f "$TRASH_ROOT/.trashd/last_purge"
+echo "trigger" > /home/test/trashd_it_autocomp_trigger.txt
+rm /home/test/trashd_it_autocomp_trigger.txt
+if mv "$TRASH_ROOT/files/trashd_it_autocomp.txt" /home/test/trashd_it_autocomp.txt 2>/dev/null \
+    && cmp -s /home/test/trashd_it_autocomp.txt /work/trashd_it_autocomp.orig; then
+    pass "Retention leaves entries uncompressed by default"
+else
+    fail "Retention leaves entries uncompressed by default" "spec-style restore yielded other bytes"
+fi
+/usr/bin/rm -f "$TRASH_ROOT/info/trashd_it_autocomp.txt.trashinfo"
+rm -f --permanent /home/test/trashd_it_autocomp.txt 2>/dev/null
+trash empty -y >/dev/null 2>&1
+
+# -----------------------------------------------------------------------
+# An operand larger than retention.max_size_gb is refused and kept, never
+# trashed and then purged with every older entry (store-core-2).
+# -----------------------------------------------------------------------
+trash config set retention.max_size_gb 0.000001 >/dev/null 2>&1   # ~1 KiB
+echo "older" > /home/test/trashd_it_cap_old.txt
+rm /home/test/trashd_it_cap_old.txt
+mkdir -p /home/test/trashd_it_cap_dir
+head -c 8192 /dev/zero > /home/test/trashd_it_cap_dir/payload
+CAP_STATUS=0
+rm -r /home/test/trashd_it_cap_dir 2>/dev/null || CAP_STATUS=$?
+if [ "$CAP_STATUS" -ne 0 ] && [ "$(stat -c %s /home/test/trashd_it_cap_dir/payload 2>/dev/null)" = 8192 ] \
+    && trash ls 2>&1 | grep >/dev/null "trashd_it_cap_old"; then
+    pass "Retention cap refuses an oversized operand and keeps older entries"
+else
+    fail "Retention cap refuses an oversized operand and keeps older entries" "exit $CAP_STATUS"
+fi
+rm -rf --permanent /home/test/trashd_it_cap_dir 2>/dev/null
+trash config reset -y >/dev/null 2>&1
 trash empty -y >/dev/null 2>&1
 
 # -----------------------------------------------------------------------
