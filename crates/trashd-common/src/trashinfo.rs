@@ -58,6 +58,67 @@ pub(crate) fn read_regular_text_file(path: &Path, limit: u64) -> io::Result<Stri
     Ok(text)
 }
 
+/// `read_regular_text_file` for the entry `name` of the open directory
+/// `dir`, following no symlink.
+pub(crate) fn read_regular_text_file_at(
+    dir: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    limit: u64,
+) -> io::Result<String> {
+    let mut text = String::new();
+    if open_regular_metadata_file_at(dir, name, limit)?
+        .0
+        .take(limit + 1)
+        .read_to_string(&mut text)? as u64
+        > limit
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is too large",
+        ));
+    }
+    Ok(text)
+}
+
+/// `read_sidecar_bytes` for the sidecar `name` of the open directory `dir`.
+pub(crate) fn read_sidecar_bytes_at(
+    dir: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if open_regular_metadata_file_at(dir, name, MAX_SIDECAR_BYTES)?
+        .0
+        .take(MAX_SIDECAR_BYTES + 1)
+        .read_to_end(&mut bytes)? as u64
+        > MAX_SIDECAR_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash metadata is too large",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn open_regular_metadata_file_at(
+    dir: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    limit: u64,
+) -> io::Result<(fs::File, fs::Metadata)> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    checked_metadata_file(unsafe { fs::File::from_raw_fd(fd) }, limit)
+}
+
 /// A sidecar's raw bytes (bounded like `read_sidecar`, no UTF-8 check), for
 /// edits that must preserve every other byte.
 pub(crate) fn read_sidecar_bytes(path: &Path) -> io::Result<Vec<u8>> {

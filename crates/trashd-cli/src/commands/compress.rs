@@ -269,14 +269,13 @@ fn compress_before_publish(
     before_commit: impl FnOnce(),
     before_persist: impl FnOnce(),
 ) -> std::io::Result<Option<u64>> {
-    use trashd_common::store::set_compression_marker;
+    use trashd_common::store::{publish_data_stage, set_compression_marker_locked};
 
     use std::io::{Read, Seek};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let path = &entry.trashed_path;
-    let info_path = &entry.info_path;
     // Open without following a replacement symlink, and don't block if the
     // entry was replaced with a FIFO after the caller inspected it.
     let mut input = std::fs::OpenOptions::new()
@@ -374,7 +373,10 @@ fn compress_before_publish(
     )?;
 
     // 1) Marker first, touching only that line of the on-disk sidecar (#218).
-    set_compression_marker(info_path, Some("zstd"))?;
+    // Marker and data go through the directories the lock validated: by
+    // path, a FUSE or NFS server could answer files/ or info/ with a symlink
+    // once the lock had checked them (security-1 follow-up).
+    set_compression_marker_locked(&guard, entry, Some("zstd"))?;
 
     before_persist();
     // The marker write syncs its temporary file, so a writer can change the
@@ -383,18 +385,18 @@ fn compress_before_publish(
         if !compression_source_matches(&metadata, &input.metadata()?) {
             return Ok(false);
         }
-        tmp.persist(path).map_err(|e| e.error)?;
+        publish_data_stage(&guard, entry, tmp)?;
         Ok(true)
     })();
     match result {
         Ok(true) => Ok(Some(compressed_len)),
         Ok(false) => {
-            set_compression_marker(info_path, None)?;
+            set_compression_marker_locked(&guard, entry, None)?;
             Ok(None)
         }
         Err(error) => {
             // Revert the marker: data is still plaintext.
-            let _ = set_compression_marker(info_path, None);
+            let _ = set_compression_marker_locked(&guard, entry, None);
             Err(error)
         }
     }

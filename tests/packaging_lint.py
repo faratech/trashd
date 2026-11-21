@@ -190,15 +190,72 @@ def lint_workflows():
                           f"{where} persists the checkout token in .git/config")
 
 
+def top_level_subcommands(build_rs):
+    """Names of the root command's own subcommands in build.rs's build_cli.
+
+    Tracks which parenthesis each `.subcommand(` opened, so subcommands of
+    subcommands (`trash config show`) are told apart from the root's.
+    """
+    body = build_rs[build_rs.index("fn build_cli"):]
+    names, stack, i = [], [], 0
+    while i < len(body):
+        if body[i] == '"':
+            j = i + 1
+            while body[j] != '"':
+                j += 2 if body[j] == "\\" else 1
+            i = j + 1
+            continue
+        if body.startswith(".subcommand(", i):
+            stack.append("subcommand")
+            i += len(".subcommand(")
+            continue
+        match = re.match(r'Command::new\("([^"]+)"\)', body[i:])
+        if match:
+            # The first command opened directly in a root-level
+            # .subcommand( is the root's own subcommand; mark it named.
+            depth = sum(entry in ("subcommand", "named") for entry in stack)
+            if depth == 1 and stack[-1] == "subcommand":
+                names.append(match.group(1))
+                stack[-1] = "named"
+            i += match.end()
+            continue
+        if body[i] == "(":
+            stack.append("(")
+        elif body[i] == ")":
+            if not stack:
+                break
+            stack.pop()
+        i += 1
+    return names
+
+
+def lint_man_pages():
+    """#425: uninstall removes the man pages named in the Makefile, so the
+    list must be exactly what crates/trashd-cli/build.rs generates: trash.1
+    and one page per top-level subcommand."""
+    makefile = (REPO / "Makefile").read_text()
+    match = re.search(r"^MAN_PAGES = ((?:.*\\\n)*.*)$", makefile, re.M)
+    if not check(match, "Makefile has no MAN_PAGES list"):
+        return
+    listed = set(match.group(1).replace("\\\n", " ").split())
+    subcommands = top_level_subcommands((REPO / "crates/trashd-cli/build.rs").read_text())
+    generated = {"trash.1"} | {f"trash-{name}.1" for name in subcommands}
+    check(len(subcommands) >= 10, f"build.rs subcommands not found: {subcommands}")
+    check(listed == generated,
+          f"Makefile MAN_PAGES differs from the pages build.rs generates: "
+          f"missing {sorted(generated - listed)}, extra {sorted(listed - generated)}")
+
+
 def main():
     lint_arch()
     lint_rpm()
     lint_workflows()
+    lint_man_pages()
     for error in ERRORS:
         print(f"FAIL: {error}")
     if ERRORS:
         return 1
-    print("ok: package scriptlets and workflow permissions")
+    print("ok: package scriptlets, workflow permissions and man page list")
     return 0
 
 

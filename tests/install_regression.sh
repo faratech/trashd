@@ -457,6 +457,21 @@ if out=$(cd /src && env PATH="$INSTALL_PATH" make install 'PREFIX=/work/back\sla
 fi
 [[ "$out" == *"unsafe for /etc/ld.so.preload"* ]] \
     || fail "install-9: make install did not refuse a backslash PREFIX: $out"
+# #424: the recipes expanded PREFIX and DESTDIR unquoted, so a space split
+# every install and uninstall path. They are quoted now, and a prefix with
+# whitespace is refused before anything is touched, as install.sh does.
+for prefix in '/work/with space' $'/work/with\ttab'; do
+    if out=$(cd /src && env PATH="$INSTALL_PATH" make install "PREFIX=$prefix" 2>&1); then
+        fail "#424: make install accepted PREFIX='$prefix'"
+    fi
+    [[ "$out" == *"unsafe for /etc/ld.so.preload"* ]] \
+        || fail "#424: make install did not refuse PREFIX='$prefix': $out"
+done
+[[ ! -e "/work/with space" ]] || fail "#424: a refused make install created its prefix"
+if out=$(cd /src && env PATH="$INSTALL_PATH" make install 'DESTDIR=/work/stage dir' 2>&1); then
+    fail "#424: make install accepted a DESTDIR with a space"
+fi
+echo "PASS: make install refuses a PREFIX or DESTDIR with whitespace"
 
 # Stand-ins for a `make build` tree. /usr is read-only here, so the units
 # are staged elsewhere.

@@ -54,6 +54,17 @@
 
 ### Fixed
 
+- Restore's move out of `files/`, `trash compress`'s marker and data
+  publication, and the `directorysizes` cache (read, rebuild and the
+  per-directory record) also go through the descriptors the trash lock
+  validated. They were the last store mutations still reached by path,
+  so a FUSE or NFS server could still swap `files/` or `info/` for a
+  symlink after the lock's check. (#508 follow-up)
+
+- `tests/packaging_lint.py` checks the Makefile's man page list against
+  the pages `build.rs` generates, and the install regression covers a
+  `PREFIX` with a space or a tab; #424 and #425 had no direct test.
+
 - The shim honors `--preserve-root`/`--no-preserve-root` in command-line
   order (the last flag wins, as in GNU rm) and refuses abbreviated
   `--no-preserve-root` spellings that GNU rejects. (#430, #431)

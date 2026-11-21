@@ -1172,8 +1172,10 @@ impl TrashStore {
         // Update the directorysizes cache if a directory landed: `sizes`
         // describes what did, which a race can make another type than the
         // operand had before the move (recent-changes-9).
-        if let Some(allocated) = sizes.allocated {
-            let _ = crate::directorysizes::record_directory(&trash_dir, OsStr::new(&id), allocated);
+        if let Some(allocated) = sizes.allocated
+            && let Some(locked) = guard.as_ref().or(verify_guard.as_ref())
+        {
+            let _ = crate::directorysizes::record_directory(locked, OsStr::new(&id), allocated);
         }
 
         drop(guard);
@@ -1689,8 +1691,10 @@ impl TrashStore {
         unsafe { libc::close(files_fd) };
 
         // A row for the directory that landed, as in trash().
-        if let Some(allocated) = victim_sizes.allocated {
-            let _ = crate::directorysizes::record_directory(&trash_dir, OsStr::new(&id), allocated);
+        if let Some(allocated) = victim_sizes.allocated
+            && let Some(locked) = guard.as_ref().or(verify_guard.as_ref())
+        {
+            let _ = crate::directorysizes::record_directory(locked, OsStr::new(&id), allocated);
         }
         drop(guard);
         drop(verify_guard);
@@ -1936,7 +1940,14 @@ impl TrashStore {
         // (#168), and a purge could delete an entry being copied across
         // filesystems without the root lock. Held through the publish. A
         // busy entry is reported as such, never as already gone (cli-5).
-        let entry_lock = lock_entry_file_until(&entry.trashed_path, self.entry_lock_deadline())
+        // Through a files/ that follows no symlink, as purge does
+        // (security-1).
+        let entry_lock = entry_names(entry)
+            .map_err(trash_to_io)
+            .and_then(|(data_name, _)| {
+                let files = open_store_child(&entry.trash_root, c"files")?;
+                lock_entry_file_at(files.as_raw_fd(), &data_name, self.entry_lock_deadline())
+            })
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::WouldBlock {
                     TrashError::Io(error)
@@ -1950,7 +1961,10 @@ impl TrashStore {
         // both the data identity and complete sidecar version under this guard.
         self.validate_entry_locked(entry, &root_guard)?;
 
-        let source_parent = open_directory_nofollow(&entry.trash_root.join("files"))?;
+        // The files/ the lock validated: opened again by path, it could be
+        // a symlink a FUSE or NFS server answered after the check
+        // (security-1 follow-up). Kept past the lock for a copy.
+        let source_parent = root_guard.files().try_clone()?;
         // Raw filename bytes, not the lossy String ID: a non-UTF-8 entry's
         // on-disk name differs from its display ID (#247).
         let source_name = CString::new(
@@ -2714,7 +2728,9 @@ impl TrashStore {
         // marker. Revert it when the atomic data swap fails (#28).
         let mut info = entry.info.clone();
         info.compressed = Some("zstd".into());
-        set_compression_marker(&entry.info_path, Some("zstd"))?;
+        // Marker and data through the directories the lock validated
+        // (security-1 follow-up).
+        set_compression_marker_locked(&guard, entry, Some("zstd"))?;
         before_persist();
         let result = (|| -> io::Result<bool> {
             // Recording the marker also syncs a file and can block. Check
@@ -2722,7 +2738,7 @@ impl TrashStore {
             if !compression_source_matches(expected, &input.metadata()?) {
                 return Ok(false);
             }
-            staging.persist(&entry.trashed_path).map_err(|e| e.error)?;
+            publish_data_stage(&guard, entry, staging)?;
             Ok(true)
         })();
         let result = match result {
@@ -2730,14 +2746,13 @@ impl TrashStore {
                 entry.info = info;
                 Ok(true)
             }
-            Ok(false) => set_compression_marker(&entry.info_path, None).map(|()| false),
+            Ok(false) => set_compression_marker_locked(&guard, entry, None).map(|()| false),
             Err(error) => {
-                let _ = set_compression_marker(&entry.info_path, None);
+                let _ = set_compression_marker_locked(&guard, entry, None);
                 Err(error)
             }
         };
-        entry.identity = file_identity(&entry.trashed_path);
-        entry.sidecar_version = sidecar_version(&entry.info_path);
+        (entry.identity, entry.sidecar_version) = locked_versions(&guard, entry);
         result.map_err(TrashError::Io)
     }
 
@@ -3442,9 +3457,8 @@ fn decompress_before_commit(
     cleared.compressed = None;
     if !has_zstd_magic {
         before_commit();
-        let _guard = RootMutationGuard::acquire(&entry.trash_root)?;
-        if file_identity(&entry.trashed_path) != Some(expected_identity)
-            || sidecar_version(&entry.info_path) != Some(expected_sidecar)
+        let guard = RootMutationGuard::acquire(&entry.trash_root)?;
+        if locked_versions(&guard, entry) != (Some(expected_identity), Some(expected_sidecar))
             || !compression_source_matches(&metadata, &input.metadata()?)
         {
             return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -3452,9 +3466,9 @@ fn decompress_before_commit(
         // Compression records the marker first. A crash in that narrow window
         // leaves ordinary plaintext plus a stale marker; clear only that known
         // state. A payload with real zstd magic must decode successfully.
-        set_compression_marker(&entry.info_path, None)?;
+        set_compression_marker_locked(&guard, entry, None)?;
         entry.info = cleared;
-        entry.sidecar_version = sidecar_version(&entry.info_path);
+        entry.sidecar_version = locked_versions(&guard, entry).1;
         return Ok(());
     }
 
@@ -3492,12 +3506,20 @@ fn decompress_before_commit(
         return Err(io::Error::last_os_error());
     }
     staging.as_file().set_permissions(metadata.permissions())?;
+    // The restored data keeps the compressed file's times, which are the
+    // original's (#202).
+    staging.as_file().set_times(
+        fs::FileTimes::new()
+            .set_accessed(metadata.accessed()?)
+            .set_modified(metadata.modified()?),
+    )?;
     staging.as_file().sync_all()?;
 
     before_commit();
-    let _guard = RootMutationGuard::acquire(&entry.trash_root)?;
-    if file_identity(&entry.trashed_path) != Some(expected_identity)
-        || sidecar_version(&entry.info_path) != Some(expected_sidecar)
+    // Checked and published through the directories the lock validated
+    // (security-1 follow-up).
+    let guard = RootMutationGuard::acquire(&entry.trash_root)?;
+    if locked_versions(&guard, entry) != (Some(expected_identity), Some(expected_sidecar))
         || !compression_source_matches(&metadata, &input.metadata()?)
     {
         return Err(io::Error::new(
@@ -3505,18 +3527,15 @@ fn decompress_before_commit(
             "trash entry changed before decompression commit",
         ));
     }
-    staging
-        .persist(&entry.trashed_path)
-        .map_err(|error| error.error)?;
-    let _ = keep_times(&entry.trashed_path, &metadata);
-    entry.identity = file_identity(&entry.trashed_path);
+    publish_data_stage(&guard, entry, staging)?;
+    entry.identity = locked_versions(&guard, entry).0;
 
     // Treat marker retirement as part of the transaction. If it fails, leave
     // the recoverable plaintext+marker state; the next restore recognizes the
     // missing magic and retries this write without decoding the file again.
-    set_compression_marker(&entry.info_path, None)?;
+    set_compression_marker_locked(&guard, entry, None)?;
     entry.info = cleared;
-    entry.sidecar_version = sidecar_version(&entry.info_path);
+    entry.sidecar_version = locked_versions(&guard, entry).1;
     Ok(())
 }
 
@@ -3683,10 +3702,16 @@ fn tree_sizes_at(dir: RawFd, name: &CStr) -> EntrySizes {
 /// Allocated bytes of the tree at `path`, for a directorysizes row: the
 /// survey's, so a rebuilt row equals the one recorded with the entry
 /// (store-metadata-9).
+#[cfg(test)]
 pub(crate) fn tree_allocated_bytes(path: &Path) -> u64 {
     CString::new(path.as_os_str().as_bytes()).map_or(0, |name| {
         tree_survey_at(libc::AT_FDCWD, &name, false).allocated
     })
+}
+
+/// `tree_allocated_bytes` of the entry `name` of the open directory `dir`.
+pub(crate) fn tree_allocated_bytes_at(dir: RawFd, name: &CStr) -> u64 {
+    tree_survey_at(dir, name, false).allocated
 }
 
 /// Replace the sidecar `name` of a locked root's info/ (`dir`, the lock's
@@ -5282,6 +5307,151 @@ pub fn write_trashinfo_atomic(info_path: &Path, info: &TrashInfo) -> io::Result<
 /// restore once the drive was mounted elsewhere (#218).
 pub fn set_compression_marker(info_path: &Path, algorithm: Option<&str>) -> io::Result<()> {
     let original = crate::trashinfo::read_sidecar_bytes(info_path)?;
+    atomic_write(info_path, &with_compression_marker(&original, algorithm))
+}
+
+/// `set_compression_marker` for an entry of the root `guard` holds, through
+/// the info/ it validated: by path, a FUSE or NFS server could answer info/
+/// with a symlink once the lock had checked it, and the rewritten sidecar
+/// replaced whatever file of that name it led to (security-1 follow-up).
+pub fn set_compression_marker_locked(
+    guard: &RootMutationGuard,
+    entry: &TrashEntry,
+    algorithm: Option<&str>,
+) -> io::Result<()> {
+    let (_, info_name) = entry_names(entry).map_err(trash_to_io)?;
+    let info = guard.info().as_raw_fd();
+    let original = crate::trashinfo::read_sidecar_bytes_at(info, &info_name)?;
+    replace_bytes_at(
+        info,
+        &info_name,
+        &with_compression_marker(&original, algorithm),
+    )
+}
+
+/// Publish a finished data stage (`create_data_stage`) as the data of an
+/// entry of the root `guard` holds: renamed out of the state directory the
+/// lock validated into the files/ it validated, once the stage is checked
+/// to be that directory's entry of its name. Renamed onto the entry's path,
+/// a symlink a FUSE or NFS server answered for files/ after the check had
+/// the staged bytes replace whatever file it led to (security-1 follow-up).
+pub fn publish_data_stage(
+    guard: &RootMutationGuard,
+    entry: &TrashEntry,
+    stage: tempfile::NamedTempFile,
+) -> io::Result<()> {
+    let (data_name, _) = entry_names(entry).map_err(trash_to_io)?;
+    let stage_name = CString::new(
+        stage
+            .path()
+            .file_name()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
+            .as_bytes(),
+    )?;
+    let state = guard.state().as_raw_fd();
+    let named = stat_at(state, &stage_name, libc::AT_SYMLINK_NOFOLLOW)?;
+    if stat_identity(&named) != stat_identity(&stat_fd(stage.as_file().as_raw_fd())?) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the data stage is not in the trash's state directory",
+        ));
+    }
+    if unsafe {
+        libc::renameat(
+            state,
+            stage_name.as_ptr(),
+            guard.files().as_raw_fd(),
+            data_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // Published: the stage's name is gone and must not be removed later.
+    let (_, path) = stage.into_parts();
+    let _ = path.keep();
+    Ok(())
+}
+
+fn trash_to_io(error: TrashError) -> io::Error {
+    match error {
+        TrashError::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::NotFound, other.to_string()),
+    }
+}
+
+/// The data identity and sidecar version of an entry of the root `guard`
+/// holds, read through the directories it validated.
+fn locked_versions(
+    guard: &RootMutationGuard,
+    entry: &TrashEntry,
+) -> (Option<(u64, u64)>, Option<SidecarVersion>) {
+    let Ok((data_name, info_name)) = entry_names(entry) else {
+        return (None, None);
+    };
+    let identity = crate::fdops::metadata_nofollow_at(guard.files().as_raw_fd(), &data_name)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    let version = crate::fdops::metadata_nofollow_at(guard.info().as_raw_fd(), &info_name)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|metadata| SidecarVersion::from_metadata(&metadata));
+    (identity, version)
+}
+
+/// Atomically replace the regular file `name` of the open directory `dir`
+/// with `data`, keeping its owner, mode and times: `atomic_write` relative
+/// to a descriptor.
+fn replace_bytes_at(dir: RawFd, name: &CStr, data: &[u8]) -> io::Result<()> {
+    let meta = crate::fdops::metadata_nofollow_at(dir, name)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic replacement requires a regular file",
+        ));
+    }
+    for attempt in 0u32..64 {
+        let staged = CString::new(format!(
+            ".trashd-sidecar-{}-{attempt}.tmp",
+            std::process::id()
+        ))?;
+        let mut file = match crate::fdops::create_excl_at(dir, &staged, 0o600) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            created => created?,
+        };
+        let published = (|| {
+            file.write_all(data)?;
+            let staged_meta = file.metadata()?;
+            if (staged_meta.uid(), staged_meta.gid()) != (meta.uid(), meta.gid())
+                && unsafe { libc::fchown(file.as_raw_fd(), meta.uid(), meta.gid()) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            file.set_permissions(meta.permissions())?;
+            // A rewritten sidecar keeps the mtime that orders entries
+            // without a deletion stamp (#345).
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_accessed(meta.accessed()?)
+                    .set_modified(meta.modified()?),
+            )?;
+            file.sync_all()?;
+            if unsafe { libc::renameat(dir, staged.as_ptr(), dir, name.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if published.is_err() {
+            let _ = raw_unlinkat(dir, &staged, 0);
+        }
+        return published;
+    }
+    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+/// `original` with its `X-Trashd-Compressed` line replaced by one for
+/// `algorithm`, or removed for None; every other byte as it was.
+fn with_compression_marker(original: &[u8], algorithm: Option<&str>) -> Vec<u8> {
     let mut text: Vec<u8> = Vec::with_capacity(original.len() + 32);
     for line in original.split_inclusive(|&b| b == b'\n') {
         if !line.starts_with(b"X-Trashd-Compressed=") {
@@ -5294,36 +5464,7 @@ pub fn set_compression_marker(info_path: &Path, algorithm: Option<&str>) -> io::
         }
         text.extend_from_slice(format!("X-Trashd-Compressed={algorithm}\n").as_bytes());
     }
-    atomic_write(info_path, &text)
-}
-
-/// Give a swapped-in file the original's access and modification times, so
-/// compressing or decompressing an entry does not change what restore
-/// publishes (#202).
-fn keep_times(path: &Path, original: &fs::Metadata) -> io::Result<()> {
-    let times = [
-        libc::timespec {
-            tv_sec: original.atime(),
-            tv_nsec: original.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: original.mtime(),
-            tv_nsec: original.mtime_nsec(),
-        },
-    ];
-    let name = CString::new(path.as_os_str().as_bytes())?;
-    if unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            name.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    text
 }
 
 /// Whether compression may replace an entry's data inode at all: a regular
@@ -5486,6 +5627,7 @@ fn open_directory_path(path: &Path, nofollow: bool) -> io::Result<fs::File> {
     }
 }
 
+#[cfg(test)]
 fn open_directory_nofollow(path: &Path) -> io::Result<fs::File> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -6800,7 +6942,7 @@ fn read_directory_names(fd: RawFd) -> io::Result<Vec<CString>> {
 /// descriptor (its offset advances, as a dup's would). fdopendir cost a
 /// dup, an fstat and an fcntl per directory, and closedir another close
 /// (#368).
-fn for_each_entry(
+pub(crate) fn for_each_entry(
     fd: RawFd,
     mut each: impl FnMut(&CStr, u8) -> std::ops::ControlFlow<()>,
 ) -> io::Result<()> {
@@ -15175,6 +15317,198 @@ mod tests {
             );
             assert_eq!(names_in(&victim), ["shadow"]);
         }
+    }
+
+    /// Answer every lookup of `root/<child>` (the root itself for "") with a
+    /// symlink to `victim` from the moment a root lock has validated it, and
+    /// with the real directory while a lock validates it, as a FUSE or NFS
+    /// server can. `unswap` puts the real one back.
+    fn swap_after_validation(root: &Path, child: &str, victim: &Path) {
+        use crate::store_lock::validation_probe;
+        let (root, child, victim) = (root.to_path_buf(), child.to_owned(), victim.to_path_buf());
+        validation_probe::set(Some(Box::new(move |locked, validated| {
+            if locked != root {
+                return;
+            }
+            if validated {
+                let (target, aside) = swapped_paths(&root, &child);
+                if !aside.exists() {
+                    fs::rename(&target, &aside).unwrap();
+                    std::os::unix::fs::symlink(&victim, &target).unwrap();
+                }
+            } else {
+                unswap(&root, &child);
+            }
+        })));
+    }
+
+    fn swapped_paths(root: &Path, child: &str) -> (PathBuf, PathBuf) {
+        let target = if child.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(child)
+        };
+        let mut aside = target.clone().into_os_string();
+        aside.push(".real");
+        (target, PathBuf::from(aside))
+    }
+
+    fn unswap(root: &Path, child: &str) {
+        let (target, aside) = swapped_paths(root, child);
+        if aside.exists() {
+            fs::remove_file(&target).unwrap();
+            fs::rename(&aside, &target).unwrap();
+        }
+    }
+
+    // security-1 follow-up: the directorysizes cache was read, staged and
+    // renamed by path below the trash root, so once a lock had validated
+    // the root a server could answer its path with a symlink, and the
+    // cache, staged as root, landed in whatever directory it named. It is
+    // written through the lock's descriptors, and an unlocked rebuild opens
+    // the root following no symlink.
+    #[test]
+    fn directorysizes_are_written_only_through_the_validated_root() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        store.defer_maintenance();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        let tree = work.path().join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/file"), vec![1u8; 8192]).unwrap();
+        swap_after_validation(&store.home, "", &victim);
+        let trashed = store.trash(&tree, None);
+        validation_probe::set(None);
+        unswap(&store.home, "");
+        let cached = |dir: &Path| {
+            names_in(dir)
+                .into_iter()
+                .any(|name| name == "directorysizes" || name.to_string_lossy().starts_with(".tmp"))
+        };
+        let locked_write_escaped = cached(&victim);
+        let id = trashed.unwrap();
+        let recorded = crate::directorysizes::read_cache(&store.home).contains_key(id.as_bytes());
+        // An unlocked rebuild (after a purge) of a root that is a symlink.
+        let real = store.home.with_file_name("Trash.real");
+        fs::rename(&store.home, &real).unwrap();
+        std::os::unix::fs::symlink(&victim, &store.home).unwrap();
+        let rebuilt = crate::directorysizes::write_cache(&store.home);
+        fs::remove_file(&store.home).unwrap();
+        fs::rename(&real, &store.home).unwrap();
+        assert!(!locked_write_escaped, "{:?}", names_in(&victim));
+        assert!(recorded, "no row for {id}");
+        assert!(
+            rebuilt.is_err() && !cached(&victim),
+            "{:?}",
+            names_in(&victim)
+        );
+    }
+
+    // security-1 follow-up: compression published its staged replacement
+    // by renaming it onto the entry's path once the root was locked, so a
+    // server answering files/ with a symlink after the lock's check had the
+    // zstd bytes replace whatever file of that name the link led to.
+    #[test]
+    fn compression_publishes_only_through_the_validated_store() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let path = store.home.join("files/data");
+        let original = vec![b'x'; 8192];
+        fs::write(&path, &original).unwrap();
+        let mut info = TrashInfo::new(work.path().join("data"));
+        info.pid = Some(1);
+        fs::write(
+            store.home.join("info/data.trashinfo"),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("data"), b"decoy").unwrap();
+        let mut entry = store.find_entry("data").unwrap();
+        let input = fs::File::open(&path).unwrap();
+        let expected = input.metadata().unwrap();
+        let encoded = zstd::encode_all(original.as_slice(), 3).unwrap();
+        swap_after_validation(&store.home, "files", &victim);
+        let published = store.publish_auto_compressed(&mut entry, &input, &expected, &encoded);
+        validation_probe::set(None);
+        unswap(&store.home, "files");
+        assert_eq!(fs::read(victim.join("data")).unwrap(), b"decoy");
+        assert!(published.unwrap());
+        assert_eq!(fs::read(&path).unwrap(), encoded);
+        assert!(
+            fs::read_to_string(store.home.join("info/data.trashinfo"))
+                .unwrap()
+                .contains("X-Trashd-Compressed=zstd")
+        );
+        let entry = store.find_entry("data").unwrap();
+        assert_eq!(entry.identity, file_identity(&path));
+    }
+
+    // security-1 follow-up: decompression for a restore checked and
+    // published the decoded data by the entry's path once the root was
+    // locked; with files/ answered by a symlink it refused (or, without
+    // the identity check, would have written through it). It works on the
+    // directories the lock validated.
+    #[test]
+    fn decompression_commits_only_through_the_validated_store() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let path = store.home.join("files/data");
+        let original = vec![b'y'; 8192];
+        fs::write(&path, zstd::encode_all(original.as_slice(), 3).unwrap()).unwrap();
+        let mut info = TrashInfo::new(work.path().join("data"));
+        info.pid = Some(1);
+        info.compressed = Some("zstd".into());
+        fs::write(
+            store.home.join("info/data.trashinfo"),
+            info.to_trashinfo_string(),
+        )
+        .unwrap();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("data"), b"decoy").unwrap();
+        let mut entry = store.find_entry("data").unwrap();
+        swap_after_validation(&store.home, "files", &victim);
+        let decoded = decompress_zstd_entry(
+            &mut entry,
+            1 << 20,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        validation_probe::set(None);
+        unswap(&store.home, "files");
+        assert_eq!(fs::read(victim.join("data")).unwrap(), b"decoy");
+        decoded.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            !fs::read_to_string(store.home.join("info/data.trashinfo"))
+                .unwrap()
+                .contains("X-Trashd-Compressed")
+        );
+        assert_eq!(entry.identity, file_identity(&path));
+    }
+
+    // security-1 follow-up: restore validated the entry through the lock's
+    // descriptors and then moved it out of a files/ it opened again by
+    // path, which a server could answer with a symlink: refused at best.
+    #[test]
+    fn restore_moves_only_out_of_the_validated_files_directory() {
+        use crate::store_lock::validation_probe;
+        let (store, _data, work, _) = test_store();
+        let source = create_file(work.path(), "kept", "the caller's data");
+        let id = store.trash(&source, None).unwrap();
+        let victim = work.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join(&id), b"decoy").unwrap();
+        swap_after_validation(&store.home, "files", &victim);
+        let restored = store.restore(&id, None);
+        validation_probe::set(None);
+        unswap(&store.home, "files");
+        assert_eq!(fs::read(victim.join(&id)).unwrap(), b"decoy");
+        assert_eq!(restored.unwrap(), source);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "the caller's data");
+        assert!(!store.home.join("files").join(&id).exists());
     }
 
     // security-2: a new entry is claimed, published and verified through the
