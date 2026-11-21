@@ -871,7 +871,8 @@ def run():
             try:
                 _, active = line(process)
                 assert active == "1"
-                path = work / "group-sigterm.lock"
+                # Not *.lock: the default never_trash would delete it for real.
+                path = work / "group-sigterm.txt"
                 path.write_bytes(b"removed by the cleanup trap\n")
                 process.stdin.write(json.dumps(["term-cleanup", str(path)]) + "\n"); process.stdin.flush()
                 assert line(process) == "armed"
