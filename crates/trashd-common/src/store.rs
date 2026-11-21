@@ -13635,8 +13635,7 @@ mod tests {
         let meta = fs::symlink_metadata(&entry.trashed_path).unwrap();
         assert!(
             meta.uid() == 65534 || meta.mode() & 0o6000 == 0,
-            "set-id bits on a copy owned by uid {}",
-            meta.uid()
+            "set-id bits on a copy owned by another user"
         );
     }
 

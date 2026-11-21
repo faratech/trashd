@@ -1933,6 +1933,12 @@ mod tests {
     #[test]
     fn handles_shared_by_two_filesystems_are_not_decoded() {
         use std::os::fd::{FromRawFd, OwnedFd};
+        // open_by_handle_at needs CAP_DAC_READ_SEARCH: unprivileged, even
+        // the unambiguous decode fails with EPERM.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: decoding a file handle requires root");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("trashd-ambiguous-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("victim");
