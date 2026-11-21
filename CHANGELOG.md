@@ -54,6 +54,12 @@
 
 ### Fixed
 
+- The preload's permission grant for an unreadable empty directory
+  (#410) also checks that the name still holds a directory, not only
+  the same device and inode number: ext4 can hand a removed directory's
+  inode number straight to a symlink created in its place, and the
+  delete then failed with `EACCES` instead of reaching the kernel.
+
 - Restore's move out of `files/`, `trash compress`'s marker and data
   publication, and the `directorysizes` cache (read, rebuild and the
   per-directory record) also go through the descriptors the trash lock

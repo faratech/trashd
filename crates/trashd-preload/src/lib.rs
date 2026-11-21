@@ -2865,11 +2865,14 @@ fn rmdir_unreadable(
     let identity = (meta.dev(), meta.ino());
     let (parent, name) = (operand.parent.fd(), operand.name.as_c_str());
     // Not that directory any more: the kernel answers for what is there.
+    // The type is checked too: a filesystem can hand a removed directory's
+    // inode number straight to the symlink that replaced it.
+    let same_directory = |s: &libc::stat| {
+        s.st_mode & libc::S_IFMT == libc::S_IFDIR && fdops::identity(s) == identity
+    };
     let pin = fdops::open_path_nofollow_at(parent, name)
         .ok()
-        .filter(|pin| {
-            fdops::stat_fd(pin.as_raw_fd()).is_ok_and(|s| fdops::identity(&s) == identity)
-        })?;
+        .filter(|pin| fdops::stat_fd(pin.as_raw_fd()).is_ok_and(|s| same_directory(&s)))?;
     #[cfg(test)]
     tests::race_probe(tests::Race::Grant);
     // Search permission too, so the pin can be entered: the scan and the
@@ -2882,8 +2885,7 @@ fn rmdir_unreadable(
         // unreadable one is reached through /proc): refused, where the
         // kernel's rmdir would remove it for real.
         let kernel_answers = matches!(error.raw_os_error(), Some(libc::EPERM | libc::EROFS))
-            || !fdops::stat_nofollow_at(parent, name)
-                .is_ok_and(|now| fdops::identity(&now) == identity);
+            || !fdops::stat_nofollow_at(parent, name).is_ok_and(|now| same_directory(&now));
         return (!kernel_answers).then_some(TrashAttempt::Error(libc::EACCES));
     }
     let scanned = fdops::open_dir_nofollow_at(pin.as_raw_fd(), c".")
