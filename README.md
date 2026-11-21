@@ -1042,7 +1042,7 @@ trashd implements the full [Trash specification v1.0](https://specifications.fre
 
 ## Contributing
 
-Contributions are welcome — bug reports, documentation fixes, and code. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test workflow, code style (`cargo fmt`, `cargo clippy -- -D warnings`, no `.unwrap()` in library code), and the sandbox testing rules. Changes are recorded in [CHANGELOG.md](CHANGELOG.md); the current release is 0.1.14.
+Contributions are welcome — bug reports, documentation fixes, and code. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test workflow, code style (`cargo fmt`, `cargo clippy -- -D warnings`, no `.unwrap()` in library code), and the sandbox testing rules. Changes are recorded in [CHANGELOG.md](CHANGELOG.md); the current release is 0.1.15.
 
 Found a deletion that trashd missed or mishandled? That is exactly the bug class this project cares most about — please file it at [github.com/faratech/trashd/issues](https://github.com/faratech/trashd/issues) with version, kernel, reproduction steps, expected vs. actual behaviour, and `TRASHD_PRELOAD_LOG=1` output where relevant.
 

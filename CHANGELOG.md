@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.15 (2026-11-20)
+
+Security and robustness release from the 2026-11-20 audit (#441–#556) and
+the remaining open issues (#402–#439). Every store change now goes through
+directory descriptors its lock validated, a busy trash fails a delete
+instead of waiting forever, and seccomp's protected mode has full CI
+coverage. Install the wrapper and preload from the same release and
+restart existing wrapped sessions.
 
 ### Changed
 
