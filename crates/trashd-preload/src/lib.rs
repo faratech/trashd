@@ -951,11 +951,7 @@ fn policy_skips(path: &Path) -> bool {
 
     // only_trash whitelist: if set and the path doesn't match, skip it so the
     // preload real-deletes it — same as the seccomp/CLI/store layers.
-    if !cfg.only_trash.is_empty() && !cfg.only_trash.iter().any(|p| pattern_matches(p, &s)) {
-        return true;
-    }
-
-    false
+    !cfg.only_trash.is_empty() && !cfg.only_trash.iter().any(|p| pattern_matches(p, &s))
 }
 
 // ---------------------------------------------------------------------------

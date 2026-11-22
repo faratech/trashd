@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/faratech/trashd/actions/workflows/ci.yml/badge.svg)](https://github.com/faratech/trashd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.99.1%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.100.0%2B-orange.svg)](https://www.rust-lang.org/)
 
 **A recycle bin for Linux that works everywhere — interactive shells, scripts, cron jobs, services, and the desktop.**
 
@@ -106,7 +106,7 @@ $ trash ls
 ### You need
 
 - A **Linux** system (any distribution; see [Compatibility](#compatibility) for kernel notes — the core `rm` protection works on every kernel).
-- **Rust 1.99.1 or newer** (`cargo`) to build from source. Check with `cargo --version`. Install Rust from [rustup.rs](https://rustup.rs/) if you do not have it.
+- **Rust 1.100.0 or newer** (`cargo`) to build from source. Check with `cargo --version`. Install Rust from [rustup.rs](https://rustup.rs/) if you do not have it.
 - `sudo` access for the system-wide install.
 
 > [!TIP]
@@ -1012,7 +1012,7 @@ Read it with `trash log` (last 20 lines) or `trash log -n 100`. It is the fastes
 | Linux 5.6+ | Layer 4 (seccomp user-notification, `openat2` pinning) | Older kernels simply lack kernel trapping |
 | Linux 5.9+ | Layer 3 (fanotify FID reporting) | The daemon idles harmlessly without markable mounts; on an older kernel, or without fanotify, it exits with status 78 and systemd does not restart it. It cannot audit btrfs subvolume mounts and warns about them |
 | `CAP_SYS_ADMIN` (via systemd ambient capabilities) | Layer 3 daemon | Granted by the shipped unit; you do not set it by hand |
-| Rust 1.99.1+ | Building from source only | Runtime has no Rust dependency |
+| Rust 1.100.0+ | Building from source only | Runtime has no Rust dependency |
 | systemd | Daemon + cleanup timer (optional conveniences) | Layers 1, 2, and 4 work without systemd |
 
 Architectures: x86-64 is the primary target (including an optional i686 preload for 32-bit processes on multilib systems, used where the system's loaders report their `$LIB` directories, glibc 2.33+); aarch64 is supported for Layers 1–3 and for Layer 4's `unlinkat`-only filter. Release artifacts are built against a glibc 2.28 floor, so they run on older enterprise distributions.
@@ -1042,7 +1042,7 @@ trashd implements the full [Trash specification v1.0](https://specifications.fre
 
 ## Contributing
 
-Contributions are welcome — bug reports, documentation fixes, and code. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test workflow, code style (`cargo fmt`, `cargo clippy -- -D warnings`, no `.unwrap()` in library code), and the sandbox testing rules. Changes are recorded in [CHANGELOG.md](CHANGELOG.md); the current release is 0.1.15.
+Contributions are welcome — bug reports, documentation fixes, and code. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test workflow, code style (`cargo fmt`, `cargo clippy -- -D warnings`, no `.unwrap()` in library code), and the sandbox testing rules. Changes are recorded in [CHANGELOG.md](CHANGELOG.md); the current release is 0.1.16.
 
 Found a deletion that trashd missed or mishandled? That is exactly the bug class this project cares most about — please file it at [github.com/faratech/trashd/issues](https://github.com/faratech/trashd/issues) with version, kernel, reproduction steps, expected vs. actual behaviour, and `TRASHD_PRELOAD_LOG=1` output where relevant.
 

@@ -749,8 +749,12 @@ mod tests {
         )
         .unwrap();
         // The same length, and so the same verdict, as the real run's stage.
-        let expected = zstd::encode_all(&vec![b'x'; 8192][..], 3).unwrap().len() as u64;
-        assert_eq!(reported, Some(expected));
+        let real_dir = tempfile::tempdir().unwrap();
+        let (real_store, real_entry) = fixture(real_dir.path(), "data");
+        let actual =
+            compress_file_zstd(&real_store, &real_entry, 8192, CommitMode::Publish).unwrap();
+        assert_eq!(reported, actual);
+        assert!(actual.is_some());
         assert_eq!(fs::read(&entry.trashed_path).unwrap(), vec![b'x'; 8192]);
         assert_eq!(fs::read(&entry.info_path).unwrap(), sidecar);
     }

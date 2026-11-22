@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.16 (2026-11-21)
+
+### Changed
+
+- Updated the Rust toolchain and minimum supported version to 1.100.0, and
+  refreshed workspace dependencies.
+
 ## 0.1.15 (2026-11-20)
 
 Security and robustness release from the 2026-11-20 audit (#441–#556) and

@@ -1,5 +1,5 @@
 Name:           trashd
-Version:        0.1.15
+Version:        0.1.16
 Release:        1%{?dist}
 Summary:        A Linux recycle bin that works in scripts, cron, and at the desktop
 License:        MIT
@@ -8,7 +8,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 # The workspace's rust-version; %{_unitdir} and the %systemd_* scriptlets
 # come from systemd-rpm-macros (#213).
-BuildRequires:  rust >= 1.99.1
+BuildRequires:  rust >= 1.100.0
 BuildRequires:  cargo
 BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
